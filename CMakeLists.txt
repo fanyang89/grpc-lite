@@ -28,6 +28,12 @@ else()
   message(FATAL_ERROR "Vendored protobuf is not wired yet. Set GRPC_LITE_USE_SYSTEM_PROTOBUF=ON.")
 endif()
 
+if(TARGET protobuf::protoc)
+  set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)
+else()
+  find_program(_PROTOBUF_PROTOC protoc REQUIRED)
+endif()
+
 if(GRPC_LITE_USE_SYSTEM_NGHTTP2)
   pkg_check_modules(NGHTTP2 REQUIRED IMPORTED_TARGET libnghttp2)
 else()
@@ -71,6 +77,42 @@ add_library(grpc_lite STATIC
 
 add_library(grpc_lite::grpc_lite ALIAS grpc_lite)
 
+set(GRPC_LITE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(GRPC_LITE_ECHO_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/proto/echo.proto")
+set(GRPC_LITE_ECHO_PROTO_RELATIVE "echo.proto")
+set(GRPC_LITE_ECHO_PROTO_SRC "${GRPC_LITE_GENERATED_DIR}/echo.pb.cc")
+set(GRPC_LITE_ECHO_PROTO_HDR "${GRPC_LITE_GENERATED_DIR}/echo.pb.h")
+
+add_custom_command(
+  OUTPUT
+    "${GRPC_LITE_ECHO_PROTO_SRC}"
+    "${GRPC_LITE_ECHO_PROTO_HDR}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${GRPC_LITE_GENERATED_DIR}"
+  COMMAND
+    ${_PROTOBUF_PROTOC}
+    --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+    --cpp_out=${GRPC_LITE_GENERATED_DIR}
+    ${GRPC_LITE_ECHO_PROTO_RELATIVE}
+  DEPENDS "${GRPC_LITE_ECHO_PROTO}"
+  VERBATIM
+)
+
+add_library(grpc_lite_echo_proto STATIC
+  "${GRPC_LITE_ECHO_PROTO_SRC}"
+)
+
+add_library(grpc_lite::echo_proto ALIAS grpc_lite_echo_proto)
+
+target_include_directories(grpc_lite_echo_proto
+  PUBLIC
+    "${GRPC_LITE_GENERATED_DIR}"
+)
+
+target_link_libraries(grpc_lite_echo_proto
+  PUBLIC
+    protobuf::libprotobuf
+)
+
 target_include_directories(grpc_lite
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -112,6 +154,13 @@ if(GRPC_LITE_BUILD_EXAMPLES)
 
   add_executable(grpc_lite_echo_server examples/echo_server.cc)
   target_link_libraries(grpc_lite_echo_server PRIVATE grpc_lite::grpc_lite)
+
+  add_executable(grpc_lite_proto_echo_server examples/proto_echo_server.cc)
+  target_link_libraries(grpc_lite_proto_echo_server
+    PRIVATE
+      grpc_lite::grpc_lite
+      grpc_lite::echo_proto
+  )
 endif()
 
 install(TARGETS grpc_lite EXPORT grpc_liteTargets
