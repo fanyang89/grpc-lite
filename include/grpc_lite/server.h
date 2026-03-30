@@ -3,12 +3,14 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "grpc_lite/status.h"
 
 namespace grpc_lite {
 
+class ServerImpl;
 class Service;
 
 class Server {
@@ -19,17 +21,24 @@ class Server {
   };
 
   explicit Server(std::vector<Listener> listeners);
+  ~Server();
 
   void AddService(Service* service);
   Status Start();
+  void Wait();
   void Shutdown();
 
   bool started() const;
   const std::vector<Listener>& listeners() const;
 
  private:
+  friend class ServerImpl;
+
+  Service* FindService(std::string_view path, std::string* method_name) const;
+
   std::vector<Listener> listeners_;
   std::vector<Service*> services_;
+  std::unique_ptr<ServerImpl> impl_;
   bool started_ = false;
 };
 
