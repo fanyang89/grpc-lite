@@ -77,40 +77,58 @@ add_library(grpc_lite STATIC
 
 add_library(grpc_lite::grpc_lite ALIAS grpc_lite)
 
+add_executable(protoc-gen-grpc_lite_upb tools/grpc_lite_upb_plugin.cc)
+target_link_libraries(protoc-gen-grpc_lite_upb
+  PRIVATE
+    protobuf::libprotoc
+    protobuf::libprotobuf
+)
+
 set(GRPC_LITE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(GRPC_LITE_ECHO_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/proto/echo.proto")
 set(GRPC_LITE_ECHO_PROTO_RELATIVE "echo.proto")
-set(GRPC_LITE_ECHO_PROTO_SRC "${GRPC_LITE_GENERATED_DIR}/echo.pb.cc")
-set(GRPC_LITE_ECHO_PROTO_HDR "${GRPC_LITE_GENERATED_DIR}/echo.pb.h")
+set(GRPC_LITE_ECHO_UPB_HDR "${GRPC_LITE_GENERATED_DIR}/echo.upb.h")
+set(GRPC_LITE_ECHO_UPB_MINITABLE_HDR "${GRPC_LITE_GENERATED_DIR}/echo.upb_minitable.h")
+set(GRPC_LITE_ECHO_UPB_MINITABLE_SRC "${GRPC_LITE_GENERATED_DIR}/echo.upb_minitable.c")
+set(GRPC_LITE_ECHO_GRPC_LITE_HDR "${GRPC_LITE_GENERATED_DIR}/echo.grpc_lite.upb.h")
 
 add_custom_command(
   OUTPUT
-    "${GRPC_LITE_ECHO_PROTO_SRC}"
-    "${GRPC_LITE_ECHO_PROTO_HDR}"
+    "${GRPC_LITE_ECHO_UPB_HDR}"
+    "${GRPC_LITE_ECHO_UPB_MINITABLE_HDR}"
+    "${GRPC_LITE_ECHO_UPB_MINITABLE_SRC}"
+    "${GRPC_LITE_ECHO_GRPC_LITE_HDR}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${GRPC_LITE_GENERATED_DIR}"
   COMMAND
     ${_PROTOBUF_PROTOC}
     --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
-    --cpp_out=${GRPC_LITE_GENERATED_DIR}
+    --plugin=protoc-gen-upb=$<TARGET_FILE:protobuf::protoc-gen-upb>
+    --plugin=protoc-gen-upb_minitable=$<TARGET_FILE:protobuf::protoc-gen-upb_minitable>
+    --plugin=protoc-gen-grpc_lite_upb=$<TARGET_FILE:protoc-gen-grpc_lite_upb>
+    --upb_out=${GRPC_LITE_GENERATED_DIR}
+    --upb_minitable_out=${GRPC_LITE_GENERATED_DIR}
+    --grpc_lite_upb_out=${GRPC_LITE_GENERATED_DIR}
     ${GRPC_LITE_ECHO_PROTO_RELATIVE}
-  DEPENDS "${GRPC_LITE_ECHO_PROTO}"
+  DEPENDS
+    "${GRPC_LITE_ECHO_PROTO}"
+    protoc-gen-grpc_lite_upb
   VERBATIM
 )
 
-add_library(grpc_lite_echo_proto STATIC
-  "${GRPC_LITE_ECHO_PROTO_SRC}"
+add_library(grpc_lite_echo_upb_proto STATIC
+  "${GRPC_LITE_ECHO_UPB_MINITABLE_SRC}"
 )
 
-add_library(grpc_lite::echo_proto ALIAS grpc_lite_echo_proto)
+add_library(grpc_lite::echo_upb_proto ALIAS grpc_lite_echo_upb_proto)
 
-target_include_directories(grpc_lite_echo_proto
+target_include_directories(grpc_lite_echo_upb_proto
   PUBLIC
     "${GRPC_LITE_GENERATED_DIR}"
 )
 
-target_link_libraries(grpc_lite_echo_proto
+target_link_libraries(grpc_lite_echo_upb_proto
   PUBLIC
-    protobuf::libprotobuf
+    protobuf::libupb
 )
 
 target_include_directories(grpc_lite
@@ -122,8 +140,6 @@ target_include_directories(grpc_lite
 )
 
 target_link_libraries(grpc_lite
-  PUBLIC
-    protobuf::libprotobuf
   PRIVATE
     Threads::Threads
     PkgConfig::NGHTTP2
@@ -132,8 +148,6 @@ target_link_libraries(grpc_lite
 )
 
 target_compile_definitions(grpc_lite
-  PUBLIC
-    GRPC_LITE_HAS_PROTOBUF=1
   PRIVATE
     $<$<BOOL:${GRPC_LITE_ENABLE_OPENSSL}>:GRPC_LITE_HAS_OPENSSL=1>
     $<$<BOOL:${GRPC_LITE_ENABLE_CARES}>:GRPC_LITE_HAS_CARES=1>
@@ -159,7 +173,7 @@ if(GRPC_LITE_BUILD_EXAMPLES)
   target_link_libraries(grpc_lite_proto_echo_server
     PRIVATE
       grpc_lite::grpc_lite
-      grpc_lite::echo_proto
+      grpc_lite::echo_upb_proto
   )
 endif()
 

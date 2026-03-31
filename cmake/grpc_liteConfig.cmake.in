@@ -4,7 +4,6 @@ include(CMakeFindDependencyMacro)
 
 find_dependency(Threads)
 find_dependency(PkgConfig)
-find_dependency(Protobuf CONFIG)
 
 pkg_check_modules(NGHTTP2 REQUIRED IMPORTED_TARGET libnghttp2)
 pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)

@@ -1,42 +1,42 @@
 #include <iostream>
-#include <string>
 #include <string_view>
+#include <cstring>
 
-#include "echo.pb.h"
+#include "echo.grpc_lite.upb.h"
 #include "grpc_lite/server_builder.h"
-#include "grpc_lite/service.h"
+#include "upb/base/string_view.h"
+#include "upb/mem/arena.h"
 
 namespace {
 
-class ProtoEchoService final : public grpc_lite::Service {
+upb_StringView CopyStringView(upb_StringView value, upb_Arena* arena) {
+  if (value.size == 0) {
+    return upb_StringView_FromDataAndSize("", 0);
+  }
+
+  char* copy = static_cast<char*>(upb_Arena_Malloc(arena, value.size));
+  if (copy == nullptr) {
+    return upb_StringView_FromDataAndSize(nullptr, 0);
+  }
+  std::memcpy(copy, value.data, value.size);
+  return upb_StringView_FromDataAndSize(copy, value.size);
+}
+
+class ProtoEchoService final : public demo::EchoService {
  public:
-  std::string service_name() const override { return "demo.EchoService"; }
-
-  grpc_lite::Status HandleUnary(std::string_view method,
-                                std::string_view request,
-                                grpc_lite::ServerContext* context,
-                                std::string* response) override {
-    if (method != "Echo") {
-      return grpc_lite::Status(grpc_lite::StatusCode::kUnimplemented,
-                               "only demo.EchoService/Echo is implemented");
-    }
-
-    demo::EchoRequest echo_request;
-    if (!echo_request.ParseFromArray(request.data(),
-                                     static_cast<int>(request.size()))) {
-      return grpc_lite::Status(grpc_lite::StatusCode::kInvalidArgument,
-                               "failed to parse demo.EchoRequest");
-    }
-
-    demo::EchoReply echo_reply;
-    echo_reply.set_message(echo_request.message());
-    if (!echo_reply.SerializeToString(response)) {
-      return grpc_lite::Status(grpc_lite::StatusCode::kInternal,
-                               "failed to serialize demo.EchoReply");
-    }
-
+  grpc_lite::Status Echo(grpc_lite::ServerContext* context,
+                         const demo_EchoRequest* request,
+                         demo_EchoReply* response,
+                         upb_Arena* arena) override {
     context->AddInitialMetadata("x-grpc-lite-service", "demo.EchoService");
     context->AddTrailingMetadata("x-grpc-lite-method", "Echo");
+    const upb_StringView request_message = demo_EchoRequest_message(request);
+    const upb_StringView response_message = CopyStringView(request_message, arena);
+    if (request_message.size != 0 && response_message.data == nullptr) {
+      return grpc_lite::Status(grpc_lite::StatusCode::kInternal,
+                               "failed to allocate response string in arena");
+    }
+    demo_EchoReply_set_message(response, response_message);
     return grpc_lite::Status::OK();
   }
 };
