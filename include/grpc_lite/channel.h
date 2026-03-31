@@ -8,6 +8,8 @@
 
 namespace grpc_lite {
 
+class ClientContext;
+
 enum class SecurityMode {
   kInsecure,
   kTls,
@@ -26,6 +28,11 @@ class Channel {
   const std::string& target() const;
   const ChannelOptions& options() const;
   bool SupportsProtocolCompatibility() const;
+
+  Status CallUnary(const std::string& method,
+                   const std::string& request_bytes,
+                   ClientContext* context,
+                   std::string* response_bytes);
 
  private:
   Channel(std::string target, ChannelOptions options);

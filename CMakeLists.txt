@@ -65,12 +65,14 @@ endif()
 
 add_library(grpc_lite STATIC
   src/channel.cc
+  src/client_call.cc
   src/client_context.cc
   src/server.cc
   src/server_builder.cc
   src/server_context.cc
   src/status.cc
   src/version.cc
+  src/core/grpc_frame.cc
   src/core/http2_transport.cc
   src/core/uv_loop.cc
 )
@@ -171,6 +173,13 @@ if(GRPC_LITE_BUILD_EXAMPLES)
 
   add_executable(grpc_lite_proto_echo_server examples/proto_echo_server.cc)
   target_link_libraries(grpc_lite_proto_echo_server
+    PRIVATE
+      grpc_lite::grpc_lite
+      grpc_lite::echo_upb_proto
+  )
+
+  add_executable(grpc_lite_proto_echo_client examples/proto_echo_client.cc)
+  target_link_libraries(grpc_lite_proto_echo_client
     PRIVATE
       grpc_lite::grpc_lite
       grpc_lite::echo_upb_proto

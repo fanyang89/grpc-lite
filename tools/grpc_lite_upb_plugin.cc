@@ -133,8 +133,11 @@ std::string GenerateHeader(const FileDescriptor* file) {
   std::ostringstream out;
   out << "#ifndef " << HeaderGuard(header_path) << "\n";
   out << "#define " << HeaderGuard(header_path) << "\n\n";
+  out << "#include <memory>\n";
   out << "#include <string>\n";
   out << "#include <string_view>\n\n";
+  out << "#include \"grpc_lite/channel.h\"\n";
+  out << "#include \"grpc_lite/client_context.h\"\n";
   out << "#include \"grpc_lite/service.h\"\n";
   out << "#include \"" << upb_header << "\"\n";
   out << "#include \"upb/mem/arena.h\"\n\n";
@@ -226,6 +229,57 @@ std::string GenerateHeader(const FileDescriptor* file) {
         out << "\n";
       }
     }
+    out << "};\n\n";
+
+    // Generate client Stub class.
+    out << "class " << service->name() << "_Stub {\n";
+    out << " public:\n";
+    out << "  explicit " << service->name()
+        << "_Stub(std::shared_ptr<::grpc_lite::Channel> channel)\n";
+    out << "      : channel_(std::move(channel)) {}\n\n";
+
+    for (int method_index = 0; method_index < service->method_count(); ++method_index) {
+      const MethodDescriptor* method = service->method(method_index);
+      out << "  ::grpc_lite::Status " << method->name() << "(\n";
+      out << "      ::grpc_lite::ClientContext* context,\n";
+      out << "      const ::" << MethodInputCType(method) << "* request,\n";
+      out << "      ::" << MethodOutputCType(method) << "** response,\n";
+      out << "      upb_Arena* arena) {\n";
+      out << "    size_t request_size = 0;\n";
+      out << "    char* request_bytes = ::" << MethodInputCType(method)
+          << "_serialize(request, arena, &request_size);\n";
+      out << "    if (request_bytes == nullptr) {\n";
+      out << "      return ::grpc_lite::Status(\n";
+      out << "          ::grpc_lite::StatusCode::kInternal,\n";
+      out << "          \"failed to serialize "
+          << EscapeForCString(method->input_type()->full_name()) << "\");\n";
+      out << "    }\n";
+      out << "    std::string response_bytes;\n";
+      out << "    ::grpc_lite::Status status = channel_->CallUnary(\n";
+      out << "        \"/" << EscapeForCString(service->full_name()) << "/"
+          << EscapeForCString(method->name()) << "\",\n";
+      out << "        std::string(request_bytes, request_size),\n";
+      out << "        context, &response_bytes);\n";
+      out << "    if (!status.ok()) {\n";
+      out << "      return status;\n";
+      out << "    }\n";
+      out << "    *response = ::" << MethodOutputCType(method)
+          << "_parse(response_bytes.data(), response_bytes.size(), arena);\n";
+      out << "    if (*response == nullptr) {\n";
+      out << "      return ::grpc_lite::Status(\n";
+      out << "          ::grpc_lite::StatusCode::kInternal,\n";
+      out << "          \"failed to parse "
+          << EscapeForCString(method->output_type()->full_name()) << "\");\n";
+      out << "    }\n";
+      out << "    return ::grpc_lite::Status::OK();\n";
+      out << "  }\n";
+      if (method_index + 1 != service->method_count()) {
+        out << "\n";
+      }
+    }
+
+    out << "\n private:\n";
+    out << "  std::shared_ptr<::grpc_lite::Channel> channel_;\n";
     out << "};\n\n";
   }
 
