@@ -1,0 +1,7 @@
+#ifndef GRPCPP_GENERIC_ASYNC_GENERIC_SERVICE_H
+#define GRPCPP_GENERIC_ASYNC_GENERIC_SERVICE_H
+
+namespace grpc {
+}  // namespace grpc
+
+#endif  // GRPCPP_GENERIC_ASYNC_GENERIC_SERVICE_H

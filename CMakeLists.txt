@@ -67,6 +67,8 @@ add_library(grpc_lite STATIC
   src/channel.cc
   src/client_call.cc
   src/client_context.cc
+  src/grpcpp_channel.cc
+  src/grpcpp_server.cc
   src/server.cc
   src/server_builder.cc
   src/server_context.cc
@@ -133,6 +135,50 @@ target_link_libraries(grpc_lite_echo_upb_proto
     protobuf::libupb
 )
 
+find_program(_GRPC_CPP_PLUGIN grpc_cpp_plugin)
+
+set(GRPC_LITE_GRPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated_grpc")
+set(GRPC_LITE_ECHO_PB_HDR "${GRPC_LITE_GRPC_GENERATED_DIR}/echo.pb.h")
+set(GRPC_LITE_ECHO_PB_SRC "${GRPC_LITE_GRPC_GENERATED_DIR}/echo.pb.cc")
+set(GRPC_LITE_ECHO_GRPC_PB_HDR "${GRPC_LITE_GRPC_GENERATED_DIR}/echo.grpc.pb.h")
+set(GRPC_LITE_ECHO_GRPC_PB_SRC "${GRPC_LITE_GRPC_GENERATED_DIR}/echo.grpc.pb.cc")
+
+add_custom_command(
+  OUTPUT
+    "${GRPC_LITE_ECHO_PB_HDR}"
+    "${GRPC_LITE_ECHO_PB_SRC}"
+    "${GRPC_LITE_ECHO_GRPC_PB_HDR}"
+    "${GRPC_LITE_ECHO_GRPC_PB_SRC}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${GRPC_LITE_GRPC_GENERATED_DIR}"
+  COMMAND
+    ${_PROTOBUF_PROTOC}
+    --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+    --cpp_out=${GRPC_LITE_GRPC_GENERATED_DIR}
+    --grpc_out=${GRPC_LITE_GRPC_GENERATED_DIR}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${GRPC_LITE_ECHO_PROTO_RELATIVE}
+  DEPENDS
+    "${GRPC_LITE_ECHO_PROTO}"
+  VERBATIM
+)
+
+add_library(grpc_lite_echo_grpc_proto STATIC
+  "${GRPC_LITE_ECHO_PB_SRC}"
+  "${GRPC_LITE_ECHO_GRPC_PB_SRC}"
+)
+
+add_library(grpc_lite::echo_grpc_proto ALIAS grpc_lite_echo_grpc_proto)
+
+target_include_directories(grpc_lite_echo_grpc_proto
+  PUBLIC
+    "${GRPC_LITE_GRPC_GENERATED_DIR}"
+)
+
+target_link_libraries(grpc_lite_echo_grpc_proto
+  PUBLIC
+    grpc_lite::grpc_lite
+)
+
 target_include_directories(grpc_lite
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -142,6 +188,8 @@ target_include_directories(grpc_lite
 )
 
 target_link_libraries(grpc_lite
+  PUBLIC
+    protobuf::libprotobuf
   PRIVATE
     Threads::Threads
     PkgConfig::NGHTTP2
@@ -183,6 +231,18 @@ if(GRPC_LITE_BUILD_EXAMPLES)
     PRIVATE
       grpc_lite::grpc_lite
       grpc_lite::echo_upb_proto
+  )
+
+  add_executable(grpc_lite_grpc_echo_server examples/grpc_echo_server.cc)
+  target_link_libraries(grpc_lite_grpc_echo_server
+    PRIVATE
+      grpc_lite::echo_grpc_proto
+  )
+
+  add_executable(grpc_lite_grpc_echo_client examples/grpc_echo_client.cc)
+  target_link_libraries(grpc_lite_grpc_echo_client
+    PRIVATE
+      grpc_lite::echo_grpc_proto
   )
 endif()
 
