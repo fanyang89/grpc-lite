@@ -1,12 +1,16 @@
 #ifndef GRPCPP_IMPL_PROTO_UTILS_H
 #define GRPCPP_IMPL_PROTO_UTILS_H
 
-#include <google/protobuf/message_lite.h>
+namespace google {
+namespace protobuf {
+class MessageLite;
+}  // namespace protobuf
+}  // namespace google
 
 namespace grpc {
 namespace protobuf {
 
-typedef ::google::protobuf::MessageLite MessageLite;
+using MessageLite = ::google::protobuf::MessageLite;
 
 }  // namespace protobuf
 }  // namespace grpc

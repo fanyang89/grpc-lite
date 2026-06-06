@@ -9,30 +9,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-option(GRPC_LITE_USE_SYSTEM_PROTOBUF "Use protobuf from the system" ON)
 option(GRPC_LITE_USE_SYSTEM_NGHTTP2 "Use nghttp2 from the system" ON)
 option(GRPC_LITE_USE_SYSTEM_LIBUV "Use libuv from the system" ON)
 option(GRPC_LITE_ENABLE_OPENSSL "Enable TLS hooks through OpenSSL" OFF)
 option(GRPC_LITE_ENABLE_CARES "Enable c-ares based resolver hooks" OFF)
 option(GRPC_LITE_ENABLE_LOGGING "Enable spdlog/fmt logging hooks when present" OFF)
 option(GRPC_LITE_BUILD_EXAMPLES "Build examples" ON)
+option(GRPC_LITE_BUILD_TESTS "Build tests" ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
-
-if(GRPC_LITE_USE_SYSTEM_PROTOBUF)
-  find_package(Protobuf CONFIG REQUIRED)
-else()
-  message(FATAL_ERROR "Vendored protobuf is not wired yet. Set GRPC_LITE_USE_SYSTEM_PROTOBUF=ON.")
-endif()
-
-if(TARGET protobuf::protoc)
-  set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)
-else()
-  find_program(_PROTOBUF_PROTOC protoc REQUIRED)
-endif()
 
 if(GRPC_LITE_USE_SYSTEM_NGHTTP2)
   pkg_check_modules(NGHTTP2 REQUIRED IMPORTED_TARGET libnghttp2)
@@ -47,6 +35,22 @@ else()
 endif()
 
 set(_grpc_lite_optional_private_libs "")
+
+add_library(struct_proto26_proto3 INTERFACE)
+add_library(struct_proto26::proto3 ALIAS struct_proto26_proto3)
+
+target_include_directories(struct_proto26_proto3
+  INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/struct_proto26/include"
+)
+
+function(grpc_lite_enable_struct_proto26 target)
+  target_compile_options(${target}
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:-std=c++26>
+      $<$<COMPILE_LANGUAGE:CXX>:-freflection>
+  )
+endfunction()
 
 if(GRPC_LITE_ENABLE_OPENSSL)
   find_package(OpenSSL REQUIRED)
@@ -81,104 +85,6 @@ add_library(grpc_lite STATIC
 
 add_library(grpc_lite::grpc_lite ALIAS grpc_lite)
 
-add_executable(protoc-gen-grpc_lite_upb tools/grpc_lite_upb_plugin.cc)
-target_link_libraries(protoc-gen-grpc_lite_upb
-  PRIVATE
-    protobuf::libprotoc
-    protobuf::libprotobuf
-)
-
-set(GRPC_LITE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-set(GRPC_LITE_ECHO_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/proto/echo.proto")
-set(GRPC_LITE_ECHO_PROTO_RELATIVE "echo.proto")
-set(GRPC_LITE_ECHO_UPB_HDR "${GRPC_LITE_GENERATED_DIR}/echo.upb.h")
-set(GRPC_LITE_ECHO_UPB_MINITABLE_HDR "${GRPC_LITE_GENERATED_DIR}/echo.upb_minitable.h")
-set(GRPC_LITE_ECHO_UPB_MINITABLE_SRC "${GRPC_LITE_GENERATED_DIR}/echo.upb_minitable.c")
-set(GRPC_LITE_ECHO_GRPC_LITE_HDR "${GRPC_LITE_GENERATED_DIR}/echo.grpc_lite.upb.h")
-
-add_custom_command(
-  OUTPUT
-    "${GRPC_LITE_ECHO_UPB_HDR}"
-    "${GRPC_LITE_ECHO_UPB_MINITABLE_HDR}"
-    "${GRPC_LITE_ECHO_UPB_MINITABLE_SRC}"
-    "${GRPC_LITE_ECHO_GRPC_LITE_HDR}"
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${GRPC_LITE_GENERATED_DIR}"
-  COMMAND
-    ${_PROTOBUF_PROTOC}
-    --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
-    --plugin=protoc-gen-upb=$<TARGET_FILE:protobuf::protoc-gen-upb>
-    --plugin=protoc-gen-upb_minitable=$<TARGET_FILE:protobuf::protoc-gen-upb_minitable>
-    --plugin=protoc-gen-grpc_lite_upb=$<TARGET_FILE:protoc-gen-grpc_lite_upb>
-    --upb_out=${GRPC_LITE_GENERATED_DIR}
-    --upb_minitable_out=${GRPC_LITE_GENERATED_DIR}
-    --grpc_lite_upb_out=${GRPC_LITE_GENERATED_DIR}
-    ${GRPC_LITE_ECHO_PROTO_RELATIVE}
-  DEPENDS
-    "${GRPC_LITE_ECHO_PROTO}"
-    protoc-gen-grpc_lite_upb
-  VERBATIM
-)
-
-add_library(grpc_lite_echo_upb_proto STATIC
-  "${GRPC_LITE_ECHO_UPB_MINITABLE_SRC}"
-)
-
-add_library(grpc_lite::echo_upb_proto ALIAS grpc_lite_echo_upb_proto)
-
-target_include_directories(grpc_lite_echo_upb_proto
-  PUBLIC
-    "${GRPC_LITE_GENERATED_DIR}"
-)
-
-target_link_libraries(grpc_lite_echo_upb_proto
-  PUBLIC
-    protobuf::libupb
-)
-
-find_program(_GRPC_CPP_PLUGIN grpc_cpp_plugin)
-
-set(GRPC_LITE_GRPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated_grpc")
-set(GRPC_LITE_ECHO_PB_HDR "${GRPC_LITE_GRPC_GENERATED_DIR}/echo.pb.h")
-set(GRPC_LITE_ECHO_PB_SRC "${GRPC_LITE_GRPC_GENERATED_DIR}/echo.pb.cc")
-set(GRPC_LITE_ECHO_GRPC_PB_HDR "${GRPC_LITE_GRPC_GENERATED_DIR}/echo.grpc.pb.h")
-set(GRPC_LITE_ECHO_GRPC_PB_SRC "${GRPC_LITE_GRPC_GENERATED_DIR}/echo.grpc.pb.cc")
-
-add_custom_command(
-  OUTPUT
-    "${GRPC_LITE_ECHO_PB_HDR}"
-    "${GRPC_LITE_ECHO_PB_SRC}"
-    "${GRPC_LITE_ECHO_GRPC_PB_HDR}"
-    "${GRPC_LITE_ECHO_GRPC_PB_SRC}"
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${GRPC_LITE_GRPC_GENERATED_DIR}"
-  COMMAND
-    ${_PROTOBUF_PROTOC}
-    --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
-    --cpp_out=${GRPC_LITE_GRPC_GENERATED_DIR}
-    --grpc_out=${GRPC_LITE_GRPC_GENERATED_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
-    ${GRPC_LITE_ECHO_PROTO_RELATIVE}
-  DEPENDS
-    "${GRPC_LITE_ECHO_PROTO}"
-  VERBATIM
-)
-
-add_library(grpc_lite_echo_grpc_proto STATIC
-  "${GRPC_LITE_ECHO_PB_SRC}"
-  "${GRPC_LITE_ECHO_GRPC_PB_SRC}"
-)
-
-add_library(grpc_lite::echo_grpc_proto ALIAS grpc_lite_echo_grpc_proto)
-
-target_include_directories(grpc_lite_echo_grpc_proto
-  PUBLIC
-    "${GRPC_LITE_GRPC_GENERATED_DIR}"
-)
-
-target_link_libraries(grpc_lite_echo_grpc_proto
-  PUBLIC
-    grpc_lite::grpc_lite
-)
-
 target_include_directories(grpc_lite
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -188,8 +94,6 @@ target_include_directories(grpc_lite
 )
 
 target_link_libraries(grpc_lite
-  PUBLIC
-    protobuf::libprotobuf
   PRIVATE
     Threads::Threads
     PkgConfig::NGHTTP2
@@ -223,27 +127,34 @@ if(GRPC_LITE_BUILD_EXAMPLES)
   target_link_libraries(grpc_lite_proto_echo_server
     PRIVATE
       grpc_lite::grpc_lite
-      grpc_lite::echo_upb_proto
+      struct_proto26::proto3
   )
+  grpc_lite_enable_struct_proto26(grpc_lite_proto_echo_server)
 
   add_executable(grpc_lite_proto_echo_client examples/proto_echo_client.cc)
   target_link_libraries(grpc_lite_proto_echo_client
     PRIVATE
       grpc_lite::grpc_lite
-      grpc_lite::echo_upb_proto
+      struct_proto26::proto3
   )
+  grpc_lite_enable_struct_proto26(grpc_lite_proto_echo_client)
+endif()
 
-  add_executable(grpc_lite_grpc_echo_server examples/grpc_echo_server.cc)
-  target_link_libraries(grpc_lite_grpc_echo_server
-    PRIVATE
-      grpc_lite::echo_grpc_proto
-  )
+if(GRPC_LITE_BUILD_TESTS)
+  enable_testing()
 
-  add_executable(grpc_lite_grpc_echo_client examples/grpc_echo_client.cc)
-  target_link_libraries(grpc_lite_grpc_echo_client
+  add_executable(grpc_lite_proto3_wire_test tests/proto3_wire_test.cc)
+  target_include_directories(grpc_lite_proto3_wire_test
     PRIVATE
-      grpc_lite::echo_grpc_proto
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
   )
+  target_link_libraries(grpc_lite_proto3_wire_test
+    PRIVATE
+      struct_proto26::proto3
+  )
+  grpc_lite_enable_struct_proto26(grpc_lite_proto3_wire_test)
+
+  add_test(NAME grpc_lite_proto3_wire_test COMMAND grpc_lite_proto3_wire_test)
 endif()
 
 install(TARGETS grpc_lite EXPORT grpc_liteTargets

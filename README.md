@@ -1,160 +1,148 @@
 # grpc-lite
 
-`grpc-lite` is a Linux-first, C++17-friendly gRPC runtime skeleton aimed at
-small C++ projects that want protocol-compatible building blocks without
-pulling in the full upstream gRPC stack.
-
-Current direction:
-
-- public API in C++
-- transport/runtime core backed by small C libraries
-- unary RPC first
-- official gRPC over HTTP/2 compatibility as the long-term target
+`grpc-lite` is a Linux-first gRPC runtime skeleton for small C++ projects that
+want protocol-compatible unary RPC building blocks without pulling in the full
+upstream gRPC stack.
 
 ## Current Selection
 
-The current implementation is converging on this stack:
+The current implementation uses this stack:
 
 - transport: `libuv + libnghttp2`
-- protobuf runtime: `upb`
-- code generation: `protoc + protoc-gen-upb + protoc-gen-upb_minitable`
+- protobuf wire codec: `struct_proto26`
+- schema source: C++ structs walked by C++26 static reflection
 - build system: `CMake`
-- language level: `C++17`
+- core language level: C++17 for the transport/runtime core
+- message language level: C++26 with `-freflection`
 
-Design rules behind this selection:
+The protobuf layer intentionally does not use `.proto` code generation in the
+default build. Message types are plain C++ structs, and `struct_proto26`
+serializes/deserializes them directly to proto3 wire bytes.
 
-- use Linux system packages first when they already exist
-- prefer small C libraries in the runtime core
-- keep heavy dependencies out of the public C++ API
-- separate the transport/runtime layer from protobuf code generation
+## Architecture
 
-That means `grpc-lite` should eventually look like this:
+- `include/grpc_lite/`: stable public C++ runtime API surface
+- `include/grpc_lite/proto3/`: struct-based example schemas
+- `src/core/`: transport/event-loop integration around system C libraries
+- `third_party/struct_proto26/`: header-only proto3 wire codec
+- `examples/`: compile-time smoke tests and reference wiring
+- `tests/`: wire-compatibility checks against canonical proto3 bytes
+- `golden/`: upstream reference trees kept for comparison work
 
-- `grpc-lite` core: HTTP/2, gRPC framing, status, metadata, service dispatch
-- `upb`: message parse and serialize
-- `grpc-lite` plugin: generate thin unary service glue on top of `upb`
+The runtime currently has a minimal cleartext HTTP/2 unary server path built on
+`libuv + nghttp2`. It accepts a single gRPC request, decodes one unary gRPC
+frame, dispatches it to a registered `Service`, and writes a gRPC response with
+trailers.
 
-## Dependency choices
+The message layer is separate from the transport layer. The transport passes
+protobuf payloads as `std::string`; examples use `proto3::serialize()` and
+`proto3::deserialize<T>()` from `struct_proto26` at the service boundary.
+
+## Dependencies
 
 Core dependencies:
 
-- `upb`
 - `libnghttp2`
 - `libuv`
 - `CMake`
 - `C++17`
 
+Message/example/test dependencies:
+
+- `struct_proto26`
+- a compiler with C++26 static reflection support and `-freflection`
+
 Optional dependencies:
 
-- `OpenSSL` for TLS/ALPN
-- `c-ares` for resolver support
-- `spdlog` and `fmt` for internal logging
+- `OpenSSL` for TLS/ALPN hooks
+- `c-ares` for resolver hooks
+- `spdlog` and `fmt` for internal logging hooks
 - `abseil-cpp` only when an internal utility really benefits from it
 
-Build-time tooling:
+Not used by the default build path:
 
+- `upb`
 - `protoc`
 - `protoc-gen-upb`
 - `protoc-gen-upb_minitable`
-
-Currently not selected as the long-term runtime path:
-
-- `libprotobuf C++` as the main message runtime
-- `grpc_cpp_plugin` as the final RPC code generator
-
-`libprotobuf` can still appear in tooling or transitional examples, but the
-runtime target is `upb` rather than the full C++ protobuf object model.
-
-The design keeps these out of the public API where possible so C++ consumers do
-not inherit unnecessary integration cost.
-
-## Architecture
-
-- `include/grpc_lite/`: stable public C++ API surface
-- `src/core/`: transport/event-loop integration around vendorable or system C
-  libraries
-- `examples/`: compile-time smoke tests and reference wiring
-- `golden/`: upstream reference trees for gRPC, protobuf, and Abseil
-
-The current codebase already has a minimal cleartext HTTP/2 unary server path
-built on `libuv + nghttp2`. The runtime can accept a single gRPC request,
-decode one unary frame, dispatch it to a registered `Service`, and write a gRPC
-response with trailers.
-
-The protobuf message layer now uses `upb` for the main generated example path.
-The intended steady state is:
-
-- core runtime does not depend on `libprotobuf C++`
-- service glue is generated separately from message code
-- message code comes from `upb` generators
-
-Current implementation limits:
-
-- cleartext `h2c` only
-- unary RPC only
-- exactly one protobuf message per request body
-- no compression
-- no TLS, resolver, streaming, or load balancing yet
-- only unary server-side glue is generated right now
+- `grpc_cpp_plugin`
+- `libprotobuf C++`
 
 ## Build
 
+Prefer Ninja when available:
+
 ```bash
-cmake -S . -B build
+cmake -S . -B build -G Ninja
 cmake --build build
 ```
 
-Run the demo echo server:
+If the selected compiler does not support `-std=c++26 -freflection`, configure
+may succeed but the struct_proto26 examples/tests will fail to compile.
+
+Run the raw echo server:
 
 ```bash
 ./build/grpc_lite_echo_server
 ```
 
-Run the current `upb`-backed echo server:
+Run the struct_proto26-backed echo server:
 
 ```bash
 ./build/grpc_lite_proto_echo_server
 ```
 
-Smoke test it with `curl` using HTTP/2 prior knowledge and an empty unary frame:
-
-```bash
-printf '\x00\x00\x00\x00\x00' > /tmp/grpc-lite-empty.bin
-curl --http2-prior-knowledge \
-  -H 'content-type: application/grpc' \
-  -H 'te: trailers' \
-  --data-binary @/tmp/grpc-lite-empty.bin \
-  http://127.0.0.1:50051/demo.EchoService/Echo
-```
-
-Smoke test the `upb` echo path end to end:
+Smoke test the struct_proto26 echo path end to end:
 
 ```bash
 ./examples/proto_echo_smoke.sh
 ```
 
-## Configuration knobs
+Run the proto3 wire compatibility test:
 
-- `GRPC_LITE_USE_SYSTEM_PROTOBUF=ON`
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+## Compatibility Testing
+
+`tests/proto3_wire_test.cc` compares `struct_proto26` output with canonical
+proto3 wire bytes for the reference schema in `proto/echo.proto`:
+
+```proto
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoReply {
+  string message = 1;
+}
+```
+
+For `message = "hello grpc-lite"`, the canonical wire bytes are:
+
+```text
+0a 0f 68 65 6c 6c 6f 20 67 72 70 63 2d 6c 69 74 65
+```
+
+The test checks both directions:
+
+- struct serialization equals the canonical proto3 bytes
+- canonical proto3 bytes deserialize into the expected C++ structs
+- default string fields are omitted, matching proto3 semantics
+
+`proto/echo.proto` remains as a human-readable compatibility reference only; it
+is not used by CMake and does not introduce a `protoc` dependency.
+
+## Configuration Knobs
+
 - `GRPC_LITE_USE_SYSTEM_NGHTTP2=ON`
 - `GRPC_LITE_USE_SYSTEM_LIBUV=ON`
 - `GRPC_LITE_ENABLE_OPENSSL=OFF`
 - `GRPC_LITE_ENABLE_CARES=OFF`
 - `GRPC_LITE_ENABLE_LOGGING=OFF`
+- `GRPC_LITE_BUILD_EXAMPLES=ON`
+- `GRPC_LITE_BUILD_TESTS=ON`
 
-Vendored fallback hooks are intentionally left as the next step so the project
-can add `third_party/nghttp2` and `third_party/libuv` cleanly instead of mixing
-system and local dependency logic into the first commit.
-
-## Near-Term Plan
-
-- keep `libuv + nghttp2` as the transport base
-- switch protobuf examples and generated glue to `upb + upb_minitable`
-- add a tiny `grpc-lite` code generator for unary server-side glue
-- validate the generated service path before building a typed client stub
-
-The generated example path now uses:
-
-- `protoc-gen-upb`
-- `protoc-gen-upb_minitable`
-- `protoc-gen-grpc_lite_upb`
+Vendored fallback hooks for `nghttp2` and `libuv` are intentionally left as a
+separate step so system-package and local dependency logic stay isolated.

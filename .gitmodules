@@ -7,3 +7,6 @@
 [submodule "golden/abseil-cpp"]
 	path = golden/abseil-cpp
 	url = http://gerrit.smartx.com/abseil-cpp.git
+[submodule "third_party/struct_proto26"]
+	path = third_party/struct_proto26
+	url = https://github.com/PikachuHyA/struct_proto26.git
