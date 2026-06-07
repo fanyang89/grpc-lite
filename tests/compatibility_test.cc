@@ -1,18 +1,10 @@
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <chrono>
-#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 #include "channel.h"
@@ -20,6 +12,7 @@
 #include "server.h"
 #include "server_builder.h"
 #include "service.h"
+#include "test_support.h"
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <grpcpp/client_context.h>
@@ -38,33 +31,6 @@
 #include "doctest/doctest.h"
 
 namespace {
-
-bool FindFreePort(std::uint16_t* out_port) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return false;
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::close(fd);
-        return false;
-    }
-
-    socklen_t len = sizeof(addr);
-    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-        ::close(fd);
-        return false;
-    }
-
-    *out_port = ntohs(addr.sin_port);
-    ::close(fd);
-    return *out_port != 0;
-}
 
 class LiteCompatService final : public grpc_lite::Service {
   public:
@@ -91,62 +57,6 @@ class LiteCompatService final : public grpc_lite::Service {
         }
         return {grpc_lite::StatusCode::kUnimplemented, "unknown method"};
     }
-};
-
-class LiteServerScope {
-  public:
-    explicit LiteServerScope(grpc_lite::Service& service) : service_(service) {}
-
-    bool Start(std::string* address) {
-        for (int attempt = 0; attempt < 6; ++attempt) {
-            std::uint16_t port;
-            if (!FindFreePort(&port)) {
-                return false;
-            }
-
-            grpc_lite::ServerBuilder builder;
-            builder.AddListeningPort("127.0.0.1:" + std::to_string(port));
-            builder.RegisterService(&service_);
-
-            server_ = builder.Build();
-            if (server_ == nullptr) {
-                return false;
-            }
-
-            const grpc_lite::Status status = server_->Start();
-            if (!status.ok()) {
-                server_.reset();
-                continue;
-            }
-
-            address_ = "127.0.0.1:" + std::to_string(port);
-            if (address != nullptr) {
-                *address = address_;
-            }
-
-            thread_ = std::thread([this]() { server_->Wait(); });
-            return true;
-        }
-        return false;
-    }
-
-    void Stop() {
-        if (server_ != nullptr) {
-            server_->Shutdown();
-        }
-        if (thread_.joinable()) {
-            thread_.join();
-        }
-        server_.reset();
-    }
-
-    ~LiteServerScope() { Stop(); }
-
-  private:
-    grpc_lite::Service& service_;
-    std::string address_;
-    std::unique_ptr<grpc_lite::Server> server_;
-    std::thread thread_;
 };
 
 bool ByteBufferToString(const grpc::ByteBuffer& buffer, std::string* output) {
@@ -226,59 +136,9 @@ class GrpcppCompatService final : public grpc::Service {
     }
 };
 
-class GrpcppServerScope {
-  public:
-    explicit GrpcppServerScope(grpc::Service& service) : service_(service) {}
-
-    bool Start(std::string* address) {
-        for (int attempt = 0; attempt < 6; ++attempt) {
-            std::uint16_t port;
-            if (!FindFreePort(&port)) {
-                return false;
-            }
-
-            grpc::ServerBuilder builder;
-            builder.AddListeningPort("127.0.0.1:" + std::to_string(port));
-            builder.RegisterService(&service_);
-
-            server_ = builder.BuildAndStart();
-            if (server_ == nullptr) {
-                continue;
-            }
-
-            address_ = "127.0.0.1:" + std::to_string(port);
-            if (address != nullptr) {
-                *address = address_;
-            }
-
-            thread_ = std::thread([this]() { server_->Wait(); });
-            return true;
-        }
-        return false;
-    }
-
-    void Stop() {
-        if (server_ != nullptr) {
-            server_->Shutdown();
-        }
-        if (thread_.joinable()) {
-            thread_.join();
-        }
-        server_.reset();
-    }
-
-    ~GrpcppServerScope() { Stop(); }
-
-  private:
-    grpc::Service& service_;
-    std::string address_;
-    std::unique_ptr<grpc::Server> server_;
-    std::thread thread_;
-};
-
 TEST_CASE("grpc_lite unary interoperability") {
     LiteCompatService service;
-    LiteServerScope server(service);
+    grpc_lite::test::ServerScope server(service);
     std::string address;
     REQUIRE(server.Start(&address));
 
@@ -336,7 +196,7 @@ TEST_CASE("grpc_lite unary interoperability") {
 
 TEST_CASE("grpcpp unary interoperability") {
     GrpcppCompatService service;
-    GrpcppServerScope server(service);
+    grpc_lite::test::GrpcppServerScope server(service);
     std::string address;
     REQUIRE(server.Start(&address));
 

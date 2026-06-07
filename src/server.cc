@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -46,6 +48,13 @@ using core::StatusCodeText;
 
 bool StartsWith(std::string_view value, std::string_view prefix) {
     return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
+}
+
+void IgnoreSigpipe() {
+#ifdef SIGPIPE
+    static std::once_flag once;
+    std::call_once(once, []() { std::signal(SIGPIPE, SIG_IGN); });
+#endif
 }
 
 struct AddressParts {
@@ -470,6 +479,8 @@ void OnNewConnection(uv_stream_t* server_stream, int status) {
 }
 
 Status ServerImpl::Start(const Server::Listener& listener) {
+    IgnoreSigpipe();
+
     if (listener.use_tls) {
         return Status(
             StatusCode::kUnimplemented, "tls listeners are not wired into the runtime yet"

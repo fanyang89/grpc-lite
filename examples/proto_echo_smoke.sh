@@ -3,7 +3,18 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${1:-${ROOT_DIR}/build}"
-PORT="${2:-50051}"
+PORT="${2:-}"
+
+if [[ -z "${PORT}" ]]; then
+  PORT="$(python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)"
+fi
 
 SERVER_BIN="${BUILD_DIR}/grpc_lite_proto_echo_server"
 CLIENT_BIN="${BUILD_DIR}/grpc_lite_proto_echo_client"

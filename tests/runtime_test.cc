@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -191,6 +192,44 @@ TEST_CASE("channel validates bad targets before connecting") {
         grpc_lite::Channel::Create("127.0.0.1:70000");
     status = out_of_range->CallUnary("/test.EchoService/Echo", "request", nullptr, &response);
     CHECK(status.code() == StatusCode::kInvalidArgument);
+}
+
+TEST_CASE("channel preserves options and reports protocol compatibility") {
+    grpc_lite::ChannelOptions options;
+    options.security = grpc_lite::SecurityMode::kTls;
+    options.use_system_resolver = true;
+
+    std::shared_ptr<grpc_lite::Channel> channel =
+        grpc_lite::Channel::Create("example.test:443", options);
+    REQUIRE(channel != nullptr);
+    CHECK(channel->target() == "example.test:443");
+    CHECK(channel->options().security == grpc_lite::SecurityMode::kTls);
+    CHECK(channel->options().use_system_resolver);
+    CHECK(channel->SupportsProtocolCompatibility());
+}
+
+TEST_CASE("channel deadline expires while request is in flight") {
+    grpc_lite::test::DelayedService service(std::chrono::milliseconds(200));
+    grpc_lite::test::ServerScope server(service);
+    std::string address;
+    REQUIRE(server.Start(&address));
+
+    std::shared_ptr<grpc_lite::Channel> channel = grpc_lite::Channel::Create(address);
+    REQUIRE(channel != nullptr);
+
+    grpc_lite::ClientContext expired_soon;
+    expired_soon.SetDeadline(std::chrono::system_clock::now() + std::chrono::milliseconds(50));
+    std::string response;
+    grpc_lite::Status status =
+        channel->CallUnary("/test.DelayedService/Echo", "slow", &expired_soon, &response);
+    CHECK(status.code() == StatusCode::kDeadlineExceeded);
+
+    grpc_lite::ClientContext enough_time;
+    enough_time.SetDeadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+    response.clear();
+    status = channel->CallUnary("/test.DelayedService/Echo", "after-timeout", &enough_time, &response);
+    CHECK(status.ok());
+    CHECK(response == "after-timeout");
 }
 
 }  // namespace

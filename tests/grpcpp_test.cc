@@ -81,55 +81,6 @@ struct FailingParseMessage {
     bool ParseFromString(const std::string&) { return false; }
 };
 
-class GrpcppServerScope {
-  public:
-    explicit GrpcppServerScope(grpc::Service& service) : service_(service) {}
-    GrpcppServerScope(const GrpcppServerScope&) = delete;
-    GrpcppServerScope& operator=(const GrpcppServerScope&) = delete;
-
-    ~GrpcppServerScope() { Stop(); }
-
-    bool Start(std::string* address) {
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            std::uint16_t port = 0;
-            if (!grpc_lite::test::FindFreePort(&port)) {
-                return false;
-            }
-
-            grpc::ServerBuilder builder;
-            builder.AddListeningPort(grpc_lite::test::LoopbackAddress(port));
-            builder.RegisterService(&service_);
-            server_ = builder.BuildAndStart();
-            if (server_ == nullptr) {
-                continue;
-            }
-
-            const std::string selected_address = grpc_lite::test::LoopbackAddress(port);
-            if (address != nullptr) {
-                *address = selected_address;
-            }
-            thread_ = std::thread([this]() { server_->Wait(); });
-            return true;
-        }
-        return false;
-    }
-
-    void Stop() {
-        if (server_ != nullptr) {
-            server_->Shutdown();
-        }
-        if (thread_.joinable()) {
-            thread_.join();
-        }
-        server_.reset();
-    }
-
-  private:
-    grpc::Service& service_;
-    std::unique_ptr<grpc::Server> server_;
-    std::thread thread_;
-};
-
 grpc::ByteBuffer MakeBuffer(const std::string& value) {
     grpc::Slice slice(value);
     return grpc::ByteBuffer(&slice, 1);
@@ -278,7 +229,7 @@ TEST_CASE("async and callback client shims report unsupported APIs") {
 
 TEST_CASE("grpcpp server dispatches multiple methods") {
     MultiMethodService service("test.MultiMethodService");
-    GrpcppServerScope server(service);
+    grpc_lite::test::GrpcppServerScope server(service);
     std::string address;
     REQUIRE(server.Start(&address));
 
@@ -324,7 +275,7 @@ TEST_CASE("grpcpp server dispatches multiple services") {
 
 TEST_CASE("grpcpp method handler reports parse failures") {
     RejectingParseService service;
-    GrpcppServerScope server(service);
+    grpc_lite::test::GrpcppServerScope server(service);
     std::string address;
     REQUIRE(server.Start(&address));
 

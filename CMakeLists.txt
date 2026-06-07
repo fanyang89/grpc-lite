@@ -338,7 +338,7 @@ if(GRPC_LITE_BUILD_TESTS)
   if(TARGET grpc_lite_proto_echo_server AND TARGET grpc_lite_proto_echo_client)
     add_test(NAME grpc_lite_proto_echo_smoke
              COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/examples/proto_echo_smoke.sh"
-                          "$<TARGET_FILE_DIR:grpc_lite_proto_echo_server>" "50052")
+                          "$<TARGET_FILE_DIR:grpc_lite_proto_echo_server>")
     set_tests_properties(grpc_lite_proto_echo_smoke PROPERTIES TIMEOUT 10)
   endif()
 endif()

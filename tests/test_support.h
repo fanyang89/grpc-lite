@@ -7,11 +7,17 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
+
+#include <grpcpp/impl/service_type.h>
+#include <grpcpp/server.h>
+#include <grpcpp/server_builder.h>
 
 #include "grpc_lite/server.h"
 #include "grpc_lite/server_builder.h"
@@ -84,6 +90,27 @@ class EchoService final : public Service {
     }
 };
 
+class DelayedService final : public Service {
+  public:
+    explicit DelayedService(std::chrono::milliseconds delay) : delay_(delay) {}
+
+    std::string service_name() const override { return "test.DelayedService"; }
+
+    Status HandleUnary(
+        std::string_view method, std::string_view request, ServerContext*, std::string* response
+    ) override {
+        if (method != "Echo") {
+            return Status(StatusCode::kUnimplemented, "unknown method");
+        }
+        std::this_thread::sleep_for(delay_);
+        *response = std::string(request);
+        return Status::OK();
+    }
+
+  private:
+    std::chrono::milliseconds delay_;
+};
+
 class ServerScope {
   public:
     explicit ServerScope(Service& service) : service_(service) {}
@@ -137,6 +164,56 @@ class ServerScope {
     Service& service_;
     std::string address_;
     std::unique_ptr<Server> server_;
+    std::thread thread_;
+};
+
+class GrpcppServerScope {
+  public:
+    explicit GrpcppServerScope(grpc::Service& service) : service_(service) {}
+    GrpcppServerScope(const GrpcppServerScope&) = delete;
+    GrpcppServerScope& operator=(const GrpcppServerScope&) = delete;
+
+    ~GrpcppServerScope() { Stop(); }
+
+    bool Start(std::string* address) {
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            std::uint16_t port = 0;
+            if (!FindFreePort(&port)) {
+                return false;
+            }
+
+            grpc::ServerBuilder builder;
+            builder.AddListeningPort(LoopbackAddress(port));
+            builder.RegisterService(&service_);
+            server_ = builder.BuildAndStart();
+            if (server_ == nullptr) {
+                continue;
+            }
+
+            address_ = LoopbackAddress(port);
+            if (address != nullptr) {
+                *address = address_;
+            }
+            thread_ = std::thread([this]() { server_->Wait(); });
+            return true;
+        }
+        return false;
+    }
+
+    void Stop() {
+        if (server_ != nullptr) {
+            server_->Shutdown();
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        server_.reset();
+    }
+
+  private:
+    grpc::Service& service_;
+    std::string address_;
+    std::unique_ptr<grpc::Server> server_;
     std::thread thread_;
 };
 
