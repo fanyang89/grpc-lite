@@ -1,0 +1,288 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+  CTEST_PARALLEL_LEVEL: 2
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build clang-format image
+        run: docker build -t grpc-lite-clang-format .
+
+      - name: Check formatting
+        env:
+          FORMAT_IMAGE: grpc-lite-clang-format
+        run: ./scripts/clang-format.sh check
+
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            ccache \
+            cmake \
+            g++ \
+            gcc \
+            libnghttp2-dev \
+            libuv1-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Checkout required submodules
+        run: |
+          set -euxo pipefail
+          git submodule sync -- golden/grpc third_party/struct_proto26
+          git submodule update --init --depth 1 -- golden/grpc third_party/struct_proto26
+          git -C golden/grpc submodule sync -- third_party/opentelemetry-cpp
+          git -C golden/grpc submodule update --init --depth 1 -- third_party/opentelemetry-cpp
+          git -C golden/grpc/third_party/opentelemetry-cpp submodule sync -- third_party/nlohmann-json
+          git -C golden/grpc/third_party/opentelemetry-cpp submodule update --init --depth 1 -- third_party/nlohmann-json
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: .ccache
+          key: ccache-smoke-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-smoke-${{ runner.os }}-
+
+      - name: Configure
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          set -euxo pipefail
+          ccache --zero-stats
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: cmake --build build
+
+      - name: Run smoke test
+        run: ctest --test-dir build --output-on-failure --tests-regex grpc_lite_proto_echo_smoke
+
+      - name: Show ccache stats
+        if: always()
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: ccache --show-stats
+
+  build-matrix:
+    name: ${{ matrix.os }} ${{ matrix.compiler }} ${{ matrix.build_type }} ssl=${{ matrix.openssl }} cares=${{ matrix.cares }} log=${{ matrix.logging }} sanitize=${{ matrix.sanitizer || 'none' }}
+    needs:
+      - format
+      - smoke
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-14
+        compiler:
+          - gcc
+          - clang
+        build_type:
+          - Debug
+        openssl:
+          - 'OFF'
+          - 'ON'
+        cares:
+          - 'OFF'
+          - 'ON'
+        logging:
+          - 'OFF'
+          - 'ON'
+        sanitizer:
+          - ''
+        exclude:
+          - os: macos-14
+            compiler: gcc
+        include:
+          - os: ubuntu-24.04
+            compiler: gcc
+            build_type: Release
+            openssl: 'ON'
+            cares: 'ON'
+            logging: 'ON'
+            sanitizer: ''
+          - os: ubuntu-24.04
+            compiler: clang
+            build_type: Release
+            openssl: 'ON'
+            cares: 'ON'
+            logging: 'ON'
+            sanitizer: ''
+          - os: macos-14
+            compiler: clang
+            build_type: Release
+            openssl: 'ON'
+            cares: 'ON'
+            logging: 'ON'
+            sanitizer: ''
+          - os: ubuntu-24.04
+            compiler: clang
+            build_type: Debug
+            openssl: 'OFF'
+            cares: 'OFF'
+            logging: 'OFF'
+            sanitizer: address
+          - os: ubuntu-24.04
+            compiler: clang
+            build_type: Debug
+            openssl: 'OFF'
+            cares: 'OFF'
+            logging: 'OFF'
+            sanitizer: thread
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Ubuntu dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            ccache \
+            clang \
+            cmake \
+            g++ \
+            gcc \
+            libc-ares-dev \
+            libfmt-dev \
+            libnghttp2-dev \
+            libspdlog-dev \
+            libssl-dev \
+            libuv1-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          set -euxo pipefail
+          brew install \
+            c-ares \
+            ccache \
+            cmake \
+            fmt \
+            libuv \
+            nghttp2 \
+            ninja \
+            openssl@3 \
+            pkg-config \
+            spdlog
+          {
+            printf 'OPENSSL_ROOT_DIR=%s\n' "$(brew --prefix openssl@3)"
+            printf 'PKG_CONFIG_PATH=%s/lib/pkgconfig:%s/lib/pkgconfig:%s/lib/pkgconfig:%s/lib/pkgconfig:%s/lib/pkgconfig:%s/lib/pkgconfig:%s\n' \
+              "$(brew --prefix openssl@3)" \
+              "$(brew --prefix c-ares)" \
+              "$(brew --prefix fmt)" \
+              "$(brew --prefix libuv)" \
+              "$(brew --prefix nghttp2)" \
+              "$(brew --prefix spdlog)" \
+              "${PKG_CONFIG_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Select compiler
+        run: |
+          set -euxo pipefail
+          if [[ '${{ matrix.compiler }}' == 'gcc' ]]; then
+            printf 'CC=gcc\n' >> "$GITHUB_ENV"
+            printf 'CXX=g++\n' >> "$GITHUB_ENV"
+          else
+            printf 'CC=clang\n' >> "$GITHUB_ENV"
+            printf 'CXX=clang++\n' >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout required submodules
+        run: |
+          set -euxo pipefail
+          git submodule sync -- golden/grpc third_party/struct_proto26
+          git submodule update --init --depth 1 -- golden/grpc third_party/struct_proto26
+          git -C golden/grpc submodule sync -- third_party/opentelemetry-cpp
+          git -C golden/grpc submodule update --init --depth 1 -- third_party/opentelemetry-cpp
+          git -C golden/grpc/third_party/opentelemetry-cpp submodule sync -- third_party/nlohmann-json
+          git -C golden/grpc/third_party/opentelemetry-cpp submodule update --init --depth 1 -- third_party/nlohmann-json
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-ssl-${{ matrix.openssl }}-cares-${{ matrix.cares }}-log-${{ matrix.logging }}-san-${{ matrix.sanitizer || 'none' }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-ssl-${{ matrix.openssl }}-cares-${{ matrix.cares }}-log-${{ matrix.logging }}-san-${{ matrix.sanitizer || 'none' }}-
+            ccache-${{ runner.os }}-${{ matrix.compiler }}-
+
+      - name: Configure
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          set -euxo pipefail
+          ccache --zero-stats
+          cmake_args=(
+            -S .
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DGRPC_LITE_ENABLE_OPENSSL=${{ matrix.openssl }}
+            -DGRPC_LITE_ENABLE_CARES=${{ matrix.cares }}
+            -DGRPC_LITE_ENABLE_LOGGING=${{ matrix.logging }}
+          )
+          if [[ -n "$SANITIZER" ]]; then
+            cmake_args+=("-DGRPC_LITE_SANITIZE=$SANITIZER")
+          fi
+          cmake "${cmake_args[@]}"
+
+      - name: Build
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Show ccache stats
+        if: always()
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: ccache --show-stats
