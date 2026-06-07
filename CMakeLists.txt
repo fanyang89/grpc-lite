@@ -20,9 +20,11 @@ option(GRPC_LITE_BUILD_TESTS "Build tests" ON)
 option(GRPC_LITE_ENABLE_IWYU "Run include-what-you-use during C++ builds" OFF)
 option(GRPC_LITE_ENABLE_UBSAN "Build with undefined sanitizer when address sanitizer is enabled" ON)
 option(GRPC_LITE_COVERAGE "Build with code coverage instrumentation" OFF)
+set(GRPC_LITE_PROTO_REFLECTION "auto" CACHE STRING "Proto reflection backend (auto, meta, refl_cpp)")
 set(GRPC_LITE_IWYU_EXECUTABLE "" CACHE FILEPATH "Path to the include-what-you-use executable")
 set(GRPC_LITE_SANITIZE "" CACHE STRING "Sanitizer to enable (address or thread)")
 set_property(CACHE GRPC_LITE_SANITIZE PROPERTY STRINGS "" "address" "thread")
+set_property(CACHE GRPC_LITE_PROTO_REFLECTION PROPERTY STRINGS "auto" "meta" "refl_cpp")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -88,21 +90,55 @@ endif()
 
 set(_grpc_lite_optional_private_libs "")
 
-add_library(struct_proto26_proto3 INTERFACE)
-add_library(struct_proto26::proto3 ALIAS struct_proto26_proto3)
+set(GRPC_LITE_SUPPORTED_PROTO_REFLECTION auto meta refl_cpp)
+if(NOT GRPC_LITE_PROTO_REFLECTION IN_LIST GRPC_LITE_SUPPORTED_PROTO_REFLECTION)
+  message(FATAL_ERROR "GRPC_LITE_PROTO_REFLECTION must be one of: auto, meta, refl_cpp")
+endif()
 
-target_include_directories(struct_proto26_proto3
+include(CheckCXXSourceCompiles)
+set(_grpc_lite_proto_has_meta OFF)
+if(GRPC_LITE_PROTO_REFLECTION STREQUAL "auto" OR GRPC_LITE_PROTO_REFLECTION STREQUAL "meta")
+  set(_grpc_lite_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+  set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -std=c++26 -freflection")
+  check_cxx_source_compiles("#include <meta>
+struct Probe { int value; };
+consteval int probe() {
+  auto fields = std::meta::nonstatic_data_members_of(^^Probe, std::meta::access_context::unchecked());
+  return static_cast<int>(fields.size());
+}
+static_assert(probe() == 1);
+int main() { return 0; }
+" GRPC_LITE_HAS_CPP26_META)
+  set(CMAKE_REQUIRED_FLAGS "${_grpc_lite_saved_required_flags}")
+  if(GRPC_LITE_HAS_CPP26_META)
+    set(_grpc_lite_proto_has_meta ON)
+  endif()
+endif()
+
+if(GRPC_LITE_PROTO_REFLECTION STREQUAL "meta" AND NOT _grpc_lite_proto_has_meta)
+  message(FATAL_ERROR "GRPC_LITE_PROTO_REFLECTION=meta requires <meta> and -freflection support")
+endif()
+
+add_library(grpc_lite_proto3 INTERFACE)
+add_library(grpc_lite::proto3 ALIAS grpc_lite_proto3)
+
+target_include_directories(grpc_lite_proto3
   INTERFACE
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/struct_proto26/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/refl-cpp/include"
 )
 
-function(grpc_lite_enable_struct_proto26 target)
-  target_compile_options(${target}
-    PRIVATE
+if(_grpc_lite_proto_has_meta)
+  target_compile_definitions(grpc_lite_proto3 INTERFACE GRPC_LITE_PROTO_USE_CPP26_META=1)
+  target_compile_options(grpc_lite_proto3
+    INTERFACE
       $<$<COMPILE_LANGUAGE:CXX>:-std=c++26>
       $<$<COMPILE_LANGUAGE:CXX>:-freflection>
   )
-endfunction()
+  message(STATUS "grpc-lite proto reflection backend: C++26 <meta>")
+else()
+  message(STATUS "grpc-lite proto reflection backend: refl-cpp")
+endif()
 
 if(GRPC_LITE_ENABLE_OPENSSL)
   find_package(OpenSSL REQUIRED)
@@ -183,18 +219,16 @@ if(GRPC_LITE_BUILD_EXAMPLES)
   target_link_libraries(grpc_lite_proto_echo_server
     PRIVATE
       grpc_lite::grpc_lite
-      struct_proto26::proto3
+      grpc_lite::proto3
   )
-  grpc_lite_enable_struct_proto26(grpc_lite_proto_echo_server)
   grpc_lite_enable_iwyu(grpc_lite_proto_echo_server)
 
   add_executable(grpc_lite_proto_echo_client examples/proto_echo_client.cc)
   target_link_libraries(grpc_lite_proto_echo_client
     PRIVATE
       grpc_lite::grpc_lite
-      struct_proto26::proto3
+      grpc_lite::proto3
   )
-  grpc_lite_enable_struct_proto26(grpc_lite_proto_echo_client)
   grpc_lite_enable_iwyu(grpc_lite_proto_echo_client)
 endif()
 
@@ -216,9 +250,8 @@ if(GRPC_LITE_BUILD_TESTS)
   )
   target_link_libraries(grpc_lite_proto3_wire_test
     PRIVATE
-      struct_proto26::proto3
+      grpc_lite::proto3
   )
-  grpc_lite_enable_struct_proto26(grpc_lite_proto3_wire_test)
   grpc_lite_enable_iwyu(grpc_lite_proto3_wire_test)
 
   add_test(NAME grpc_lite_proto3_wire_test COMMAND grpc_lite_proto3_wire_test)
@@ -350,6 +383,7 @@ install(TARGETS grpc_lite EXPORT grpc_liteTargets
 )
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY third_party/refl-cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/grpc_liteConfigVersion.cmake"
