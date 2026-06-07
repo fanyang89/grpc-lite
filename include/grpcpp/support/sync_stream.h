@@ -5,32 +5,32 @@ namespace grpc {
 
 template <class R>
 class ServerReader {
- public:
-  ServerReader() = default;
+  public:
+    ServerReader() = default;
 };
 
 template <class W>
 class ServerWriter {
- public:
-  ServerWriter() = default;
+  public:
+    ServerWriter() = default;
 };
 
 template <class W, class R>
 class ServerReaderWriter {
- public:
-  ServerReaderWriter() = default;
+  public:
+    ServerReaderWriter() = default;
 };
 
 template <class RequestType, class ResponseType>
 class ServerUnaryStreamer {
- public:
-  ServerUnaryStreamer() = default;
+  public:
+    ServerUnaryStreamer() = default;
 };
 
 template <class RequestType, class ResponseType>
 class ServerSplitStreamer {
- public:
-  ServerSplitStreamer() = default;
+  public:
+    ServerSplitStreamer() = default;
 };
 
 }  // namespace grpc

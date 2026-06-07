@@ -11,34 +11,33 @@ namespace grpc_lite {
 class ClientContext;
 
 enum class SecurityMode {
-  kInsecure,
-  kTls,
+    kInsecure,
+    kTls,
 };
 
 struct ChannelOptions {
-  SecurityMode security = SecurityMode::kInsecure;
-  bool use_system_resolver = false;
+    SecurityMode security = SecurityMode::kInsecure;
+    bool use_system_resolver = false;
 };
 
 class Channel {
- public:
-  static std::shared_ptr<Channel> Create(std::string target,
-                                         ChannelOptions options = {});
+  public:
+    static std::shared_ptr<Channel> Create(std::string target, ChannelOptions options = {});
 
-  const std::string& target() const;
-  const ChannelOptions& options() const;
-  bool SupportsProtocolCompatibility() const;
+    const std::string& target() const;
+    const ChannelOptions& options() const;
+    bool SupportsProtocolCompatibility() const;
 
-  Status CallUnary(const std::string& method,
-                   const std::string& request_bytes,
-                   ClientContext* context,
-                   std::string* response_bytes);
+    Status CallUnary(
+        const std::string& method, const std::string& request_bytes, ClientContext* context,
+        std::string* response_bytes
+    );
 
- private:
-  Channel(std::string target, ChannelOptions options);
+  private:
+    Channel(std::string target, ChannelOptions options);
 
-  std::string target_;
-  ChannelOptions options_;
+    std::string target_;
+    ChannelOptions options_;
 };
 
 }  // namespace grpc_lite

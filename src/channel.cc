@@ -7,17 +7,20 @@
 
 namespace grpc_lite {
 
-std::shared_ptr<Channel> Channel::Create(std::string target,
-                                         ChannelOptions options) {
-  return std::shared_ptr<Channel>(new Channel(std::move(target), options));
+std::shared_ptr<Channel> Channel::Create(std::string target, ChannelOptions options) {
+    return std::shared_ptr<Channel>(new Channel(std::move(target), options));
 }
 
-const std::string& Channel::target() const { return target_; }
+const std::string& Channel::target() const {
+    return target_;
+}
 
-const ChannelOptions& Channel::options() const { return options_; }
+const ChannelOptions& Channel::options() const {
+    return options_;
+}
 
 bool Channel::SupportsProtocolCompatibility() const {
-  return core::Nghttp2Version() != 0U;
+    return core::Nghttp2Version() != 0U;
 }
 
 Channel::Channel(std::string target, ChannelOptions options)

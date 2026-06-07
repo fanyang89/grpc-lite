@@ -12,14 +12,15 @@ class ClientContext;
 class CompletionQueue;
 
 class ChannelInterface {
- public:
-  virtual ~ChannelInterface() = default;
+  public:
+    virtual ~ChannelInterface() = default;
 
-  virtual void* RegisterMethod(const char* method) = 0;
+    virtual void* RegisterMethod(const char* method) = 0;
 
-  virtual Status CallUnary(const char* method, ClientContext* context,
-                           const std::string& request_bytes,
-                           std::string* response_bytes) = 0;
+    virtual Status CallUnary(
+        const char* method, ClientContext* context, const std::string& request_bytes,
+        std::string* response_bytes
+    ) = 0;
 };
 
 }  // namespace grpc

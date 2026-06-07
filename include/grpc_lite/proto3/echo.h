@@ -6,11 +6,11 @@
 namespace demo {
 
 struct EchoRequest {
-  std::string message;
+    std::string message;
 };
 
 struct EchoReply {
-  std::string message;
+    std::string message;
 };
 
 }  // namespace demo

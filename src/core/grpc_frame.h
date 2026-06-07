@@ -1,10 +1,10 @@
 #ifndef GRPC_LITE_CORE_GRPC_FRAME_H_
 #define GRPC_LITE_CORE_GRPC_FRAME_H_
 
-#include <nghttp2/nghttp2.h>
-
 #include <string>
 #include <string_view>
+
+#include <nghttp2/nghttp2.h>
 
 #include "grpc_lite/status.h"
 

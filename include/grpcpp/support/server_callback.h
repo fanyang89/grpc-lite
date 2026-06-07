@@ -4,8 +4,8 @@
 namespace grpc {
 
 class ServerUnaryReactor {
- public:
-  virtual ~ServerUnaryReactor() = default;
+  public:
+    virtual ~ServerUnaryReactor() = default;
 };
 
 }  // namespace grpc

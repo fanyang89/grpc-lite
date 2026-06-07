@@ -9,20 +9,20 @@
 namespace grpc_lite::core {
 
 struct TransportFeatures {
-  bool supports_http2 = false;
-  bool supports_client = false;
-  bool supports_server = false;
-  bool supports_tls = false;
-  bool supports_dns = false;
+    bool supports_http2 = false;
+    bool supports_client = false;
+    bool supports_server = false;
+    bool supports_tls = false;
+    bool supports_dns = false;
 };
 
 class Transport {
- public:
-  virtual ~Transport() = default;
+  public:
+    virtual ~Transport() = default;
 
-  virtual const char* name() const = 0;
-  virtual TransportFeatures features() const = 0;
-  virtual Status Initialize() = 0;
+    virtual const char* name() const = 0;
+    virtual TransportFeatures features() const = 0;
+    virtual Status Initialize() = 0;
 };
 
 std::uint32_t Nghttp2Version();

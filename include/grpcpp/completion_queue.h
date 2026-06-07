@@ -4,13 +4,13 @@
 namespace grpc {
 
 class CompletionQueue {
- public:
-  CompletionQueue() = default;
+  public:
+    CompletionQueue() = default;
 };
 
 class ServerCompletionQueue : public CompletionQueue {
- public:
-  ServerCompletionQueue() = default;
+  public:
+    ServerCompletionQueue() = default;
 };
 
 }  // namespace grpc

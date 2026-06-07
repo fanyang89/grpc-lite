@@ -12,15 +12,15 @@ namespace grpc_lite {
 class Service;
 
 class ServerBuilder {
- public:
-  void AddListeningPort(std::string address, bool use_tls = false);
-  void RegisterService(Service* service);
+  public:
+    void AddListeningPort(std::string address, bool use_tls = false);
+    void RegisterService(Service* service);
 
-  std::unique_ptr<Server> Build();
+    std::unique_ptr<Server> Build();
 
- private:
-  std::vector<Server::Listener> listeners_;
-  std::vector<Service*> services_;
+  private:
+    std::vector<Server::Listener> listeners_;
+    std::vector<Service*> services_;
 };
 
 }  // namespace grpc_lite

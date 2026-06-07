@@ -1,41 +1,39 @@
-#include "core/transport.h"
-
 #include <nghttp2/nghttp2.h>
+
+#include "core/transport.h"
 
 namespace grpc_lite::core {
 
 namespace {
 
 class Http2Transport final : public Transport {
- public:
-  const char* name() const override { return "nghttp2"; }
+  public:
+    const char* name() const override { return "nghttp2"; }
 
-  TransportFeatures features() const override {
-    return TransportFeatures{
-        true,
-        true,
-        true,
+    TransportFeatures features() const override {
+        return TransportFeatures{
+            true, true, true,
 #ifdef GRPC_LITE_HAS_OPENSSL
-        true,
+            true,
 #else
-        false,
+            false,
 #endif
 #ifdef GRPC_LITE_HAS_CARES
-        true,
+            true,
 #else
-        false,
+            false,
 #endif
-    };
-  }
+        };
+    }
 
-  Status Initialize() override { return Status::OK(); }
+    Status Initialize() override { return Status::OK(); }
 };
 
 }  // namespace
 
 std::uint32_t Nghttp2Version() {
-  const nghttp2_info* info = nghttp2_version(0);
-  return info == nullptr ? 0U : info->version_num;
+    const nghttp2_info* info = nghttp2_version(0);
+    return info == nullptr ? 0U : info->version_num;
 }
 
 unsigned int LibuvVersion();

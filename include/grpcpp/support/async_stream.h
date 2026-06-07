@@ -8,28 +8,28 @@ namespace grpc {
 
 template <class R>
 class ClientAsyncReaderInterface {
- public:
-  virtual ~ClientAsyncReaderInterface() = default;
+  public:
+    virtual ~ClientAsyncReaderInterface() = default;
 };
 
 template <class W>
 class ClientAsyncWriterInterface {
- public:
-  virtual ~ClientAsyncWriterInterface() = default;
+  public:
+    virtual ~ClientAsyncWriterInterface() = default;
 };
 
 template <class W, class R>
 class ClientAsyncReaderWriterInterface {
- public:
-  virtual ~ClientAsyncReaderWriterInterface() = default;
+  public:
+    virtual ~ClientAsyncReaderWriterInterface() = default;
 };
 
 template <class W>
-class ServerAsyncResponseWriter
-    : public internal::ServerAsyncStreamingInterface {
- public:
-  ServerAsyncResponseWriter() = default;
-  void SendInitialMetadata(void* tag) override { (void)tag; }
+class ServerAsyncResponseWriter : public internal::ServerAsyncStreamingInterface {
+  public:
+    ServerAsyncResponseWriter() = default;
+
+    void SendInitialMetadata(void* tag) override { (void)tag; }
 };
 
 }  // namespace grpc
