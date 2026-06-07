@@ -114,6 +114,7 @@ class DelayedService final : public Service {
 class ServerScope {
   public:
     explicit ServerScope(Service& service) : service_(service) {}
+
     ServerScope(const ServerScope&) = delete;
     ServerScope& operator=(const ServerScope&) = delete;
 
@@ -170,6 +171,7 @@ class ServerScope {
 class GrpcppServerScope {
   public:
     explicit GrpcppServerScope(grpc::Service& service) : service_(service) {}
+
     GrpcppServerScope(const GrpcppServerScope&) = delete;
     GrpcppServerScope& operator=(const GrpcppServerScope&) = delete;
 

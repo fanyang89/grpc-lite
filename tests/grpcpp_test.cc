@@ -1,6 +1,4 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include "doctest/doctest.h"
-
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -25,6 +23,7 @@
 #include <grpcpp/support/client_callback.h>
 #include <grpcpp/support/method_handler.h>
 
+#include "doctest/doctest.h"
 #include "test_support.h"
 
 namespace {
@@ -99,10 +98,12 @@ grpc::Status CallUnary(
 ) {
     grpc::ClientContext context;
     grpc::ByteBuffer response_buffer;
-    const grpc::Status status = grpc::internal::BlockingUnaryCall<grpc::ByteBuffer, grpc::ByteBuffer>(
-        channel.get(), grpc::internal::RpcMethod(method.c_str(), grpc::internal::RpcMethod::NORMAL_RPC),
-        &context, MakeBuffer(request), &response_buffer
-    );
+    const grpc::Status status =
+        grpc::internal::BlockingUnaryCall<grpc::ByteBuffer, grpc::ByteBuffer>(
+            channel.get(),
+            grpc::internal::RpcMethod(method.c_str(), grpc::internal::RpcMethod::NORMAL_RPC),
+            &context, MakeBuffer(request), &response_buffer
+        );
     if (status.ok()) {
         *response = ToString(response_buffer);
     }
@@ -128,10 +129,12 @@ class MultiMethodService final : public grpc::Service {
         method_names_.push_back(full_name);
         AddMethod(new grpc::internal::RpcServiceMethod(
             method_names_.back().c_str(), grpc::internal::RpcMethod::NORMAL_RPC,
-            new grpc::internal::RpcMethodHandler<MultiMethodService, grpc::ByteBuffer,
-                                                  grpc::ByteBuffer>(
-                [handler](MultiMethodService*, grpc::ServerContext*, const grpc::ByteBuffer* request,
-                          grpc::ByteBuffer* response) {
+            new grpc::internal::RpcMethodHandler<
+                MultiMethodService, grpc::ByteBuffer, grpc::ByteBuffer>(
+                [handler](
+                    MultiMethodService*, grpc::ServerContext*, const grpc::ByteBuffer* request,
+                    grpc::ByteBuffer* response
+                ) {
                     const std::string response_value = handler(ToString(*request));
                     *response = MakeBuffer(response_value);
                     return grpc::Status(grpc::StatusCode::OK, "");
@@ -150,12 +153,10 @@ class RejectingParseService final : public grpc::Service {
     RejectingParseService() {
         AddMethod(new grpc::internal::RpcServiceMethod(
             "/test.RejectingParseService/Reject", grpc::internal::RpcMethod::NORMAL_RPC,
-            new grpc::internal::RpcMethodHandler<RejectingParseService, FailingParseMessage,
-                                                  grpc::ByteBuffer>(
+            new grpc::internal::RpcMethodHandler<
+                RejectingParseService, FailingParseMessage, grpc::ByteBuffer>(
                 [](RejectingParseService*, grpc::ServerContext*, const FailingParseMessage*,
-                   grpc::ByteBuffer*) {
-                    return grpc::Status(grpc::StatusCode::OK, "unexpected");
-                },
+                   grpc::ByteBuffer*) { return grpc::Status(grpc::StatusCode::OK, "unexpected"); },
                 this
             )
         ));
@@ -169,11 +170,14 @@ TEST_CASE("blocking unary call serializes request and parses response") {
     grpc::ClientContext context;
     SerializableMessage request{"client-request"};
     SerializableMessage response;
-    const grpc::Status status = grpc::internal::BlockingUnaryCall<SerializableMessage,
-                                                                  SerializableMessage>(
-        &channel, grpc::internal::RpcMethod("/test.Service/Method", grpc::internal::RpcMethod::NORMAL_RPC),
-        &context, request, &response
-    );
+    const grpc::Status status =
+        grpc::internal::BlockingUnaryCall<SerializableMessage, SerializableMessage>(
+            &channel,
+            grpc::internal::RpcMethod(
+                "/test.Service/Method", grpc::internal::RpcMethod::NORMAL_RPC
+            ),
+            &context, request, &response
+        );
 
     CHECK(status.ok());
     CHECK(channel.called_method == "/test.Service/Method");
@@ -187,18 +191,22 @@ TEST_CASE("blocking unary call reports serialize and parse failures") {
     FailingSerializeMessage bad_request;
     SerializableMessage response;
 
-    grpc::Status status = grpc::internal::BlockingUnaryCall<FailingSerializeMessage,
-                                                            SerializableMessage>(
-        &channel, grpc::internal::RpcMethod("/test.Service/Method", grpc::internal::RpcMethod::NORMAL_RPC),
-        &context, bad_request, &response
-    );
+    grpc::Status status =
+        grpc::internal::BlockingUnaryCall<FailingSerializeMessage, SerializableMessage>(
+            &channel,
+            grpc::internal::RpcMethod(
+                "/test.Service/Method", grpc::internal::RpcMethod::NORMAL_RPC
+            ),
+            &context, bad_request, &response
+        );
     CHECK(status.error_code() == grpc::StatusCode::INTERNAL);
 
     SerializableMessage request{"client-request"};
     FailingParseMessage bad_response;
     channel.response = "unparseable";
     status = grpc::internal::BlockingUnaryCall<SerializableMessage, FailingParseMessage>(
-        &channel, grpc::internal::RpcMethod("/test.Service/Method", grpc::internal::RpcMethod::NORMAL_RPC),
+        &channel,
+        grpc::internal::RpcMethod("/test.Service/Method", grpc::internal::RpcMethod::NORMAL_RPC),
         &context, request, &bad_response
     );
     CHECK(status.error_code() == grpc::StatusCode::INTERNAL);
@@ -215,10 +223,12 @@ TEST_CASE("async and callback client shims report unsupported APIs") {
     CHECK(status.error_message() == "async CQ API not supported by grpc-lite");
 
     bool callback_ran = false;
-    grpc::internal::CallbackUnaryCall<grpc::ByteBuffer, grpc::ByteBuffer, grpc::ByteBuffer,
-                                      grpc::ByteBuffer>(
-        nullptr, grpc::internal::RpcMethod("/test.Service/Method", grpc::internal::RpcMethod::NORMAL_RPC),
-        nullptr, nullptr, nullptr, [&](grpc::Status callback_status) {
+    grpc::internal::CallbackUnaryCall<
+        grpc::ByteBuffer, grpc::ByteBuffer, grpc::ByteBuffer, grpc::ByteBuffer>(
+        nullptr,
+        grpc::internal::RpcMethod("/test.Service/Method", grpc::internal::RpcMethod::NORMAL_RPC),
+        nullptr, nullptr, nullptr,
+        [&](grpc::Status callback_status) {
             callback_ran = true;
             CHECK(callback_status.error_code() == grpc::StatusCode::UNIMPLEMENTED);
             CHECK(callback_status.error_message() == "callback API not supported by grpc-lite");

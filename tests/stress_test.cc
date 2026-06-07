@@ -1,12 +1,11 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include "doctest/doctest.h"
-
 #include <atomic>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "doctest/doctest.h"
 #include "grpc_lite/channel.h"
 #include "grpc_lite/client_context.h"
 #include "test_support.h"
@@ -63,7 +62,7 @@ TEST_CASE("server handles concurrent unary calls") {
             std::shared_ptr<grpc_lite::Channel> channel = grpc_lite::Channel::Create(address);
             for (int call_index = 0; call_index < kCallsPerThread; ++call_index) {
                 const std::string request = "thread-" + std::to_string(thread_index) + "-call-" +
-                                            std::to_string(call_index);
+                    std::to_string(call_index);
                 std::string response;
                 const grpc_lite::Status status =
                     channel->CallUnary("/test.EchoService/Echo", request, nullptr, &response);

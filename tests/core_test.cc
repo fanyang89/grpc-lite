@@ -1,6 +1,4 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include "doctest/doctest.h"
-
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -9,6 +7,7 @@
 #include <grpcpp/support/byte_buffer.h>
 
 #include "core/grpc_frame.h"
+#include "doctest/doctest.h"
 #include "grpc_lite/client_context.h"
 #include "grpc_lite/server_context.h"
 #include "grpc_lite/status.h"
@@ -134,8 +133,9 @@ TEST_CASE("grpcpp byte buffer stores empty binary and multi-slice payloads") {
     CHECK(empty.SerializeToString(&serialized));
     CHECK(serialized.empty());
 
-    const grpc::Slice slices[] = {grpc::Slice(std::string("abc", 3)),
-                                  grpc::Slice(std::string("\0def", 4))};
+    const grpc::Slice slices[] = {
+        grpc::Slice(std::string("abc", 3)), grpc::Slice(std::string("\0def", 4))
+    };
     grpc::ByteBuffer buffer(slices, 2);
     CHECK(buffer.SerializeToString(&serialized));
     CHECK(serialized == std::string("abc\0def", 7));

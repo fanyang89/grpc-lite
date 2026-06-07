@@ -1,6 +1,4 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include "doctest/doctest.h"
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -11,6 +9,7 @@
 #include <memory>
 #include <string>
 
+#include "doctest/doctest.h"
 #include "grpc_lite/channel.h"
 #include "grpc_lite/client_context.h"
 #include "grpc_lite/server.h"
@@ -227,7 +226,8 @@ TEST_CASE("channel deadline expires while request is in flight") {
     grpc_lite::ClientContext enough_time;
     enough_time.SetDeadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
     response.clear();
-    status = channel->CallUnary("/test.DelayedService/Echo", "after-timeout", &enough_time, &response);
+    status =
+        channel->CallUnary("/test.DelayedService/Echo", "after-timeout", &enough_time, &response);
     CHECK(status.ok());
     CHECK(response == "after-timeout");
 }

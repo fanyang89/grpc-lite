@@ -1,13 +1,9 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include "doctest/doctest.h"
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-#include <nghttp2/nghttp2.h>
 
 #include <cerrno>
 #include <chrono>
@@ -21,7 +17,10 @@
 #include <utility>
 #include <vector>
 
+#include <nghttp2/nghttp2.h>
+
 #include "core/grpc_frame.h"
+#include "doctest/doctest.h"
 #include "grpc_lite/channel.h"
 #include "grpc_lite/client_context.h"
 #include "grpc_lite/status.h"
@@ -63,8 +62,10 @@ bool FlushSession(int fd, nghttp2_session* session) {
             return true;
         }
         if (!SendAll(
-                fd, std::string_view(reinterpret_cast<const char*>(data),
-                                     static_cast<std::size_t>(bytes))
+                fd,
+                std::string_view(
+                    reinterpret_cast<const char*>(data), static_cast<std::size_t>(bytes)
+                )
             )) {
             return false;
         }
@@ -104,7 +105,8 @@ std::vector<nghttp2_nv> BuildResponseTrailers(FakeServerState* state) {
     std::vector<nghttp2_nv> trailers;
     trailers.push_back(grpc_lite::core::MakeHeader("grpc-status", state->grpc_status_text));
     if (!state->response.grpc_message.empty()) {
-        trailers.push_back(grpc_lite::core::MakeHeader("grpc-message", state->response.grpc_message));
+        trailers.push_back(grpc_lite::core::MakeHeader("grpc-message", state->response.grpc_message)
+        );
     }
     for (const auto& metadata : state->response.trailing_metadata) {
         trailers.push_back(grpc_lite::core::MakeHeader(metadata.first, metadata.second));
@@ -240,9 +242,7 @@ int FakeOnStreamClose(nghttp2_session*, int32_t stream_id, std::uint32_t, void* 
 
 class FakeHttp2Server {
   public:
-    explicit FakeHttp2Server(ResponseSpec response) {
-        state_.response = std::move(response);
-    }
+    explicit FakeHttp2Server(ResponseSpec response) { state_.response = std::move(response); }
 
     ~FakeHttp2Server() { Stop(); }
 
@@ -296,6 +296,7 @@ class FakeHttp2Server {
     }
 
     const std::string& address() const { return address_; }
+
     const CapturedRequest& request() const { return state_.request; }
 
   private:
@@ -371,10 +372,8 @@ struct RawClientState {
     bool stream_closed = false;
 };
 
-ssize_t RawClientReadCallback(
-    nghttp2_session*, int32_t, std::uint8_t* buffer, std::size_t length,
-    std::uint32_t* data_flags, nghttp2_data_source* source, void*
-) {
+ssize_t
+RawClientReadCallback(nghttp2_session*, int32_t, std::uint8_t* buffer, std::size_t length, std::uint32_t* data_flags, nghttp2_data_source* source, void*) {
     auto* state = static_cast<RawClientState*>(source->ptr);
     const std::size_t remaining = state->request.body.size() - state->body_offset;
     const std::size_t to_copy = std::min(remaining, length);
@@ -481,9 +480,8 @@ RawResponse SendRawRequest(const std::string& address, RequestSpec request) {
     nghttp2_data_provider provider{};
     provider.source.ptr = &state;
     provider.read_callback = RawClientReadCallback;
-    state.stream_id = nghttp2_submit_request(
-        session, nullptr, headers.data(), headers.size(), &provider, &state
-    );
+    state.stream_id =
+        nghttp2_submit_request(session, nullptr, headers.data(), headers.size(), &provider, &state);
     REQUIRE(state.stream_id > 0);
     REQUIRE(FlushSession(fd, session));
 
@@ -590,9 +588,9 @@ TEST_CASE("channel preserves metadata and grpc error responses") {
     CHECK(status.code() == StatusCode::kInvalidArgument);
     CHECK(status.message() == "bad request");
     CHECK(grpc_lite::test::HasMetadata(context.server_initial_metadata(), "x-initial", "fake"));
-    CHECK(grpc_lite::test::HasMetadata(
-        context.server_trailing_metadata(), "x-trailing", "fake-done"
-    ));
+    CHECK(
+        grpc_lite::test::HasMetadata(context.server_trailing_metadata(), "x-trailing", "fake-done")
+    );
     server.Stop();
 }
 
