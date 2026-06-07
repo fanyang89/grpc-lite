@@ -109,6 +109,9 @@ endif()
 if(GRPC_LITE_BUILD_EXAMPLES)
   add_executable(grpc_lite_architecture examples/architecture.cc)
   target_link_libraries(grpc_lite_architecture PRIVATE grpc_lite::grpc_lite)
+
+  add_executable(grpc_lite_echo_server examples/echo_server.cc)
+  target_link_libraries(grpc_lite_echo_server PRIVATE grpc_lite::grpc_lite)
 endif()
 
 install(TARGETS grpc_lite EXPORT grpc_liteTargets

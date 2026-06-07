@@ -40,14 +40,41 @@ not inherit unnecessary integration cost.
 - `golden/`: upstream reference trees for gRPC, protobuf, and Abseil
 
 The current codebase is still a scaffold. It already expresses the chosen
-dependency split and build strategy, but it does not yet implement real HTTP/2
-streams, gRPC framing, protobuf dispatch, or code generation.
+dependency split and build strategy, and it now includes a minimal cleartext
+HTTP/2 unary server path built on `libuv + nghttp2`. The runtime can accept a
+single gRPC request, decode one unary frame, dispatch it to a registered
+`Service`, and write a gRPC response with trailers.
+
+Current implementation limits:
+
+- cleartext `h2c` only
+- unary RPC only
+- exactly one protobuf message per request body
+- no compression
+- no TLS, resolver, streaming, reflection, or code generation yet
 
 ## Build
 
 ```bash
 cmake -S . -B build
 cmake --build build
+```
+
+Run the demo echo server:
+
+```bash
+./build/grpc_lite_echo_server
+```
+
+Smoke test it with `curl` using HTTP/2 prior knowledge and an empty unary frame:
+
+```bash
+printf '\x00\x00\x00\x00\x00' > /tmp/grpc-lite-empty.bin
+curl --http2-prior-knowledge \
+  -H 'content-type: application/grpc' \
+  -H 'te: trailers' \
+  --data-binary @/tmp/grpc-lite-empty.bin \
+  http://127.0.0.1:50051/demo.EchoService/Echo
 ```
 
 ## Configuration knobs

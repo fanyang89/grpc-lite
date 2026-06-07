@@ -1,9 +1,7 @@
 #include <iostream>
 
-#include "grpc_lite/channel.h"
 #include "grpc_lite/server_builder.h"
 #include "grpc_lite/service.h"
-#include "grpc_lite/version.h"
 
 namespace {
 
@@ -15,8 +13,8 @@ class EchoService final : public grpc_lite::Service {
                                 std::string_view request,
                                 grpc_lite::ServerContext* context,
                                 std::string* response) override {
-    (void)method;
-    context->AddTrailingMetadata("demo-mode", "echo");
+    context->AddInitialMetadata("x-grpc-lite-service", "demo.EchoService");
+    context->AddTrailingMetadata("x-grpc-lite-method", std::string(method));
     *response = std::string(request);
     return grpc_lite::Status::OK();
   }
@@ -33,14 +31,14 @@ int main() {
 
   auto server = builder.Build();
   const grpc_lite::Status status = server->Start();
-  auto channel = grpc_lite::Channel::Create("127.0.0.1:50051");
+  if (!status.ok()) {
+    std::cerr << "failed to start grpc-lite server: " << status.message()
+              << "\n";
+    return 1;
+  }
 
-  std::cout << "grpc-lite " << grpc_lite::VersionString() << "\n";
-  std::cout << "service: " << service.service_name() << "\n";
-  std::cout << "server started: " << status.ok() << "\n";
-  std::cout << "http2 compatible transport: "
-            << channel->SupportsProtocolCompatibility() << "\n";
-
-  server->Shutdown();
-  return status.ok() ? 0 : 1;
+  std::cout << "grpc-lite echo server listening on 0.0.0.0:50051\n";
+  std::cout << "grpc path: /demo.EchoService/Echo\n";
+  server->Wait();
+  return 0;
 }
