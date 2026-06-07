@@ -47,11 +47,16 @@ class ProtoEchoService final : public grpc_lite::Service {
 
 }  // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
+    std::string address = "0.0.0.0:50051";
+    if (argc > 1) {
+        address = argv[1];
+    }
+
     ProtoEchoService service;
 
     grpc_lite::ServerBuilder builder;
-    builder.AddListeningPort("0.0.0.0:50051");
+    builder.AddListeningPort(address);
     builder.RegisterService(&service);
 
     auto server = builder.Build();
@@ -61,7 +66,7 @@ int main() {
         return 1;
     }
 
-    std::cout << "grpc-lite proto echo server listening on 0.0.0.0:50051\n";
+    std::cout << "grpc-lite proto echo server listening on " << address << "\n";
     std::cout << "grpc path: /demo.EchoService/Echo\n";
     server->Wait();
     return 0;

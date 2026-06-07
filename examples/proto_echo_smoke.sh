@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${1:-${ROOT_DIR}/build}"
+PORT="${2:-50051}"
 
 SERVER_BIN="${BUILD_DIR}/grpc_lite_proto_echo_server"
 CLIENT_BIN="${BUILD_DIR}/grpc_lite_proto_echo_client"
@@ -22,11 +23,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"${SERVER_BIN}" > "${work_dir}/server.log" 2>&1 &
+"${SERVER_BIN}" "127.0.0.1:${PORT}" > "${work_dir}/server.log" 2>&1 &
 server_pid=$!
 sleep 1
 
-output=$("${CLIENT_BIN}" 127.0.0.1:50051 "hello grpc-lite")
+output=$("${CLIENT_BIN}" "127.0.0.1:${PORT}" "hello grpc-lite")
 printf '%s\n' "${output}"
 
 case "${output}" in

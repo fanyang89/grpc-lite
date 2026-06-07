@@ -257,6 +257,24 @@ if(GRPC_LITE_BUILD_TESTS)
 
   add_test(NAME grpc_lite_runtime_test COMMAND grpc_lite_runtime_test)
 
+  add_executable(grpc_lite_stress_test tests/stress_test.cc)
+  target_include_directories(grpc_lite_stress_test
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${_grpc_lite_doctest_include_dir}"
+  )
+  target_link_libraries(grpc_lite_stress_test
+    PRIVATE
+      grpc_lite::grpc_lite
+      Threads::Threads
+      PkgConfig::NGHTTP2
+      PkgConfig::LIBUV
+      ${_grpc_lite_optional_private_libs}
+  )
+  grpc_lite_enable_iwyu(grpc_lite_stress_test)
+
+  add_test(NAME grpc_lite_stress_test COMMAND grpc_lite_stress_test)
+
   add_executable(grpc_lite_protocol_test tests/protocol_test.cc)
   target_include_directories(grpc_lite_protocol_test
     PRIVATE
@@ -279,6 +297,25 @@ if(GRPC_LITE_BUILD_TESTS)
   add_test(NAME grpc_lite_protocol_server_test
            COMMAND grpc_lite_protocol_test --test-case=raw\ protocol*)
 
+  add_executable(grpc_lite_grpcpp_test tests/grpcpp_test.cc)
+  target_include_directories(grpc_lite_grpcpp_test
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/include/grpc_lite"
+      "${_grpc_lite_doctest_include_dir}"
+  )
+  target_link_libraries(grpc_lite_grpcpp_test
+    PRIVATE
+      grpc_lite::grpc_lite
+      Threads::Threads
+      PkgConfig::NGHTTP2
+      PkgConfig::LIBUV
+      ${_grpc_lite_optional_private_libs}
+  )
+  grpc_lite_enable_iwyu(grpc_lite_grpcpp_test)
+
+  add_test(NAME grpc_lite_grpcpp_test COMMAND grpc_lite_grpcpp_test)
+
   add_executable(grpc_lite_compatibility_test tests/compatibility_test.cc)
   target_include_directories(grpc_lite_compatibility_test
     PRIVATE
@@ -297,6 +334,13 @@ if(GRPC_LITE_BUILD_TESTS)
   grpc_lite_enable_iwyu(grpc_lite_compatibility_test)
 
   add_test(NAME grpc_lite_compatibility_test COMMAND grpc_lite_compatibility_test)
+
+  if(TARGET grpc_lite_proto_echo_server AND TARGET grpc_lite_proto_echo_client)
+    add_test(NAME grpc_lite_proto_echo_smoke
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/examples/proto_echo_smoke.sh"
+                          "$<TARGET_FILE_DIR:grpc_lite_proto_echo_server>" "50052")
+    set_tests_properties(grpc_lite_proto_echo_smoke PROPERTIES TIMEOUT 10)
+  endif()
 endif()
 
 install(TARGETS grpc_lite EXPORT grpc_liteTargets
