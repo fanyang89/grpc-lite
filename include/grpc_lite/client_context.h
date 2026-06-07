@@ -8,6 +8,8 @@
 
 namespace grpc_lite {
 
+class Channel;
+
 class ClientContext {
  public:
   using MetadataEntry = std::pair<std::string, std::string>;
@@ -18,9 +20,19 @@ class ClientContext {
   const std::vector<MetadataEntry>& metadata() const;
   std::chrono::system_clock::time_point deadline() const;
 
+  const std::vector<MetadataEntry>& server_initial_metadata() const;
+  const std::vector<MetadataEntry>& server_trailing_metadata() const;
+
  private:
+  friend class Channel;
+
+  void SetServerInitialMetadata(std::vector<MetadataEntry> metadata);
+  void SetServerTrailingMetadata(std::vector<MetadataEntry> metadata);
+
   std::vector<MetadataEntry> metadata_;
   std::chrono::system_clock::time_point deadline_{};
+  std::vector<MetadataEntry> server_initial_metadata_;
+  std::vector<MetadataEntry> server_trailing_metadata_;
 };
 
 }  // namespace grpc_lite
