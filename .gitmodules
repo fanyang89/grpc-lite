@@ -1,0 +1,9 @@
+[submodule "golden/protobuf"]
+	path = golden/protobuf
+	url = https://github.com/protocolbuffers/protobuf.git
+[submodule "golden/grpc"]
+	path = golden/grpc
+	url = https://github.com/grpc/grpc.git
+[submodule "golden/abseil-cpp"]
+	path = golden/abseil-cpp
+	url = http://gerrit.smartx.com/abseil-cpp.git
