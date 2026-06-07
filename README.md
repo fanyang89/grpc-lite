@@ -43,7 +43,8 @@ The current codebase is still a scaffold. It already expresses the chosen
 dependency split and build strategy, and it now includes a minimal cleartext
 HTTP/2 unary server path built on `libuv + nghttp2`. The runtime can accept a
 single gRPC request, decode one unary frame, dispatch it to a registered
-`Service`, and write a gRPC response with trailers.
+`Service`, and write a gRPC response with trailers. It also has a protobuf echo
+example built from `proto/echo.proto` through `protoc`.
 
 Current implementation limits:
 
@@ -66,6 +67,12 @@ Run the demo echo server:
 ./build/grpc_lite_echo_server
 ```
 
+Run the protobuf-backed echo server:
+
+```bash
+./build/grpc_lite_proto_echo_server
+```
+
 Smoke test it with `curl` using HTTP/2 prior knowledge and an empty unary frame:
 
 ```bash
@@ -75,6 +82,12 @@ curl --http2-prior-knowledge \
   -H 'te: trailers' \
   --data-binary @/tmp/grpc-lite-empty.bin \
   http://127.0.0.1:50051/demo.EchoService/Echo
+```
+
+Smoke test the protobuf echo path end to end:
+
+```bash
+./examples/proto_echo_smoke.sh
 ```
 
 ## Configuration knobs
