@@ -47,6 +47,11 @@ Core dependencies:
 - `CMake`
 - `C++17`
 
+`libnghttp2` and `libuv` can come from system packages or from the public
+submodules under `third_party/`. System packages are the default for normal
+builds. Sanitizer builds use the submodules so the dependency code is built with
+the same instrumentation as `grpc-lite`.
+
 Message/example/test dependencies:
 
 - `struct_proto26`
@@ -136,13 +141,15 @@ is not used by CMake and does not introduce a `protoc` dependency.
 
 ## Configuration Knobs
 
-- `GRPC_LITE_USE_SYSTEM_NGHTTP2=ON`
-- `GRPC_LITE_USE_SYSTEM_LIBUV=ON`
+- `GRPC_LITE_USE_SYSTEM_NGHTTP2=ON` uses `pkg-config` system `libnghttp2`
+- `GRPC_LITE_USE_SYSTEM_NGHTTP2=OFF` builds `third_party/nghttp2`
+- `GRPC_LITE_USE_SYSTEM_LIBUV=ON` uses `pkg-config` system `libuv`
+- `GRPC_LITE_USE_SYSTEM_LIBUV=OFF` builds `third_party/libuv`
 - `GRPC_LITE_ENABLE_OPENSSL=OFF`
 - `GRPC_LITE_ENABLE_CARES=OFF`
 - `GRPC_LITE_ENABLE_LOGGING=OFF`
 - `GRPC_LITE_BUILD_EXAMPLES=ON`
 - `GRPC_LITE_BUILD_TESTS=ON`
-
-Vendored fallback hooks for `nghttp2` and `libuv` are intentionally left as a
-separate step so system-package and local dependency logic stay isolated.
+- `GRPC_LITE_SANITIZE=` enables no sanitizer
+- `GRPC_LITE_SANITIZE=address` builds with ASan and vendored `nghttp2/libuv`
+- `GRPC_LITE_SANITIZE=thread` builds with TSan and vendored `nghttp2/libuv`

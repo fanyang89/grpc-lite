@@ -76,16 +76,51 @@ if(GRPC_LITE_COVERAGE)
   endif()
 endif()
 
+if(GRPC_LITE_SANITIZE)
+  if(GRPC_LITE_USE_SYSTEM_NGHTTP2 OR GRPC_LITE_USE_SYSTEM_LIBUV)
+    message(STATUS "grpc-lite sanitizer builds use vendored nghttp2/libuv")
+  endif()
+  set(GRPC_LITE_USE_SYSTEM_NGHTTP2 OFF CACHE BOOL "Use nghttp2 from the system" FORCE)
+  set(GRPC_LITE_USE_SYSTEM_LIBUV OFF CACHE BOOL "Use libuv from the system" FORCE)
+endif()
+
 if(GRPC_LITE_USE_SYSTEM_NGHTTP2)
   pkg_check_modules(NGHTTP2 REQUIRED IMPORTED_TARGET libnghttp2)
+  set(_grpc_lite_nghttp2_target PkgConfig::NGHTTP2)
 else()
-  message(FATAL_ERROR "Vendored nghttp2 is not wired yet. Set GRPC_LITE_USE_SYSTEM_NGHTTP2=ON or add third_party/nghttp2 support.")
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nghttp2/CMakeLists.txt")
+    message(FATAL_ERROR "Vendored nghttp2 not found. Run: git submodule update --init third_party/nghttp2")
+  endif()
+  set(ENABLE_LIB_ONLY ON CACHE BOOL "Build libnghttp2 only" FORCE)
+  set(ENABLE_APP OFF CACHE BOOL "Build nghttp2 applications" FORCE)
+  set(ENABLE_EXAMPLES OFF CACHE BOOL "Build nghttp2 examples" FORCE)
+  set(ENABLE_HPACK_TOOLS OFF CACHE BOOL "Build nghttp2 HPACK tools" FORCE)
+  set(ENABLE_DOC OFF CACHE BOOL "Build nghttp2 documentation" FORCE)
+  set(BUILD_TESTING OFF CACHE BOOL "Build third-party tests" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
+  set(BUILD_STATIC_LIBS ON CACHE BOOL "Build static libraries" FORCE)
+  add_subdirectory(third_party/nghttp2 EXCLUDE_FROM_ALL)
+  set(_grpc_lite_nghttp2_target nghttp2)
 endif()
 
 if(GRPC_LITE_USE_SYSTEM_LIBUV)
   pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)
+  set(_grpc_lite_libuv_target PkgConfig::LIBUV)
 else()
-  message(FATAL_ERROR "Vendored libuv is not wired yet. Set GRPC_LITE_USE_SYSTEM_LIBUV=ON or add third_party/libuv support.")
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libuv/CMakeLists.txt")
+    message(FATAL_ERROR "Vendored libuv not found. Run: git submodule update --init third_party/libuv")
+  endif()
+  set(LIBUV_BUILD_SHARED OFF CACHE BOOL "Build shared libuv" FORCE)
+  set(LIBUV_BUILD_TESTS OFF CACHE BOOL "Build libuv tests" FORCE)
+  set(LIBUV_BUILD_BENCH OFF CACHE BOOL "Build libuv benchmarks" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
+  set(BUILD_TESTING OFF CACHE BOOL "Build third-party tests" FORCE)
+  add_subdirectory(third_party/libuv EXCLUDE_FROM_ALL)
+  if(TARGET libuv::libuv)
+    set(_grpc_lite_libuv_target libuv::libuv)
+  else()
+    set(_grpc_lite_libuv_target uv_a)
+  endif()
 endif()
 
 set(_grpc_lite_optional_private_libs "")
@@ -184,8 +219,8 @@ target_include_directories(grpc_lite
 target_link_libraries(grpc_lite
   PRIVATE
     Threads::Threads
-    PkgConfig::NGHTTP2
-    PkgConfig::LIBUV
+    ${_grpc_lite_nghttp2_target}
+    ${_grpc_lite_libuv_target}
     ${_grpc_lite_optional_private_libs}
 )
 
@@ -266,7 +301,7 @@ if(GRPC_LITE_BUILD_TESTS)
   target_link_libraries(grpc_lite_core_test
     PRIVATE
       grpc_lite::grpc_lite
-      PkgConfig::NGHTTP2
+      ${_grpc_lite_nghttp2_target}
   )
   grpc_lite_enable_iwyu(grpc_lite_core_test)
 
@@ -282,8 +317,8 @@ if(GRPC_LITE_BUILD_TESTS)
     PRIVATE
       grpc_lite::grpc_lite
       Threads::Threads
-      PkgConfig::NGHTTP2
-      PkgConfig::LIBUV
+      ${_grpc_lite_nghttp2_target}
+      ${_grpc_lite_libuv_target}
       ${_grpc_lite_optional_private_libs}
   )
   grpc_lite_enable_iwyu(grpc_lite_runtime_test)
@@ -300,8 +335,8 @@ if(GRPC_LITE_BUILD_TESTS)
     PRIVATE
       grpc_lite::grpc_lite
       Threads::Threads
-      PkgConfig::NGHTTP2
-      PkgConfig::LIBUV
+      ${_grpc_lite_nghttp2_target}
+      ${_grpc_lite_libuv_target}
       ${_grpc_lite_optional_private_libs}
   )
   grpc_lite_enable_iwyu(grpc_lite_stress_test)
@@ -319,8 +354,8 @@ if(GRPC_LITE_BUILD_TESTS)
     PRIVATE
       grpc_lite::grpc_lite
       Threads::Threads
-      PkgConfig::NGHTTP2
-      PkgConfig::LIBUV
+      ${_grpc_lite_nghttp2_target}
+      ${_grpc_lite_libuv_target}
       ${_grpc_lite_optional_private_libs}
   )
   grpc_lite_enable_iwyu(grpc_lite_protocol_test)
@@ -341,8 +376,8 @@ if(GRPC_LITE_BUILD_TESTS)
     PRIVATE
       grpc_lite::grpc_lite
       Threads::Threads
-      PkgConfig::NGHTTP2
-      PkgConfig::LIBUV
+      ${_grpc_lite_nghttp2_target}
+      ${_grpc_lite_libuv_target}
       ${_grpc_lite_optional_private_libs}
   )
   grpc_lite_enable_iwyu(grpc_lite_grpcpp_test)
@@ -360,8 +395,8 @@ if(GRPC_LITE_BUILD_TESTS)
     PRIVATE
        grpc_lite::grpc_lite
        Threads::Threads
-       PkgConfig::NGHTTP2
-       PkgConfig::LIBUV
+       ${_grpc_lite_nghttp2_target}
+       ${_grpc_lite_libuv_target}
        ${_grpc_lite_optional_private_libs}
     )
   grpc_lite_enable_iwyu(grpc_lite_compatibility_test)

@@ -232,10 +232,16 @@ jobs:
           fi
 
       - name: Checkout required submodules
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
         run: |
           set -euxo pipefail
           git submodule sync -- golden/grpc third_party/struct_proto26
           git submodule update --init --depth 1 -- golden/grpc third_party/struct_proto26
+          if [[ -n "$SANITIZER" ]]; then
+            git submodule sync -- third_party/libuv third_party/nghttp2
+            git submodule update --init --depth 1 -- third_party/libuv third_party/nghttp2
+          fi
           git -C golden/grpc submodule sync -- third_party/opentelemetry-cpp
           git -C golden/grpc submodule update --init --depth 1 -- third_party/opentelemetry-cpp
           git -C golden/grpc/third_party/opentelemetry-cpp submodule sync -- third_party/nlohmann-json
@@ -270,6 +276,10 @@ jobs:
           )
           if [[ -n "$SANITIZER" ]]; then
             cmake_args+=("-DGRPC_LITE_SANITIZE=$SANITIZER")
+            cmake_args+=(
+              -DGRPC_LITE_USE_SYSTEM_NGHTTP2=OFF
+              -DGRPC_LITE_USE_SYSTEM_LIBUV=OFF
+            )
           fi
           cmake "${cmake_args[@]}"
 

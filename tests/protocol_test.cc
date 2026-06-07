@@ -397,6 +397,15 @@ int RawOnHeader(
     }
     const std::string_view header_name(reinterpret_cast<const char*>(name), namelen);
     const std::string_view header_value(reinterpret_cast<const char*>(value), valuelen);
+    if (header_name == "grpc-status") {
+        state->response.grpc_status = std::atoi(std::string(header_value).c_str());
+        return 0;
+    }
+    if (header_name == "grpc-message") {
+        state->response.grpc_message.assign(header_value);
+        return 0;
+    }
+
     if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
         if (header_name == ":status") {
             state->response.http_status.assign(header_value);
@@ -404,13 +413,7 @@ int RawOnHeader(
             state->response.initial_metadata.emplace_back(header_name, header_value);
         }
     } else if (frame->headers.cat == NGHTTP2_HCAT_HEADERS) {
-        if (header_name == "grpc-status") {
-            state->response.grpc_status = std::atoi(std::string(header_value).c_str());
-        } else if (header_name == "grpc-message") {
-            state->response.grpc_message.assign(header_value);
-        } else {
-            state->response.trailing_metadata.emplace_back(header_name, header_value);
-        }
+        state->response.trailing_metadata.emplace_back(header_name, header_value);
     }
     return 0;
 }
