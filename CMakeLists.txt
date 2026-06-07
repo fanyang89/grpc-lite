@@ -257,6 +257,28 @@ if(GRPC_LITE_BUILD_TESTS)
 
   add_test(NAME grpc_lite_runtime_test COMMAND grpc_lite_runtime_test)
 
+  add_executable(grpc_lite_protocol_test tests/protocol_test.cc)
+  target_include_directories(grpc_lite_protocol_test
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${_grpc_lite_doctest_include_dir}"
+  )
+  target_link_libraries(grpc_lite_protocol_test
+    PRIVATE
+      grpc_lite::grpc_lite
+      Threads::Threads
+      PkgConfig::NGHTTP2
+      PkgConfig::LIBUV
+      ${_grpc_lite_optional_private_libs}
+  )
+  grpc_lite_enable_iwyu(grpc_lite_protocol_test)
+
+  add_test(NAME grpc_lite_protocol_client_test
+           COMMAND grpc_lite_protocol_test --test-case=channel*)
+  add_test(NAME grpc_lite_protocol_server_test
+           COMMAND grpc_lite_protocol_test --test-case=raw\ protocol*)
+
   add_executable(grpc_lite_compatibility_test tests/compatibility_test.cc)
   target_include_directories(grpc_lite_compatibility_test
     PRIVATE
