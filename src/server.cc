@@ -33,6 +33,7 @@ struct StreamState {
     Status status;
     std::size_t response_offset = 0;
     bool response_submitted = false;
+    bool trailers_submitted = false;
 };
 
 struct PendingWrite {
@@ -159,6 +160,28 @@ void QueueOutput(Http2Connection* connection) {
     }
 }
 
+int SubmitGrpcTrailers(nghttp2_session* session, int32_t stream_id, StreamState* stream) {
+    if (stream->trailers_submitted) {
+        return 0;
+    }
+
+    std::vector<nghttp2_nv> trailers;
+    trailers.reserve(stream->trailing_metadata.size() + 2);
+    trailers.push_back(MakeHeader("grpc-status", StatusCodeText(stream->status.code())));
+    if (!stream->status.message().empty()) {
+        trailers.push_back(MakeHeader("grpc-message", stream->status.message()));
+    }
+    for (const auto& metadata : stream->trailing_metadata) {
+        trailers.push_back(MakeHeader(metadata.first, metadata.second));
+    }
+
+    const int rc = nghttp2_submit_trailer(session, stream_id, trailers.data(), trailers.size());
+    if (rc == 0) {
+        stream->trailers_submitted = true;
+    }
+    return rc;
+}
+
 void FlushPendingWrites(Http2Connection* connection) {
     if (connection->closed || connection->write_in_flight || connection->pending_writes.empty()) {
         return;
@@ -207,18 +230,8 @@ void SubmitGrpcResponse(Http2Connection* connection, int32_t stream_id, StreamSt
 
         if (state->response_offset == state->response_frame.size()) {
             *data_flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
-            std::vector<nghttp2_nv> trailers;
-            trailers.reserve(state->trailing_metadata.size() + 2);
-            trailers.push_back(MakeHeader("grpc-status", StatusCodeText(state->status.code())));
-            if (!state->status.message().empty()) {
-                trailers.push_back(MakeHeader("grpc-message", state->status.message()));
-            }
-            for (const auto& metadata : state->trailing_metadata) {
-                trailers.push_back(MakeHeader(metadata.first, metadata.second));
-            }
-            if (nghttp2_submit_trailer(
-                    session, current_stream_id, trailers.data(), trailers.size()
-                ) != 0) {
+            if (state->response_frame.empty() &&
+                SubmitGrpcTrailers(session, current_stream_id, state) != 0) {
                 return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
             }
         }
@@ -236,6 +249,26 @@ void SubmitGrpcResponse(Http2Connection* connection, int32_t stream_id, StreamSt
     stream->response_submitted = true;
     QueueOutput(connection);
     FlushPendingWrites(connection);
+}
+
+int OnFrameSend(nghttp2_session* session, const nghttp2_frame* frame, void* user_data) {
+    auto* connection = static_cast<Http2Connection*>(user_data);
+    if (frame->hd.type != NGHTTP2_DATA) {
+        return 0;
+    }
+
+    auto it = connection->streams.find(frame->hd.stream_id);
+    if (it == connection->streams.end()) {
+        return 0;
+    }
+
+    StreamState* stream = &it->second;
+    if (stream->response_offset == stream->response_frame.size() &&
+        !stream->response_frame.empty() &&
+        SubmitGrpcTrailers(session, frame->hd.stream_id, stream) != 0) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    return 0;
 }
 
 Status ServerImpl::BuildUnaryResponse(StreamState* stream) {
@@ -463,6 +496,7 @@ void OnNewConnection(uv_stream_t* server_stream, int status) {
     nghttp2_session_callbacks_set_on_header_callback(callbacks, OnHeader);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, OnDataChunkRecv);
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, OnFrameRecv);
+    nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, OnFrameSend);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, OnStreamClose);
     if (nghttp2_session_server_new(&connection->session, callbacks, connection) != 0) {
         nghttp2_session_callbacks_del(callbacks);
