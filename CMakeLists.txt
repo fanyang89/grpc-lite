@@ -223,6 +223,40 @@ if(GRPC_LITE_BUILD_TESTS)
 
   add_test(NAME grpc_lite_proto3_wire_test COMMAND grpc_lite_proto3_wire_test)
 
+  add_executable(grpc_lite_core_test tests/core_test.cc)
+  target_include_directories(grpc_lite_core_test
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${_grpc_lite_doctest_include_dir}"
+  )
+  target_link_libraries(grpc_lite_core_test
+    PRIVATE
+      grpc_lite::grpc_lite
+      PkgConfig::NGHTTP2
+  )
+  grpc_lite_enable_iwyu(grpc_lite_core_test)
+
+  add_test(NAME grpc_lite_core_test COMMAND grpc_lite_core_test)
+
+  add_executable(grpc_lite_runtime_test tests/runtime_test.cc)
+  target_include_directories(grpc_lite_runtime_test
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${_grpc_lite_doctest_include_dir}"
+  )
+  target_link_libraries(grpc_lite_runtime_test
+    PRIVATE
+      grpc_lite::grpc_lite
+      Threads::Threads
+      PkgConfig::NGHTTP2
+      PkgConfig::LIBUV
+      ${_grpc_lite_optional_private_libs}
+  )
+  grpc_lite_enable_iwyu(grpc_lite_runtime_test)
+
+  add_test(NAME grpc_lite_runtime_test COMMAND grpc_lite_runtime_test)
+
   add_executable(grpc_lite_compatibility_test tests/compatibility_test.cc)
   target_include_directories(grpc_lite_compatibility_test
     PRIVATE

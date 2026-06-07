@@ -57,6 +57,24 @@ tasks:
     cmds:
       - ctest --test-dir build --output-on-failure --tests-regex grpc_lite_proto3_wire_test
 
+  core-test:
+    desc: Run core unit tests
+    aliases:
+      - core
+    deps:
+      - build
+    cmds:
+      - ctest --test-dir build --output-on-failure --tests-regex grpc_lite_core_test
+
+  runtime-test:
+    desc: Run runtime lifecycle and integration tests
+    aliases:
+      - rt
+    deps:
+      - build
+    cmds:
+      - ctest --test-dir build --output-on-failure --tests-regex grpc_lite_runtime_test
+
   compatibility-test:
     desc: Run grpc-lite/grpcpp compatibility test
     aliases:
@@ -106,7 +124,7 @@ tasks:
     vars:
       PROF_DATA: build/coverage.profdata
       REPORT_DIR: build/coverage-report
-      BINS: ./build/grpc_lite_proto3_wire_test -object ./build/grpc_lite_compatibility_test
+      BINS: ./build/grpc_lite_proto3_wire_test -object ./build/grpc_lite_core_test -object ./build/grpc_lite_runtime_test -object ./build/grpc_lite_compatibility_test
       IGNORE: (tests|third_party|golden|\.pb\.)
     cmds:
       - cmake -E rm -rf build
