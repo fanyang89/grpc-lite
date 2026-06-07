@@ -1,1 +1,11 @@
-build/
+/.cache
+/.clangd
+/.env
+/.idea
+/.opencode
+/.task
+/.vscode
+/build
+/build-*
+/cmake-build-*
+/opencode.json

@@ -4,8 +4,8 @@
 #include <string>
 #include <string_view>
 
-#include "grpc_lite/server_context.h"
-#include "grpc_lite/status.h"
+#include "server_context.h"
+#include "status.h"
 
 namespace grpc_lite {
 

@@ -5,6 +5,7 @@ project(grpc-lite VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -16,11 +17,62 @@ option(GRPC_LITE_ENABLE_CARES "Enable c-ares based resolver hooks" OFF)
 option(GRPC_LITE_ENABLE_LOGGING "Enable spdlog/fmt logging hooks when present" OFF)
 option(GRPC_LITE_BUILD_EXAMPLES "Build examples" ON)
 option(GRPC_LITE_BUILD_TESTS "Build tests" ON)
+option(GRPC_LITE_ENABLE_IWYU "Run include-what-you-use during C++ builds" OFF)
+option(GRPC_LITE_ENABLE_UBSAN "Build with undefined sanitizer when address sanitizer is enabled" ON)
+option(GRPC_LITE_COVERAGE "Build with code coverage instrumentation" OFF)
+set(GRPC_LITE_IWYU_EXECUTABLE "" CACHE FILEPATH "Path to the include-what-you-use executable")
+set(GRPC_LITE_SANITIZE "" CACHE STRING "Sanitizer to enable (address or thread)")
+set_property(CACHE GRPC_LITE_SANITIZE PROPERTY STRINGS "" "address" "thread")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
+
+function(grpc_lite_enable_iwyu target_name)
+  if(TARGET ${target_name} AND GRPC_LITE_ENABLE_IWYU)
+    set_property(TARGET ${target_name} PROPERTY
+      CXX_INCLUDE_WHAT_YOU_USE "${GRPC_LITE_IWYU_BIN}")
+  endif()
+endfunction()
+
+if(GRPC_LITE_ENABLE_IWYU)
+  if(GRPC_LITE_IWYU_EXECUTABLE AND IS_ABSOLUTE "${GRPC_LITE_IWYU_EXECUTABLE}")
+    if(NOT EXISTS "${GRPC_LITE_IWYU_EXECUTABLE}")
+      message(FATAL_ERROR "GRPC_LITE_IWYU_EXECUTABLE does not exist: ${GRPC_LITE_IWYU_EXECUTABLE}")
+    endif()
+    set(GRPC_LITE_IWYU_BIN "${GRPC_LITE_IWYU_EXECUTABLE}")
+  elseif(GRPC_LITE_IWYU_EXECUTABLE)
+    find_program(GRPC_LITE_IWYU_BIN NAMES "${GRPC_LITE_IWYU_EXECUTABLE}" REQUIRED)
+  else()
+    find_program(GRPC_LITE_IWYU_BIN NAMES include-what-you-use iwyu REQUIRED)
+  endif()
+endif()
+
+set(GRPC_LITE_SUPPORTED_SANITIZERS address thread)
+if(GRPC_LITE_SANITIZE)
+  if(NOT GRPC_LITE_SANITIZE IN_LIST GRPC_LITE_SUPPORTED_SANITIZERS)
+    message(FATAL_ERROR "GRPC_LITE_SANITIZE must be one of: address, thread")
+  endif()
+
+  add_compile_options(-fsanitize=${GRPC_LITE_SANITIZE})
+  add_link_options(-fsanitize=${GRPC_LITE_SANITIZE})
+  if(GRPC_LITE_SANITIZE STREQUAL "address" AND GRPC_LITE_ENABLE_UBSAN)
+    add_compile_options(-fsanitize=undefined)
+    add_link_options(-fsanitize=undefined)
+  endif()
+endif()
+
+if(GRPC_LITE_COVERAGE)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
+    add_link_options(-fprofile-instr-generate -fcoverage-mapping)
+  else()
+    message(WARNING "GRPC_LITE_COVERAGE with GCC: use gcov/lcov to generate reports (task coverage requires Clang)")
+    add_compile_options(--coverage)
+    add_link_options(--coverage)
+  endif()
+endif()
 
 if(GRPC_LITE_USE_SYSTEM_NGHTTP2)
   pkg_check_modules(NGHTTP2 REQUIRED IMPORTED_TARGET libnghttp2)
@@ -108,6 +160,8 @@ target_compile_definitions(grpc_lite
     $<$<BOOL:${GRPC_LITE_ENABLE_LOGGING}>:GRPC_LITE_HAS_LOGGING=1>
 )
 
+grpc_lite_enable_iwyu(grpc_lite)
+
 if(TARGET PkgConfig::SPDLOG)
   target_link_libraries(grpc_lite PRIVATE PkgConfig::SPDLOG)
 endif()
@@ -119,9 +173,11 @@ endif()
 if(GRPC_LITE_BUILD_EXAMPLES)
   add_executable(grpc_lite_architecture examples/architecture.cc)
   target_link_libraries(grpc_lite_architecture PRIVATE grpc_lite::grpc_lite)
+  grpc_lite_enable_iwyu(grpc_lite_architecture)
 
   add_executable(grpc_lite_echo_server examples/echo_server.cc)
   target_link_libraries(grpc_lite_echo_server PRIVATE grpc_lite::grpc_lite)
+  grpc_lite_enable_iwyu(grpc_lite_echo_server)
 
   add_executable(grpc_lite_proto_echo_server examples/proto_echo_server.cc)
   target_link_libraries(grpc_lite_proto_echo_server
@@ -130,6 +186,7 @@ if(GRPC_LITE_BUILD_EXAMPLES)
       struct_proto26::proto3
   )
   grpc_lite_enable_struct_proto26(grpc_lite_proto_echo_server)
+  grpc_lite_enable_iwyu(grpc_lite_proto_echo_server)
 
   add_executable(grpc_lite_proto_echo_client examples/proto_echo_client.cc)
   target_link_libraries(grpc_lite_proto_echo_client
@@ -138,10 +195,19 @@ if(GRPC_LITE_BUILD_EXAMPLES)
       struct_proto26::proto3
   )
   grpc_lite_enable_struct_proto26(grpc_lite_proto_echo_client)
+  grpc_lite_enable_iwyu(grpc_lite_proto_echo_client)
 endif()
 
 if(GRPC_LITE_BUILD_TESTS)
   enable_testing()
+
+  set(_grpc_lite_doctest_include_dir
+    "${CMAKE_CURRENT_SOURCE_DIR}/golden/grpc/third_party/opentelemetry-cpp/third_party/nlohmann-json/tests/thirdparty")
+  if(NOT EXISTS "${_grpc_lite_doctest_include_dir}/doctest/doctest.h")
+    message(FATAL_ERROR
+            "doctest header not found under _grpc_lite_doctest_include_dir. "
+            "Set up doctest include path before building tests.")
+  endif()
 
   add_executable(grpc_lite_proto3_wire_test tests/proto3_wire_test.cc)
   target_include_directories(grpc_lite_proto3_wire_test
@@ -153,8 +219,28 @@ if(GRPC_LITE_BUILD_TESTS)
       struct_proto26::proto3
   )
   grpc_lite_enable_struct_proto26(grpc_lite_proto3_wire_test)
+  grpc_lite_enable_iwyu(grpc_lite_proto3_wire_test)
 
   add_test(NAME grpc_lite_proto3_wire_test COMMAND grpc_lite_proto3_wire_test)
+
+  add_executable(grpc_lite_compatibility_test tests/compatibility_test.cc)
+  target_include_directories(grpc_lite_compatibility_test
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/include/grpc_lite"
+      "${_grpc_lite_doctest_include_dir}"
+  )
+  target_link_libraries(grpc_lite_compatibility_test
+    PRIVATE
+       grpc_lite::grpc_lite
+       Threads::Threads
+       PkgConfig::NGHTTP2
+       PkgConfig::LIBUV
+       ${_grpc_lite_optional_private_libs}
+    )
+  grpc_lite_enable_iwyu(grpc_lite_compatibility_test)
+
+  add_test(NAME grpc_lite_compatibility_test COMMAND grpc_lite_compatibility_test)
 endif()
 
 install(TARGETS grpc_lite EXPORT grpc_liteTargets

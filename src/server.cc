@@ -4,6 +4,7 @@
 #include <uv.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -103,12 +104,15 @@ class ServerImpl {
   uv_tcp_t listener_handle{};
   bool loop_initialized = false;
   bool listener_initialized = false;
-  bool shutting_down = false;
+  bool shutdown_signal_initialized = false;
+  uv_async_t shutdown_signal{};
+  std::atomic<bool> shutting_down{false};
   std::vector<Http2Connection*> connections;
 };
 
 void FlushPendingWrites(Http2Connection* connection);
 void CloseConnection(Http2Connection* connection);
+void OnLoopShutdown(uv_async_t* handle);
 
 void FreeWrite(uv_write_t* request) {
   auto* pending = static_cast<PendingWrite*>(request->data);
@@ -370,6 +374,29 @@ void OnConnectionClosed(uv_handle_t* handle) {
   delete connection;
 }
 
+void OnLoopShutdown(uv_async_t* handle) {
+  auto* impl = static_cast<ServerImpl*>(handle->data);
+
+  if (!impl->loop_initialized) {
+    return;
+  }
+
+  for (Http2Connection* connection : impl->connections) {
+    CloseConnection(connection);
+  }
+  impl->connections.clear();
+
+  if (impl->listener_initialized &&
+      !uv_is_closing(
+          reinterpret_cast<uv_handle_t*>(&impl->listener_handle))) {
+    uv_close(reinterpret_cast<uv_handle_t*>(&impl->listener_handle), nullptr);
+  }
+
+  if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&impl->shutdown_signal))) {
+    uv_close(reinterpret_cast<uv_handle_t*>(&impl->shutdown_signal), nullptr);
+  }
+}
+
 void CloseConnection(Http2Connection* connection) {
   if (connection->closed) {
     return;
@@ -503,30 +530,57 @@ Status ServerImpl::Start(const Server::Listener& listener) {
     return Status(StatusCode::kUnavailable,
                   "failed to listen on the requested address");
   }
+
+  if (uv_async_init(&loop, &shutdown_signal, OnLoopShutdown) != 0) {
+    Shutdown();
+    return Status(StatusCode::kInternal, "failed to initialize shutdown signal");
+  }
+  shutdown_signal.data = this;
+  shutdown_signal_initialized = true;
+
   return Status::OK();
 }
 
-void ServerImpl::Wait() { uv_run(&loop, UV_RUN_DEFAULT); }
-
-void ServerImpl::Shutdown() {
-  if (shutting_down) {
-    return;
-  }
-  shutting_down = true;
-
-  for (Http2Connection* connection : connections) {
-    CloseConnection(connection);
-  }
-  if (listener_initialized && !uv_is_closing(reinterpret_cast<uv_handle_t*>(&listener_handle))) {
-    uv_close(reinterpret_cast<uv_handle_t*>(&listener_handle), nullptr);
-  }
-
+void ServerImpl::Wait() {
   if (loop_initialized) {
+    uv_run(&loop, UV_RUN_DEFAULT);
     while (uv_run(&loop, UV_RUN_NOWAIT) != 0) {
     }
     uv_loop_close(&loop);
     loop_initialized = false;
     listener_initialized = false;
+    shutdown_signal_initialized = false;
+  }
+}
+
+void ServerImpl::Shutdown() {
+  if (shutting_down.exchange(true)) {
+    return;
+  }
+
+  if (!shutdown_signal_initialized) {
+    for (Http2Connection* connection : connections) {
+      CloseConnection(connection);
+    }
+    connections.clear();
+
+    if (listener_initialized &&
+        !uv_is_closing(reinterpret_cast<uv_handle_t*>(&listener_handle))) {
+      uv_close(reinterpret_cast<uv_handle_t*>(&listener_handle), nullptr);
+    }
+
+    if (loop_initialized) {
+      while (uv_run(&loop, UV_RUN_NOWAIT) != 0) {
+      }
+      uv_loop_close(&loop);
+      loop_initialized = false;
+      listener_initialized = false;
+    }
+    return;
+  }
+
+  if (loop_initialized && shutdown_signal_initialized) {
+    uv_async_send(&shutdown_signal);
   }
 }
 
@@ -572,7 +626,6 @@ void Server::Wait() {
 void Server::Shutdown() {
   if (impl_ != nullptr) {
     impl_->Shutdown();
-    impl_.reset();
   }
   started_ = false;
 }

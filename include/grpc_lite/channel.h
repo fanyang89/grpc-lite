@@ -4,7 +4,7 @@
 #include <memory>
 #include <string>
 
-#include "grpc_lite/status.h"
+#include "status.h"
 
 namespace grpc_lite {
 

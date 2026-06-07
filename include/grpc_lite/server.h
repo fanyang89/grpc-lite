@@ -6,7 +6,7 @@
 #include <string_view>
 #include <vector>
 
-#include "grpc_lite/status.h"
+#include "status.h"
 
 namespace grpc_lite {
 

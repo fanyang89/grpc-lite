@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "grpc_lite/server.h"
+#include "server.h"
 
 namespace grpc_lite {
 

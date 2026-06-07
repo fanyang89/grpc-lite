@@ -111,6 +111,10 @@ void Server::Shutdown() {
   }
 }
 
+void Server::AddOwnedService(std::unique_ptr<grpc_lite::Service> service) {
+  owned_services_.push_back(std::move(service));
+}
+
 std::unique_ptr<Server> ServerBuilder::BuildAndStart() {
   grpc_lite::ServerBuilder lite_builder;
   lite_builder.AddListeningPort(address_);
@@ -129,11 +133,8 @@ std::unique_ptr<Server> ServerBuilder::BuildAndStart() {
   }
 
   auto server = std::make_unique<Server>(std::move(lite_server));
-  // Transfer adapter ownership — store them alongside the server.
-  // For simplicity, leak them (they must outlive the server).
-  // A production implementation would store them in Server.
   for (auto& a : adapters) {
-    a.release();
+    server->AddOwnedService(std::move(a));
   }
   return server;
 }

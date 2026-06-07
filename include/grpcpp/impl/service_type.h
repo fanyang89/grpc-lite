@@ -12,6 +12,7 @@ namespace grpc {
 class CompletionQueue;
 class ServerCompletionQueue;
 class ServerContext;
+class ServerInterface;
 
 namespace internal {
 class ServerAsyncStreamingInterface {
@@ -134,6 +135,9 @@ class Service {
   }
 
  private:
+  friend class Server;
+  friend class ServerInterface;
+  ServerInterface* server_ = nullptr;
   std::vector<std::unique_ptr<internal::RpcServiceMethod>> methods_;
 };
 
