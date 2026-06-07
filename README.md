@@ -1,155 +1,146 @@
 # grpc-lite
 
-`grpc-lite` is a Linux-first gRPC runtime skeleton for small C++ projects that
-want protocol-compatible unary RPC building blocks without pulling in the full
-upstream gRPC stack.
+[![CI](https://github.com/fanyang89/grpc-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/fanyang89/grpc-lite/actions/workflows/ci.yml)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
+![C++26](https://img.shields.io/badge/C%2B%2B-26%20reflection-orange)
+![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-## Current Selection
+> A lightweight, protocol-compatible gRPC runtime for C++ — without the upstream bloat.
 
-The current implementation uses this stack:
+`grpc-lite` gives you HTTP/2 unary RPC building blocks on Linux using only `libuv` +
+`nghttp2`. No `protoc`, no `libprotobuf`, no 50 MB dependency tree.
+Just a static library you can link and run.
 
-- transport: `libuv + libnghttp2`
-- protobuf wire codec: `struct_proto26`
-- schema source: C++ structs walked by C++26 static reflection
-- build system: `CMake`
-- core language level: C++17 for the transport/runtime core
-- message language level: C++26 with `-freflection`
+## Features
 
-The protobuf layer intentionally does not use `.proto` code generation in the
-default build. Message types are plain C++ structs, and `struct_proto26`
-serializes/deserializes them directly to proto3 wire bytes.
+- **Tiny footprint** — core runtime is ~few thousand lines of C++17
+- **Protocol compatible** — speaks standard gRPC over HTTP/2 (cleartext)
+- **Zero code generation** — messages are plain C++ structs serialized via
+  `struct_proto26` (C++26 reflection) or your own codec
+- **Transport / message separation** — swap the protobuf layer without touching HTTP/2
+- **Sanitizer-ready** — ASan / TSan presets with vendored deps built under
+  instrumentation
 
-## Architecture
-
-- `include/grpc_lite/`: stable public C++ runtime API surface
-- `include/grpc_lite/proto3/`: struct-based example schemas
-- `src/core/`: transport/event-loop integration around system C libraries
-- `third_party/struct_proto26/`: header-only proto3 wire codec
-- `examples/`: compile-time smoke tests and reference wiring
-- `tests/`: wire-compatibility checks against canonical proto3 bytes
-- `golden/`: upstream reference trees kept for comparison work
-
-The runtime currently has a minimal cleartext HTTP/2 unary server path built on
-`libuv + nghttp2`. It accepts a single gRPC request, decodes one unary gRPC
-frame, dispatches it to a registered `Service`, and writes a gRPC response with
-trailers.
-
-The message layer is separate from the transport layer. The transport passes
-protobuf payloads as `std::string`; examples use `proto3::serialize()` and
-`proto3::deserialize<T>()` from `struct_proto26` at the service boundary.
-
-## Dependencies
-
-Core dependencies:
-
-- `libnghttp2`
-- `libuv`
-- `CMake`
-- `C++17`
-
-`libnghttp2` and `libuv` can come from system packages or from the public
-submodules under `third_party/`. System packages are the default for normal
-builds. Sanitizer builds use the submodules so the dependency code is built with
-the same instrumentation as `grpc-lite`.
-
-Message/example/test dependencies:
-
-- `struct_proto26`
-- a compiler with C++26 static reflection support and `-freflection`
-
-Optional dependencies:
-
-- `OpenSSL` for TLS/ALPN hooks
-- `c-ares` for resolver hooks
-- `spdlog` and `fmt` for internal logging hooks
-- `abseil-cpp` only when an internal utility really benefits from it
-
-Not used by the default build path:
-
-- `upb`
-- `protoc`
-- `protoc-gen-upb`
-- `protoc-gen-upb_minitable`
-- `grpc_cpp_plugin`
-- `libprotobuf C++`
-
-## Build
-
-Prefer Ninja when available:
+## Quick Start
 
 ```bash
+# 1. Install system dependencies (Ubuntu/Debian)
+sudo apt-get install cmake ninja-build libuv1-dev libnghttp2-dev pkg-config
+
+# 2. Clone and build
+git clone https://github.com/fanyang89/grpc-lite.git
+cd grpc-lite
 cmake -S . -B build -G Ninja
 cmake --build build
-```
 
-If the selected compiler does not support `-std=c++26 -freflection`, configure
-may succeed but the struct_proto26 examples/tests will fail to compile.
-
-Run the raw echo server:
-
-```bash
+# 3. Run the echo server
 ./build/grpc_lite_echo_server
 ```
 
-Run the struct_proto26-backed echo server:
+## Minimal Example
 
-```bash
-./build/grpc_lite_proto_echo_server
+```cpp
+#include "grpc_lite/server_builder.h"
+#include "grpc_lite/service.h"
+
+class EchoService final : public grpc_lite::Service {
+  public:
+    std::string service_name() const override { return "demo.EchoService"; }
+
+    grpc_lite::Status HandleUnary(
+        std::string_view method, std::string_view request,
+        grpc_lite::ServerContext* ctx, std::string* response
+    ) override {
+        *response = std::string(request);
+        return grpc_lite::Status::OK();
+    }
+};
+
+int main() {
+    EchoService svc;
+    grpc_lite::ServerBuilder builder;
+    builder.AddListeningPort("0.0.0.0:50051");
+    builder.RegisterService(&svc);
+
+    auto server = builder.Build();
+    if (!server->Start().ok()) return 1;
+    server->Wait();
+    return 0;
+}
 ```
 
-Smoke test the struct_proto26 echo path end to end:
+## Building
+
+### Prerequisites
+
+| Component | Minimum | Notes |
+| --- | --- | --- |
+| CMake | 3.20 |  |
+| C++ compiler | C++17 compliant | GCC ≥ 12 or Clang ≥ 16 recommended |
+| libuv | system or vendored | `libuv1-dev` |
+| libnghttp2 | system or vendored | `libnghttp2-dev` |
+
+For the struct-based protobuf examples you also need a compiler that supports C++26
+static reflection (`-std=c++26 -freflection`). These targets are skipped automatically
+if your compiler lacks support.
+
+### CMake Presets
 
 ```bash
+# Default build (system packages)
+cmake -S . -B build -G Ninja
+cmake --build build
+
+# Address sanitizer (uses vendored nghttp2 + libuv)
+cmake -S . -B build-asan -G Ninja -DGRPC_LITE_SANITIZE=address
+cmake --build build-asan
+
+# Thread sanitizer
+cmake -S . -B build-tsan -G Ninja -DGRPC_LITE_SANITIZE=thread
+cmake --build build-tsan
+```
+
+### Running Tests
+
+```bash
+# Unit + integration tests
+ctest --test-dir build --output-on-failure
+
+# End-to-end smoke test (proto echo roundtrip)
 ./examples/proto_echo_smoke.sh
 ```
 
-Run the proto3 wire compatibility test:
+## Architecture
 
-```bash
-ctest --test-dir build --output-on-failure
+```
+include/grpc_lite/   Public C++ API (channel, server_builder, service, status)
+src/core/             HTTP/2 framing + libuv event-loop integration
+src/                  Runtime implementation (server, client_call, grpcpp compat)
+examples/             Smoke tests and reference wiring
+tests/                Wire-compatibility checks and protocol tests
+third_party/          struct_proto26, nghttp2, libuv, refl-cpp
+golden/               Upstream reference trees for comparison work
 ```
 
-## Compatibility Testing
+The transport layer passes protobuf payloads as `std::string`. You can use
+`struct_proto26` to serialize plain C++ structs directly to proto3 wire bytes, or bring
+your own codec.
 
-`tests/proto3_wire_test.cc` compares `struct_proto26` output with canonical
-proto3 wire bytes for the reference schema in `proto/echo.proto`:
+## Documentation
 
-```proto
-message EchoRequest {
-  string message = 1;
-}
+- [AGENTS.md](./AGENTS.md) — build constraints, CMake options, developer workflow, and
+  architecture details for contributors and AI agents.
 
-message EchoReply {
-  string message = 1;
-}
-```
+## Contributing
 
-For `message = "hello grpc-lite"`, the canonical wire bytes are:
+Issues and pull requests are welcome.
+Please ensure:
 
-```text
-0a 0f 68 65 6c 6c 6f 20 67 72 70 63 2d 6c 69 74 65
-```
+- Code follows the existing style (`clang-format` is enforced in CI).
+- All tests pass (`ctest --output-on-failure`).
+- Sanitizer builds remain clean if you touch transport code.
 
-The test checks both directions:
+## License
 
-- struct serialization equals the canonical proto3 bytes
-- canonical proto3 bytes deserialize into the expected C++ structs
-- default string fields are omitted, matching proto3 semantics
-
-`proto/echo.proto` remains as a human-readable compatibility reference only; it
-is not used by CMake and does not introduce a `protoc` dependency.
-
-## Configuration Knobs
-
-- `GRPC_LITE_USE_SYSTEM_NGHTTP2=ON` uses `pkg-config` system `libnghttp2`
-- `GRPC_LITE_USE_SYSTEM_NGHTTP2=OFF` builds `third_party/nghttp2`
-- `GRPC_LITE_USE_SYSTEM_LIBUV=ON` uses `pkg-config` system `libuv`
-- `GRPC_LITE_USE_SYSTEM_LIBUV=OFF` builds `third_party/libuv`
-- `GRPC_LITE_ENABLE_OPENSSL=OFF`
-- `GRPC_LITE_ENABLE_CARES=OFF`
-- `GRPC_LITE_ENABLE_LOGGING=OFF`
-- `GRPC_LITE_BUILD_EXAMPLES=ON`
-- `GRPC_LITE_BUILD_TESTS=ON`
-- `GRPC_LITE_SANITIZE=` enables no sanitizer
-- `GRPC_LITE_SANITIZE=address` builds with ASan and vendored `nghttp2/libuv`
-- `GRPC_LITE_SANITIZE=thread` builds with TSan and vendored `nghttp2/libuv`
+[MIT](https://opensource.org/licenses/MIT)
