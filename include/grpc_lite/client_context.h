@@ -23,11 +23,11 @@ class ClientContext {
     const std::vector<MetadataEntry>& server_initial_metadata() const;
     const std::vector<MetadataEntry>& server_trailing_metadata() const;
 
-  private:
-    friend class Channel;
-
     void SetServerInitialMetadata(std::vector<MetadataEntry> metadata);
     void SetServerTrailingMetadata(std::vector<MetadataEntry> metadata);
+
+  private:
+    friend class Channel;
 
     std::vector<MetadataEntry> metadata_;
     std::chrono::system_clock::time_point deadline_{};

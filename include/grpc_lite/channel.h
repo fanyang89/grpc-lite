@@ -3,8 +3,10 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "status.h"
+#include "stream.h"
 
 namespace grpc_lite {
 
@@ -31,6 +33,33 @@ class Channel {
     Status CallUnary(
         const std::string& method, const std::string& request_bytes, ClientContext* context,
         std::string* response_bytes
+    );
+
+    Status CallServerStreaming(
+        const std::string& method, const std::string& request_bytes, ClientContext* context,
+        std::vector<std::string>* response_messages
+    );
+
+    std::unique_ptr<ClientReader> StartServerStreaming(
+        const std::string& method, const std::string& request_bytes, ClientContext* context
+    );
+
+    std::unique_ptr<ClientWriter> StartClientStreaming(
+        const std::string& method, ClientContext* context
+    );
+
+    std::unique_ptr<ClientReaderWriter> StartBidiStreaming(
+        const std::string& method, ClientContext* context
+    );
+
+    Status CallClientStreaming(
+        const std::string& method, const std::vector<std::string>& request_messages,
+        ClientContext* context, std::string* response_bytes
+    );
+
+    Status CallBidiStreaming(
+        const std::string& method, const std::vector<std::string>& request_messages,
+        ClientContext* context, std::vector<std::string>* response_messages
     );
 
   private:

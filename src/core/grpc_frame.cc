@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <utility>
 
 namespace grpc_lite {
 namespace core {
@@ -21,29 +22,61 @@ std::string EncodeGrpcFrame(std::string_view payload) {
     return frame;
 }
 
-Status DecodeGrpcFrame(std::string_view frame, std::string* payload) {
-    if (frame.size() < 5) {
-        return Status(
-            StatusCode::kInvalidArgument, "grpc request body is smaller than the frame header"
-        );
+std::string EncodeGrpcFrames(const std::vector<std::string>& payloads) {
+    std::string frames;
+    for (const auto& payload : payloads) {
+        frames.append(EncodeGrpcFrame(payload));
     }
-    if (static_cast<unsigned char>(frame[0]) != 0) {
-        return Status(StatusCode::kUnimplemented, "compressed grpc messages are not supported yet");
-    }
+    return frames;
+}
 
-    const std::uint32_t size =
-        (static_cast<std::uint32_t>(static_cast<unsigned char>(frame[1])) << 24) |
-        (static_cast<std::uint32_t>(static_cast<unsigned char>(frame[2])) << 16) |
-        (static_cast<std::uint32_t>(static_cast<unsigned char>(frame[3])) << 8) |
-        static_cast<std::uint32_t>(static_cast<unsigned char>(frame[4]));
-    if (frame.size() != size + 5U) {
+Status DecodeGrpcFrame(std::string_view frame, std::string* payload) {
+    std::vector<std::string> payloads;
+    Status status = DecodeGrpcFrames(frame, &payloads);
+    if (!status.ok()) {
+        return status;
+    }
+    if (payloads.size() != 1U) {
         return Status(
             StatusCode::kInvalidArgument,
             "grpc request body does not contain exactly one unary message"
         );
     }
+    *payload = std::move(payloads.front());
+    return Status::OK();
+}
 
-    payload->assign(frame.data() + 5, size);
+Status DecodeGrpcFrames(std::string_view frames, std::vector<std::string>* payloads) {
+    payloads->clear();
+    std::size_t offset = 0;
+    while (offset < frames.size()) {
+        const std::string_view frame = frames.substr(offset);
+        if (frame.size() < 5) {
+            return Status(
+                StatusCode::kInvalidArgument, "grpc request body is smaller than the frame header"
+            );
+        }
+        if (static_cast<unsigned char>(frame[0]) != 0) {
+            return Status(
+                StatusCode::kUnimplemented, "compressed grpc messages are not supported yet"
+            );
+        }
+
+        const std::uint32_t size =
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(frame[1])) << 24) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(frame[2])) << 16) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(frame[3])) << 8) |
+            static_cast<std::uint32_t>(static_cast<unsigned char>(frame[4]));
+        const std::size_t full_size = static_cast<std::size_t>(size) + 5U;
+        if (frame.size() < full_size) {
+            return Status(
+                StatusCode::kInvalidArgument, "grpc request body contains a truncated message"
+            );
+        }
+
+        payloads->emplace_back(frame.data() + 5, size);
+        offset += full_size;
+    }
     return Status::OK();
 }
 

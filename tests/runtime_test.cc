@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "doctest/doctest.h"
 #include "grpc_lite/channel.h"
@@ -230,6 +231,116 @@ TEST_CASE("channel deadline expires while request is in flight") {
         channel->CallUnary("/test.DelayedService/Echo", "after-timeout", &enough_time, &response);
     CHECK(status.ok());
     CHECK(response == "after-timeout");
+}
+
+class StreamingService final : public grpc_lite::Service {
+  public:
+    std::string service_name() const override { return "test.StreamingService"; }
+
+    grpc_lite::RpcType method_type(std::string_view method) const override {
+        if (method == "Expand") {
+            return grpc_lite::RpcType::kServerStreaming;
+        }
+        if (method == "Join") {
+            return grpc_lite::RpcType::kClientStreaming;
+        }
+        if (method == "Chat") {
+            return grpc_lite::RpcType::kBidiStreaming;
+        }
+        return grpc_lite::RpcType::kUnary;
+    }
+
+    grpc_lite::Status HandleServerStreaming(
+        std::string_view method, std::string_view request, grpc_lite::ServerContext*,
+        grpc_lite::ServerWriter* writer
+    ) override {
+        if (method != "Expand") {
+            return {StatusCode::kUnimplemented, "unknown method"};
+        }
+        writer->Write(std::string(request) + ":one");
+        writer->Write(std::string(request) + ":two");
+        return grpc_lite::Status::OK();
+    }
+
+    grpc_lite::Status HandleClientStreaming(
+        std::string_view method, grpc_lite::ServerReader* reader, grpc_lite::ServerContext* context,
+        std::string* response
+    ) override {
+        if (method != "Join") {
+            return {StatusCode::kUnimplemented, "unknown method"};
+        }
+        context->AddInitialMetadata("x-stream-initial", "join");
+        context->AddTrailingMetadata("x-stream-trailing", "joined");
+        std::string item;
+        while (reader->Read(&item)) {
+            if (!response->empty()) {
+                response->push_back(',');
+            }
+            response->append(item);
+        }
+        return grpc_lite::Status::OK();
+    }
+
+    grpc_lite::Status
+    HandleBidiStreaming(std::string_view method, grpc_lite::ServerReaderWriter* stream, grpc_lite::ServerContext*)
+        override {
+        if (method != "Chat") {
+            return {StatusCode::kUnimplemented, "unknown method"};
+        }
+        std::string item;
+        while (stream->Read(&item)) {
+            stream->Write("echo:" + item);
+        }
+        return grpc_lite::Status::OK();
+    }
+};
+
+TEST_CASE("channel performs all synchronous streaming RPC shapes") {
+    StreamingService service;
+    grpc_lite::test::ServerScope server(service);
+    std::string address;
+    REQUIRE(server.Start(&address));
+
+    std::shared_ptr<grpc_lite::Channel> channel = grpc_lite::Channel::Create(address);
+
+    std::vector<std::string> server_stream;
+    grpc_lite::Status status = channel->CallServerStreaming(
+        "/test.StreamingService/Expand", "seed", nullptr, &server_stream
+    );
+    CHECK(status.ok());
+    CHECK(server_stream == std::vector<std::string>{"seed:one", "seed:two"});
+
+    std::string client_stream_response;
+    grpc_lite::ClientContext client_stream_context;
+    auto writer =
+        channel->StartClientStreaming("/test.StreamingService/Join", &client_stream_context);
+    CHECK(writer->Write("a"));
+    CHECK(writer->Write("b"));
+    CHECK(writer->WritesDone());
+    status = writer->Finish(&client_stream_response);
+    CHECK(status.ok());
+    CHECK(client_stream_response == "a,b");
+    CHECK(grpc_lite::test::HasMetadata(
+        client_stream_context.server_initial_metadata(), "x-stream-initial", "join"
+    ));
+    CHECK(grpc_lite::test::HasMetadata(
+        client_stream_context.server_trailing_metadata(), "x-stream-trailing", "joined"
+    ));
+
+    auto bidi = channel->StartBidiStreaming("/test.StreamingService/Chat", nullptr);
+    CHECK(bidi->Write("left"));
+    std::vector<std::string> bidi_responses;
+    std::string message;
+    CHECK(bidi->Read(&message));
+    bidi_responses.push_back(message);
+    CHECK(bidi->Write("right"));
+    CHECK(bidi->Read(&message));
+    bidi_responses.push_back(message);
+    CHECK(bidi->WritesDone());
+    CHECK(!bidi->Read(&message));
+    status = bidi->Finish();
+    CHECK(status.ok());
+    CHECK(bidi_responses == std::vector<std::string>{"echo:left", "echo:right"});
 }
 
 }  // namespace

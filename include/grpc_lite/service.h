@@ -6,6 +6,7 @@
 
 #include "server_context.h"
 #include "status.h"
+#include "stream.h"
 
 namespace grpc_lite {
 
@@ -14,6 +15,11 @@ class Service {
     virtual ~Service() = default;
 
     virtual std::string service_name() const = 0;
+
+    virtual RpcType method_type(std::string_view method) const {
+        (void)method;
+        return RpcType::kUnary;
+    }
 
     virtual Status HandleUnary(
         std::string_view method, std::string_view request, ServerContext* context,
@@ -26,6 +32,42 @@ class Service {
             response->clear();
         }
         return Status(StatusCode::kUnimplemented, "service does not implement unary handling yet");
+    }
+
+    virtual Status HandleServerStreaming(
+        std::string_view method, std::string_view request, ServerContext* context,
+        ServerWriter* writer
+    ) {
+        (void)method;
+        (void)request;
+        (void)context;
+        (void)writer;
+        return Status(
+            StatusCode::kUnimplemented, "service does not implement server streaming yet"
+        );
+    }
+
+    virtual Status HandleClientStreaming(
+        std::string_view method, ServerReader* reader, ServerContext* context, std::string* response
+    ) {
+        (void)method;
+        (void)reader;
+        (void)context;
+        if (response != nullptr) {
+            response->clear();
+        }
+        return Status(
+            StatusCode::kUnimplemented, "service does not implement client streaming yet"
+        );
+    }
+
+    virtual Status HandleBidiStreaming(
+        std::string_view method, ServerReaderWriter* stream, ServerContext* context
+    ) {
+        (void)method;
+        (void)stream;
+        (void)context;
+        return Status(StatusCode::kUnimplemented, "service does not implement bidi streaming yet");
     }
 };
 

@@ -56,7 +56,14 @@ class ClientStreamingHandler : public MethodHandler {
     )
         : func_(func), service_(service) {}
 
-    void RunHandler(const HandlerParameter& param) override { (void)param; }
+    void RunHandler(const HandlerParameter& param) override {
+        ServerReader<RequestType> reader(param.server_reader);
+        ResponseType response;
+        *param.status = func_(service_, param.server_context, &reader, &response);
+        if (param.status->ok() && !response.SerializeToString(param.response_bytes)) {
+            *param.status = Status(StatusCode::INTERNAL, "failed to serialize response");
+        }
+    }
 
   private:
     std::function<
@@ -77,7 +84,15 @@ class ServerStreamingHandler : public MethodHandler {
     )
         : func_(func), service_(service) {}
 
-    void RunHandler(const HandlerParameter& param) override { (void)param; }
+    void RunHandler(const HandlerParameter& param) override {
+        RequestType request;
+        if (!request.ParseFromString(param.request_bytes)) {
+            *param.status = Status(StatusCode::INTERNAL, "failed to parse request");
+            return;
+        }
+        ServerWriter<ResponseType> writer(param.server_writer);
+        *param.status = func_(service_, param.server_context, &request, &writer);
+    }
 
   private:
     std::function<
@@ -95,7 +110,10 @@ class TemplatedBidiStreamingHandler : public MethodHandler {
     )
         : func_(std::move(func)) {}
 
-    void RunHandler(const HandlerParameter& param) override { (void)param; }
+    void RunHandler(const HandlerParameter& param) override {
+        Streamer stream(param.server_reader_writer);
+        *param.status = func_(param.server_context, &stream);
+    }
 
   private:
     std::function<grpc::Status(grpc::ServerContext*, Streamer*)> func_;

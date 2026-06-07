@@ -11,6 +11,7 @@
 #include "grpc_lite/server.h"
 #include "grpc_lite/server_builder.h"
 #include "grpc_lite/service.h"
+#include "grpc_lite/stream.h"
 
 namespace grpc {
 namespace {
@@ -34,19 +35,31 @@ class ServiceAdapter : public grpc_lite::Service {
 
     std::string service_name() const override { return service_name_; }
 
+    grpc_lite::RpcType method_type(std::string_view method) const override {
+        const auto* m = FindMethod(method);
+        if (m == nullptr) {
+            return grpc_lite::RpcType::kUnary;
+        }
+        switch (m->method_type()) {
+            case internal::RpcMethod::CLIENT_STREAMING:
+                return grpc_lite::RpcType::kClientStreaming;
+            case internal::RpcMethod::SERVER_STREAMING:
+                return grpc_lite::RpcType::kServerStreaming;
+            case internal::RpcMethod::BIDI_STREAMING:
+                return grpc_lite::RpcType::kBidiStreaming;
+            case internal::RpcMethod::NORMAL_RPC:
+                return grpc_lite::RpcType::kUnary;
+        }
+        return grpc_lite::RpcType::kUnary;
+    }
+
     grpc_lite::Status HandleUnary(
         std::string_view method, std::string_view request, grpc_lite::ServerContext* lite_context,
         std::string* response
     ) override {
         const auto& methods = grpc_service_->methods();
         for (const auto& m : methods) {
-            if (!m)
-                continue;
-            std::string_view full_name = m->name();
-            auto slash = full_name.rfind('/');
-            std::string_view method_name =
-                (slash != std::string_view::npos) ? full_name.substr(slash + 1) : full_name;
-            if (method_name == method) {
+            if (MethodNameMatches(m.get(), method)) {
                 grpc::ServerContext grpc_context;
                 internal::MethodHandler* handler = m->handler();
                 if (handler == nullptr) {
@@ -84,7 +97,119 @@ class ServiceAdapter : public grpc_lite::Service {
         return grpc_lite::Status(grpc_lite::StatusCode::kUnimplemented, "unknown method");
     }
 
+    grpc_lite::Status HandleServerStreaming(
+        std::string_view method, std::string_view request, grpc_lite::ServerContext* lite_context,
+        grpc_lite::ServerWriter* writer
+    ) override {
+        return RunStreamingHandler(
+            method, lite_context,
+            [&](internal::MethodHandler* handler, grpc::ServerContext* grpc_context,
+                grpc::Status* grpc_status) {
+                internal::MethodHandler::HandlerParameter param;
+                param.server_context = grpc_context;
+                param.request_bytes = std::string(request);
+                param.server_writer = writer;
+                param.status = grpc_status;
+                handler->RunHandler(param);
+            }
+        );
+    }
+
+    grpc_lite::Status HandleClientStreaming(
+        std::string_view method, grpc_lite::ServerReader* reader,
+        grpc_lite::ServerContext* lite_context, std::string* response
+    ) override {
+        return RunStreamingHandler(
+            method, lite_context,
+            [&](internal::MethodHandler* handler, grpc::ServerContext* grpc_context,
+                grpc::Status* grpc_status) {
+                std::string response_bytes;
+                internal::MethodHandler::HandlerParameter param;
+                param.server_context = grpc_context;
+                param.response_bytes = &response_bytes;
+                param.server_reader = reader;
+                param.status = grpc_status;
+                handler->RunHandler(param);
+                if (grpc_status->ok()) {
+                    *response = std::move(response_bytes);
+                }
+            }
+        );
+    }
+
+    grpc_lite::Status HandleBidiStreaming(
+        std::string_view method, grpc_lite::ServerReaderWriter* stream,
+        grpc_lite::ServerContext* lite_context
+    ) override {
+        return RunStreamingHandler(
+            method, lite_context,
+            [&](internal::MethodHandler* handler, grpc::ServerContext* grpc_context,
+                grpc::Status* grpc_status) {
+                internal::MethodHandler::HandlerParameter param;
+                param.server_context = grpc_context;
+                param.server_reader_writer = stream;
+                param.status = grpc_status;
+                handler->RunHandler(param);
+            }
+        );
+    }
+
   private:
+    static bool MethodNameMatches(const internal::RpcServiceMethod* method, std::string_view name) {
+        if (method == nullptr) {
+            return false;
+        }
+        std::string_view full_name = method->name();
+        auto slash = full_name.rfind('/');
+        std::string_view method_name =
+            (slash != std::string_view::npos) ? full_name.substr(slash + 1) : full_name;
+        return method_name == name;
+    }
+
+    const internal::RpcServiceMethod* FindMethod(std::string_view method) const {
+        for (const auto& m : grpc_service_->methods()) {
+            if (MethodNameMatches(m.get(), method)) {
+                return m.get();
+            }
+        }
+        return nullptr;
+    }
+
+    template <class Run>
+    grpc_lite::Status RunStreamingHandler(
+        std::string_view method, grpc_lite::ServerContext* lite_context, Run run
+    ) {
+        const auto* rpc_method = FindMethod(method);
+        if (rpc_method == nullptr) {
+            return grpc_lite::Status(grpc_lite::StatusCode::kUnimplemented, "unknown method");
+        }
+        internal::MethodHandler* handler = rpc_method->handler();
+        if (handler == nullptr) {
+            return grpc_lite::Status(
+                grpc_lite::StatusCode::kUnimplemented, "method has no handler"
+            );
+        }
+
+        grpc::ServerContext grpc_context;
+        grpc::Status grpc_status;
+        run(handler, &grpc_context, &grpc_status);
+
+        for (const auto& md : grpc_context.initial_metadata()) {
+            lite_context->AddInitialMetadata(md.first, md.second);
+        }
+        for (const auto& md : grpc_context.trailing_metadata()) {
+            lite_context->AddTrailingMetadata(md.first, md.second);
+        }
+
+        if (grpc_status.ok()) {
+            return grpc_lite::Status::OK();
+        }
+        return grpc_lite::Status(
+            static_cast<grpc_lite::StatusCode>(static_cast<int>(grpc_status.error_code())),
+            grpc_status.error_message()
+        );
+    }
+
     grpc::Service* grpc_service_;
     std::string service_name_;
 };

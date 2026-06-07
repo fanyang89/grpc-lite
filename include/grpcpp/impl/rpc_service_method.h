@@ -11,6 +11,16 @@ namespace grpc {
 
 class ServerContext;
 
+namespace internal {}  // namespace internal
+}  // namespace grpc
+
+namespace grpc_lite {
+class ServerReader;
+class ServerWriter;
+class ServerReaderWriter;
+}  // namespace grpc_lite
+
+namespace grpc {
 namespace internal {
 
 class MethodHandler {
@@ -21,6 +31,9 @@ class MethodHandler {
         ServerContext* server_context;
         std::string request_bytes;
         std::string* response_bytes;
+        grpc_lite::ServerReader* server_reader = nullptr;
+        grpc_lite::ServerWriter* server_writer = nullptr;
+        grpc_lite::ServerReaderWriter* server_reader_writer = nullptr;
         Status* status;
     };
 

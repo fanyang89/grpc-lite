@@ -7,10 +7,13 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -27,13 +30,23 @@ struct StreamState {
     std::string path;
     std::string content_type;
     std::string request_body;
+    std::string pending_request_frame;
     std::string response_frame;
+    std::deque<std::string> outgoing_frames;
+    std::string current_outgoing_frame;
     std::vector<std::pair<std::string, std::string>> initial_metadata;
     std::vector<std::pair<std::string, std::string>> trailing_metadata;
     Status status;
     std::size_t response_offset = 0;
+    std::size_t current_outgoing_offset = 0;
+    std::shared_ptr<internal::MessageQueue> request_messages;
+    RpcType rpc_type = RpcType::kUnary;
     bool response_submitted = false;
     bool trailers_submitted = false;
+    bool handler_started = false;
+    bool request_closed = false;
+    bool live_response = false;
+    bool response_done = false;
 };
 
 struct PendingWrite {
@@ -43,7 +56,9 @@ struct PendingWrite {
 };
 
 using core::DecodeGrpcFrame;
+using core::DecodeGrpcFrames;
 using core::EncodeGrpcFrame;
+using core::EncodeGrpcFrames;
 using core::MakeHeader;
 using core::StatusCodeText;
 
@@ -91,7 +106,7 @@ struct Http2Connection {
     uv_tcp_t handle{};
     ServerImpl* owner = nullptr;
     nghttp2_session* session = nullptr;
-    std::unordered_map<int32_t, StreamState> streams;
+    std::unordered_map<int32_t, std::shared_ptr<StreamState>> streams;
     std::vector<std::string> pending_writes;
     bool write_in_flight = false;
     bool closed = false;
@@ -105,6 +120,7 @@ class ServerImpl {
     void Wait();
     void Shutdown();
     Status BuildUnaryResponse(StreamState* stream);
+    Service* FindService(std::string_view path, std::string* method_name) const;
 
     Server* server;
     uv_loop_t loop{};
@@ -113,13 +129,30 @@ class ServerImpl {
     bool listener_initialized = false;
     bool shutdown_signal_initialized = false;
     uv_async_t shutdown_signal{};
+    uv_async_t command_signal{};
+    bool command_signal_initialized = false;
     std::atomic<bool> shutting_down{false};
     std::vector<Http2Connection*> connections;
+    std::mutex commands_mutex;
+    std::vector<std::function<void()>> commands;
 };
 
 void FlushPendingWrites(Http2Connection* connection);
 void CloseConnection(Http2Connection* connection);
 void OnLoopShutdown(uv_async_t* handle);
+void OnCommand(uv_async_t* handle);
+int SubmitGrpcTrailers(nghttp2_session* session, int32_t stream_id, StreamState* stream);
+void MaybeHandleRequest(Http2Connection* connection, int32_t stream_id);
+
+void PostCommand(ServerImpl* impl, std::function<void()> command) {
+    {
+        std::lock_guard<std::mutex> lock(impl->commands_mutex);
+        impl->commands.push_back(std::move(command));
+    }
+    if (impl->command_signal_initialized) {
+        uv_async_send(&impl->command_signal);
+    }
+}
 
 void FreeWrite(uv_write_t* request) {
     auto* pending = static_cast<PendingWrite*>(request->data);
@@ -158,6 +191,79 @@ void QueueOutput(Http2Connection* connection) {
             reinterpret_cast<const char*>(data), static_cast<std::size_t>(bytes)
         );
     }
+}
+
+Status PushCompleteFrames(StreamState* stream, const uint8_t* data, size_t len) {
+    stream->pending_request_frame.append(reinterpret_cast<const char*>(data), len);
+    for (;;) {
+        if (stream->pending_request_frame.empty()) {
+            return Status::OK();
+        }
+        if (stream->pending_request_frame.size() < 5U) {
+            return Status::OK();
+        }
+        if (static_cast<unsigned char>(stream->pending_request_frame[0]) != 0) {
+            return Status(
+                StatusCode::kUnimplemented, "compressed grpc messages are not supported yet"
+            );
+        }
+        const std::string& frame = stream->pending_request_frame;
+        const std::uint32_t size =
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(frame[1])) << 24) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(frame[2])) << 16) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(frame[3])) << 8) |
+            static_cast<std::uint32_t>(static_cast<unsigned char>(frame[4]));
+        const std::size_t full_size = static_cast<std::size_t>(size) + 5U;
+        if (frame.size() < full_size) {
+            return Status::OK();
+        }
+        if (stream->request_messages != nullptr) {
+            stream->request_messages->Push(frame.substr(5, size));
+        }
+        stream->pending_request_frame.erase(0, full_size);
+    }
+}
+
+ssize_t StreamingReadCallback(
+    nghttp2_session* session, int32_t stream_id, uint8_t* buffer, size_t length,
+    uint32_t* data_flags, nghttp2_data_source* source, void* user_data
+) {
+    (void)session;
+    (void)stream_id;
+    (void)user_data;
+    auto* stream = static_cast<StreamState*>(source->ptr);
+
+    if (stream->current_outgoing_frame.empty() && !stream->outgoing_frames.empty()) {
+        stream->current_outgoing_frame = std::move(stream->outgoing_frames.front());
+        stream->outgoing_frames.pop_front();
+        stream->current_outgoing_offset = 0;
+    }
+
+    if (stream->current_outgoing_frame.empty()) {
+        if (stream->response_done) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
+            if (SubmitGrpcTrailers(session, stream_id, stream) != 0) {
+                return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+            }
+            return 0;
+        }
+        return NGHTTP2_ERR_DEFERRED;
+    }
+
+    const std::size_t remaining =
+        stream->current_outgoing_frame.size() - stream->current_outgoing_offset;
+    const std::size_t to_copy = std::min(remaining, length);
+    if (to_copy != 0) {
+        std::memcpy(
+            buffer, stream->current_outgoing_frame.data() + stream->current_outgoing_offset, to_copy
+        );
+        stream->current_outgoing_offset += to_copy;
+    }
+    if (stream->current_outgoing_offset == stream->current_outgoing_frame.size()) {
+        stream->current_outgoing_frame.clear();
+        stream->current_outgoing_offset = 0;
+    }
+    return static_cast<ssize_t>(to_copy);
 }
 
 int SubmitGrpcTrailers(nghttp2_session* session, int32_t stream_id, StreamState* stream) {
@@ -202,6 +308,62 @@ void FlushPendingWrites(Http2Connection* connection) {
         FreeWrite(&pending->request);
         CloseConnection(connection);
     }
+}
+
+void EnsureStreamingResponse(
+    Http2Connection* connection, int32_t stream_id, const std::shared_ptr<StreamState>& stream
+) {
+    if (connection->closed || stream->response_submitted) {
+        if (stream->response_submitted) {
+            nghttp2_session_resume_data(connection->session, stream_id);
+        }
+        return;
+    }
+
+    std::vector<nghttp2_nv> headers;
+    headers.push_back(MakeHeader(":status", "200"));
+    headers.push_back(MakeHeader("content-type", "application/grpc"));
+    headers.push_back(MakeHeader("grpc-encoding", "identity"));
+    for (const auto& metadata : stream->initial_metadata) {
+        headers.push_back(MakeHeader(metadata.first, metadata.second));
+    }
+
+    nghttp2_data_provider provider{};
+    provider.source.ptr = stream.get();
+    provider.read_callback = StreamingReadCallback;
+    if (nghttp2_submit_response(
+            connection->session, stream_id, headers.data(), headers.size(), &provider
+        ) != 0) {
+        CloseConnection(connection);
+        return;
+    }
+    stream->response_submitted = true;
+}
+
+void QueueStreamingMessage(
+    Http2Connection* connection, int32_t stream_id, const std::shared_ptr<StreamState>& stream,
+    std::string message
+) {
+    if (connection->closed || stream->response_done) {
+        return;
+    }
+    stream->outgoing_frames.push_back(EncodeGrpcFrame(message));
+    EnsureStreamingResponse(connection, stream_id, stream);
+    QueueOutput(connection);
+    FlushPendingWrites(connection);
+}
+
+void FinishStreamingResponse(
+    Http2Connection* connection, int32_t stream_id, const std::shared_ptr<StreamState>& stream
+) {
+    if (connection->closed || stream->response_done) {
+        return;
+    }
+    stream->response_done = true;
+    EnsureStreamingResponse(connection, stream_id, stream);
+    nghttp2_session_resume_data(connection->session, stream_id);
+    QueueOutput(connection);
+    FlushPendingWrites(connection);
 }
 
 void SubmitGrpcResponse(Http2Connection* connection, int32_t stream_id, StreamState* stream) {
@@ -262,7 +424,7 @@ int OnFrameSend(nghttp2_session* session, const nghttp2_frame* frame, void* user
         return 0;
     }
 
-    StreamState* stream = &it->second;
+    StreamState* stream = it->second.get();
     if (stream->response_offset == stream->response_frame.size() &&
         !stream->response_frame.empty() &&
         SubmitGrpcTrailers(session, frame->hd.stream_id, stream) != 0) {
@@ -281,46 +443,302 @@ Status ServerImpl::BuildUnaryResponse(StreamState* stream) {
         );
     }
 
-    std::string request_payload;
-    Status decode_status = DecodeGrpcFrame(stream->request_body, &request_payload);
-    if (!decode_status.ok()) {
-        return decode_status;
-    }
-
     std::string method_name;
     Service* service = server->FindService(stream->path, &method_name);
     if (service == nullptr) {
         return Status(StatusCode::kUnimplemented, "requested grpc method is not registered");
     }
 
+    std::vector<std::string> request_payloads;
+    Status decode_status = DecodeGrpcFrames(stream->request_body, &request_payloads);
+    if (!decode_status.ok()) {
+        return decode_status;
+    }
+
     ServerContext context;
-    std::string response_payload;
-    Status status = service->HandleUnary(method_name, request_payload, &context, &response_payload);
+    std::vector<std::string> response_payloads;
+    Status status;
+    switch (service->method_type(method_name)) {
+        case RpcType::kUnary: {
+            if (request_payloads.size() != 1U) {
+                return Status(
+                    StatusCode::kInvalidArgument,
+                    "grpc request body does not contain exactly one unary message"
+                );
+            }
+            std::string response_payload;
+            status = service->HandleUnary(
+                method_name, request_payloads.front(), &context, &response_payload
+            );
+            if (status.ok()) {
+                response_payloads.push_back(std::move(response_payload));
+            }
+            break;
+        }
+        case RpcType::kServerStreaming: {
+            if (request_payloads.size() != 1U) {
+                return Status(
+                    StatusCode::kInvalidArgument,
+                    "server streaming request must contain exactly one message"
+                );
+            }
+            ServerWriter writer(&response_payloads);
+            status = service->HandleServerStreaming(
+                method_name, request_payloads.front(), &context, &writer
+            );
+            break;
+        }
+        case RpcType::kClientStreaming: {
+            ServerReader reader(std::move(request_payloads));
+            std::string response_payload;
+            status =
+                service->HandleClientStreaming(method_name, &reader, &context, &response_payload);
+            if (status.ok()) {
+                response_payloads.push_back(std::move(response_payload));
+            }
+            break;
+        }
+        case RpcType::kBidiStreaming: {
+            ServerReaderWriter rw(std::move(request_payloads), &response_payloads);
+            status = service->HandleBidiStreaming(method_name, &rw, &context);
+            break;
+        }
+    }
+
     stream->initial_metadata = context.initial_metadata();
     stream->trailing_metadata = context.trailing_metadata();
     if (status.ok()) {
-        stream->response_frame = EncodeGrpcFrame(response_payload);
+        stream->response_frame = EncodeGrpcFrames(response_payloads);
     } else {
         stream->response_frame.clear();
     }
     return status;
 }
 
-void MaybeHandleRequest(Http2Connection* connection, int32_t stream_id) {
-    auto it = connection->streams.find(stream_id);
-    if (it == connection->streams.end() || it->second.response_submitted) {
+Service* ServerImpl::FindService(std::string_view path, std::string* method_name) const {
+    return server->FindService(path, method_name);
+}
+
+void StartLiveStreamingHandler(
+    Http2Connection* connection, int32_t stream_id, const std::shared_ptr<StreamState>& stream
+) {
+    if (stream->handler_started) {
+        return;
+    }
+    stream->handler_started = true;
+    stream->live_response = true;
+
+    std::string method_name;
+    Service* service = connection->owner->FindService(stream->path, &method_name);
+    if (service == nullptr) {
+        stream->status =
+            Status(StatusCode::kUnimplemented, "requested grpc method is not registered");
+        stream->request_messages->Close(stream->status);
+        FinishStreamingResponse(connection, stream_id, stream);
         return;
     }
 
-    it->second.status = connection->owner->BuildUnaryResponse(&it->second);
-    SubmitGrpcResponse(connection, stream_id, &it->second);
+    const auto write_message = [connection, stream_id, stream](std::string_view message) {
+        const std::string copy(message);
+        PostCommand(connection->owner, [connection, stream_id, stream, copy]() {
+            QueueStreamingMessage(connection, stream_id, stream, copy);
+        });
+        return true;
+    };
+
+    std::thread([connection, stream_id, stream, service, method_name, write_message]() {
+        ServerContext context;
+        Status status;
+        if (stream->rpc_type == RpcType::kServerStreaming) {
+            std::string request;
+            if (!stream->request_messages->Read(&request)) {
+                status =
+                    Status(StatusCode::kInvalidArgument, "server streaming request is missing");
+            } else {
+                std::string extra_request;
+                if (stream->request_messages->Read(&extra_request)) {
+                    status = Status(
+                        StatusCode::kInvalidArgument,
+                        "server streaming request must contain exactly one message"
+                    );
+                } else if (!stream->request_messages->status().ok()) {
+                    status = stream->request_messages->status();
+                } else {
+                    ServerWriter writer([&context, connection, stream_id,
+                                         stream](std::string_view message) {
+                        const std::string copy(message);
+                        const auto initial_metadata = context.initial_metadata();
+                        PostCommand(
+                            connection->owner,
+                            [connection, stream_id, stream, copy, initial_metadata]() {
+                                if (!stream->response_submitted) {
+                                    stream->initial_metadata = initial_metadata;
+                                }
+                                QueueStreamingMessage(connection, stream_id, stream, copy);
+                            }
+                        );
+                        return true;
+                    });
+                    status =
+                        service->HandleServerStreaming(method_name, request, &context, &writer);
+                }
+            }
+        } else if (stream->rpc_type == RpcType::kClientStreaming) {
+            ServerReader reader(stream->request_messages);
+            std::string response;
+            status = service->HandleClientStreaming(method_name, &reader, &context, &response);
+            if (status.ok() && !stream->request_messages->status().ok()) {
+                status = stream->request_messages->status();
+            }
+            if (status.ok()) {
+                const auto initial_metadata = context.initial_metadata();
+                PostCommand(
+                    connection->owner,
+                    [connection, stream_id, stream, response, initial_metadata]() {
+                        if (!stream->response_submitted) {
+                            stream->initial_metadata = initial_metadata;
+                        }
+                        QueueStreamingMessage(connection, stream_id, stream, response);
+                    }
+                );
+            }
+        } else {
+            ServerReaderWriter rw(
+                stream->request_messages,
+                [&context, connection, stream_id, stream](std::string_view message) {
+                    const std::string copy(message);
+                    const auto initial_metadata = context.initial_metadata();
+                    PostCommand(
+                        connection->owner,
+                        [connection, stream_id, stream, copy, initial_metadata]() {
+                            if (!stream->response_submitted) {
+                                stream->initial_metadata = initial_metadata;
+                            }
+                            QueueStreamingMessage(connection, stream_id, stream, copy);
+                        }
+                    );
+                    return true;
+                }
+            );
+            status = service->HandleBidiStreaming(method_name, &rw, &context);
+            if (status.ok() && !stream->request_messages->status().ok()) {
+                status = stream->request_messages->status();
+            }
+        }
+
+        auto trailing_metadata = context.trailing_metadata();
+        auto initial_metadata = context.initial_metadata();
+        PostCommand(
+            connection->owner,
+            [connection, stream_id, stream, status, trailing_metadata, initial_metadata]() {
+                if (!stream->response_submitted) {
+                    stream->initial_metadata = initial_metadata;
+                }
+                stream->trailing_metadata = trailing_metadata;
+                stream->status = status;
+                FinishStreamingResponse(connection, stream_id, stream);
+            }
+        );
+    }).detach();
+}
+
+Status ResolveRpcType(Http2Connection* connection, const std::shared_ptr<StreamState>& stream) {
+    if (stream->method != "POST") {
+        return Status(StatusCode::kUnimplemented, "only POST grpc requests are supported");
+    }
+    if (!StartsWith(stream->content_type, "application/grpc")) {
+        return Status(
+            StatusCode::kInvalidArgument, "content-type must start with application/grpc"
+        );
+    }
+
+    std::string method_name;
+    Service* service = connection->owner->FindService(stream->path, &method_name);
+    if (service == nullptr) {
+        return Status(StatusCode::kUnimplemented, "requested grpc method is not registered");
+    }
+    stream->rpc_type = service->method_type(method_name);
+    return Status::OK();
+}
+
+void MaybeStartLiveStreaming(
+    Http2Connection* connection, int32_t stream_id, const std::shared_ptr<StreamState>& stream,
+    bool request_complete
+) {
+    if (stream->handler_started) {
+        if (request_complete && !stream->request_closed) {
+            stream->request_closed = true;
+            if (!stream->pending_request_frame.empty()) {
+                stream->request_messages->Close(Status(
+                    StatusCode::kInvalidArgument, "grpc request body contains a truncated message"
+                ));
+            } else {
+                stream->request_messages->Close();
+            }
+        }
+        return;
+    }
+
+    Status status = ResolveRpcType(connection, stream);
+    if (!status.ok()) {
+        stream->status = status;
+        FinishStreamingResponse(connection, stream_id, stream);
+        return;
+    }
+    if (stream->rpc_type == RpcType::kUnary) {
+        if (request_complete) {
+            MaybeHandleRequest(connection, stream_id);
+        }
+        return;
+    }
+
+    if (stream->rpc_type == RpcType::kClientStreaming ||
+        stream->rpc_type == RpcType::kBidiStreaming) {
+        StartLiveStreamingHandler(connection, stream_id, stream);
+    }
+
+    if (request_complete) {
+        if (!stream->request_body.empty()) {
+            Status parse_status = PushCompleteFrames(
+                stream.get(), reinterpret_cast<const uint8_t*>(stream->request_body.data()),
+                stream->request_body.size()
+            );
+            if (!parse_status.ok()) {
+                stream->request_messages->Close(parse_status);
+            }
+        }
+        if (stream->rpc_type == RpcType::kServerStreaming) {
+            StartLiveStreamingHandler(connection, stream_id, stream);
+        }
+        stream->request_closed = true;
+        if (!stream->pending_request_frame.empty()) {
+            stream->request_messages->Close(Status(
+                StatusCode::kInvalidArgument, "grpc request body contains a truncated message"
+            ));
+        } else {
+            stream->request_messages->Close();
+        }
+    }
+}
+
+void MaybeHandleRequest(Http2Connection* connection, int32_t stream_id) {
+    auto it = connection->streams.find(stream_id);
+    if (it == connection->streams.end() || it->second->response_submitted) {
+        return;
+    }
+
+    StreamState* stream = it->second.get();
+    stream->status = connection->owner->BuildUnaryResponse(stream);
+    SubmitGrpcResponse(connection, stream_id, stream);
 }
 
 int OnBeginHeaders(nghttp2_session* session, const nghttp2_frame* frame, void* user_data) {
     (void)session;
     auto* connection = static_cast<Http2Connection*>(user_data);
     if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
-        connection->streams[frame->hd.stream_id] = StreamState{};
+        auto stream = std::make_shared<StreamState>();
+        stream->request_messages = std::make_shared<internal::MessageQueue>();
+        connection->streams[frame->hd.stream_id] = std::move(stream);
     }
     return 0;
 }
@@ -344,11 +762,11 @@ int OnHeader(
     const std::string_view header_name(reinterpret_cast<const char*>(name), namelen);
     const std::string_view header_value(reinterpret_cast<const char*>(value), valuelen);
     if (header_name == ":method") {
-        it->second.method.assign(header_value);
+        it->second->method.assign(header_value);
     } else if (header_name == ":path") {
-        it->second.path.assign(header_value);
+        it->second->path.assign(header_value);
     } else if (header_name == "content-type") {
-        it->second.content_type.assign(header_value);
+        it->second->content_type.assign(header_value);
     }
     return 0;
 }
@@ -362,7 +780,14 @@ int OnDataChunkRecv(
     auto* connection = static_cast<Http2Connection*>(user_data);
     auto it = connection->streams.find(stream_id);
     if (it != connection->streams.end()) {
-        it->second.request_body.append(reinterpret_cast<const char*>(data), len);
+        it->second->request_body.append(reinterpret_cast<const char*>(data), len);
+        if (it->second->handler_started) {
+            Status status = PushCompleteFrames(it->second.get(), data, len);
+            if (!status.ok()) {
+                it->second->status = status;
+                it->second->request_messages->Close(status);
+            }
+        }
     }
     return 0;
 }
@@ -372,12 +797,20 @@ int OnFrameRecv(nghttp2_session* session, const nghttp2_frame* frame, void* user
     auto* connection = static_cast<Http2Connection*>(user_data);
 
     if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST &&
-        (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
-        MaybeHandleRequest(connection, frame->hd.stream_id);
+        (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) == 0) {
+        auto it = connection->streams.find(frame->hd.stream_id);
+        if (it != connection->streams.end()) {
+            MaybeStartLiveStreaming(connection, frame->hd.stream_id, it->second, false);
+        }
     }
 
-    if (frame->hd.type == NGHTTP2_DATA && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
-        MaybeHandleRequest(connection, frame->hd.stream_id);
+    if (((frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST) ||
+         frame->hd.type == NGHTTP2_DATA) &&
+        (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
+        auto it = connection->streams.find(frame->hd.stream_id);
+        if (it != connection->streams.end()) {
+            MaybeStartLiveStreaming(connection, frame->hd.stream_id, it->second, true);
+        }
     }
     return 0;
 }
@@ -388,6 +821,10 @@ int OnStreamClose(
     (void)session;
     (void)error_code;
     auto* connection = static_cast<Http2Connection*>(user_data);
+    auto it = connection->streams.find(stream_id);
+    if (it != connection->streams.end() && it->second->request_messages != nullptr) {
+        it->second->request_messages->Close(Status(StatusCode::kCancelled, "stream closed"));
+    }
     connection->streams.erase(stream_id);
     return 0;
 }
@@ -424,6 +861,23 @@ void OnLoopShutdown(uv_async_t* handle) {
 
     if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&impl->shutdown_signal))) {
         uv_close(reinterpret_cast<uv_handle_t*>(&impl->shutdown_signal), nullptr);
+    }
+
+    if (impl->command_signal_initialized &&
+        !uv_is_closing(reinterpret_cast<uv_handle_t*>(&impl->command_signal))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&impl->command_signal), nullptr);
+    }
+}
+
+void OnCommand(uv_async_t* handle) {
+    auto* impl = static_cast<ServerImpl*>(handle->data);
+    std::vector<std::function<void()>> commands;
+    {
+        std::lock_guard<std::mutex> lock(impl->commands_mutex);
+        commands.swap(impl->commands);
+    }
+    for (auto& command : commands) {
+        command();
     }
 }
 
@@ -564,6 +1018,13 @@ Status ServerImpl::Start(const Server::Listener& listener) {
     shutdown_signal.data = this;
     shutdown_signal_initialized = true;
 
+    if (uv_async_init(&loop, &command_signal, OnCommand) != 0) {
+        Shutdown();
+        return Status(StatusCode::kInternal, "failed to initialize command signal");
+    }
+    command_signal.data = this;
+    command_signal_initialized = true;
+
     return Status::OK();
 }
 
@@ -575,6 +1036,7 @@ void ServerImpl::Wait() {
         loop_initialized = false;
         listener_initialized = false;
         shutdown_signal_initialized = false;
+        command_signal_initialized = false;
     }
 }
 
@@ -599,6 +1061,7 @@ void ServerImpl::Shutdown() {
             uv_loop_close(&loop);
             loop_initialized = false;
             listener_initialized = false;
+            command_signal_initialized = false;
         }
         return;
     }

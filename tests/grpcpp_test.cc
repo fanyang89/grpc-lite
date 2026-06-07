@@ -163,6 +163,63 @@ class RejectingParseService final : public grpc::Service {
     }
 };
 
+class GrpcppStreamingService final : public grpc::Service {
+  public:
+    GrpcppStreamingService() {
+        AddMethod(new grpc::internal::RpcServiceMethod(
+            "/test.GrpcppStreamingService/Expand", grpc::internal::RpcMethod::SERVER_STREAMING,
+            new grpc::internal::ServerStreamingHandler<
+                GrpcppStreamingService, grpc::ByteBuffer, grpc::ByteBuffer>(
+                [](GrpcppStreamingService*, grpc::ServerContext*, const grpc::ByteBuffer* request,
+                   grpc::ServerWriter<grpc::ByteBuffer>* writer) {
+                    const std::string value = ToString(*request);
+                    writer->Write(MakeBuffer(value + ":one"));
+                    writer->Write(MakeBuffer(value + ":two"));
+                    return grpc::Status(grpc::StatusCode::OK, "");
+                },
+                this
+            )
+        ));
+
+        AddMethod(new grpc::internal::RpcServiceMethod(
+            "/test.GrpcppStreamingService/Join", grpc::internal::RpcMethod::CLIENT_STREAMING,
+            new grpc::internal::ClientStreamingHandler<
+                GrpcppStreamingService, grpc::ByteBuffer, grpc::ByteBuffer>(
+                [](GrpcppStreamingService*, grpc::ServerContext*,
+                   grpc::ServerReader<grpc::ByteBuffer>* reader, grpc::ByteBuffer* response) {
+                    grpc::ByteBuffer item;
+                    std::string joined;
+                    while (reader->Read(&item)) {
+                        if (!joined.empty()) {
+                            joined.push_back(',');
+                        }
+                        joined.append(ToString(item));
+                    }
+                    *response = MakeBuffer(joined);
+                    return grpc::Status(grpc::StatusCode::OK, "");
+                },
+                this
+            )
+        ));
+
+        AddMethod(new grpc::internal::RpcServiceMethod(
+            "/test.GrpcppStreamingService/Chat", grpc::internal::RpcMethod::BIDI_STREAMING,
+            new grpc::internal::BidiStreamingHandler<
+                GrpcppStreamingService, grpc::ByteBuffer, grpc::ByteBuffer>(
+                [](GrpcppStreamingService*, grpc::ServerContext*,
+                   grpc::ServerReaderWriter<grpc::ByteBuffer, grpc::ByteBuffer>* stream) {
+                    grpc::ByteBuffer item;
+                    while (stream->Read(&item)) {
+                        stream->Write(MakeBuffer("echo:" + ToString(item)));
+                    }
+                    return grpc::Status(grpc::StatusCode::OK, "");
+                },
+                this
+            )
+        ));
+    }
+};
+
 TEST_CASE("blocking unary call serializes request and parses response") {
     FakeChannel channel;
     channel.response = "server-response";
@@ -281,6 +338,74 @@ TEST_CASE("grpcpp server dispatches multiple services") {
 
     server->Shutdown();
     server_thread.join();
+}
+
+TEST_CASE("grpcpp server dispatches synchronous streaming handlers") {
+    GrpcppStreamingService service;
+    grpc_lite::test::GrpcppServerScope server(service);
+    std::string address;
+    REQUIRE(server.Start(&address));
+
+    std::shared_ptr<grpc::ChannelInterface> channel = grpc::CreateChannel(address);
+    grpc::ClientContext context;
+
+    std::vector<std::string> server_stream;
+    grpc::Status status = channel->CallServerStreaming(
+        "/test.GrpcppStreamingService/Expand", &context, "seed", &server_stream
+    );
+    CHECK(status.ok());
+    CHECK(server_stream == std::vector<std::string>{"seed:one", "seed:two"});
+
+    std::string client_stream_response;
+    status = channel->CallClientStreaming(
+        "/test.GrpcppStreamingService/Join", &context, {"a", "b"}, &client_stream_response
+    );
+    CHECK(status.ok());
+    CHECK(client_stream_response == "a,b");
+
+    std::vector<std::string> bidi_responses;
+    status = channel->CallBidiStreaming(
+        "/test.GrpcppStreamingService/Chat", &context, {"left", "right"}, &bidi_responses
+    );
+    CHECK(status.ok());
+    CHECK(bidi_responses == std::vector<std::string>{"echo:left", "echo:right"});
+
+    grpc::ClientReader<grpc::ByteBuffer> typed_reader(
+        channel->StartServerStreaming("/test.GrpcppStreamingService/Expand", &context, "typed")
+    );
+    grpc::ByteBuffer item;
+    std::vector<std::string> typed_server_stream;
+    while (typed_reader.Read(&item)) {
+        typed_server_stream.push_back(ToString(item));
+    }
+    status = typed_reader.Finish();
+    CHECK(status.ok());
+    CHECK(typed_server_stream == std::vector<std::string>{"typed:one", "typed:two"});
+
+    grpc::ClientWriter<grpc::ByteBuffer> typed_writer(
+        channel->StartClientStreaming("/test.GrpcppStreamingService/Join", &context)
+    );
+    CHECK(typed_writer.Write(MakeBuffer("x")));
+    CHECK(typed_writer.Write(MakeBuffer("y")));
+    CHECK(typed_writer.WritesDone());
+    grpc::ByteBuffer typed_join_response;
+    status = typed_writer.Finish(&typed_join_response);
+    CHECK(status.ok());
+    CHECK(ToString(typed_join_response) == "x,y");
+
+    grpc::ClientReaderWriter<grpc::ByteBuffer, grpc::ByteBuffer> typed_bidi(
+        channel->StartBidiStreaming("/test.GrpcppStreamingService/Chat", &context)
+    );
+    CHECK(typed_bidi.Write(MakeBuffer("first")));
+    CHECK(typed_bidi.Read(&item));
+    CHECK(ToString(item) == "echo:first");
+    CHECK(typed_bidi.Write(MakeBuffer("second")));
+    CHECK(typed_bidi.Read(&item));
+    CHECK(ToString(item) == "echo:second");
+    CHECK(typed_bidi.WritesDone());
+    CHECK(!typed_bidi.Read(&item));
+    status = typed_bidi.Finish();
+    CHECK(status.ok());
 }
 
 TEST_CASE("grpcpp method handler reports parse failures") {

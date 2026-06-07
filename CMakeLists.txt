@@ -200,6 +200,7 @@ add_library(grpc_lite STATIC
   src/server_builder.cc
   src/server_context.cc
   src/status.cc
+  src/stream.cc
   src/version.cc
   src/core/grpc_frame.cc
   src/core/http2_transport.cc
