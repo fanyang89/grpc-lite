@@ -2,8 +2,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <uv.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,331 +28,6 @@
 namespace grpc_lite {
 
 namespace {
-
-struct ClientCallState {
-    uv_loop_t* loop = nullptr;
-    uv_tcp_t tcp_handle{};
-    uv_connect_t connect_req{};
-    uv_timer_t deadline_timer{};
-    nghttp2_session* session = nullptr;
-
-    std::string request_frame;
-    std::size_t send_offset = 0;
-
-    std::string response_body;
-    std::vector<std::pair<std::string, std::string>> initial_metadata;
-    std::vector<std::pair<std::string, std::string>> trailing_metadata;
-
-    int grpc_status = -1;
-    std::string grpc_message;
-    std::string http_status;
-
-    bool stream_closed = false;
-    bool has_deadline = false;
-    bool deadline_expired = false;
-    bool closed = false;
-    Status transport_error;
-    int32_t stream_id = 0;
-
-    std::string method;
-    std::string authority;
-    std::vector<std::pair<std::string, std::string>> client_metadata;
-
-    std::vector<std::string> pending_writes;
-    bool write_in_flight = false;
-};
-
-struct PendingWrite {
-    uv_write_t request;
-    uv_buf_t buffer;
-    std::string data;
-};
-
-void CloseClient(ClientCallState* state);
-
-void FreeWrite(uv_write_t* request) {
-    auto* pending = static_cast<PendingWrite*>(request->data);
-    delete pending;
-}
-
-void FlushPendingWrites(ClientCallState* state);
-
-void AfterWrite(uv_write_t* request, int status) {
-    auto* state = static_cast<ClientCallState*>(request->handle->data);
-    state->write_in_flight = false;
-    FreeWrite(request);
-
-    if (status < 0) {
-        state->transport_error = Status(StatusCode::kUnavailable, "write to server failed");
-        CloseClient(state);
-        return;
-    }
-
-    if (!state->pending_writes.empty()) {
-        state->pending_writes.erase(state->pending_writes.begin());
-    }
-    FlushPendingWrites(state);
-}
-
-void FlushPendingWrites(ClientCallState* state) {
-    if (state->closed || state->write_in_flight || state->pending_writes.empty()) {
-        return;
-    }
-
-    auto* pending = new PendingWrite();
-    pending->data = state->pending_writes.front();
-    pending->buffer = uv_buf_init(pending->data.data(), pending->data.size());
-    pending->request.data = pending;
-    state->write_in_flight = true;
-
-    const int rc = uv_write(
-        &pending->request, reinterpret_cast<uv_stream_t*>(&state->tcp_handle), &pending->buffer, 1,
-        AfterWrite
-    );
-    if (rc != 0) {
-        state->write_in_flight = false;
-        FreeWrite(&pending->request);
-        state->transport_error = Status(StatusCode::kUnavailable, "failed to queue write");
-        CloseClient(state);
-    }
-}
-
-void QueueOutput(ClientCallState* state) {
-    const uint8_t* data = nullptr;
-    for (;;) {
-        const ssize_t bytes = nghttp2_session_mem_send(state->session, &data);
-        if (bytes < 0) {
-            state->transport_error = Status(StatusCode::kInternal, "nghttp2 send error");
-            CloseClient(state);
-            return;
-        }
-        if (bytes == 0) {
-            return;
-        }
-        state->pending_writes.emplace_back(
-            reinterpret_cast<const char*>(data), static_cast<std::size_t>(bytes)
-        );
-    }
-}
-
-void OnHandleClosed(uv_handle_t* handle) {
-    (void)handle;
-}
-
-void CloseClient(ClientCallState* state) {
-    if (state->closed) {
-        return;
-    }
-    state->closed = true;
-    uv_read_stop(reinterpret_cast<uv_stream_t*>(&state->tcp_handle));
-    if (state->has_deadline &&
-        !uv_is_closing(reinterpret_cast<uv_handle_t*>(&state->deadline_timer))) {
-        uv_close(reinterpret_cast<uv_handle_t*>(&state->deadline_timer), OnHandleClosed);
-    }
-    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&state->tcp_handle))) {
-        uv_close(reinterpret_cast<uv_handle_t*>(&state->tcp_handle), OnHandleClosed);
-    }
-}
-
-int OnHeaderCallback(
-    nghttp2_session* session, const nghttp2_frame* frame, const uint8_t* name, size_t namelen,
-    const uint8_t* value, size_t valuelen, uint8_t flags, void* user_data
-) {
-    (void)session;
-    (void)flags;
-    auto* state = static_cast<ClientCallState*>(user_data);
-
-    if (frame->hd.stream_id != state->stream_id) {
-        return 0;
-    }
-
-    const std::string_view hname(reinterpret_cast<const char*>(name), namelen);
-    const std::string_view hvalue(reinterpret_cast<const char*>(value), valuelen);
-
-    if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
-        if (hname == ":status") {
-            state->http_status.assign(hvalue);
-        } else {
-            state->initial_metadata.emplace_back(std::string(hname), std::string(hvalue));
-        }
-    } else if (frame->headers.cat == NGHTTP2_HCAT_HEADERS) {
-        if (hname == "grpc-status") {
-            state->grpc_status = std::atoi(std::string(hvalue).c_str());
-        } else if (hname == "grpc-message") {
-            state->grpc_message.assign(hvalue);
-        } else {
-            state->trailing_metadata.emplace_back(std::string(hname), std::string(hvalue));
-        }
-    }
-
-    return 0;
-}
-
-int OnDataChunkRecvCallback(
-    nghttp2_session* session, uint8_t flags, int32_t stream_id, const uint8_t* data, size_t len,
-    void* user_data
-) {
-    (void)session;
-    (void)flags;
-    auto* state = static_cast<ClientCallState*>(user_data);
-    if (stream_id == state->stream_id) {
-        state->response_body.append(reinterpret_cast<const char*>(data), len);
-    }
-    return 0;
-}
-
-int OnFrameRecvCallback(nghttp2_session* session, const nghttp2_frame* frame, void* user_data) {
-    (void)session;
-    (void)user_data;
-    return 0;
-}
-
-int OnStreamCloseCallback(
-    nghttp2_session* session, int32_t stream_id, uint32_t error_code, void* user_data
-) {
-    (void)session;
-    (void)error_code;
-    auto* state = static_cast<ClientCallState*>(user_data);
-    if (stream_id == state->stream_id) {
-        state->stream_closed = true;
-        CloseClient(state);
-    }
-    return 0;
-}
-
-void AllocBuffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buffer) {
-    (void)handle;
-    buffer->base = new char[suggested_size];
-    buffer->len = suggested_size;
-}
-
-void AfterRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buffer) {
-    auto* state = static_cast<ClientCallState*>(stream->data);
-    std::unique_ptr<char[]> cleanup(buffer->base);
-
-    if (nread < 0) {
-        if (!state->stream_closed) {
-            state->transport_error =
-                Status(StatusCode::kUnavailable, "connection closed by server");
-        }
-        CloseClient(state);
-        return;
-    }
-    if (nread == 0) {
-        return;
-    }
-
-    const ssize_t consumed = nghttp2_session_mem_recv(
-        state->session, reinterpret_cast<const uint8_t*>(buffer->base), static_cast<size_t>(nread)
-    );
-    if (consumed < 0) {
-        state->transport_error = Status(StatusCode::kInternal, "nghttp2 receive error");
-        CloseClient(state);
-        return;
-    }
-
-    QueueOutput(state);
-    FlushPendingWrites(state);
-}
-
-ssize_t RequestDataProvider(
-    nghttp2_session* session, int32_t stream_id, uint8_t* buf, size_t length, uint32_t* data_flags,
-    nghttp2_data_source* source, void* user_data
-) {
-    (void)session;
-    (void)stream_id;
-    (void)user_data;
-    auto* state = static_cast<ClientCallState*>(source->ptr);
-
-    const std::size_t remaining = state->request_frame.size() - state->send_offset;
-    const std::size_t to_copy = std::min(remaining, length);
-    if (to_copy != 0) {
-        std::memcpy(buf, state->request_frame.data() + state->send_offset, to_copy);
-        state->send_offset += to_copy;
-    }
-
-    if (state->send_offset == state->request_frame.size()) {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    }
-
-    return static_cast<ssize_t>(to_copy);
-}
-
-void OnDeadlineExpired(uv_timer_t* timer) {
-    auto* state = static_cast<ClientCallState*>(timer->data);
-    state->deadline_expired = true;
-    state->transport_error = Status(StatusCode::kDeadlineExceeded, "deadline exceeded");
-    if (state->session != nullptr) {
-        nghttp2_session_terminate_session(state->session, NGHTTP2_NO_ERROR);
-        QueueOutput(state);
-        FlushPendingWrites(state);
-    }
-    CloseClient(state);
-}
-
-void OnConnect(uv_connect_t* req, int status) {
-    auto* state = static_cast<ClientCallState*>(req->data);
-
-    if (status < 0) {
-        state->transport_error = Status(StatusCode::kUnavailable, "failed to connect to server");
-        CloseClient(state);
-        return;
-    }
-
-    nghttp2_session_callbacks* callbacks = nullptr;
-    nghttp2_session_callbacks_new(&callbacks);
-    nghttp2_session_callbacks_set_on_header_callback(callbacks, OnHeaderCallback);
-    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, OnDataChunkRecvCallback);
-    nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, OnFrameRecvCallback);
-    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, OnStreamCloseCallback);
-
-    if (nghttp2_session_client_new(&state->session, callbacks, state) != 0) {
-        nghttp2_session_callbacks_del(callbacks);
-        state->transport_error =
-            Status(StatusCode::kInternal, "failed to create nghttp2 client session");
-        CloseClient(state);
-        return;
-    }
-    nghttp2_session_callbacks_del(callbacks);
-
-    nghttp2_submit_settings(state->session, NGHTTP2_FLAG_NONE, nullptr, 0);
-
-    std::string content_type = "application/grpc";
-    std::string te = "trailers";
-    std::string scheme = "http";
-    std::string post = "POST";
-    std::string encoding = "identity";
-
-    std::vector<nghttp2_nv> headers;
-    headers.push_back(core::MakeHeader(":method", post));
-    headers.push_back(core::MakeHeader(":scheme", scheme));
-    headers.push_back(core::MakeHeader(":path", state->method));
-    headers.push_back(core::MakeHeader(":authority", state->authority));
-    headers.push_back(core::MakeHeader("content-type", content_type));
-    headers.push_back(core::MakeHeader("te", te));
-    headers.push_back(core::MakeHeader("grpc-encoding", encoding));
-    for (const auto& md : state->client_metadata) {
-        headers.push_back(core::MakeHeader(md.first, md.second));
-    }
-
-    nghttp2_data_provider provider{};
-    provider.source.ptr = state;
-    provider.read_callback = RequestDataProvider;
-
-    state->stream_id = nghttp2_submit_request(
-        state->session, nullptr, headers.data(), headers.size(), &provider, state
-    );
-    if (state->stream_id < 0) {
-        state->transport_error = Status(StatusCode::kInternal, "failed to submit HTTP/2 request");
-        CloseClient(state);
-        return;
-    }
-
-    QueueOutput(state);
-    FlushPendingWrites(state);
-
-    uv_read_start(reinterpret_cast<uv_stream_t*>(&state->tcp_handle), AllocBuffer, AfterRead);
-}
 
 struct AddressParts {
     std::string host;
@@ -382,190 +58,267 @@ Status ParseAddress(std::string_view address, AddressParts* out) {
     return Status::OK();
 }
 
-class LiveClientCall : public std::enable_shared_from_this<LiveClientCall> {
+Status PushResponseFrames(
+    std::string* pending, const uint8_t* data, size_t len,
+    const std::shared_ptr<internal::MessageQueue>& responses
+) {
+    pending->append(reinterpret_cast<const char*>(data), len);
+    for (;;) {
+        if (pending->empty() || pending->size() < 5U) {
+            return Status::OK();
+        }
+        if (static_cast<unsigned char>((*pending)[0]) != 0) {
+            return Status(
+                StatusCode::kUnimplemented, "compressed grpc messages are not supported yet"
+            );
+        }
+        const std::uint32_t size =
+            (static_cast<std::uint32_t>(static_cast<unsigned char>((*pending)[1])) << 24) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>((*pending)[2])) << 16) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>((*pending)[3])) << 8) |
+            static_cast<std::uint32_t>(static_cast<unsigned char>((*pending)[4]));
+        const std::size_t full_size = static_cast<std::size_t>(size) + 5U;
+        if (pending->size() < full_size) {
+            return Status::OK();
+        }
+        responses->Push(pending->substr(5, size));
+        pending->erase(0, full_size);
+    }
+}
+
+Status BuildFinalStatus(
+    const std::string& http_status, int grpc_status, const std::string& grpc_message
+) {
+    if (http_status != "200") {
+        return Status(StatusCode::kUnavailable, "server returned HTTP status " + http_status);
+    }
+    if (grpc_status < 0) {
+        return Status(StatusCode::kInternal, "server did not send grpc-status trailer");
+    }
+    const StatusCode grpc_code = core::StatusCodeFromInt(grpc_status);
+    return grpc_code == StatusCode::kOk ? Status::OK() : Status(grpc_code, grpc_message);
+}
+
+class ClientStream {
   public:
-    LiveClientCall(std::string target, std::string method, ClientContext* context)
-        : target_(std::move(target)),
-          method_(std::move(method)),
-          context_(context),
-          responses_(std::make_shared<internal::MessageQueue>()) {}
+    ClientStream(std::string method, ClientContext* context)
+        : method(std::move(method)),
+          context(context),
+          responses(std::make_shared<internal::MessageQueue>()) {}
 
-    ~LiveClientCall() { Close(); }
+    void Finish(Status finish_status) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (finished) {
+                return;
+            }
+            status = std::move(finish_status);
+            finished = true;
+        }
+        responses->Close(status);
+        cv.notify_all();
+    }
 
-    Status Start() {
-        AddressParts address;
-        Status addr_status = ParseAddress(target_, &address);
-        if (!addr_status.ok()) {
-            status_ = addr_status;
-            responses_->Close(status_);
-            return status_;
+    Status Wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (context != nullptr && context->deadline() != std::chrono::system_clock::time_point{}) {
+            if (!cv.wait_until(lock, context->deadline(), [this]() { return finished; })) {
+                status = Status(StatusCode::kDeadlineExceeded, "deadline exceeded");
+                finished = true;
+                responses->Close(status);
+            }
+        } else {
+            cv.wait(lock, [this]() { return finished; });
+        }
+        return status;
+    }
+
+    void CopyMetadata() {
+        if (context == nullptr) {
+            return;
+        }
+        context->SetServerInitialMetadata(initial_metadata);
+        context->SetServerTrailingMetadata(trailing_metadata);
+    }
+
+    std::string method;
+    ClientContext* context = nullptr;
+    int32_t stream_id = 0;
+    std::deque<std::string> outgoing;
+    std::string current_outgoing;
+    std::size_t current_outgoing_offset = 0;
+    std::string pending_response_frame;
+    std::shared_ptr<internal::MessageQueue> responses;
+    std::vector<std::pair<std::string, std::string>> initial_metadata;
+    std::vector<std::pair<std::string, std::string>> trailing_metadata;
+    std::string http_status;
+    int grpc_status = -1;
+    std::string grpc_message;
+    bool writes_done = false;
+    bool finished = false;
+    Status status;
+    std::mutex mutex;
+    std::condition_variable cv;
+};
+
+}  // namespace
+
+class ChannelImpl : public std::enable_shared_from_this<ChannelImpl> {
+  public:
+    ChannelImpl(std::string target, ChannelOptions options)
+        : target_(std::move(target)), options_(options) {}
+
+    ~ChannelImpl() { Shutdown(); }
+
+    Status StartCall(
+        const std::string& method, ClientContext* context,
+        const std::vector<std::string>& initial_messages, bool writes_done,
+        std::shared_ptr<ClientStream>* out
+    ) {
+        JoinInactiveThreads();
+
+        std::shared_ptr<ClientStream> stream = std::make_shared<ClientStream>(method, context);
+        for (const auto& message : initial_messages) {
+            stream->outgoing.push_back(core::EncodeGrpcFrame(message));
+        }
+        stream->writes_done = writes_done;
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        Status connected = EnsureConnectedLocked();
+        if (!connected.ok()) {
+            stream->Finish(connected);
+            *out = stream;
+            return connected;
         }
 
-        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd_ < 0) {
-            status_ = Status(StatusCode::kUnavailable, "failed to create socket");
-            responses_->Close(status_);
-            return status_;
+        if (draining_) {
+            if (!streams_.empty()) {
+                Status status(StatusCode::kUnavailable, "connection is draining");
+                stream->Finish(status);
+                *out = stream;
+                return status;
+            }
+            CloseConnectionLocked(Status(StatusCode::kUnavailable, "connection is draining"));
+            lock.unlock();
+            JoinReadThread();
+            JoinKeepaliveThread();
+            lock.lock();
+            connected = EnsureConnectedLocked();
+            if (!connected.ok()) {
+                stream->Finish(connected);
+                *out = stream;
+                return connected;
+            }
+        }
+        if (options_.max_concurrent_streams != 0 &&
+            streams_.size() >= options_.max_concurrent_streams) {
+            Status status(StatusCode::kResourceExhausted, "maximum concurrent streams exceeded");
+            stream->Finish(status);
+            *out = stream;
+            return status;
         }
 
-        sockaddr_in socket_address{};
-        socket_address.sin_family = AF_INET;
-        socket_address.sin_port = htons(static_cast<std::uint16_t>(address.port));
-        if (::inet_pton(AF_INET, address.host.c_str(), &socket_address.sin_addr) != 1) {
-            status_ =
-                Status(StatusCode::kInvalidArgument, "only IPv4 targets are supported for now");
-            responses_->Close(status_);
-            return status_;
-        }
-        if (::connect(fd_, reinterpret_cast<sockaddr*>(&socket_address), sizeof(socket_address)) !=
-            0) {
-            status_ = Status(StatusCode::kUnavailable, "failed to connect to server");
-            responses_->Close(status_);
-            return status_;
-        }
-
-        nghttp2_session_callbacks* callbacks = nullptr;
-        nghttp2_session_callbacks_new(&callbacks);
-        nghttp2_session_callbacks_set_on_header_callback(callbacks, OnHeader);
-        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, OnData);
-        nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, OnStreamClose);
-        if (nghttp2_session_client_new(&session_, callbacks, this) != 0) {
-            nghttp2_session_callbacks_del(callbacks);
-            status_ = Status(StatusCode::kInternal, "failed to create nghttp2 client session");
-            responses_->Close(status_);
-            return status_;
-        }
-        nghttp2_session_callbacks_del(callbacks);
-
-        nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, nullptr, 0);
-
-        std::string content_type = "application/grpc";
-        std::string te = "trailers";
-        std::string scheme = "http";
-        std::string post = "POST";
-        std::string encoding = "identity";
-
+        std::vector<std::string> header_values{
+            "POST", "http", method, target_, "application/grpc", "trailers", "identity"
+        };
         std::vector<nghttp2_nv> headers;
-        headers.push_back(core::MakeHeader(":method", post));
-        headers.push_back(core::MakeHeader(":scheme", scheme));
-        headers.push_back(core::MakeHeader(":path", method_));
-        headers.push_back(core::MakeHeader(":authority", target_));
-        headers.push_back(core::MakeHeader("content-type", content_type));
-        headers.push_back(core::MakeHeader("te", te));
-        headers.push_back(core::MakeHeader("grpc-encoding", encoding));
-        if (context_ != nullptr) {
-            for (const auto& md : context_->metadata()) {
-                headers.push_back(core::MakeHeader(md.first, md.second));
+        headers.push_back(core::MakeHeader(":method", header_values[0]));
+        headers.push_back(core::MakeHeader(":scheme", header_values[1]));
+        headers.push_back(core::MakeHeader(":path", header_values[2]));
+        headers.push_back(core::MakeHeader(":authority", header_values[3]));
+        headers.push_back(core::MakeHeader("content-type", header_values[4]));
+        headers.push_back(core::MakeHeader("te", header_values[5]));
+        headers.push_back(core::MakeHeader("grpc-encoding", header_values[6]));
+        if (context != nullptr) {
+            for (const auto& metadata : context->metadata()) {
+                headers.push_back(core::MakeHeader(metadata.first, metadata.second));
             }
         }
 
         nghttp2_data_provider provider{};
-        provider.source.ptr = this;
+        provider.source.ptr = stream.get();
         provider.read_callback = ReadRequestData;
-        stream_id_ = nghttp2_submit_request(
-            session_, nullptr, headers.data(), headers.size(), &provider, this
+        const int32_t stream_id = nghttp2_submit_request(
+            session_, nullptr, headers.data(), headers.size(), &provider, stream.get()
         );
-        if (stream_id_ < 0) {
-            status_ = Status(StatusCode::kInternal, "failed to submit HTTP/2 request");
-            responses_->Close(status_);
-            return status_;
+        if (stream_id < 0) {
+            stream->Finish(Status(StatusCode::kInternal, "failed to submit HTTP/2 request"));
+            *out = stream;
+            return stream->status;
         }
-
-        {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            FlushLocked();
+        stream->stream_id = stream_id;
+        streams_[stream_id] = stream;
+        QueueOutputLocked();
+        Status flush_status = FlushLocked();
+        if (!flush_status.ok()) {
+            stream->Finish(flush_status);
+            streams_.erase(stream_id);
         }
-
-        io_thread_ = std::thread([self = shared_from_this()]() { self->ReadLoop(); });
+        *out = stream;
         return Status::OK();
     }
 
-    std::shared_ptr<internal::MessageQueue> responses() const { return responses_; }
-
-    bool Write(std::string_view message) {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        if (closed_ || writes_done_) {
+    bool Write(const std::shared_ptr<ClientStream>& stream, std::string_view message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_ || stream->finished || stream->writes_done) {
             return false;
         }
-        outgoing_.push_back(core::EncodeGrpcFrame(message));
-        nghttp2_session_resume_data(session_, stream_id_);
-        FlushLocked();
-        return true;
+        stream->outgoing.push_back(core::EncodeGrpcFrame(message));
+        nghttp2_session_resume_data(session_, stream->stream_id);
+        QueueOutputLocked();
+        return FlushLocked().ok();
     }
 
-    bool WritesDone() {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        if (closed_ || writes_done_) {
+    bool WritesDone(const std::shared_ptr<ClientStream>& stream) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_ || stream->finished || stream->writes_done) {
             return false;
         }
-        writes_done_ = true;
-        nghttp2_session_resume_data(session_, stream_id_);
-        FlushLocked();
-        return true;
+        stream->writes_done = true;
+        nghttp2_session_resume_data(session_, stream->stream_id);
+        QueueOutputLocked();
+        return FlushLocked().ok();
     }
 
-    Status Finish(std::string* unary_response = nullptr) {
-        WritesDone();
-        if (unary_response != nullptr) {
-            std::string response;
-            if (responses_->Read(&response)) {
-                *unary_response = std::move(response);
-            }
-        }
-        Join();
-        CopyMetadata();
-        return status_;
-    }
-
-    void Close() {
+    void Shutdown() {
         {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            if (!closed_) {
-                closed_ = true;
-                if (fd_ >= 0) {
-                    ::shutdown(fd_, SHUT_RDWR);
-                }
-            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            CloseConnectionLocked(Status(StatusCode::kCancelled, "channel closed"));
+            shutdown_ = true;
         }
-        Join();
-        if (session_ != nullptr) {
-            nghttp2_session_del(session_);
-            session_ = nullptr;
-        }
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
+        JoinReadThread();
+        JoinKeepaliveThread();
     }
 
   private:
     static ssize_t
     ReadRequestData(nghttp2_session*, int32_t, uint8_t* buffer, size_t length, uint32_t* data_flags, nghttp2_data_source* source, void*) {
-        auto* self = static_cast<LiveClientCall*>(source->ptr);
-        if (self->current_outgoing_.empty() && !self->outgoing_.empty()) {
-            self->current_outgoing_ = std::move(self->outgoing_.front());
-            self->outgoing_.pop_front();
-            self->current_outgoing_offset_ = 0;
+        auto* stream = static_cast<ClientStream*>(source->ptr);
+        if (stream->current_outgoing.empty() && !stream->outgoing.empty()) {
+            stream->current_outgoing = std::move(stream->outgoing.front());
+            stream->outgoing.pop_front();
+            stream->current_outgoing_offset = 0;
         }
-        if (self->current_outgoing_.empty()) {
-            if (self->writes_done_) {
+        if (stream->current_outgoing.empty()) {
+            if (stream->writes_done) {
                 *data_flags |= NGHTTP2_DATA_FLAG_EOF;
                 return 0;
             }
             return NGHTTP2_ERR_DEFERRED;
         }
+
         const std::size_t remaining =
-            self->current_outgoing_.size() - self->current_outgoing_offset_;
+            stream->current_outgoing.size() - stream->current_outgoing_offset;
         const std::size_t to_copy = std::min(remaining, length);
         if (to_copy != 0) {
             std::memcpy(
-                buffer, self->current_outgoing_.data() + self->current_outgoing_offset_, to_copy
+                buffer, stream->current_outgoing.data() + stream->current_outgoing_offset, to_copy
             );
-            self->current_outgoing_offset_ += to_copy;
+            stream->current_outgoing_offset += to_copy;
         }
-        if (self->current_outgoing_offset_ == self->current_outgoing_.size()) {
-            self->current_outgoing_.clear();
-            self->current_outgoing_offset_ = 0;
+        if (stream->current_outgoing_offset == stream->current_outgoing.size()) {
+            stream->current_outgoing.clear();
+            stream->current_outgoing_offset = 0;
         }
         return static_cast<ssize_t>(to_copy);
     }
@@ -574,25 +327,26 @@ class LiveClientCall : public std::enable_shared_from_this<LiveClientCall> {
         nghttp2_session*, const nghttp2_frame* frame, const uint8_t* name, size_t namelen,
         const uint8_t* value, size_t valuelen, uint8_t, void* user_data
     ) {
-        auto* self = static_cast<LiveClientCall*>(user_data);
-        if (frame->hd.stream_id != self->stream_id_) {
+        auto* self = static_cast<ChannelImpl*>(user_data);
+        std::shared_ptr<ClientStream> stream = self->FindStream(frame->hd.stream_id);
+        if (stream == nullptr) {
             return 0;
         }
         const std::string_view hname(reinterpret_cast<const char*>(name), namelen);
         const std::string_view hvalue(reinterpret_cast<const char*>(value), valuelen);
         if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
             if (hname == ":status") {
-                self->http_status_.assign(hvalue);
+                stream->http_status.assign(hvalue);
             } else {
-                self->initial_metadata_.emplace_back(std::string(hname), std::string(hvalue));
+                stream->initial_metadata.emplace_back(std::string(hname), std::string(hvalue));
             }
         } else if (frame->headers.cat == NGHTTP2_HCAT_HEADERS) {
             if (hname == "grpc-status") {
-                self->grpc_status_ = std::atoi(std::string(hvalue).c_str());
+                stream->grpc_status = std::atoi(std::string(hvalue).c_str());
             } else if (hname == "grpc-message") {
-                self->grpc_message_.assign(hvalue);
+                stream->grpc_message.assign(hvalue);
             } else {
-                self->trailing_metadata_.emplace_back(std::string(hname), std::string(hvalue));
+                stream->trailing_metadata.emplace_back(std::string(hname), std::string(hvalue));
             }
         }
         return 0;
@@ -602,419 +356,406 @@ class LiveClientCall : public std::enable_shared_from_this<LiveClientCall> {
         nghttp2_session*, uint8_t, int32_t stream_id, const uint8_t* data, size_t len,
         void* user_data
     ) {
-        auto* self = static_cast<LiveClientCall*>(user_data);
-        if (stream_id != self->stream_id_) {
+        auto* self = static_cast<ChannelImpl*>(user_data);
+        std::shared_ptr<ClientStream> stream = self->FindStream(stream_id);
+        if (stream == nullptr) {
             return 0;
         }
-        Status status = self->PushResponseFrames(data, len);
+        Status status =
+            PushResponseFrames(&stream->pending_response_frame, data, len, stream->responses);
         if (!status.ok()) {
-            self->status_ = status;
-            self->responses_->Close(status);
+            stream->Finish(status);
+        }
+        return 0;
+    }
+
+    static int OnFrameRecv(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
+        auto* self = static_cast<ChannelImpl*>(user_data);
+        if (frame->hd.type == NGHTTP2_GOAWAY) {
+            self->draining_ = true;
+        }
+        if (frame->hd.type == NGHTTP2_PING && (frame->hd.flags & NGHTTP2_FLAG_ACK) != 0) {
+            self->ping_outstanding_ = false;
         }
         return 0;
     }
 
     static int OnStreamClose(nghttp2_session*, int32_t stream_id, uint32_t, void* user_data) {
-        auto* self = static_cast<LiveClientCall*>(user_data);
-        if (stream_id != self->stream_id_) {
+        auto* self = static_cast<ChannelImpl*>(user_data);
+        std::shared_ptr<ClientStream> stream;
+        auto it = self->streams_.find(stream_id);
+        if (it == self->streams_.end()) {
             return 0;
         }
-        self->stream_closed_ = true;
-        if (self->http_status_ != "200") {
-            self->status_ = Status(
-                StatusCode::kUnavailable, "server returned HTTP status " + self->http_status_
-            );
-        } else if (self->grpc_status_ < 0) {
-            self->status_ =
-                Status(StatusCode::kInternal, "server did not send grpc-status trailer");
-        } else {
-            const StatusCode grpc_code = core::StatusCodeFromInt(self->grpc_status_);
-            self->status_ = grpc_code == StatusCode::kOk ? Status::OK()
-                                                         : Status(grpc_code, self->grpc_message_);
-        }
-        self->responses_->Close(self->status_);
+        stream = it->second;
+        self->streams_.erase(it);
+        Status status =
+            BuildFinalStatus(stream->http_status, stream->grpc_status, stream->grpc_message);
+        stream->Finish(status);
         return 0;
     }
 
-    Status PushResponseFrames(const uint8_t* data, size_t len) {
-        pending_response_frame_.append(reinterpret_cast<const char*>(data), len);
-        for (;;) {
-            if (pending_response_frame_.empty() || pending_response_frame_.size() < 5U) {
-                return Status::OK();
-            }
-            if (static_cast<unsigned char>(pending_response_frame_[0]) != 0) {
-                return Status(
-                    StatusCode::kUnimplemented, "compressed grpc messages are not supported yet"
-                );
-            }
-            const std::uint32_t size =
-                (static_cast<std::uint32_t>(static_cast<unsigned char>(pending_response_frame_[1]))
-                 << 24) |
-                (static_cast<std::uint32_t>(static_cast<unsigned char>(pending_response_frame_[2]))
-                 << 16) |
-                (static_cast<std::uint32_t>(static_cast<unsigned char>(pending_response_frame_[3]))
-                 << 8) |
-                static_cast<std::uint32_t>(static_cast<unsigned char>(pending_response_frame_[4]));
-            const std::size_t full_size = static_cast<std::size_t>(size) + 5U;
-            if (pending_response_frame_.size() < full_size) {
-                return Status::OK();
-            }
-            responses_->Push(pending_response_frame_.substr(5, size));
-            pending_response_frame_.erase(0, full_size);
+    std::shared_ptr<ClientStream> FindStream(int32_t stream_id) {
+        auto it = streams_.find(stream_id);
+        if (it == streams_.end()) {
+            return nullptr;
         }
+        return it->second;
+    }
+
+    Status EnsureConnectedLocked() {
+        if (session_ != nullptr && fd_ >= 0 && !closed_) {
+            return Status::OK();
+        }
+        if (shutdown_) {
+            return Status(StatusCode::kCancelled, "channel closed");
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (next_connect_attempt_ > now) {
+            return Status(StatusCode::kUnavailable, "connection backoff in progress");
+        }
+
+        AddressParts address;
+        Status addr_status = ParseAddress(target_, &address);
+        if (!addr_status.ok()) {
+            return addr_status;
+        }
+
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            Status status(StatusCode::kUnavailable, "failed to create socket");
+            RecordConnectFailureLocked();
+            return status;
+        }
+
+        sockaddr_in socket_address{};
+        socket_address.sin_family = AF_INET;
+        socket_address.sin_port = htons(static_cast<std::uint16_t>(address.port));
+        if (::inet_pton(AF_INET, address.host.c_str(), &socket_address.sin_addr) != 1) {
+            ::close(fd);
+            return Status(StatusCode::kInvalidArgument, "only IPv4 targets are supported for now");
+        }
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&socket_address), sizeof(socket_address)) !=
+            0) {
+            ::close(fd);
+            Status status(StatusCode::kUnavailable, "failed to connect to server");
+            RecordConnectFailureLocked();
+            return status;
+        }
+
+        nghttp2_session_callbacks* callbacks = nullptr;
+        nghttp2_session_callbacks_new(&callbacks);
+        nghttp2_session_callbacks_set_on_header_callback(callbacks, OnHeader);
+        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, OnData);
+        nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, OnFrameRecv);
+        nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, OnStreamClose);
+        if (nghttp2_session_client_new(&session_, callbacks, this) != 0) {
+            nghttp2_session_callbacks_del(callbacks);
+            ::close(fd);
+            Status status(StatusCode::kInternal, "failed to create nghttp2 client session");
+            RecordConnectFailureLocked();
+            return status;
+        }
+        nghttp2_session_callbacks_del(callbacks);
+
+        fd_ = fd;
+        closed_ = false;
+        draining_ = false;
+        ping_outstanding_ = false;
+        nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, nullptr, 0);
+        QueueOutputLocked();
+        Status flush_status = FlushLocked();
+        if (!flush_status.ok()) {
+            CloseConnectionLocked(flush_status);
+            RecordConnectFailureLocked();
+            return flush_status;
+        }
+        backoff_delay_ = std::chrono::milliseconds(100);
+        next_connect_attempt_ = {};
+        read_thread_ = std::thread([this]() { ReadLoop(); });
+        if (options_.keepalive_time.count() > 0) {
+            keepalive_thread_ = std::thread([this]() { KeepaliveLoop(); });
+        }
+        return Status::OK();
     }
 
     void ReadLoop() {
-        char buffer[4096];
-        while (!stream_closed_) {
+        char buffer[8192];
+        for (;;) {
             const ssize_t nread = ::recv(fd_, buffer, sizeof(buffer), 0);
             if (nread <= 0) {
                 break;
             }
-            std::lock_guard<std::mutex> lock(session_mutex_);
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (session_ == nullptr) {
+                break;
+            }
             if (nghttp2_session_mem_recv(
                     session_, reinterpret_cast<const uint8_t*>(buffer), static_cast<size_t>(nread)
                 ) < 0) {
-                status_ = Status(StatusCode::kInternal, "nghttp2 receive error");
-                responses_->Close(status_);
-                break;
+                CloseConnectionLocked(Status(StatusCode::kInternal, "nghttp2 receive error"));
+                return;
             }
+            QueueOutputLocked();
             FlushLocked();
         }
-        if (!stream_closed_) {
-            status_ = Status(StatusCode::kUnavailable, "connection closed by server");
-            responses_->Close(status_);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!closed_ && !shutdown_) {
+            CloseConnectionLocked(Status(StatusCode::kUnavailable, "connection closed by server"));
         }
     }
 
-    void FlushLocked() {
+    void QueueOutputLocked() {
+        if (session_ == nullptr) {
+            return;
+        }
         const uint8_t* data = nullptr;
         for (;;) {
             const ssize_t bytes = nghttp2_session_mem_send(session_, &data);
             if (bytes <= 0) {
                 return;
             }
-            std::string_view out(
+            pending_writes_.emplace_back(
                 reinterpret_cast<const char*>(data), static_cast<std::size_t>(bytes)
             );
-            while (!out.empty()) {
-                const ssize_t sent = ::send(fd_, out.data(), out.size(), MSG_NOSIGNAL);
+        }
+    }
+
+    Status FlushLocked() {
+        while (!pending_writes_.empty()) {
+            std::string out = std::move(pending_writes_.front());
+            pending_writes_.pop_front();
+            std::string_view remaining(out);
+            while (!remaining.empty()) {
+                const ssize_t sent = ::send(fd_, remaining.data(), remaining.size(), MSG_NOSIGNAL);
                 if (sent <= 0) {
-                    status_ = Status(StatusCode::kUnavailable, "write to server failed");
-                    responses_->Close(status_);
-                    return;
+                    Status status(StatusCode::kUnavailable, "write to server failed");
+                    CloseConnectionLocked(status);
+                    return status;
                 }
-                out.remove_prefix(static_cast<std::size_t>(sent));
+                remaining.remove_prefix(static_cast<std::size_t>(sent));
             }
         }
+        return Status::OK();
     }
 
-    void Join() {
-        if (io_thread_.joinable()) {
-            io_thread_.join();
-        }
-    }
-
-    void CopyMetadata() {
-        if (context_ == nullptr) {
+    void CloseConnectionLocked(const Status& status) {
+        if (closed_) {
             return;
         }
-        context_->SetServerInitialMetadata(initial_metadata_);
-        context_->SetServerTrailingMetadata(trailing_metadata_);
+        closed_ = true;
+        keepalive_cv_.notify_all();
+        pending_writes_.clear();
+        for (const auto& entry : streams_) {
+            entry.second->Finish(status);
+        }
+        streams_.clear();
+        if (fd_ >= 0) {
+            ::shutdown(fd_, SHUT_RDWR);
+            ::close(fd_);
+            fd_ = -1;
+        }
+        if (session_ != nullptr) {
+            nghttp2_session_del(session_);
+            session_ = nullptr;
+        }
+    }
+
+    void JoinReadThread() {
+        if (read_thread_.joinable() && std::this_thread::get_id() != read_thread_.get_id()) {
+            read_thread_.join();
+        }
+    }
+
+    void JoinKeepaliveThread() {
+        if (keepalive_thread_.joinable() &&
+            std::this_thread::get_id() != keepalive_thread_.get_id()) {
+            keepalive_thread_.join();
+        }
+    }
+
+    void JoinInactiveThreads() {
+        std::lock_guard<std::mutex> join_lock(join_mutex_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!closed_) {
+                return;
+            }
+        }
+        JoinReadThread();
+        JoinKeepaliveThread();
+    }
+
+    void RecordConnectFailureLocked() {
+        next_connect_attempt_ = std::chrono::steady_clock::now() + backoff_delay_;
+        const auto next =
+            std::chrono::duration_cast<std::chrono::milliseconds>(backoff_delay_ * 8 / 5);
+        backoff_delay_ = std::min(next, std::chrono::milliseconds(120000));
+    }
+
+    void KeepaliveLoop() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            if (keepalive_cv_.wait_for(lock, options_.keepalive_time, [this]() {
+                    return shutdown_ || closed_;
+                })) {
+                return;
+            }
+            if (session_ == nullptr) {
+                return;
+            }
+            if (ping_outstanding_) {
+                const auto elapsed = std::chrono::steady_clock::now() - last_ping_;
+                if (elapsed >= options_.keepalive_timeout) {
+                    CloseConnectionLocked(Status(StatusCode::kUnavailable, "keepalive timeout"));
+                    return;
+                }
+                continue;
+            }
+            std::uint8_t opaque_data[8] = {'g', 'r', 'p', 'c', '-', 'l', 'i', 't'};
+            if (nghttp2_submit_ping(session_, NGHTTP2_FLAG_NONE, opaque_data) != 0) {
+                CloseConnectionLocked(Status(StatusCode::kInternal, "failed to submit keepalive"));
+                return;
+            }
+            ping_outstanding_ = true;
+            last_ping_ = std::chrono::steady_clock::now();
+            QueueOutputLocked();
+            FlushLocked();
+        }
     }
 
     std::string target_;
-    std::string method_;
-    ClientContext* context_ = nullptr;
+    ChannelOptions options_;
+    std::mutex mutex_;
+    std::mutex join_mutex_;
+    std::condition_variable keepalive_cv_;
     int fd_ = -1;
     nghttp2_session* session_ = nullptr;
-    int32_t stream_id_ = 0;
-    std::mutex session_mutex_;
-    std::thread io_thread_;
-    std::deque<std::string> outgoing_;
-    std::string current_outgoing_;
-    std::size_t current_outgoing_offset_ = 0;
-    std::string pending_response_frame_;
-    std::shared_ptr<internal::MessageQueue> responses_;
-    std::vector<std::pair<std::string, std::string>> initial_metadata_;
-    std::vector<std::pair<std::string, std::string>> trailing_metadata_;
-    std::string http_status_;
-    int grpc_status_ = -1;
-    std::string grpc_message_;
-    Status status_;
-    bool writes_done_ = false;
-    bool stream_closed_ = false;
-    bool closed_ = false;
+    std::thread read_thread_;
+    std::thread keepalive_thread_;
+    std::unordered_map<int32_t, std::shared_ptr<ClientStream>> streams_;
+    std::deque<std::string> pending_writes_;
+    bool closed_ = true;
+    bool shutdown_ = false;
+    bool draining_ = false;
+    bool ping_outstanding_ = false;
+    std::chrono::steady_clock::time_point last_ping_;
+    std::chrono::steady_clock::time_point next_connect_attempt_;
+    std::chrono::milliseconds backoff_delay_{100};
 };
 
-Status PerformStreamingCall(
-    const std::string& target, const std::string& method,
-    const std::vector<std::string>& request_messages, ClientContext* context,
-    std::vector<std::string>* response_messages
-) {
-    AddressParts address;
-    Status addr_status = ParseAddress(target, &address);
-    if (!addr_status.ok()) {
-        return addr_status;
+Channel::~Channel() = default;
+
+std::shared_ptr<ChannelImpl> Channel::impl() {
+    std::lock_guard<std::mutex> lock(impl_mutex_);
+    if (impl_ == nullptr) {
+        impl_ = std::make_shared<ChannelImpl>(target_, options_);
     }
-
-    uv_loop_t loop;
-    if (uv_loop_init(&loop) != 0) {
-        return Status(StatusCode::kInternal, "failed to initialize libuv loop");
-    }
-
-    ClientCallState state;
-    state.loop = &loop;
-    state.method = method;
-    state.authority = target;
-    state.request_frame = core::EncodeGrpcFrames(request_messages);
-    if (context != nullptr) {
-        for (const auto& md : context->metadata()) {
-            state.client_metadata.push_back(md);
-        }
-    }
-
-    if (uv_tcp_init(&loop, &state.tcp_handle) != 0) {
-        uv_loop_close(&loop);
-        return Status(StatusCode::kInternal, "failed to initialize TCP handle");
-    }
-    state.tcp_handle.data = &state;
-
-    if (context != nullptr && context->deadline() != std::chrono::system_clock::time_point{}) {
-        const auto now = std::chrono::system_clock::now();
-        const auto timeout =
-            std::chrono::duration_cast<std::chrono::milliseconds>(context->deadline() - now);
-        if (timeout.count() <= 0) {
-            uv_close(reinterpret_cast<uv_handle_t*>(&state.tcp_handle), OnHandleClosed);
-            uv_run(&loop, UV_RUN_DEFAULT);
-            uv_loop_close(&loop);
-            return Status(StatusCode::kDeadlineExceeded, "deadline exceeded");
-        }
-        if (uv_timer_init(&loop, &state.deadline_timer) == 0) {
-            state.deadline_timer.data = &state;
-            state.has_deadline = true;
-            uv_timer_start(
-                &state.deadline_timer, OnDeadlineExpired, static_cast<uint64_t>(timeout.count()), 0
-            );
-        }
-    }
-
-    sockaddr_in socket_address{};
-    if (uv_ip4_addr(address.host.c_str(), address.port, &socket_address) != 0) {
-        CloseClient(&state);
-        uv_run(&loop, UV_RUN_DEFAULT);
-        uv_loop_close(&loop);
-        return Status(StatusCode::kInvalidArgument, "only IPv4 targets are supported for now");
-    }
-
-    state.connect_req.data = &state;
-    if (uv_tcp_connect(
-            &state.connect_req, &state.tcp_handle,
-            reinterpret_cast<const sockaddr*>(&socket_address), OnConnect
-        ) != 0) {
-        CloseClient(&state);
-        uv_run(&loop, UV_RUN_DEFAULT);
-        uv_loop_close(&loop);
-        return Status(StatusCode::kUnavailable, "failed to initiate connection");
-    }
-
-    uv_run(&loop, UV_RUN_DEFAULT);
-
-    if (state.session != nullptr) {
-        nghttp2_session_del(state.session);
-        state.session = nullptr;
-    }
-    uv_loop_close(&loop);
-
-    if (!state.transport_error.ok()) {
-        return state.transport_error;
-    }
-
-    if (state.http_status != "200") {
-        return Status(StatusCode::kUnavailable, "server returned HTTP status " + state.http_status);
-    }
-
-    if (context != nullptr) {
-        context->SetServerInitialMetadata(std::move(state.initial_metadata));
-        context->SetServerTrailingMetadata(std::move(state.trailing_metadata));
-    }
-
-    if (state.grpc_status < 0) {
-        return Status(StatusCode::kInternal, "server did not send grpc-status trailer");
-    }
-
-    const StatusCode grpc_code = core::StatusCodeFromInt(state.grpc_status);
-    if (grpc_code != StatusCode::kOk) {
-        return Status(grpc_code, state.grpc_message);
-    }
-
-    return core::DecodeGrpcFrames(state.response_body, response_messages);
+    return impl_;
 }
-
-}  // namespace
 
 Status Channel::CallUnary(
     const std::string& method, const std::string& request_bytes, ClientContext* context,
     std::string* response_bytes
 ) {
-    AddressParts address;
-    Status addr_status = ParseAddress(target_, &address);
-    if (!addr_status.ok()) {
-        return addr_status;
+    std::vector<std::string> responses;
+    Status status = CallServerStreaming(method, request_bytes, context, &responses);
+    if (!status.ok()) {
+        return status;
     }
-
-    uv_loop_t loop;
-    if (uv_loop_init(&loop) != 0) {
-        return Status(StatusCode::kInternal, "failed to initialize libuv loop");
+    if (responses.size() != 1U) {
+        return Status(
+            StatusCode::kInvalidArgument,
+            "grpc request body does not contain exactly one unary message"
+        );
     }
-
-    ClientCallState state;
-    state.loop = &loop;
-    state.method = method;
-    state.authority = target_;
-    state.request_frame = core::EncodeGrpcFrame(request_bytes);
-    if (context != nullptr) {
-        for (const auto& md : context->metadata()) {
-            state.client_metadata.push_back(md);
-        }
-    }
-
-    if (uv_tcp_init(&loop, &state.tcp_handle) != 0) {
-        uv_loop_close(&loop);
-        return Status(StatusCode::kInternal, "failed to initialize TCP handle");
-    }
-    state.tcp_handle.data = &state;
-
-    // Set up deadline timer if configured.
-    if (context != nullptr && context->deadline() != std::chrono::system_clock::time_point{}) {
-        const auto now = std::chrono::system_clock::now();
-        const auto timeout =
-            std::chrono::duration_cast<std::chrono::milliseconds>(context->deadline() - now);
-        if (timeout.count() <= 0) {
-            uv_close(reinterpret_cast<uv_handle_t*>(&state.tcp_handle), OnHandleClosed);
-            uv_run(&loop, UV_RUN_DEFAULT);
-            uv_loop_close(&loop);
-            return Status(StatusCode::kDeadlineExceeded, "deadline exceeded");
-        }
-        if (uv_timer_init(&loop, &state.deadline_timer) == 0) {
-            state.deadline_timer.data = &state;
-            state.has_deadline = true;
-            uv_timer_start(
-                &state.deadline_timer, OnDeadlineExpired, static_cast<uint64_t>(timeout.count()), 0
-            );
-        }
-    }
-
-    sockaddr_in socket_address{};
-    if (uv_ip4_addr(address.host.c_str(), address.port, &socket_address) != 0) {
-        CloseClient(&state);
-        uv_run(&loop, UV_RUN_DEFAULT);
-        uv_loop_close(&loop);
-        return Status(StatusCode::kInvalidArgument, "only IPv4 targets are supported for now");
-    }
-
-    state.connect_req.data = &state;
-    if (uv_tcp_connect(
-            &state.connect_req, &state.tcp_handle,
-            reinterpret_cast<const sockaddr*>(&socket_address), OnConnect
-        ) != 0) {
-        CloseClient(&state);
-        uv_run(&loop, UV_RUN_DEFAULT);
-        uv_loop_close(&loop);
-        return Status(StatusCode::kUnavailable, "failed to initiate connection");
-    }
-
-    uv_run(&loop, UV_RUN_DEFAULT);
-
-    if (state.session != nullptr) {
-        nghttp2_session_del(state.session);
-        state.session = nullptr;
-    }
-    uv_loop_close(&loop);
-
-    // Check transport-level errors first.
-    if (!state.transport_error.ok()) {
-        return state.transport_error;
-    }
-
-    // Check HTTP status.
-    if (state.http_status != "200") {
-        return Status(StatusCode::kUnavailable, "server returned HTTP status " + state.http_status);
-    }
-
-    // Populate context with server metadata.
-    if (context != nullptr) {
-        context->SetServerInitialMetadata(std::move(state.initial_metadata));
-        context->SetServerTrailingMetadata(std::move(state.trailing_metadata));
-    }
-
-    // Check gRPC status from trailers.
-    if (state.grpc_status < 0) {
-        return Status(StatusCode::kInternal, "server did not send grpc-status trailer");
-    }
-
-    const StatusCode grpc_code = core::StatusCodeFromInt(state.grpc_status);
-    if (grpc_code != StatusCode::kOk) {
-        return Status(grpc_code, state.grpc_message);
-    }
-
-    // Decode the gRPC response frame.
-    return core::DecodeGrpcFrame(state.response_body, response_bytes);
+    *response_bytes = std::move(responses.front());
+    return Status::OK();
 }
 
 Status Channel::CallServerStreaming(
     const std::string& method, const std::string& request_bytes, ClientContext* context,
     std::vector<std::string>* response_messages
 ) {
-    return PerformStreamingCall(target_, method, {request_bytes}, context, response_messages);
+    std::shared_ptr<ClientStream> stream;
+    Status start_status = impl()->StartCall(method, context, {request_bytes}, true, &stream);
+    if (!start_status.ok()) {
+        return start_status;
+    }
+    Status status = stream->Wait();
+    std::string message;
+    while (stream->responses->Read(&message)) {
+        response_messages->push_back(std::move(message));
+    }
+    stream->CopyMetadata();
+    return status;
 }
 
 std::unique_ptr<ClientReader> Channel::StartServerStreaming(
     const std::string& method, const std::string& request_bytes, ClientContext* context
 ) {
-    auto call = std::make_shared<LiveClientCall>(target_, method, context);
-    Status status = call->Start();
+    std::shared_ptr<ClientStream> stream;
+    std::shared_ptr<ChannelImpl> channel_impl = impl();
+    Status status = channel_impl->StartCall(method, context, {request_bytes}, true, &stream);
     if (!status.ok()) {
         return std::make_unique<ClientReader>(std::move(status), std::vector<std::string>{});
     }
-    call->Write(request_bytes);
-    call->WritesDone();
-    return std::make_unique<ClientReader>(call->responses(), [call]() mutable {
-        return call->Finish();
+    return std::make_unique<ClientReader>(stream->responses, [stream]() mutable {
+        Status finish_status = stream->Wait();
+        stream->CopyMetadata();
+        return finish_status;
     });
 }
 
 std::unique_ptr<ClientWriter> Channel::StartClientStreaming(
     const std::string& method, ClientContext* context
 ) {
-    auto call = std::make_shared<LiveClientCall>(target_, method, context);
-    Status status = call->Start();
+    std::shared_ptr<ClientStream> stream;
+    std::shared_ptr<ChannelImpl> channel_impl = impl();
+    Status status = channel_impl->StartCall(method, context, {}, false, &stream);
     if (!status.ok()) {
         return std::make_unique<ClientWriter>(
             [status](const std::vector<std::string>&, std::string*) { return status; }
         );
     }
     return std::make_unique<ClientWriter>(
-        [call](std::string_view message) { return call->Write(message); },
-        [call]() { return call->WritesDone(); },
-        [call](std::string* response) mutable { return call->Finish(response); }
+        [channel_impl, stream](std::string_view message) {
+            return channel_impl->Write(stream, message);
+        },
+        [channel_impl, stream]() { return channel_impl->WritesDone(stream); },
+        [stream](std::string* response) mutable {
+            Status status = stream->Wait();
+            std::string message;
+            if (response != nullptr && stream->responses->Read(&message)) {
+                *response = std::move(message);
+            }
+            stream->CopyMetadata();
+            return status;
+        }
     );
 }
 
 std::unique_ptr<ClientReaderWriter> Channel::StartBidiStreaming(
     const std::string& method, ClientContext* context
 ) {
-    auto call = std::make_shared<LiveClientCall>(target_, method, context);
-    Status status = call->Start();
+    std::shared_ptr<ClientStream> stream;
+    std::shared_ptr<ChannelImpl> channel_impl = impl();
+    Status status = channel_impl->StartCall(method, context, {}, false, &stream);
     if (!status.ok()) {
         return std::make_unique<ClientReaderWriter>(
             [status](const std::vector<std::string>&, std::vector<std::string>*) { return status; }
         );
     }
     return std::make_unique<ClientReaderWriter>(
-        [call](std::string_view message) { return call->Write(message); },
-        [call]() { return call->WritesDone(); }, call->responses(),
-        [call]() mutable { return call->Finish(); }
+        [channel_impl, stream](std::string_view message) {
+            return channel_impl->Write(stream, message);
+        },
+        [channel_impl, stream]() { return channel_impl->WritesDone(stream); }, stream->responses,
+        [stream]() mutable {
+            Status status = stream->Wait();
+            stream->CopyMetadata();
+            return status;
+        }
     );
 }
 
@@ -1023,7 +764,7 @@ Status Channel::CallClientStreaming(
     ClientContext* context, std::string* response_bytes
 ) {
     std::vector<std::string> responses;
-    Status status = PerformStreamingCall(target_, method, request_messages, context, &responses);
+    Status status = CallBidiStreaming(method, request_messages, context, &responses);
     if (!status.ok()) {
         return status;
     }
@@ -1041,7 +782,18 @@ Status Channel::CallBidiStreaming(
     const std::string& method, const std::vector<std::string>& request_messages,
     ClientContext* context, std::vector<std::string>* response_messages
 ) {
-    return PerformStreamingCall(target_, method, request_messages, context, response_messages);
+    std::shared_ptr<ClientStream> stream;
+    Status start_status = impl()->StartCall(method, context, request_messages, true, &stream);
+    if (!start_status.ok()) {
+        return start_status;
+    }
+    Status status = stream->Wait();
+    std::string message;
+    while (stream->responses->Read(&message)) {
+        response_messages->push_back(std::move(message));
+    }
+    stream->CopyMetadata();
+    return status;
 }
 
 }  // namespace grpc_lite

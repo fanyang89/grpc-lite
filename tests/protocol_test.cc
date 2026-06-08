@@ -11,9 +11,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -347,6 +349,364 @@ class FakeHttp2Server {
     std::thread thread_;
 };
 
+struct MultiStreamState {
+    struct Stream {
+        std::string request_body;
+        std::string response_body;
+        std::size_t response_offset = 0;
+    };
+
+    int fd = -1;
+    int expected_streams = 0;
+    int stream_count = 0;
+    int closed_count = 0;
+    int ping_count = 0;
+    bool defer_responses_until_all_streams = false;
+    bool send_goaway_before_response = false;
+    bool goaway_sent = false;
+    std::unordered_map<int32_t, std::shared_ptr<Stream>> streams;
+};
+
+ssize_t
+MultiReadCallback(nghttp2_session*, int32_t, std::uint8_t* buffer, std::size_t length, std::uint32_t* data_flags, nghttp2_data_source* source, void*) {
+    auto* stream = static_cast<MultiStreamState::Stream*>(source->ptr);
+    const std::size_t remaining = stream->response_body.size() - stream->response_offset;
+    const std::size_t to_copy = std::min(remaining, length);
+    if (to_copy != 0) {
+        std::memcpy(buffer, stream->response_body.data() + stream->response_offset, to_copy);
+        stream->response_offset += to_copy;
+    }
+    if (stream->response_offset == stream->response_body.size()) {
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
+    }
+    return static_cast<ssize_t>(to_copy);
+}
+
+int MultiOnBeginHeaders(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
+    auto* state = static_cast<MultiStreamState*>(user_data);
+    if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+        state->streams[frame->hd.stream_id] = std::make_shared<MultiStreamState::Stream>();
+        ++state->stream_count;
+    }
+    return 0;
+}
+
+int MultiOnData(
+    nghttp2_session*, std::uint8_t, int32_t stream_id, const std::uint8_t* data, std::size_t len,
+    void* user_data
+) {
+    auto* state = static_cast<MultiStreamState*>(user_data);
+    auto it = state->streams.find(stream_id);
+    if (it != state->streams.end()) {
+        it->second->request_body.append(reinterpret_cast<const char*>(data), len);
+    }
+    return 0;
+}
+
+void SubmitMultiResponse(nghttp2_session* session, MultiStreamState* state, int32_t stream_id) {
+    auto it = state->streams.find(stream_id);
+    if (it == state->streams.end()) {
+        return;
+    }
+
+    std::string payload;
+    grpc_lite::Status decode = grpc_lite::core::DecodeGrpcFrame(it->second->request_body, &payload);
+    if (!decode.ok()) {
+        payload = "decode-error";
+    }
+    it->second->response_body = grpc_lite::core::EncodeGrpcFrame(payload);
+
+    std::string status = "200";
+    std::string content_type = "application/grpc";
+    std::vector<nghttp2_nv> headers;
+    headers.push_back(grpc_lite::core::MakeHeader(":status", status));
+    headers.push_back(grpc_lite::core::MakeHeader("content-type", content_type));
+
+    nghttp2_data_provider provider{};
+    provider.source.ptr = it->second.get();
+    provider.read_callback = MultiReadCallback;
+    nghttp2_submit_response(session, stream_id, headers.data(), headers.size(), &provider);
+}
+
+int MultiOnFrameRecv(nghttp2_session* session, const nghttp2_frame* frame, void* user_data) {
+    auto* state = static_cast<MultiStreamState*>(user_data);
+    if (frame->hd.type == NGHTTP2_PING && (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
+        ++state->ping_count;
+    }
+    if ((frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA) &&
+        (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
+        if (state->send_goaway_before_response && !state->goaway_sent) {
+            state->goaway_sent = true;
+            nghttp2_submit_goaway(
+                session, NGHTTP2_FLAG_NONE, frame->hd.stream_id, NGHTTP2_NO_ERROR, nullptr, 0
+            );
+            FlushSession(state->fd, session);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!state->defer_responses_until_all_streams ||
+            state->stream_count >= state->expected_streams) {
+            if (state->defer_responses_until_all_streams) {
+                for (const auto& entry : state->streams) {
+                    SubmitMultiResponse(session, state, entry.first);
+                }
+            } else {
+                SubmitMultiResponse(session, state, frame->hd.stream_id);
+            }
+        }
+        FlushSession(state->fd, session);
+    }
+    return 0;
+}
+
+int MultiOnFrameSend(nghttp2_session* session, const nghttp2_frame* frame, void* user_data) {
+    auto* state = static_cast<MultiStreamState*>(user_data);
+    if (frame->hd.type != NGHTTP2_DATA) {
+        return 0;
+    }
+    auto it = state->streams.find(frame->hd.stream_id);
+    if (it == state->streams.end() ||
+        it->second->response_offset != it->second->response_body.size()) {
+        return 0;
+    }
+    std::string grpc_status = "0";
+    std::vector<nghttp2_nv> trailers;
+    trailers.push_back(grpc_lite::core::MakeHeader("grpc-status", grpc_status));
+    nghttp2_submit_trailer(session, frame->hd.stream_id, trailers.data(), trailers.size());
+    return 0;
+}
+
+int MultiOnStreamClose(nghttp2_session*, int32_t, std::uint32_t, void* user_data) {
+    auto* state = static_cast<MultiStreamState*>(user_data);
+    ++state->closed_count;
+    return 0;
+}
+
+class SingleConnectionHttp2Server {
+  public:
+    explicit SingleConnectionHttp2Server(
+        int expected_streams, bool defer_responses_until_all_streams = false,
+        bool send_goaway_before_response = false
+    ) {
+        state_.expected_streams = expected_streams;
+        state_.defer_responses_until_all_streams = defer_responses_until_all_streams;
+        state_.send_goaway_before_response = send_goaway_before_response;
+    }
+
+    ~SingleConnectionHttp2Server() { Stop(); }
+
+    bool Start() {
+        std::uint16_t port = 0;
+        if (!grpc_lite::test::FindFreePort(&port)) {
+            return false;
+        }
+        address_ = grpc_lite::test::LoopbackAddress(port);
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) {
+            return false;
+        }
+        int reuse = 1;
+        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        SetSocketTimeouts(listen_fd_);
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            ::listen(listen_fd_, 1) != 0) {
+            Stop();
+            return false;
+        }
+        thread_ = std::thread([this]() { Run(); });
+        return true;
+    }
+
+    void Stop() {
+        if (listen_fd_ >= 0) {
+            ::shutdown(listen_fd_, SHUT_RDWR);
+        }
+        if (state_.fd >= 0) {
+            ::shutdown(state_.fd, SHUT_RDWR);
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        if (listen_fd_ >= 0) {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+        }
+        if (state_.fd >= 0) {
+            ::close(state_.fd);
+            state_.fd = -1;
+        }
+    }
+
+    const std::string& address() const { return address_; }
+
+    int stream_count() const { return state_.stream_count; }
+
+    int ping_count() const { return state_.ping_count; }
+
+  private:
+    void Run() {
+        state_.fd = ::accept(listen_fd_, nullptr, nullptr);
+        if (state_.fd < 0) {
+            return;
+        }
+        SetSocketTimeouts(state_.fd);
+
+        nghttp2_session_callbacks* callbacks = nullptr;
+        nghttp2_session_callbacks_new(&callbacks);
+        nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, MultiOnBeginHeaders);
+        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, MultiOnData);
+        nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, MultiOnFrameRecv);
+        nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, MultiOnFrameSend);
+        nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, MultiOnStreamClose);
+
+        nghttp2_session* session = nullptr;
+        nghttp2_session_server_new(&session, callbacks, &state_);
+        nghttp2_session_callbacks_del(callbacks);
+        nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, nullptr, 0);
+        FlushSession(state_.fd, session);
+
+        char buffer[4096];
+        while (state_.closed_count < state_.expected_streams || state_.ping_count == 0) {
+            const ssize_t nread = ::recv(state_.fd, buffer, sizeof(buffer), 0);
+            if (nread <= 0) {
+                break;
+            }
+            if (nghttp2_session_mem_recv(
+                    session, reinterpret_cast<const std::uint8_t*>(buffer),
+                    static_cast<std::size_t>(nread)
+                ) < 0) {
+                break;
+            }
+            FlushSession(state_.fd, session);
+        }
+        nghttp2_session_del(session);
+    }
+
+    MultiStreamState state_;
+    std::string address_;
+    int listen_fd_ = -1;
+    std::thread thread_;
+};
+
+class GoawayReconnectServer {
+  public:
+    ~GoawayReconnectServer() { Stop(); }
+
+    bool Start() {
+        std::uint16_t port = 0;
+        if (!grpc_lite::test::FindFreePort(&port)) {
+            return false;
+        }
+        address_ = grpc_lite::test::LoopbackAddress(port);
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) {
+            return false;
+        }
+        int reuse = 1;
+        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        SetSocketTimeouts(listen_fd_);
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            ::listen(listen_fd_, 2) != 0) {
+            Stop();
+            return false;
+        }
+
+        thread_ = std::thread([this]() { Run(); });
+        return true;
+    }
+
+    void Stop() {
+        if (listen_fd_ >= 0) {
+            ::shutdown(listen_fd_, SHUT_RDWR);
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        if (listen_fd_ >= 0) {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+        }
+    }
+
+    const std::string& address() const { return address_; }
+
+    int accepted_connections() const { return accepted_connections_; }
+
+  private:
+    void Run() {
+        for (int i = 0; i < 2; ++i) {
+            const int fd = ::accept(listen_fd_, nullptr, nullptr);
+            if (fd < 0) {
+                return;
+            }
+            ++accepted_connections_;
+            HandleConnection(fd, i == 0);
+            ::shutdown(fd, SHUT_RDWR);
+            ::close(fd);
+        }
+    }
+
+    void HandleConnection(int fd, bool send_goaway) {
+        SetSocketTimeouts(fd);
+
+        FakeServerState state;
+        state.fd = fd;
+        state.response = ResponseSpec{};
+
+        nghttp2_session_callbacks* callbacks = nullptr;
+        nghttp2_session_callbacks_new(&callbacks);
+        nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, FakeOnBeginHeaders);
+        nghttp2_session_callbacks_set_on_header_callback(callbacks, FakeOnHeader);
+        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, FakeOnDataChunk);
+        nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, FakeOnFrameRecv);
+        nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, FakeOnFrameSend);
+        nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, FakeOnStreamClose);
+
+        nghttp2_session* session = nullptr;
+        nghttp2_session_server_new(&session, callbacks, &state);
+        nghttp2_session_callbacks_del(callbacks);
+        nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, nullptr, 0);
+        FlushSession(fd, session);
+
+        char buffer[4096];
+        while (!state.stream_closed) {
+            const ssize_t nread = ::recv(fd, buffer, sizeof(buffer), 0);
+            if (nread <= 0) {
+                break;
+            }
+            if (nghttp2_session_mem_recv(
+                    session, reinterpret_cast<const std::uint8_t*>(buffer),
+                    static_cast<std::size_t>(nread)
+                ) < 0) {
+                break;
+            }
+            FlushSession(fd, session);
+        }
+        if (send_goaway && state.stream_id > 0) {
+            nghttp2_submit_goaway(
+                session, NGHTTP2_FLAG_NONE, state.stream_id, NGHTTP2_NO_ERROR, nullptr, 0
+            );
+            FlushSession(fd, session);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        nghttp2_session_del(session);
+    }
+
+    std::string address_;
+    int listen_fd_ = -1;
+    int accepted_connections_ = 0;
+    std::thread thread_;
+};
+
 struct RequestSpec {
     std::string method = "POST";
     std::string path = "/test.EchoService/Echo";
@@ -595,6 +955,169 @@ TEST_CASE("channel preserves metadata and grpc error responses") {
         grpc_lite::test::HasMetadata(context.server_trailing_metadata(), "x-trailing", "fake-done")
     );
     server.Stop();
+}
+
+TEST_CASE("channel reuses one HTTP/2 connection for sequential unary streams") {
+    SingleConnectionHttp2Server server(4);
+    REQUIRE(server.Start());
+
+    std::shared_ptr<grpc_lite::Channel> channel = grpc_lite::Channel::Create(server.address());
+    for (int i = 0; i < 4; ++i) {
+        const std::string request = "reuse-" + std::to_string(i);
+        std::string response;
+        grpc_lite::Status status =
+            channel->CallUnary("/test.EchoService/Echo", request, nullptr, &response);
+        REQUIRE(status.ok());
+        CHECK(response == request);
+    }
+
+    server.Stop();
+    CHECK(server.stream_count() == 4);
+}
+
+TEST_CASE("channel multiplexes concurrent unary streams on one HTTP/2 connection") {
+    constexpr int kStreamCount = 6;
+    SingleConnectionHttp2Server server(kStreamCount);
+    REQUIRE(server.Start());
+
+    std::shared_ptr<grpc_lite::Channel> channel = grpc_lite::Channel::Create(server.address());
+    std::vector<std::thread> threads;
+    std::vector<grpc_lite::Status> statuses;
+    std::vector<std::string> responses;
+    statuses.resize(kStreamCount);
+    responses.resize(kStreamCount);
+
+    for (int i = 0; i < kStreamCount; ++i) {
+        threads.emplace_back([&, i]() {
+            grpc_lite::ClientContext context;
+            context.SetDeadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+            const std::string request = "parallel-" + std::to_string(i);
+            statuses[i] =
+                channel->CallUnary("/test.EchoService/Echo", request, &context, &responses[i]);
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+
+    for (int i = 0; i < kStreamCount; ++i) {
+        CHECK(statuses[i].ok());
+        CHECK(responses[i] == "parallel-" + std::to_string(i));
+    }
+    server.Stop();
+    CHECK(server.stream_count() == kStreamCount);
+}
+
+TEST_CASE("channel enforces configured concurrent stream limit") {
+    SingleConnectionHttp2Server server(2, true);
+    REQUIRE(server.Start());
+
+    grpc_lite::ChannelOptions options;
+    options.max_concurrent_streams = 1;
+    std::shared_ptr<grpc_lite::Channel> channel =
+        grpc_lite::Channel::Create(server.address(), options);
+
+    grpc_lite::ClientContext first_context;
+    first_context.SetDeadline(std::chrono::system_clock::now() + std::chrono::milliseconds(200));
+    auto reader =
+        channel->StartServerStreaming("/test.EchoService/Echo", "held-open", &first_context);
+
+    std::string response;
+    grpc_lite::Status status =
+        channel->CallUnary("/test.EchoService/Echo", "second", nullptr, &response);
+    CHECK(status.code() == StatusCode::kResourceExhausted);
+
+    status = reader->Finish();
+    CHECK(status.code() == StatusCode::kDeadlineExceeded);
+
+    server.Stop();
+    CHECK(server.stream_count() == 1);
+}
+
+TEST_CASE("channel sends HTTP/2 keepalive pings when configured") {
+    SingleConnectionHttp2Server server(2, true);
+    REQUIRE(server.Start());
+
+    grpc_lite::ChannelOptions options;
+    options.keepalive_time = std::chrono::milliseconds(20);
+    options.keepalive_timeout = std::chrono::milliseconds(200);
+    std::shared_ptr<grpc_lite::Channel> channel =
+        grpc_lite::Channel::Create(server.address(), options);
+
+    grpc_lite::ClientContext context;
+    context.SetDeadline(std::chrono::system_clock::now() + std::chrono::milliseconds(300));
+    auto reader =
+        channel->StartServerStreaming("/test.EchoService/Echo", "wait-for-ping", &context);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+    server.Stop();
+    std::string response;
+    CHECK(!reader->Read(&response));
+    CHECK(server.ping_count() > 0);
+}
+
+TEST_CASE("channel applies backoff after connection failures") {
+    std::uint16_t port = 0;
+    REQUIRE(grpc_lite::test::FindFreePort(&port));
+    std::shared_ptr<grpc_lite::Channel> channel =
+        grpc_lite::Channel::Create(grpc_lite::test::LoopbackAddress(port));
+
+    std::string response;
+    grpc_lite::Status status =
+        channel->CallUnary("/test.EchoService/Echo", "first", nullptr, &response);
+    REQUIRE(status.code() == StatusCode::kUnavailable);
+
+    status = channel->CallUnary("/test.EchoService/Echo", "second", nullptr, &response);
+    CHECK(status.code() == StatusCode::kUnavailable);
+    CHECK(status.message() == "connection backoff in progress");
+}
+
+TEST_CASE("channel opens a new connection after GOAWAY for later RPCs") {
+    GoawayReconnectServer server;
+    REQUIRE(server.Start());
+
+    std::shared_ptr<grpc_lite::Channel> channel = grpc_lite::Channel::Create(server.address());
+
+    std::string response;
+    grpc_lite::Status status =
+        channel->CallUnary("/test.EchoService/Echo", "first", nullptr, &response);
+    REQUIRE(status.ok());
+    CHECK(response == "response");
+
+    response.clear();
+    status = channel->CallUnary("/test.EchoService/Echo", "second", nullptr, &response);
+    REQUIRE(status.ok());
+    CHECK(response == "response");
+
+    server.Stop();
+    CHECK(server.accepted_connections() == 2);
+}
+
+TEST_CASE("channel lets active streams drain after GOAWAY") {
+    SingleConnectionHttp2Server server(1, false, true);
+    REQUIRE(server.Start());
+
+    std::shared_ptr<grpc_lite::Channel> channel = grpc_lite::Channel::Create(server.address());
+
+    grpc_lite::Status first_status;
+    std::string first_response;
+    std::thread first_call([&]() {
+        first_status =
+            channel->CallUnary("/test.EchoService/Echo", "first", nullptr, &first_response);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    std::string second_response;
+    grpc_lite::Status second_status =
+        channel->CallUnary("/test.EchoService/Echo", "second", nullptr, &second_response);
+
+    first_call.join();
+    CHECK(first_status.ok());
+    CHECK(first_response == "first");
+    CHECK(second_status.code() == StatusCode::kUnavailable);
+
+    server.Stop();
+    CHECK(server.stream_count() == 1);
 }
 
 TEST_CASE("raw protocol client observes server rejection of invalid request metadata") {

@@ -1,7 +1,10 @@
 #ifndef GRPC_LITE_CHANNEL_H_
 #define GRPC_LITE_CHANNEL_H_
 
+#include <chrono>
+#include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -11,6 +14,7 @@
 namespace grpc_lite {
 
 class ClientContext;
+class ChannelImpl;
 
 enum class SecurityMode {
     kInsecure,
@@ -20,10 +24,15 @@ enum class SecurityMode {
 struct ChannelOptions {
     SecurityMode security = SecurityMode::kInsecure;
     bool use_system_resolver = false;
+    std::chrono::milliseconds keepalive_time{0};
+    std::chrono::milliseconds keepalive_timeout{20000};
+    std::size_t max_concurrent_streams = 100;
 };
 
 class Channel {
   public:
+    ~Channel();
+
     static std::shared_ptr<Channel> Create(std::string target, ChannelOptions options = {});
 
     const std::string& target() const;
@@ -64,9 +73,12 @@ class Channel {
 
   private:
     Channel(std::string target, ChannelOptions options);
+    std::shared_ptr<ChannelImpl> impl();
 
     std::string target_;
     ChannelOptions options_;
+    std::mutex impl_mutex_;
+    std::shared_ptr<ChannelImpl> impl_;
 };
 
 }  // namespace grpc_lite
