@@ -223,6 +223,7 @@ const Stream = struct {
     method_post: bool = false,
     content_type_grpc: bool = false,
     request_compression: ?Compression = .identity,
+    accepts_response_gzip: bool = false,
     response_compression: Compression = .identity,
     header_too_large: bool = false,
     request_too_large: bool = false,
@@ -622,6 +623,8 @@ fn onHeader(
         stream.content_type_grpc = std.mem.startsWith(u8, value, "application/grpc");
     } else if (std.mem.eql(u8, name, "grpc-encoding")) {
         stream.request_compression = Compression.parse(value);
+    } else if (std.mem.eql(u8, name, "grpc-accept-encoding")) {
+        stream.accepts_response_gzip = stream.accepts_response_gzip or acceptsEncoding(value, .gzip);
     } else if (isRequestMetadata(name)) {
         stream.request_metadata.appendDecoded(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     }
@@ -712,7 +715,10 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
         return;
     };
     defer response.deinit();
-    stream.response_compression = context.response_compression;
+    stream.response_compression = if (context.response_compression == .gzip and stream.accepts_response_gzip)
+        .gzip
+    else
+        .identity;
     for (context.trailing_metadata.items()) |entry| stream.trailing_metadata.append(entry.key, entry.value) catch {
         submitFailure(session, stream, .internal, "metadata allocation failed");
         return;
@@ -851,6 +857,14 @@ fn isValidMethodPath(path: []const u8) bool {
     return separator > 1 and separator + 1 < path.len and std.mem.indexOfScalarPos(u8, path, separator + 1, '/') == null;
 }
 
+fn acceptsEncoding(value: []const u8, encoding: Compression) bool {
+    var values = std.mem.splitScalar(u8, value, ',');
+    while (values.next()) |item| {
+        if (std.mem.eql(u8, std.mem.trim(u8, item, " \t"), encoding.name())) return true;
+    }
+    return false;
+}
+
 fn isRequestMetadata(name: []const u8) bool {
     if (name.len == 0 or name[0] == ':') return false;
     const protocol_headers = [_][]const u8{
@@ -933,6 +947,7 @@ test "raw HTTP/2 request routes unary data and ends with trailers" {
         fn handle(self: *@This(), allocator: std.mem.Allocator, context: *service.ServerContext, request: []const u8) !service.UnaryResponse {
             self.saw_metadata = std.mem.eql(u8, context.request_metadata.getFirst("x-test") orelse "", "value");
             try std.testing.expectEqualStrings("ping", request);
+            context.setResponseCompression(.gzip);
             try context.addInitialMetadata("x-initial", "yes");
             try context.addTrailingMetadata("x-trailing", "yes");
             return service.UnaryResponse.ok(allocator, "pong");
@@ -1052,4 +1067,12 @@ test "raw HTTP/2 request routes unary data and ends with trailers" {
     try std.testing.expectEqualSlices(u8, expected_response, response_data.items);
     try std.testing.expect(saw_final_trailers);
     try std.testing.expect(handler_context.saw_metadata);
+}
+
+test "response encoding list parsing" {
+    try std.testing.expect(acceptsEncoding("gzip", .gzip));
+    try std.testing.expect(acceptsEncoding("identity, gzip", .gzip));
+    try std.testing.expect(acceptsEncoding("identity,unknown,\tgzip ", .gzip));
+    try std.testing.expect(!acceptsEncoding("identity", .gzip));
+    try std.testing.expect(!acceptsEncoding("xgzip", .gzip));
 }
