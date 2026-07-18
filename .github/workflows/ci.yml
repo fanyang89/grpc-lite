@@ -22,7 +22,33 @@ jobs:
           submodules: true
 
       - name: Install mise tools
-        uses: jdx/mise-action@v3
+        uses: jdx/mise-action@v4
 
       - name: Check
         run: mise run check
+
+  official-interop:
+    runs-on: ubuntu-24.04
+    needs: check
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install mise tools
+        uses: jdx/mise-action@v4
+
+      - name: Run official unary interop
+        run: mise run interop-official
+
+      - name: Run official HTTP/2 framing report
+        run: mise run interop-http2
+
+      - name: Upload HTTP/2 framing report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: official-http2-framing-report
+          path: .zig-cache/official/http2-framing.log
+          if-no-files-found: warn
