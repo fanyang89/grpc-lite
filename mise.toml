@@ -72,6 +72,10 @@ run = "tests/official/run_unary.sh"
 description = "Run the official gRPC HTTP/2 framing suite"
 run = "tests/official/run_http2.sh"
 
+[tasks.interop-http2-edge]
+description = "Run official gRPC HTTP/2 edge-case server tests"
+run = "tests/official/run_http2_edge.sh"
+
 [tasks.check]
 description = "Run formatting and tests"
 run = "mise run fmt-check && mise run test && mise run interop"

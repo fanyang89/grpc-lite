@@ -46,6 +46,20 @@ pub fn main(init: std.process.Init) !void {
         try expectUnimplemented(init.gpa, &channel, "/grpc.testing.TestService/UnimplementedCall");
     } else if (std.mem.eql(u8, config.test_case, "unimplemented_service")) {
         try expectUnimplemented(init.gpa, &channel, "/grpc.testing.UnimplementedService/UnimplementedCall");
+    } else if (std.mem.eql(u8, config.test_case, "goaway")) {
+        try goaway(init, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "rst_after_header") or
+        std.mem.eql(u8, config.test_case, "rst_after_data") or
+        std.mem.eql(u8, config.test_case, "rst_during_data"))
+    {
+        try expectLargeUnaryFailure(init.gpa, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "ping") or
+        std.mem.eql(u8, config.test_case, "data_frame_padding") or
+        std.mem.eql(u8, config.test_case, "no_df_padding_sanity_test"))
+    {
+        try largeUnary(init.gpa, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "max_streams")) {
+        try maxStreams(init.gpa, &channel);
     } else {
         std.debug.print("unsupported test case: {s}\n", .{config.test_case});
         return error.UnsupportedTestCase;
@@ -69,6 +83,12 @@ fn emptyUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
 }
 
 fn largeUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
+    var result = try callLargeUnary(allocator, channel);
+    defer result.deinit();
+    try expectLargeResponse(allocator, &result);
+}
+
+fn callLargeUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !grpc.CallResult {
     const body = try allocator.alloc(u8, large_request_size);
     defer allocator.free(body);
     @memset(body, 0);
@@ -80,14 +100,54 @@ fn largeUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
             .body = body,
         },
     };
-    var result = try callMessage(
+    return callMessageWithOptions(
         allocator,
         channel,
         "/grpc.testing.TestService/UnaryCall",
         request,
+        .{ .timeout_ns = 60 * std.time.ns_per_s },
     );
+}
+
+fn expectLargeUnaryFailure(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
+    var result = callLargeUnary(allocator, channel) catch return;
     defer result.deinit();
-    try expectLargeResponse(allocator, &result);
+    if (result.status.isOk()) return error.ExpectedRpcFailure;
+}
+
+fn goaway(init: std.process.Init, channel: *grpc.Channel) !void {
+    try largeUnary(init.gpa, channel);
+    try std.Io.sleep(init.io, .fromSeconds(1), .awake);
+    try largeUnary(init.gpa, channel);
+}
+
+fn maxStreams(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
+    try largeUnary(allocator, channel);
+
+    const Worker = struct {
+        channel: *grpc.Channel,
+        succeeded: bool = false,
+
+        fn run(self: *@This()) void {
+            largeUnary(std.heap.page_allocator, self.channel) catch return;
+            self.succeeded = true;
+        }
+    };
+    var workers: [10]Worker = undefined;
+    var threads: [10]std.Thread = undefined;
+    var spawned: usize = 0;
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .channel = channel };
+        thread.* = std.Thread.spawn(.{}, Worker.run, .{worker}) catch |err| {
+            for (threads[0..spawned]) |spawned_thread| spawned_thread.join();
+            return err;
+        };
+        spawned += 1;
+    }
+    for (&threads) |thread| thread.join();
+    for (&workers) |worker| {
+        if (!worker.succeeded) return error.ConcurrentRpcFailed;
+    }
 }
 
 fn clientCompressedUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {

@@ -45,10 +45,15 @@ jobs:
       - name: Run official HTTP/2 framing report
         run: mise run interop-http2
 
-      - name: Upload HTTP/2 framing report
+      - name: Run official HTTP/2 edge cases
+        run: mise run interop-http2-edge
+
+      - name: Upload HTTP/2 reports
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: official-http2-framing-report
-          path: .zig-cache/official/http2-framing.log
+          name: official-http2-reports
+          path: |
+            .zig-cache/official/http2-framing.log
+            .zig-cache/official/http2-edge-server.log
           if-no-files-found: warn

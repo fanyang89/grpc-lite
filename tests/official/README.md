@@ -6,6 +6,7 @@ submodule. Run the suites from the repository root:
 ```bash
 mise run interop-official
 mise run interop-http2
+mise run interop-http2-edge
 ```
 
 ## Current Matrix
@@ -18,7 +19,7 @@ mise run interop-http2
 | gRPC HTTP/2 framing | `TestSoonShortPreface`, `TestSoonUnknownFrameType`, `TestSoonAllSettingsFramesAcked` | Pass |
 | gRPC HTTP/2 framing | `TestSoonClientShortSettings`, `TestSoonClientPrefaceWithStreamId`, `TestSoonSmallMaxFrameSize` | Reported non-fatal failures by the upstream `TestSoon` suite |
 | gRPC HTTP/2 TLS framing | TLS application protocol, version, and cipher suite cases | Skipped; TLS is out of scope |
-| gRPC HTTP/2 edge-case server | reset, GOAWAY, ping, max-stream, and DATA padding cases | Not yet integrated |
+| gRPC HTTP/2 edge-case server | reset, GOAWAY, ping, max-stream, and DATA padding cases | Pass |
 | grpc-go client to grpc-lite server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
 
 The HTTP/2 framing tool deliberately treats every `TestSoon*` failure as non-fatal and
@@ -26,3 +27,8 @@ returns success unless a non-`TestSoon` case fails. `run_http2.sh` preserves tha
 exit behavior and stores the complete report in
 `.zig-cache/official/http2-framing.log`; completion must not be presented as all cases
 passing.
+
+The edge-case server sources and container image are pinned to the same grpc commit.
+The upstream server still contains Python 2 idioms, so the harness applies
+`http2-test-python3.patch`, which only updates Python compatibility without changing test
+behavior. Docker is required for this suite.
