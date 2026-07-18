@@ -5,16 +5,20 @@ const manifest = @import("build.zig.zon");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const target_triple = target.result.zigTriple(b.allocator) catch @panic("out of memory");
-    const native_root = b.fmt(".zig-cache/native/{s}/{s}", .{ target_triple, @tagName(optimize) });
-    const libuv_build_dir = b.fmt("{s}/libuv", .{native_root});
-    const nghttp2_build_dir = b.fmt("{s}/nghttp2", .{native_root});
+    const libuv_dependency = b.dependency("libuv", .{});
+    const nghttp2_dependency = b.dependency("nghttp2", .{});
     const protobuf_dependency = b.dependency("protobuf", .{
         .target = target,
         .optimize = optimize,
     });
     const grpc_lite_options = b.addOptions();
     grpc_lite_options.addOption([]const u8, "version", manifest.version);
+    const native = addNativeDependencies(
+        b,
+        libuv_dependency.path(""),
+        nghttp2_dependency.path(""),
+        optimize,
+    );
 
     const generate_proto = protobuf_build.RunProtocStep.create(
         protobuf_dependency.builder,
@@ -68,11 +72,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     grpc_lite.addOptions("grpc_lite_options", grpc_lite_options);
-    grpc_lite.addIncludePath(b.path("third_party/libuv/include"));
-    grpc_lite.addIncludePath(b.path("third_party/nghttp2/lib/includes"));
-    grpc_lite.addIncludePath(b.path(b.fmt("{s}/lib/includes", .{nghttp2_build_dir})));
-    grpc_lite.addObjectFile(b.path(b.fmt("{s}/libuv.a", .{libuv_build_dir})));
-    grpc_lite.addObjectFile(b.path(b.fmt("{s}/lib/libnghttp2.a", .{nghttp2_build_dir})));
+    grpc_lite.addIncludePath(libuv_dependency.path("include"));
+    grpc_lite.addIncludePath(nghttp2_dependency.path("lib/includes"));
+    grpc_lite.addIncludePath(native.nghttp2_include);
+    grpc_lite.addObjectFile(native.libuv_archive);
+    grpc_lite.addObjectFile(native.nghttp2_archive);
 
     if (target.result.os.tag == .linux) {
         grpc_lite.linkSystemLibrary("pthread", .{});
@@ -90,19 +94,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const native_deps = addNativeDependencies(b, libuv_build_dir, nghttp2_build_dir, optimize);
-
     const library = b.addLibrary(.{
         .name = "grpc_lite",
         .root_module = grpc_lite,
     });
-    library.step.dependOn(native_deps);
     b.installArtifact(library);
 
     const unit_tests = b.addTest(.{
         .root_module = grpc_lite,
     });
-    unit_tests.step.dependOn(native_deps);
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const public_api_tests = b.addTest(.{
@@ -114,7 +114,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
         }),
     });
-    public_api_tests.step.dependOn(native_deps);
     const run_public_api_tests = b.addRunArtifact(public_api_tests);
 
     const protobuf_tests = b.addTest(.{
@@ -143,7 +142,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     protobuf_adapter_tests.step.dependOn(&generate_proto.step);
-    protobuf_adapter_tests.step.dependOn(native_deps);
     const run_protobuf_adapter_tests = b.addRunArtifact(protobuf_adapter_tests);
 
     const official_proto_tests = b.addTest(.{
@@ -170,7 +168,6 @@ pub fn build(b: *std.Build) void {
         "grpc-lite-echo-server",
         "examples/echo_server.zig",
         grpc_lite,
-        native_deps,
     );
     echo_server.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
     echo_server.root_module.addImport("demo_proto", demo_proto);
@@ -180,7 +177,6 @@ pub fn build(b: *std.Build) void {
         "grpc-lite-echo-client",
         "examples/echo_client.zig",
         grpc_lite,
-        native_deps,
     );
     echo_client.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
     echo_client.root_module.addImport("demo_proto", demo_proto);
@@ -193,7 +189,6 @@ pub fn build(b: *std.Build) void {
         "grpc-lite-interop-server",
         "tests/official/interop_server.zig",
         grpc_lite,
-        native_deps,
     );
     interop_server.root_module.addImport("grpc_testing", interop_proto);
     interop_server.step.dependOn(&generate_interop_proto.step);
@@ -202,7 +197,6 @@ pub fn build(b: *std.Build) void {
         "grpc-lite-interop-client",
         "tests/official/interop_client.zig",
         grpc_lite,
-        native_deps,
     );
     interop_client.root_module.addImport("grpc_testing", interop_proto);
     interop_client.step.dependOn(&generate_interop_proto.step);
@@ -215,7 +209,6 @@ fn addExample(
     name: []const u8,
     source: []const u8,
     grpc_lite: *std.Build.Module,
-    native_deps: *std.Build.Step,
 ) *std.Build.Step.Compile {
     const module = b.createModule(.{
         .root_source_file = b.path(source),
@@ -227,17 +220,21 @@ fn addExample(
         .name = name,
         .root_module = module,
     });
-    executable.step.dependOn(native_deps);
     return executable;
 }
 
+const NativeDependencies = struct {
+    libuv_archive: std.Build.LazyPath,
+    nghttp2_archive: std.Build.LazyPath,
+    nghttp2_include: std.Build.LazyPath,
+};
+
 fn addNativeDependencies(
     b: *std.Build,
-    libuv_build_dir: []const u8,
-    nghttp2_build_dir: []const u8,
+    libuv_source_dir: std.Build.LazyPath,
+    nghttp2_source_dir: std.Build.LazyPath,
     optimize: std.builtin.OptimizeMode,
-) *std.Build.Step {
-    const native_deps = b.step("native-deps", "Build native dependencies");
+) NativeDependencies {
     const cc = b.fmt("{s} cc", .{b.graph.zig_exe});
     const cmake_build_type = switch (optimize) {
         .Debug => "Debug",
@@ -245,12 +242,11 @@ fn addNativeDependencies(
         .ReleaseFast, .ReleaseSmall => "Release",
     };
 
-    const configure_libuv = b.addSystemCommand(&.{
-        "cmake",
-        "-S",
-        "third_party/libuv",
-        "-B",
-        libuv_build_dir,
+    const configure_libuv = b.addSystemCommand(&.{ "cmake", "-S" });
+    configure_libuv.addDirectoryArg(libuv_source_dir);
+    configure_libuv.addArg("-B");
+    const libuv_build_dir = configure_libuv.addOutputDirectoryArg("libuv");
+    configure_libuv.addArgs(&.{
         "-G",
         "Ninja",
         b.fmt("-DCMAKE_BUILD_TYPE={s}", .{cmake_build_type}),
@@ -262,19 +258,18 @@ fn addNativeDependencies(
     });
     configure_libuv.setEnvironmentVariable("CC", cc);
 
-    const build_libuv = b.addSystemCommand(&.{
-        "cmake",
-        "--build",
-        libuv_build_dir,
-    });
-    build_libuv.step.dependOn(&configure_libuv.step);
+    const build_libuv = b.addSystemCommand(&.{ "cmake", "--build" });
+    build_libuv.addDirectoryArg(libuv_build_dir);
+    const copy_libuv = b.addSystemCommand(&.{ "cmake", "-E", "copy" });
+    copy_libuv.addFileArg(libuv_build_dir.path(b, "libuv.a"));
+    const libuv_archive = copy_libuv.addOutputFileArg("libuv.a");
+    copy_libuv.step.dependOn(&build_libuv.step);
 
-    const configure_nghttp2 = b.addSystemCommand(&.{
-        "cmake",
-        "-S",
-        "third_party/nghttp2",
-        "-B",
-        nghttp2_build_dir,
+    const configure_nghttp2 = b.addSystemCommand(&.{ "cmake", "-S" });
+    configure_nghttp2.addDirectoryArg(nghttp2_source_dir);
+    configure_nghttp2.addArg("-B");
+    const nghttp2_build_dir = configure_nghttp2.addOutputDirectoryArg("nghttp2");
+    configure_nghttp2.addArgs(&.{
         "-G",
         "Ninja",
         b.fmt("-DCMAKE_BUILD_TYPE={s}", .{cmake_build_type}),
@@ -290,14 +285,16 @@ fn addNativeDependencies(
     });
     configure_nghttp2.setEnvironmentVariable("CC", cc);
 
-    const build_nghttp2 = b.addSystemCommand(&.{
-        "cmake",
-        "--build",
-        nghttp2_build_dir,
-    });
-    build_nghttp2.step.dependOn(&configure_nghttp2.step);
+    const build_nghttp2 = b.addSystemCommand(&.{ "cmake", "--build" });
+    build_nghttp2.addDirectoryArg(nghttp2_build_dir);
+    const copy_nghttp2 = b.addSystemCommand(&.{ "cmake", "-E", "copy" });
+    copy_nghttp2.addFileArg(nghttp2_build_dir.path(b, "lib/libnghttp2.a"));
+    const nghttp2_archive = copy_nghttp2.addOutputFileArg("libnghttp2.a");
+    copy_nghttp2.step.dependOn(&build_nghttp2.step);
 
-    native_deps.dependOn(&build_libuv.step);
-    native_deps.dependOn(&build_nghttp2.step);
-    return native_deps;
+    return .{
+        .libuv_archive = libuv_archive,
+        .nghttp2_archive = nghttp2_archive,
+        .nghttp2_include = nghttp2_build_dir.path(b, "lib/includes"),
+    };
 }
