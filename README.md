@@ -54,6 +54,9 @@ workflow runs extended official unary soak tests.
 
 ## Unary Client
 
+`Channel.callUnary` supports concurrent callers. `Channel.shutdown` may run while calls
+are active; join those caller threads before giving `Channel.deinit` exclusive access.
+
 ```zig
 const std = @import("std");
 const grpc = @import("grpc_lite");
