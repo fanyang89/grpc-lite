@@ -114,6 +114,15 @@ pub const UnaryHandler = struct {
     }
 };
 
+fn testUnaryResponseAllocations(allocator: std.mem.Allocator) !void {
+    var response = try UnaryResponse.init(
+        allocator,
+        status.Status.init(.internal, "failure"),
+        "payload",
+    );
+    defer response.deinit();
+}
+
 test "typed unary handler owns its response" {
     const Echo = struct {
         prefix: []const u8,
@@ -142,14 +151,28 @@ test "typed unary handler owns its response" {
     try std.testing.expectEqualStrings("echo", context.trailing_metadata.getFirst("x-handler").?);
 }
 
-test "unary response owns its status message" {
+test "unary response owns its status message and payload" {
     const message = try std.testing.allocator.dupe(u8, "dynamic status");
-    var response = try UnaryResponse.fail(
+    defer std.testing.allocator.free(message);
+    const payload = try std.testing.allocator.dupe(u8, "dynamic payload");
+    defer std.testing.allocator.free(payload);
+    var response = try UnaryResponse.init(
         std.testing.allocator,
         status.Status.init(.unknown, message),
+        payload,
     );
-    std.testing.allocator.free(message);
     defer response.deinit();
+    @memset(message, 'x');
+    @memset(payload, 'y');
 
     try std.testing.expectEqualStrings("dynamic status", response.status.message);
+    try std.testing.expectEqualStrings("dynamic payload", response.payload);
+}
+
+test "unary response handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testUnaryResponseAllocations,
+        .{},
+    );
 }

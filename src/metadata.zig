@@ -82,14 +82,50 @@ pub fn encodeValue(allocator: std.mem.Allocator, key: []const u8, value: []const
     return encoded;
 }
 
+fn testMetadataAllocations(allocator: std.mem.Allocator) !void {
+    var metadata = Metadata.init(allocator);
+    defer metadata.deinit();
+    try metadata.append("x-request-id", "value");
+    try metadata.appendDecoded("trace-bin", "qw==");
+
+    const encoded = try encodeValue(allocator, "trace-bin", "binary");
+    defer allocator.free(encoded);
+}
+
 test "metadata owns entries and preserves duplicates" {
     var metadata = Metadata.init(std.testing.allocator);
     defer metadata.deinit();
 
-    try metadata.append("x-request-id", "one");
+    var source_key = [_]u8{ 'x', '-', 'r', 'e', 'q', 'u', 'e', 's', 't', '-', 'i', 'd' };
+    var source_value = [_]u8{ 'o', 'n', 'e' };
+    try metadata.append(&source_key, &source_value);
     try metadata.append("x-request-id", "two");
+    @memset(&source_key, 'x');
+    @memset(&source_value, 'y');
     try std.testing.expectEqual(@as(usize, 2), metadata.items().len);
+    try std.testing.expectEqualStrings("x-request-id", metadata.items()[0].key);
     try std.testing.expectEqualStrings("one", metadata.getFirst("x-request-id").?);
+}
+
+test "metadata append is atomic at every allocation failure" {
+    for (0..3) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        var metadata = Metadata.init(failing.allocator());
+        defer metadata.deinit();
+
+        try std.testing.expectError(error.OutOfMemory, metadata.append("x-key", "value"));
+        try std.testing.expectEqual(@as(usize, 0), metadata.items().len);
+    }
+}
+
+test "metadata handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testMetadataAllocations,
+        .{},
+    );
 }
 
 test "metadata rejects invalid keys" {

@@ -48,3 +48,10 @@ test "status code mapping covers the gRPC range" {
     try std.testing.expect(Status.ok.isOk());
     try std.testing.expect(!Status.init(.internal, "failed").isOk());
 }
+
+test "status message is borrowed" {
+    var message = [_]u8{ 'd', 'y', 'n', 'a', 'm', 'i', 'c' };
+    const value = Status.init(.unknown, &message);
+    message[0] = 'D';
+    try std.testing.expectEqualStrings("Dynamic", value.message);
+}
