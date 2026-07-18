@@ -258,59 +258,40 @@ fn addNativeDependencies(
         .ReleaseFast, .ReleaseSmall => "Release",
     };
 
-    const configure_libuv = b.addSystemCommand(&.{ "cmake", "-S" });
-    configure_libuv.addDirectoryArg(libuv_source_dir);
-    configure_libuv.addArg("-B");
-    const libuv_build_dir = configure_libuv.addOutputDirectoryArg("libuv");
-    configure_libuv.addArgs(&.{
-        "-G",
-        "Ninja",
-        b.fmt("-DCMAKE_BUILD_TYPE={s}", .{cmake_build_type}),
-        "-DCMAKE_C_FLAGS=-fno-sanitize=undefined",
-        "-DBUILD_SHARED_LIBS=OFF",
-        "-DLIBUV_BUILD_SHARED=OFF",
-        "-DLIBUV_BUILD_TESTS=OFF",
-        "-DLIBUV_BUILD_BENCH=OFF",
-    });
-    configure_libuv.setEnvironmentVariable("CC", cc);
-
-    const build_libuv = b.addSystemCommand(&.{ "cmake", "--build" });
-    build_libuv.addDirectoryArg(libuv_build_dir);
-    const copy_libuv = b.addSystemCommand(&.{ "cmake", "-E", "copy" });
-    copy_libuv.addFileArg(libuv_build_dir.path(b, "libuv.a"));
-    const libuv_archive = copy_libuv.addOutputFileArg("libuv.a");
-    copy_libuv.step.dependOn(&build_libuv.step);
-
-    const configure_nghttp2 = b.addSystemCommand(&.{ "cmake", "-S" });
-    configure_nghttp2.addDirectoryArg(nghttp2_source_dir);
-    configure_nghttp2.addArg("-B");
-    const nghttp2_build_dir = configure_nghttp2.addOutputDirectoryArg("nghttp2");
-    configure_nghttp2.addArgs(&.{
-        "-G",
-        "Ninja",
-        b.fmt("-DCMAKE_BUILD_TYPE={s}", .{cmake_build_type}),
-        "-DCMAKE_C_FLAGS=-fno-sanitize=undefined",
-        "-DENABLE_LIB_ONLY=ON",
-        "-DENABLE_APP=OFF",
-        "-DENABLE_EXAMPLES=OFF",
-        "-DENABLE_HPACK_TOOLS=OFF",
-        "-DENABLE_DOC=OFF",
-        "-DBUILD_TESTING=OFF",
-        "-DBUILD_SHARED_LIBS=OFF",
-        "-DBUILD_STATIC_LIBS=ON",
-    });
-    configure_nghttp2.setEnvironmentVariable("CC", cc);
-
-    const build_nghttp2 = b.addSystemCommand(&.{ "cmake", "--build" });
-    build_nghttp2.addDirectoryArg(nghttp2_build_dir);
-    const copy_nghttp2 = b.addSystemCommand(&.{ "cmake", "-E", "copy" });
-    copy_nghttp2.addFileArg(nghttp2_build_dir.path(b, "lib/libnghttp2.a"));
-    const nghttp2_archive = copy_nghttp2.addOutputFileArg("libnghttp2.a");
-    copy_nghttp2.step.dependOn(&build_nghttp2.step);
+    const build_libuv = addNativeBuild(
+        b,
+        "libuv",
+        libuv_source_dir,
+        cmake_build_type,
+        cc,
+    );
+    const build_nghttp2 = addNativeBuild(
+        b,
+        "nghttp2",
+        nghttp2_source_dir,
+        cmake_build_type,
+        cc,
+    );
 
     return .{
-        .libuv_archive = libuv_archive,
-        .nghttp2_archive = nghttp2_archive,
-        .nghttp2_include = nghttp2_build_dir.path(b, "lib/includes"),
+        .libuv_archive = build_libuv.path(b, "libuv.a"),
+        .nghttp2_archive = build_nghttp2.path(b, "lib/libnghttp2.a"),
+        .nghttp2_include = build_nghttp2.path(b, "lib/includes"),
     };
+}
+
+fn addNativeBuild(
+    b: *std.Build,
+    name: []const u8,
+    source_dir: std.Build.LazyPath,
+    cmake_build_type: []const u8,
+    cc: []const u8,
+) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{"bash"});
+    run.addFileArg(b.path("tools/build_native.sh"));
+    run.addArg(name);
+    run.addDirectoryArg(source_dir);
+    const output = run.addOutputDirectoryArg(name);
+    run.addArgs(&.{ cmake_build_type, cc });
+    return output;
 }
