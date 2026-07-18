@@ -1,5 +1,4 @@
 const std = @import("std");
-const protobuf_build = @import("protobuf");
 const manifest = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
@@ -7,10 +6,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const libuv_dependency = b.dependency("libuv", .{});
     const nghttp2_dependency = b.dependency("nghttp2", .{});
-    const protobuf_dependency = b.dependency("protobuf", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const enable_protobuf = b.option(
+        bool,
+        "protobuf",
+        "Enable the typed protobuf adapter, examples, and tests",
+    ) orelse (b.pkg_hash.len == 0);
     const grpc_lite_options = b.addOptions();
     grpc_lite_options.addOption([]const u8, "version", manifest.version);
     const native = addNativeDependencies(
@@ -20,6 +20,77 @@ pub fn build(b: *std.Build) void {
         optimize,
     );
 
+    const grpc_lite = b.addModule("grpc_lite", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    grpc_lite.addOptions("grpc_lite_options", grpc_lite_options);
+    grpc_lite.addIncludePath(libuv_dependency.path("include"));
+    grpc_lite.addIncludePath(nghttp2_dependency.path("lib/includes"));
+    grpc_lite.addIncludePath(native.nghttp2_include);
+    grpc_lite.addObjectFile(native.libuv_archive);
+    grpc_lite.addObjectFile(native.nghttp2_archive);
+
+    if (target.result.os.tag == .linux) {
+        grpc_lite.linkSystemLibrary("pthread", .{});
+        grpc_lite.linkSystemLibrary("dl", .{});
+        grpc_lite.linkSystemLibrary("rt", .{});
+    }
+
+    const library = b.addLibrary(.{
+        .name = "grpc_lite",
+        .root_module = grpc_lite,
+    });
+    b.installArtifact(library);
+
+    const unit_tests = b.addTest(.{
+        .root_module = grpc_lite,
+    });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    const public_api_tests = b.addTest(.{
+        .name = "public-api",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/public_api_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
+        }),
+    });
+    const run_public_api_tests = b.addRunArtifact(public_api_tests);
+
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_public_api_tests.step);
+
+    if (!enable_protobuf) return;
+    const protobuf_build = b.lazyImport(@This(), "protobuf") orelse return;
+    const protobuf_dependency = b.lazyDependency("protobuf", .{
+        .target = target,
+        .optimize = optimize,
+    }) orelse return;
+    addProtobufSupport(
+        b,
+        protobuf_build,
+        protobuf_dependency,
+        grpc_lite,
+        test_step,
+        target,
+        optimize,
+    );
+}
+
+fn addProtobufSupport(
+    b: *std.Build,
+    comptime protobuf_build: type,
+    protobuf_dependency: *std.Build.Dependency,
+    grpc_lite: *std.Build.Module,
+    test_step: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
     const generate_proto = protobuf_build.RunProtocStep.create(
         protobuf_dependency.builder,
         target,
@@ -64,26 +135,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "protobuf", .module = protobuf }},
     });
-
-    const grpc_lite = b.addModule("grpc_lite", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    grpc_lite.addOptions("grpc_lite_options", grpc_lite_options);
-    grpc_lite.addIncludePath(libuv_dependency.path("include"));
-    grpc_lite.addIncludePath(nghttp2_dependency.path("lib/includes"));
-    grpc_lite.addIncludePath(native.nghttp2_include);
-    grpc_lite.addObjectFile(native.libuv_archive);
-    grpc_lite.addObjectFile(native.nghttp2_archive);
-
-    if (target.result.os.tag == .linux) {
-        grpc_lite.linkSystemLibrary("pthread", .{});
-        grpc_lite.linkSystemLibrary("dl", .{});
-        grpc_lite.linkSystemLibrary("rt", .{});
-    }
-
     const grpc_lite_protobuf = b.addModule("grpc_lite_protobuf", .{
         .root_source_file = b.path("src/protobuf_adapter.zig"),
         .target = target,
@@ -93,28 +144,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "protobuf", .module = protobuf },
         },
     });
-
-    const library = b.addLibrary(.{
-        .name = "grpc_lite",
-        .root_module = grpc_lite,
-    });
-    b.installArtifact(library);
-
-    const unit_tests = b.addTest(.{
-        .root_module = grpc_lite,
-    });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-
-    const public_api_tests = b.addTest(.{
-        .name = "public-api",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/public_api_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
-        }),
-    });
-    const run_public_api_tests = b.addRunArtifact(public_api_tests);
 
     const protobuf_tests = b.addTest(.{
         .name = "protobuf-integration",
@@ -156,28 +185,15 @@ pub fn build(b: *std.Build) void {
     official_proto_tests.step.dependOn(&generate_interop_proto.step);
     const run_official_proto_tests = b.addRunArtifact(official_proto_tests);
 
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
-    test_step.dependOn(&run_public_api_tests.step);
     test_step.dependOn(&run_protobuf_tests.step);
     test_step.dependOn(&run_protobuf_adapter_tests.step);
     test_step.dependOn(&run_official_proto_tests.step);
 
-    const echo_server = addExample(
-        b,
-        "grpc-lite-echo-server",
-        "examples/echo_server.zig",
-        grpc_lite,
-    );
+    const echo_server = addExample(b, "grpc-lite-echo-server", "examples/echo_server.zig", grpc_lite);
     echo_server.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
     echo_server.root_module.addImport("demo_proto", demo_proto);
     echo_server.step.dependOn(&generate_proto.step);
-    const echo_client = addExample(
-        b,
-        "grpc-lite-echo-client",
-        "examples/echo_client.zig",
-        grpc_lite,
-    );
+    const echo_client = addExample(b, "grpc-lite-echo-client", "examples/echo_client.zig", grpc_lite);
     echo_client.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
     echo_client.root_module.addImport("demo_proto", demo_proto);
     echo_client.step.dependOn(&generate_proto.step);

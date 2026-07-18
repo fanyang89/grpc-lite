@@ -15,6 +15,7 @@
         .protobuf = .{
             .url = "https://github.com/Arwalk/zig-protobuf/archive/1f6cb06156b3ff4f52f98bc14f829c0b8393a6fc.tar.gz",
             .hash = "protobuf-5.0.0-0e82avKUKAAVwTWJzTIEZ14Fu0zC11_lElR8tE6H__y1",
+            .lazy = true,
         },
     },
     .paths = .{
