@@ -1,5 +1,9 @@
 const std = @import("std");
+const demo = @import("demo_proto");
 const grpc = @import("grpc_lite");
+const grpc_pb = @import("grpc_lite_protobuf");
+
+const EchoApi = demo.EchoService(void, error{});
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -8,17 +12,18 @@ pub fn main(init: std.process.Init) !void {
 
     var channel = try grpc.Channel.init(init.gpa, target, .{});
     defer channel.deinit();
-    var result = try channel.callUnary(
+    var client = grpc_pb.ServiceClient(EchoApi).init(&channel);
+    var result = try client.callUnary(
         init.gpa,
-        "/demo.EchoService/Echo",
-        request,
+        "Echo",
+        demo.EchoRequest{ .message = request },
         .{ .timeout_ns = 5 * std.time.ns_per_s },
     );
     defer result.deinit();
 
-    if (!result.status.isOk()) {
-        std.debug.print("RPC failed: {t}: {s}\n", .{ result.status.code, result.status.message });
+    if (!result.raw.status.isOk()) {
+        std.debug.print("RPC failed: {t}: {s}\n", .{ result.raw.status.code, result.raw.status.message });
         return error.RpcFailed;
     }
-    std.debug.print("response: {s}\n", .{result.payload});
+    std.debug.print("response: {s}\n", .{result.response.?.message});
 }

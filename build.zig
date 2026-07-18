@@ -112,6 +112,9 @@ pub fn build(b: *std.Build) void {
         grpc_lite,
         native_deps,
     );
+    echo_server.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
+    echo_server.root_module.addImport("demo_proto", demo_proto);
+    echo_server.step.dependOn(&generate_proto.step);
     const echo_client = addExample(
         b,
         "grpc-lite-echo-client",
@@ -119,6 +122,9 @@ pub fn build(b: *std.Build) void {
         grpc_lite,
         native_deps,
     );
+    echo_client.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
+    echo_client.root_module.addImport("demo_proto", demo_proto);
+    echo_client.step.dependOn(&generate_proto.step);
     b.installArtifact(echo_server);
     b.installArtifact(echo_client);
 }
