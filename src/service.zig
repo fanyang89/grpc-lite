@@ -1,5 +1,6 @@
 const std = @import("std");
 const Compression = @import("compression.zig").Compression;
+const deadline = @import("deadline.zig");
 const metadata = @import("metadata.zig");
 const status = @import("status.zig");
 
@@ -7,6 +8,7 @@ pub const ServerContext = struct {
     allocator: std.mem.Allocator,
     request_compression: Compression = .identity,
     response_compression: Compression = .identity,
+    deadline: ?deadline.Deadline = null,
     request_metadata: metadata.Metadata,
     initial_metadata: metadata.Metadata,
     trailing_metadata: metadata.Metadata,
@@ -37,6 +39,21 @@ pub const ServerContext = struct {
 
     pub fn setResponseCompression(self: *ServerContext, response_compression: Compression) void {
         self.response_compression = response_compression;
+    }
+
+    /// Returns whether the client supplied a deadline for this call.
+    pub fn hasDeadline(self: *const ServerContext) bool {
+        return self.deadline != null;
+    }
+
+    /// Returns the remaining monotonic duration, saturated at zero.
+    pub fn remainingTimeNs(self: *const ServerContext) ?u64 {
+        return if (self.deadline) |value| value.remainingNs() else null;
+    }
+
+    /// Returns whether the call deadline has elapsed.
+    pub fn isDeadlineExceeded(self: *const ServerContext) bool {
+        return if (self.deadline) |value| value.isExceeded() else false;
     }
 };
 
@@ -149,6 +166,31 @@ test "typed unary handler owns its response" {
 
     try std.testing.expectEqualStrings("echo:hello", response.payload);
     try std.testing.expectEqualStrings("echo", context.trailing_metadata.getFirst("x-handler").?);
+}
+
+test "server context exposes an optional live deadline" {
+    const FakeClock = struct {
+        now_ns: u64,
+
+        fn now(context: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.now_ns;
+        }
+    };
+
+    var context = ServerContext.init(std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expect(!context.hasDeadline());
+    try std.testing.expectEqual(@as(?u64, null), context.remainingTimeNs());
+    try std.testing.expect(!context.isDeadlineExceeded());
+
+    var fake = FakeClock{ .now_ns = 100 };
+    const clock = deadline.Clock{ .context = &fake, .now_fn = FakeClock.now };
+    context.deadline = deadline.Deadline.initAfter(clock, 50);
+    try std.testing.expect(context.hasDeadline());
+    try std.testing.expectEqual(@as(?u64, 50), context.remainingTimeNs());
+    fake.now_ns = 150;
+    try std.testing.expect(context.isDeadlineExceeded());
 }
 
 test "unary response owns its status message and payload" {

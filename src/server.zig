@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig").api;
 const Compression = @import("compression.zig").Compression;
+const deadline = @import("deadline.zig");
 const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
@@ -181,7 +182,10 @@ const Impl = struct {
     listener: c.uv_tcp_t = undefined,
     shutdown_async: c.uv_async_t = undefined,
     drain_timer: c.uv_timer_t = undefined,
+    deadline_timer: c.uv_timer_t = undefined,
+    deadline_timer_initialized: bool = false,
     drain_started: bool = false,
+    clock: deadline.Clock = .{ .now_fn = uvNow },
     local_host: [15]u8 = undefined,
     local_host_len: usize = 0,
     local_port: u16 = 0,
@@ -225,6 +229,9 @@ const Stream = struct {
     request_compression: ?Compression = .identity,
     accepts_response_gzip: bool = false,
     response_compression: Compression = .identity,
+    timeout_seen: bool = false,
+    timeout_invalid: bool = false,
+    deadline: ?deadline.Deadline = null,
     header_too_large: bool = false,
     request_too_large: bool = false,
     responded: bool = false,
@@ -352,9 +359,11 @@ fn setupLoop(server: *Impl) StartupError!void {
 
     var listener_initialized = false;
     var async_initialized = false;
-    var timer_initialized = false;
+    var drain_timer_initialized = false;
+    var deadline_timer_initialized = false;
     errdefer {
-        if (timer_initialized) c.uv_close(@ptrCast(&server.drain_timer), null);
+        if (deadline_timer_initialized) c.uv_close(@ptrCast(&server.deadline_timer), null);
+        if (drain_timer_initialized) c.uv_close(@ptrCast(&server.drain_timer), null);
         if (async_initialized) c.uv_close(@ptrCast(&server.shutdown_async), null);
         if (listener_initialized) c.uv_close(@ptrCast(&server.listener), null);
         _ = c.uv_run(&server.loop, c.UV_RUN_DEFAULT);
@@ -384,8 +393,13 @@ fn setupLoop(server: *Impl) StartupError!void {
     server.shutdown_async.data = server;
 
     if (c.uv_timer_init(&server.loop, &server.drain_timer) < 0) return error.TimerInitializationFailed;
-    timer_initialized = true;
+    drain_timer_initialized = true;
     server.drain_timer.data = server;
+
+    if (c.uv_timer_init(&server.loop, &server.deadline_timer) < 0) return error.TimerInitializationFailed;
+    deadline_timer_initialized = true;
+    server.deadline_timer_initialized = true;
+    server.deadline_timer.data = server;
 }
 
 fn onConnection(listener: ?*c.uv_stream_t, connection_status: c_int) callconv(.c) void {
@@ -561,6 +575,11 @@ fn stopImmediately(server: *Impl) void {
 }
 
 fn closeControlHandles(server: *Impl) void {
+    if (server.deadline_timer_initialized) {
+        server.deadline_timer_initialized = false;
+        _ = c.uv_timer_stop(&server.deadline_timer);
+        if (c.uv_is_closing(@ptrCast(&server.deadline_timer)) == 0) c.uv_close(@ptrCast(&server.deadline_timer), null);
+    }
     _ = c.uv_timer_stop(&server.drain_timer);
     if (c.uv_is_closing(@ptrCast(&server.drain_timer)) == 0) c.uv_close(@ptrCast(&server.drain_timer), null);
     if (c.uv_is_closing(@ptrCast(&server.shutdown_async)) == 0) c.uv_close(@ptrCast(&server.shutdown_async), null);
@@ -625,6 +644,19 @@ fn onHeader(
         stream.request_compression = Compression.parse(value);
     } else if (std.mem.eql(u8, name, "grpc-accept-encoding")) {
         stream.accepts_response_gzip = stream.accepts_response_gzip or acceptsEncoding(value, .gzip);
+    } else if (std.mem.eql(u8, name, "grpc-timeout")) {
+        if (stream.timeout_seen) {
+            stream.timeout_invalid = true;
+            stream.deadline = null;
+        } else {
+            stream.timeout_seen = true;
+            const timeout_ns = deadline.parseTimeout(value) catch {
+                stream.timeout_invalid = true;
+                return 0;
+            };
+            stream.deadline = deadline.Deadline.initAfter(connection.server.clock, timeout_ns);
+        }
+        scheduleDeadlineTimer(connection.server);
     } else if (isRequestMetadata(name)) {
         stream.request_metadata.appendDecoded(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     }
@@ -641,6 +673,7 @@ fn onDataChunk(
 ) callconv(.c) c_int {
     const connection: *Connection = @ptrCast(@alignCast(user_data.?));
     const stream = connection.streams.get(stream_id) orelse return 0;
+    if (stream.responded) return 0;
     const body_limit = wireMessageLimit(connection.server.max_request_size);
     if (data_length > body_limit -| stream.request_body.items.len) {
         stream.request_too_large = true;
@@ -665,9 +698,20 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
 
 fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
     stream.responded = true;
+    scheduleDeadlineTimer(stream.connection.server);
     if (stream.header_too_large or stream.request_too_large) {
         submitFailure(session, stream, .resource_exhausted, "request too large");
         return;
+    }
+    if (stream.timeout_invalid) {
+        submitFailure(session, stream, .invalid_argument, "invalid grpc-timeout");
+        return;
+    }
+    if (stream.deadline) |value| {
+        if (value.isExceeded()) {
+            submitFailure(session, stream, .deadline_exceeded, "deadline exceeded");
+            return;
+        }
     }
     if (!stream.method_post) {
         submitFailure(session, stream, .unimplemented, "POST required");
@@ -705,6 +749,7 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
 
     var context = service.ServerContext.init(stream.allocator);
     defer context.deinit();
+    context.deadline = stream.deadline;
     context.request_compression = if (stream.request_body.items[0] == 1) .gzip else .identity;
     for (stream.request_metadata.items()) |entry| context.request_metadata.append(entry.key, entry.value) catch {
         submitFailure(session, stream, .internal, "metadata allocation failed");
@@ -715,6 +760,10 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
         return;
     };
     defer response.deinit();
+    if (context.isDeadlineExceeded()) {
+        submitFailure(session, stream, .deadline_exceeded, "deadline exceeded");
+        return;
+    }
     stream.response_compression = if (context.response_compression == .gzip and stream.accepts_response_gzip)
         .gzip
     else
@@ -837,8 +886,63 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, _: u32, user_data: ?*an
         entry.value.deinit();
         connection.server.allocator.destroy(entry.value);
     }
+    scheduleDeadlineTimer(connection.server);
     if (connection.draining) _ = c.uv_async_send(&connection.server.shutdown_async);
     return 0;
+}
+
+fn uvNow(_: ?*anyopaque) u64 {
+    return c.uv_hrtime();
+}
+
+fn scheduleDeadlineTimer(server: *Impl) void {
+    if (!server.deadline_timer_initialized or c.uv_is_closing(@ptrCast(&server.deadline_timer)) != 0) return;
+    var earliest: ?u64 = null;
+    for (server.connections.items) |connection| {
+        var iterator = connection.streams.valueIterator();
+        while (iterator.next()) |stream_ptr| {
+            const stream = stream_ptr.*;
+            if (stream.responded) continue;
+            if (stream.deadline) |value| {
+                if (earliest == null or value.expires_at_ns < earliest.?) earliest = value.expires_at_ns;
+            }
+        }
+    }
+    if (earliest == null) {
+        _ = c.uv_timer_stop(&server.deadline_timer);
+        return;
+    }
+    const remaining = earliest.? -| server.clock.now();
+    const timeout_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining, std.time.ns_per_ms) catch 1);
+    _ = c.uv_timer_start(&server.deadline_timer, onDeadlineTimer, timeout_ms, 0);
+}
+
+fn onDeadlineTimer(handle: ?*c.uv_timer_t) callconv(.c) void {
+    const server: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
+    const now = server.clock.now();
+    expireDeadlines(server, now);
+    for (server.connections.items) |connection| {
+        if (connection.closing or connection.session == null) continue;
+        connection.flush() catch connection.close();
+    }
+    scheduleDeadlineTimer(server);
+}
+
+fn expireDeadlines(server: *Impl, now: u64) void {
+    for (server.connections.items) |connection| {
+        if (connection.closing or connection.session == null) continue;
+        var iterator = connection.streams.valueIterator();
+        while (iterator.next()) |stream_ptr| {
+            const stream = stream_ptr.*;
+            if (stream.responded) continue;
+            if (stream.deadline) |value| {
+                if (value.expires_at_ns <= now) {
+                    stream.responded = true;
+                    submitFailure(connection.session.?, stream, .deadline_exceeded, "deadline exceeded");
+                }
+            }
+        }
+    }
 }
 
 fn nativeHeader(name: []const u8, value: []const u8) c.nghttp2_nv {
@@ -890,6 +994,56 @@ fn wireMessageLimit(max_message_size: usize) usize {
 
 fn isReservedTrailer(name: []const u8) bool {
     return std.mem.eql(u8, name, "grpc-status") or std.mem.eql(u8, name, "grpc-message");
+}
+
+fn appendTestHeader(block: *std.ArrayList(u8), name: []const u8, value: []const u8) !void {
+    try block.append(std.testing.allocator, 0);
+    try block.append(std.testing.allocator, @intCast(name.len));
+    try block.appendSlice(std.testing.allocator, name);
+    try block.append(std.testing.allocator, @intCast(value.len));
+    try block.appendSlice(std.testing.allocator, value);
+}
+
+fn feedTestRequest(connection: *Connection, timeout_values: []const []const u8, end_stream: bool) !void {
+    var header_block: std.ArrayList(u8) = .empty;
+    defer header_block.deinit(std.testing.allocator);
+    try header_block.appendSlice(std.testing.allocator, &.{ 0x83, 0x86, 0x04, 0x10 });
+    try header_block.appendSlice(std.testing.allocator, "/test.Echo/Unary");
+    try header_block.appendSlice(std.testing.allocator, &.{ 0x01, 0x09 });
+    try header_block.appendSlice(std.testing.allocator, "localhost");
+    try appendTestHeader(&header_block, "content-type", "application/grpc");
+    for (timeout_values) |value| try appendTestHeader(&header_block, "grpc-timeout", value);
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try wire.appendSlice(std.testing.allocator, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try wire.appendSlice(std.testing.allocator, &.{ 0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0 });
+    try wire.appendSlice(std.testing.allocator, &.{
+        @intCast(header_block.items.len >> 16),
+        @intCast(header_block.items.len >> 8),
+        @intCast(header_block.items.len),
+        c.NGHTTP2_HEADERS,
+        @as(u8, @intCast(c.NGHTTP2_FLAG_END_HEADERS)) |
+            if (end_stream) @as(u8, @intCast(c.NGHTTP2_FLAG_END_STREAM)) else 0,
+        0,
+        0,
+        0,
+        1,
+    });
+    try wire.appendSlice(std.testing.allocator, header_block.items);
+
+    const consumed = c.nghttp2_session_mem_recv2(connection.session, wire.items.ptr, wire.items.len);
+    try std.testing.expectEqual(@as(c.nghttp2_ssize, @intCast(wire.items.len)), consumed);
+}
+
+fn deinitTestConnection(connection: *Connection) void {
+    if (connection.session) |session| c.nghttp2_session_del(session);
+    var iterator = connection.streams.iterator();
+    while (iterator.next()) |entry| {
+        entry.value_ptr.*.deinit();
+        std.testing.allocator.destroy(entry.value_ptr.*);
+    }
+    connection.streams.deinit(std.testing.allocator);
 }
 
 test "server validates registration and has deterministic lifecycle" {
@@ -1075,4 +1229,70 @@ test "response encoding list parsing" {
     try std.testing.expect(acceptsEncoding("identity,unknown,\tgzip ", .gzip));
     try std.testing.expect(!acceptsEncoding("identity", .gzip));
     try std.testing.expect(!acceptsEncoding("xgzip", .gzip));
+}
+
+test "expired and malformed grpc-timeout values fail only their stream" {
+    const Handler = struct {
+        calls: usize = 0,
+
+        fn handle(self: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            self.calls += 1;
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    const cases = [_]struct {
+        values: []const []const u8,
+        expected: status.Code,
+    }{
+        .{ .values = &.{"0n"}, .expected = .deadline_exceeded },
+        .{ .values = &.{""}, .expected = .invalid_argument },
+        .{ .values = &.{"1"}, .expected = .invalid_argument },
+        .{ .values = &.{"123456789n"}, .expected = .invalid_argument },
+        .{ .values = &.{"1x"}, .expected = .invalid_argument },
+        .{ .values = &.{ "1S", "2S" }, .expected = .invalid_argument },
+    };
+
+    var handler = Handler{};
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    try server.registerUnary(
+        "/test.Echo/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+
+    for (cases) |case| {
+        var connection = Connection{ .server = server.impl };
+        try connection.initializeSession();
+        defer deinitTestConnection(&connection);
+        try feedTestRequest(&connection, case.values, true);
+        const stream = connection.streams.get(1).?;
+        try std.testing.expect(stream.timeout_seen);
+        try std.testing.expect(stream.responded);
+        if (case.expected == .deadline_exceeded) {
+            try std.testing.expect(stream.deadline != null);
+            try std.testing.expect(stream.deadline.?.isExceeded());
+        }
+        try std.testing.expectEqual(case.expected, stream.response_code);
+        try std.testing.expect(!connection.closing);
+    }
+    try std.testing.expectEqual(@as(usize, 0), handler.calls);
+}
+
+test "deadline expiration completes a stream before request body end" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer deinitTestConnection(&connection);
+    try server.impl.connections.append(std.testing.allocator, &connection);
+    defer _ = server.impl.connections.pop();
+
+    try feedTestRequest(&connection, &.{"0n"}, false);
+    const stream = connection.streams.get(1).?;
+    try std.testing.expect(!stream.responded);
+    expireDeadlines(server.impl, server.impl.clock.now());
+    try std.testing.expect(stream.responded);
+    try std.testing.expectEqual(status.Code.deadline_exceeded, stream.response_code);
+    try std.testing.expect(!connection.closing);
 }

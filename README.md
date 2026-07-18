@@ -92,6 +92,10 @@ try server.start();
 server.wait();
 ```
 
+Handlers can inspect propagated deadlines with `ServerContext.hasDeadline`,
+`remainingTimeNs`, and `isDeadlineExceeded`. Handlers are not force-cancelled; a response
+returned after the deadline is replaced with `DEADLINE_EXCEEDED`.
+
 See `examples/echo_server.zig` and `examples/echo_client.zig` for complete programs.
 
 ## Protobuf

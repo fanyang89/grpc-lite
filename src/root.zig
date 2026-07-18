@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const c = @import("c.zig");
+const deadline = @import("deadline.zig");
 pub const message = @import("message.zig");
 
 pub const call = @import("call.zig");
@@ -41,6 +42,7 @@ test {
     _ = call;
     _ = channel;
     _ = compression;
+    _ = deadline;
     _ = frame;
     _ = metadata;
     _ = message;

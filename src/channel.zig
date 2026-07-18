@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("c.zig").api;
 const call = @import("call.zig");
 const Compression = @import("compression.zig").Compression;
+const deadline_wire = @import("deadline.zig");
 const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
@@ -289,25 +290,6 @@ const Operation = struct {
         allocator.destroy(self);
     }
 
-    fn setTimeoutHeader(self: *Operation, timeout_ns: u64) void {
-        const units = [_]struct { divisor: u64, suffix: u8 }{
-            .{ .divisor = 1, .suffix = 'n' },
-            .{ .divisor = std.time.ns_per_us, .suffix = 'u' },
-            .{ .divisor = std.time.ns_per_ms, .suffix = 'm' },
-            .{ .divisor = std.time.ns_per_s, .suffix = 'S' },
-            .{ .divisor = 60 * std.time.ns_per_s, .suffix = 'M' },
-            .{ .divisor = 60 * 60 * std.time.ns_per_s, .suffix = 'H' },
-        };
-        for (units) |unit| {
-            const value = @max(@as(u64, 1), std.math.divCeil(u64, timeout_ns, unit.divisor) catch 1);
-            if (value <= 99_999_999 or unit.suffix == 'H') {
-                const text = std.fmt.bufPrint(&self.timeout_header, "{d}{c}", .{ @min(value, 99_999_999), unit.suffix }) catch unreachable;
-                self.timeout_header_len = text.len;
-                return;
-            }
-        }
-    }
-
     fn setOutcome(self: *Operation, code: status.Code, text: []const u8) !void {
         if (self.outcome_set) return;
         const owned = try self.impl.allocator.dupe(u8, text);
@@ -548,7 +530,7 @@ fn processPending(impl: *Impl) void {
                 operation.complete();
                 continue;
             }
-            operation.setTimeoutHeader(deadline - now);
+            operation.timeout_header_len = deadline_wire.formatTimeout(&operation.timeout_header, deadline - now).len;
         }
         submitOperation(impl, operation) catch {
             operation.setOutcome(.unavailable, "request submission failed") catch {};
@@ -991,7 +973,7 @@ fn wireMessageLimit(max_message_size: usize) usize {
     return std.math.add(usize, max_message_size, total_overhead) catch std.math.maxInt(usize);
 }
 
-test "target and timeout formatting" {
+test "target parsing" {
     const target = try parseTarget("127.0.0.1:50051");
     try std.testing.expectEqualStrings("127.0.0.1", target.host);
     try std.testing.expectEqual(@as(u16, 50051), target.port);
@@ -1408,6 +1390,76 @@ test "channel shutdown safely completes an active call before exclusive deinit" 
 
     try std.testing.expect(worker.returned_result);
     try std.testing.expectEqual(status.Code.unavailable, worker.code);
+}
+
+test "server context observes a wire deadline and overrides a late handler response" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const FakeClock = struct {
+        now_ns: u64 = 100,
+
+        fn now(context: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.now_ns;
+        }
+    };
+    const Handler = struct {
+        clock: *FakeClock,
+        saw_deadline: bool = false,
+        saw_no_deadline: bool = false,
+        calls: usize = 0,
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            context: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            self.calls += 1;
+            if (context.hasDeadline()) {
+                self.saw_deadline = context.remainingTimeNs().? > 0 and !context.isDeadlineExceeded();
+                self.clock.now_ns +|= 20 * std.time.ns_per_s;
+            } else {
+                self.saw_no_deadline = true;
+            }
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var fake_clock = FakeClock{};
+    var handler = Handler{ .clock = &fake_clock };
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    test_server.impl.clock = .{ .context = &fake_clock, .now_fn = FakeClock.now };
+    try test_server.registerUnary(
+        "/test.Deadline/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var expired = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Deadline/Unary",
+        "late",
+        .{ .timeout_ns = 10 * std.time.ns_per_s },
+    );
+    defer expired.deinit();
+    try std.testing.expectEqual(status.Code.deadline_exceeded, expired.status.code);
+    try std.testing.expect(handler.saw_deadline);
+
+    var reused = try channel.callUnary(std.testing.allocator, "/test.Deadline/Unary", "reused", .{});
+    defer reused.deinit();
+    try std.testing.expect(reused.status.isOk());
+    try std.testing.expectEqualStrings("reused", reused.payload);
+    try std.testing.expect(handler.saw_no_deadline);
+    try std.testing.expectEqual(@as(usize, 2), handler.calls);
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
 }
 
 test "channel performs reusable concurrent unary calls end to end" {
