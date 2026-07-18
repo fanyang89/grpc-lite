@@ -46,6 +46,16 @@ pub fn build(b: *std.Build) void {
         grpc_lite.linkSystemLibrary("rt", .{});
     }
 
+    const grpc_lite_protobuf = b.addModule("grpc_lite_protobuf", .{
+        .root_source_file = b.path("src/protobuf_adapter.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "grpc_lite", .module = grpc_lite },
+            .{ .name = "protobuf", .module = protobuf },
+        },
+    });
+
     const native_deps = addNativeDependencies(b);
 
     const library = b.addLibrary(.{
@@ -73,9 +83,27 @@ pub fn build(b: *std.Build) void {
     protobuf_tests.step.dependOn(&generate_proto.step);
     const run_protobuf_tests = b.addRunArtifact(protobuf_tests);
 
+    const protobuf_adapter_tests = b.addTest(.{
+        .name = "protobuf-adapter",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/protobuf_adapter_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "grpc_lite", .module = grpc_lite },
+                .{ .name = "grpc_lite_protobuf", .module = grpc_lite_protobuf },
+                .{ .name = "demo_proto", .module = demo_proto },
+            },
+        }),
+    });
+    protobuf_adapter_tests.step.dependOn(&generate_proto.step);
+    protobuf_adapter_tests.step.dependOn(native_deps);
+    const run_protobuf_adapter_tests = b.addRunArtifact(protobuf_adapter_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_protobuf_tests.step);
+    test_step.dependOn(&run_protobuf_adapter_tests.step);
 
     const echo_server = addExample(
         b,
