@@ -16,6 +16,8 @@ mise run test
 mise run fmt
 mise run check
 mise run interop
+mise run interop-official
+mise run interop-http2
 mise run gen-proto
 ```
 

@@ -68,6 +68,10 @@ esac
 description = "Run official grpc-go unary interoperability tests"
 run = "tests/official/run_unary.sh"
 
+[tasks.interop-http2]
+description = "Run the official gRPC HTTP/2 framing suite"
+run = "tests/official/run_http2.sh"
+
 [tasks.check]
 description = "Run formatting and tests"
 run = "mise run fmt-check && mise run test && mise run interop"
