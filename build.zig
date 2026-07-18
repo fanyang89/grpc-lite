@@ -4,6 +4,10 @@ const protobuf_build = @import("protobuf");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const target_triple = target.result.zigTriple(b.allocator) catch @panic("out of memory");
+    const native_root = b.fmt(".zig-cache/native/{s}/{s}", .{ target_triple, @tagName(optimize) });
+    const libuv_build_dir = b.fmt("{s}/libuv", .{native_root});
+    const nghttp2_build_dir = b.fmt("{s}/nghttp2", .{native_root});
     const protobuf_dependency = b.dependency("protobuf", .{
         .target = target,
         .optimize = optimize,
@@ -62,9 +66,9 @@ pub fn build(b: *std.Build) void {
     });
     grpc_lite.addIncludePath(b.path("third_party/libuv/include"));
     grpc_lite.addIncludePath(b.path("third_party/nghttp2/lib/includes"));
-    grpc_lite.addIncludePath(b.path(".zig-cache/native/nghttp2/lib/includes"));
-    grpc_lite.addObjectFile(b.path(".zig-cache/native/libuv/libuv.a"));
-    grpc_lite.addObjectFile(b.path(".zig-cache/native/nghttp2/lib/libnghttp2.a"));
+    grpc_lite.addIncludePath(b.path(b.fmt("{s}/lib/includes", .{nghttp2_build_dir})));
+    grpc_lite.addObjectFile(b.path(b.fmt("{s}/libuv.a", .{libuv_build_dir})));
+    grpc_lite.addObjectFile(b.path(b.fmt("{s}/lib/libnghttp2.a", .{nghttp2_build_dir})));
 
     if (target.result.os.tag == .linux) {
         grpc_lite.linkSystemLibrary("pthread", .{});
@@ -82,7 +86,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const native_deps = addNativeDependencies(b);
+    const native_deps = addNativeDependencies(b, libuv_build_dir, nghttp2_build_dir, optimize);
 
     const library = b.addLibrary(.{
         .name = "grpc_lite",
@@ -210,19 +214,29 @@ fn addExample(
     return executable;
 }
 
-fn addNativeDependencies(b: *std.Build) *std.Build.Step {
+fn addNativeDependencies(
+    b: *std.Build,
+    libuv_build_dir: []const u8,
+    nghttp2_build_dir: []const u8,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step {
     const native_deps = b.step("native-deps", "Build native dependencies");
     const cc = b.fmt("{s} cc", .{b.graph.zig_exe});
+    const cmake_build_type = switch (optimize) {
+        .Debug => "Debug",
+        .ReleaseSafe => "RelWithDebInfo",
+        .ReleaseFast, .ReleaseSmall => "Release",
+    };
 
     const configure_libuv = b.addSystemCommand(&.{
         "cmake",
         "-S",
         "third_party/libuv",
         "-B",
-        ".zig-cache/native/libuv",
+        libuv_build_dir,
         "-G",
         "Ninja",
-        "-DCMAKE_BUILD_TYPE=Debug",
+        b.fmt("-DCMAKE_BUILD_TYPE={s}", .{cmake_build_type}),
         "-DCMAKE_C_FLAGS=-fno-sanitize=undefined",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DLIBUV_BUILD_SHARED=OFF",
@@ -234,7 +248,7 @@ fn addNativeDependencies(b: *std.Build) *std.Build.Step {
     const build_libuv = b.addSystemCommand(&.{
         "cmake",
         "--build",
-        ".zig-cache/native/libuv",
+        libuv_build_dir,
     });
     build_libuv.step.dependOn(&configure_libuv.step);
 
@@ -243,10 +257,10 @@ fn addNativeDependencies(b: *std.Build) *std.Build.Step {
         "-S",
         "third_party/nghttp2",
         "-B",
-        ".zig-cache/native/nghttp2",
+        nghttp2_build_dir,
         "-G",
         "Ninja",
-        "-DCMAKE_BUILD_TYPE=Debug",
+        b.fmt("-DCMAKE_BUILD_TYPE={s}", .{cmake_build_type}),
         "-DCMAKE_C_FLAGS=-fno-sanitize=undefined",
         "-DENABLE_LIB_ONLY=ON",
         "-DENABLE_APP=OFF",
@@ -262,7 +276,7 @@ fn addNativeDependencies(b: *std.Build) *std.Build.Step {
     const build_nghttp2 = b.addSystemCommand(&.{
         "cmake",
         "--build",
-        ".zig-cache/native/nghttp2",
+        nghttp2_build_dir,
     });
     build_nghttp2.step.dependOn(&configure_nghttp2.step);
 

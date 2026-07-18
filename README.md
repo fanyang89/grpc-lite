@@ -34,6 +34,7 @@ Useful tasks:
 ```bash
 mise run build
 mise run test
+mise run test-release-safe
 mise run fmt
 mise run interop
 mise run interop-official

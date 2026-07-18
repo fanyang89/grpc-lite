@@ -13,6 +13,7 @@ Run `mise install` followed by `mise run bootstrap` before the first build.
 ```bash
 mise run build
 mise run test
+mise run test-release-safe
 mise run fmt
 mise run check
 mise run interop

@@ -17,6 +17,10 @@ run = "zig build"
 description = "Run all tests"
 run = "zig build test --summary all"
 
+[tasks.test-release-safe]
+description = "Run all tests with ReleaseSafe optimization"
+run = "zig build test -Doptimize=ReleaseSafe --summary all"
+
 [tasks.gen-proto]
 description = "Generate Zig protobuf sources"
 run = "zig build gen-proto"
