@@ -1,221 +1,83 @@
-# grpc-lite — Agent / Developer Guide
+# grpc-lite Developer Guide
 
-This document contains build constraints, configuration references, and internal
-architecture details for contributors and automated agents working on `grpc-lite`.
+## Toolchain
 
-## Build Constraints
+- Zig 0.16.0
+- CMake and Ninja for upstream C dependencies
+- mise for tool versions and project tasks
 
-### Language Levels
+Run `mise install` followed by `mise run bootstrap` before the first build.
 
-- **Transport / runtime core**: C++17 (`-std=c++17`)
-- **Message layer (struct_proto26)**: C++26 with `-freflection`
+## Commands
 
-If the selected compiler does not support `-std=c++26 -freflection`, CMake configuration
-will still succeed, but the `struct_proto26` examples and tests will fail to compile.
-The core runtime builds fine with C++17 only.
+```bash
+mise run build
+mise run test
+mise run test-release-safe
+mise run fmt
+mise run ci-lint
+mise run check
+mise run interop
+mise run interop-official
+mise run interop-http2
+mise run interop-http2-edge
+mise run gen-proto
+```
 
-### Compiler Recommendations
+## Architecture
 
-- GCC ≥ 12
-- Clang ≥ 16
+- `src/root.zig` is the public module entry point.
+- `src/protobuf_adapter.zig` is the optional typed zig-protobuf integration.
+- Public APIs use explicit allocators and deterministic `deinit` methods.
+- `nghttp2` owns HTTP/2 framing, HPACK, stream state, and flow control.
+- `libuv` owns socket and event-loop integration.
+- gRPC payloads remain raw protobuf wire bytes.
+- Generated protobuf sources live under `.zig-cache` and are not committed.
+- The first phase supports cleartext IPv4 unary RPC only.
 
-### Platform
+Keep C types private to transport modules. Keep protobuf out of `src/root.zig` so the
+raw transport remains independently usable. Do not add streaming, TLS, or grpcpp
+compatibility without expanding the project scope first.
 
-Linux-first. The codebase uses `epoll` and Linux-specific `libuv` APIs.
-Porting to other platforms requires abstraction work in `src/core/uv_loop.cc` and the
-transport layer.
+## Scope Decisions
 
-## Dependency Matrix
+The compatibility target is `grpc-lite-unary-insecure-v1`. This table is authoritative:
+change it before implementing a feature with a different decision.
 
-### Core Dependencies
-
-| Dependency | System Default | Vendored Path | Notes |
-| --- | --- | --- | --- |
-| `libnghttp2` | `pkg-config libnghttp2` | `third_party/nghttp2` | Vendored build used automatically for sanitizer builds |
-| `libuv` | `pkg-config libuv` | `third_party/libuv` | Vendored build used automatically for sanitizer builds |
-| `CMake` | ≥ 3.20 | — |  |
-
-### Message / Example / Test Dependencies
-
-| Dependency | Source | Notes |
+| Capability | Decision | Notes |
 | --- | --- | --- |
-| `struct_proto26` | `third_party/struct_proto26/` | Header-only proto3 wire codec |
-| `refl-cpp` | `third_party/refl-cpp/include/` | Fallback reflection backend when C++26 `<meta>` is unavailable |
-| `doctest` | `golden/grpc/.../doctest/` | Test framework (header-only) |
+| Raw and typed unary RPC | Required | Client and server |
+| Official bidirectional unary interop profile | Required | Test against official grpc-go peers |
+| Large messages and HTTP/2 flow control | Required | Include padding and max-stream tests |
+| ASCII and binary metadata | Required | `-bin` values use standard base64 encoding |
+| Status codes and Unicode status messages | Required | Preserve percent-encoded UTF-8 bytes |
+| Deadlines | Required | No separate public cancellation API |
+| Unary gzip compression | Selected | Only `identity` and `gzip` |
+| GOAWAY connection replacement | Selected | New calls use a new connection; no RPC retry |
+| Graceful server drain | Selected | Stop admission, send GOAWAY, wait with timeout |
+| Client, server, or bidi streaming | Out of scope | Generated streaming methods remain unsupported |
+| TLS, ALPN, and mTLS | Out of scope | Interop profile is explicitly insecure |
+| DNS and IPv6 | Out of scope | IPv4 literals only |
+| Reflection and health services | Out of scope | Reflection requires bidi streaming |
+| Interceptors and middleware | Out of scope | Keep the core API small |
+| Retry policies and connection backoff | Out of scope | Applications retry explicitly |
+| Service config and load balancing | Out of scope | No policy layer |
+| xDS, ORCA, ALTS, and cloud credentials | Out of scope | Not required for lite deployments |
+| Cacheable unary GET | Out of scope | Depends on proxy cache semantics |
+| grpcpp compatibility | Out of scope | Zig-native APIs only |
 
-### Optional Dependencies
+## Official Interop Profile
 
-| Feature | CMake Option | Dependency |
-| --- | --- | --- |
-| TLS / ALPN | `GRPC_LITE_ENABLE_OPENSSL=ON` | OpenSSL |
-| Async DNS | `GRPC_LITE_ENABLE_CARES=ON` | c-ares |
-| Structured logging | `GRPC_LITE_ENABLE_LOGGING=ON` | spdlog + fmt |
+The required standard cases are `empty_unary`, `large_unary`,
+`special_status_message`, `unimplemented_method`, `unimplemented_service`,
+`client_compressed_unary`, and `server_compressed_unary`. Also run `rpc_soak`,
+`channel_soak`, the public HTTP/2 framing suite, and the negative HTTP/2 client cases.
 
-### Explicitly NOT in Default Build
+Cases requiring streaming, TLS, auth, service config, ORCA, or xDS must be reported as
+skipped with the scope-table reason, never presented as passing. grpc-core `bad_client`
+tests use private C APIs and are not part of this profile; use the public HTTP/2 interop
+tools instead.
 
-- `upb`
-- `protoc`
-- `protoc-gen-upb`
-- `protoc-gen-upb_minitable`
-- `grpc_cpp_plugin`
-- `libprotobuf` (C++ runtime)
+## Style
 
-## CMake Configuration Reference
-
-| Option | Type | Default | Description |
-| --- | --- | --- | --- |
-| `GRPC_LITE_USE_SYSTEM_NGHTTP2` | BOOL | `ON` | Use system `libnghttp2` via `pkg-config` |
-| `GRPC_LITE_USE_SYSTEM_LIBUV` | BOOL | `ON` | Use system `libuv` via `pkg-config` |
-| `GRPC_LITE_ENABLE_OPENSSL` | BOOL | `OFF` | Enable TLS hooks through OpenSSL |
-| `GRPC_LITE_ENABLE_CARES` | BOOL | `OFF` | Enable c-ares based resolver hooks |
-| `GRPC_LITE_ENABLE_LOGGING` | BOOL | `OFF` | Enable spdlog/fmt logging hooks when present |
-| `GRPC_LITE_BUILD_EXAMPLES` | BOOL | `ON` | Build example executables |
-| `GRPC_LITE_BUILD_TESTS` | BOOL | `ON` | Build test executables and enable `ctest` |
-| `GRPC_LITE_ENABLE_IWYU` | BOOL | `OFF` | Run include-what-you-use during C++ builds |
-| `GRPC_LITE_ENABLE_UBSAN` | BOOL | `ON` | Also enable UBSan when ASan is active |
-| `GRPC_LITE_COVERAGE` | BOOL | `OFF` | Build with code-coverage instrumentation (Clang preferred) |
-| `GRPC_LITE_SANITIZE` | STRING | `""` | `"address"` or `"thread"`. Forces vendored nghttp2/libuv. |
-| `GRPC_LITE_PROTO_REFLECTION` | STRING | `"auto"` | `"auto"`, `"meta"` (C++26 `<meta>`), or `"refl_cpp"` |
-| `GRPC_LITE_IWYU_EXECUTABLE` | FILEPATH | `""` | Path to `include-what-you-use` binary |
-
-## Development Workflow
-
-### Formatting
-
-```bash
-# Check formatting (CI uses Docker image built from repo Dockerfile)
-./scripts/clang-format.sh check
-
-# Apply formatting
-./scripts/clang-format.sh
-```
-
-### Sanitizer Builds
-
-Sanitizer builds automatically switch to vendored `nghttp2` and `libuv` so the
-dependency code is instrumented with the same flags as `grpc-lite`.
-
-```bash
-cmake -S . -B build-asan -G Ninja -DGRPC_LITE_SANITIZE=address
-cmake --build build-asan
-ctest --test-dir build-asan --output-on-failure
-```
-
-```bash
-cmake -S . -B build-tsan -G Ninja -DGRPC_LITE_SANITIZE=thread
-cmake --build build-tsan
-ctest --test-dir build-tsan --output-on-failure
-```
-
-### Coverage
-
-```bash
-cmake -S . -B build-cov -G Ninja -DGRPC_LITE_COVERAGE=ON
-cmake --build build-cov
-ctest --test-dir build-cov --output-on-failure
-```
-
-### Include-What-You-Use
-
-```bash
-cmake -S . -B build-iwyu -G Ninja -DGRPC_LITE_ENABLE_IWYU=ON
-cmake --build build-iwyu 2>&1 | tee iwyu.log
-```
-
-## Architecture Details
-
-### Directory Layout
-
-- **`include/grpc_lite/`** — Stable public C++ runtime API surface.
-  - `channel.h`, `server_builder.h`, `service.h`, `status.h`, `server_context.h`,
-    `client_context.h`
-- **`include/grpc_lite/proto3/`** — Struct-based example schemas (e.g., `echo.h`).
-- **`src/core/`** — Transport and event-loop integration around system C libraries.
-  - `grpc_frame.{cc,h}` — gRPC framing logic (length-prefixed messages, compression
-    flags)
-  - `http2_transport.cc` — nghttp2 integration
-  - `uv_loop.cc` — libuv event-loop wiring
-  - `transport.h` — Internal transport abstraction
-- **`src/`** — Runtime implementation.
-  - `server.cc`, `server_builder.cc`, `channel.cc`, `client_call.cc`
-  - `grpcpp_server.cc`, `grpcpp_channel.cc` — `grpcpp`-compatible wrappers
-  - `status.cc`, `version.cc`
-- **`examples/`** — Compile-time smoke tests and reference wiring.
-- **`tests/`** — Wire-compatibility checks against canonical proto3 bytes.
-- **`golden/`** — Upstream reference trees (`abseil-cpp`, `grpc`, `protobuf`) kept for
-  comparison work.
-
-### Transport / Message Separation
-
-The runtime currently has a minimal cleartext HTTP/2 unary server path built on
-`libuv + nghttp2`. It accepts a single gRPC request, decodes one unary gRPC frame,
-dispatches it to a registered `Service`, and writes a gRPC response with trailers.
-
-The message layer is intentionally separate from the transport layer.
-The transport passes protobuf payloads as `std::string`. Examples use
-`proto3::serialize()` and `proto3::deserialize<T>()` from `struct_proto26` at the
-service boundary, but any codec that produces proto3 wire bytes will work.
-
-### Proto Reflection Backends
-
-CMake auto-detects which reflection backend to use:
-
-1. **C++26 `<meta>`** (`-std=c++26 -freflection`) — preferred, compile-time static
-   reflection.
-2. **`refl-cpp`** — fallback when `<meta>` is unavailable; slightly slower compile
-   times.
-
-Force a backend with `-DGRPC_LITE_PROTO_REFLECTION=meta` or `refl_cpp`.
-
-## Compatibility Testing
-
-`tests/proto3_wire_test.cc` compares `struct_proto26` output with canonical proto3 wire
-bytes for the reference schema in `proto/echo.proto`:
-
-```proto
-message EchoRequest {
-  string message = 1;
-}
-
-message EchoReply {
-  string message = 1;
-}
-```
-
-For `message = "hello grpc-lite"`, the canonical wire bytes are:
-
-```text
-0a 0f 68 65 6c 6c 6f 20 67 72 70 63 2d 6c 69 74 65
-```
-
-The test checks both directions:
-
-- struct serialization equals the canonical proto3 bytes
-- canonical proto3 bytes deserialize into the expected C++ structs
-- default string fields are omitted, matching proto3 semantics
-
-`proto/echo.proto` remains as a human-readable compatibility reference only; it is not
-used by CMake and does not introduce a `protoc` dependency.
-
-## Submodules
-
-The following submodules are required for a full build:
-
-```bash
-# For tests
-git submodule update --init -- golden/grpc third_party/struct_proto26
-
-# Nested: doctest via opentelemetry-cpp
-git -C golden/grpc submodule update --init -- third_party/opentelemetry-cpp
-git -C golden/grpc/third_party/opentelemetry-cpp submodule update --init -- third_party/nlohmann-json
-
-# For vendored dependencies (sanitizer builds)
-git submodule update --init -- third_party/nghttp2 third_party/libuv
-```
-
-## CI / Automation Notes
-
-- CI runs on `ubuntu-24.04`.
-- Format job builds a Docker image from the repo `Dockerfile` and runs `clang-format`.
-- Smoke and test jobs use `ccache` for acceleration.
-- Sanitizer jobs are separate from the default build to keep PR feedback fast.
+Use `zig fmt`. Prefer small modules, explicit ownership, and no detached threads.

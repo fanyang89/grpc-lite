@@ -1,18 +1,9 @@
-[submodule "golden/protobuf"]
-	path = golden/protobuf
-	url = https://github.com/protocolbuffers/protobuf.git
-[submodule "golden/grpc"]
-	path = golden/grpc
-	url = https://github.com/grpc/grpc.git
-[submodule "golden/abseil-cpp"]
-	path = golden/abseil-cpp
-	url = https://github.com/abseil/abseil-cpp.git
-[submodule "third_party/struct_proto26"]
-	path = third_party/struct_proto26
-	url = https://github.com/PikachuHyA/struct_proto26.git
 [submodule "third_party/libuv"]
 	path = third_party/libuv
 	url = https://github.com/libuv/libuv.git
 [submodule "third_party/nghttp2"]
 	path = third_party/nghttp2
 	url = https://github.com/nghttp2/nghttp2.git
+[submodule "third_party/grpc-proto"]
+	path = third_party/grpc-proto
+	url = https://github.com/grpc/grpc-proto.git

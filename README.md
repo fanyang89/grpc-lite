@@ -1,146 +1,154 @@
 # grpc-lite
 
 [![CI](https://github.com/fanyang89/grpc-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/fanyang89/grpc-lite/actions/workflows/ci.yml)
-![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
-![C++26](https://img.shields.io/badge/C%2B%2B-26%20reflection-orange)
-![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-> A lightweight, protocol-compatible gRPC runtime for C++ — without the upstream bloat.
-
-`grpc-lite` gives you HTTP/2 unary RPC building blocks on Linux using only `libuv` +
-`nghttp2`. No `protoc`, no `libprotobuf`, no 50 MB dependency tree.
-Just a static library you can link and run.
+A lightweight gRPC core runtime for Zig. HTTP/2 and event-loop behavior are delegated
+to pinned upstream `nghttp2` and `libuv` submodules. Protobuf encoding remains separate
+from transport.
 
 ## Features
 
-- **Tiny footprint** — core runtime is ~few thousand lines of C++17
-- **Protocol compatible** — speaks standard gRPC over HTTP/2 (cleartext)
-- **Zero code generation** — messages are plain C++ structs serialized via
-  `struct_proto26` (C++26 reflection) or your own codec
-- **Transport / message separation** — swap the protobuf layer without touching HTTP/2
-- **Sanitizer-ready** — ASan / TSan presets with vendored deps built under
-  instrumentation
+- Standard unary gRPC over cleartext HTTP/2
+- Persistent multiplexed channels
+- ASCII and binary initial and trailing metadata
+- Deadlines and HTTP/2 stream cancellation
+- Unary identity and gzip compression
+- GOAWAY connection replacement and graceful server draining
+- Explicit allocators and deterministic `deinit`
+- Raw protobuf wire APIs with no required message runtime
+- Optional typed APIs and service registration through zig-protobuf
 
-## Quick Start
+The first phase is IPv4-only. Streaming, TLS, DNS, automatic RPC retries, and server
+reflection are not implemented.
 
-```bash
-# 1. Install system dependencies (Ubuntu/Debian)
-sudo apt-get install cmake ninja-build libuv1-dev libnghttp2-dev pkg-config
-
-# 2. Clone and build
-git clone https://github.com/fanyang89/grpc-lite.git
-cd grpc-lite
-cmake -S . -B build -G Ninja
-cmake --build build
-
-# 3. Run the echo server
-./build/grpc_lite_echo_server
-```
-
-## Minimal Example
-
-```cpp
-#include "grpc_lite/server_builder.h"
-#include "grpc_lite/service.h"
-
-class EchoService final : public grpc_lite::Service {
-  public:
-    std::string service_name() const override { return "demo.EchoService"; }
-
-    grpc_lite::Status HandleUnary(
-        std::string_view method, std::string_view request,
-        grpc_lite::ServerContext* ctx, std::string* response
-    ) override {
-        *response = std::string(request);
-        return grpc_lite::Status::OK();
-    }
-};
-
-int main() {
-    EchoService svc;
-    grpc_lite::ServerBuilder builder;
-    builder.AddListeningPort("0.0.0.0:50051");
-    builder.RegisterService(&svc);
-
-    auto server = builder.Build();
-    if (!server->Start().ok()) return 1;
-    server->Wait();
-    return 0;
-}
-```
-
-## Building
-
-### Prerequisites
-
-| Component | Minimum | Notes |
-| --- | --- | --- |
-| CMake | 3.20 |  |
-| C++ compiler | C++17 compliant | GCC ≥ 12 or Clang ≥ 16 recommended |
-| libuv | system or vendored | `libuv1-dev` |
-| libnghttp2 | system or vendored | `libnghttp2-dev` |
-
-For the struct-based protobuf examples you also need a compiler that supports C++26
-static reflection (`-std=c++26 -freflection`). These targets are skipped automatically
-if your compiler lacks support.
-
-### CMake Presets
+## Development
 
 ```bash
-# Default build (system packages)
-cmake -S . -B build -G Ninja
-cmake --build build
-
-# Address sanitizer (uses vendored nghttp2 + libuv)
-cmake -S . -B build-asan -G Ninja -DGRPC_LITE_SANITIZE=address
-cmake --build build-asan
-
-# Thread sanitizer
-cmake -S . -B build-tsan -G Ninja -DGRPC_LITE_SANITIZE=thread
-cmake --build build-tsan
+mise install
+mise run bootstrap
+mise run check
 ```
 
-### Running Tests
+Useful tasks:
 
 ```bash
-# Unit + integration tests
-ctest --test-dir build --output-on-failure
-
-# End-to-end smoke test (proto echo roundtrip)
-./examples/proto_echo_smoke.sh
+mise run build
+mise run test
+mise run test-release-safe
+mise run fmt
+mise run ci-lint
+mise run interop
+mise run interop-official
+mise run interop-http2
+mise run interop-http2-edge
+mise run gen-proto
 ```
 
-## Architecture
+See `tests/official/README.md` for the supported interoperability profile and current
+results.
 
+CI runs the core build and test suite on Linux x64 and arm64 in Debug and ReleaseSafe
+modes. Runtime interoperability runs on both architectures; the official HTTP/2
+edge-case container runs on x64 because its pinned image is amd64-only. A scheduled x64
+workflow runs extended official unary soak tests.
+
+## Unary Client
+
+```zig
+const std = @import("std");
+const grpc = @import("grpc_lite");
+
+var channel = try grpc.Channel.init(allocator, "127.0.0.1:50051", .{});
+defer channel.deinit();
+
+var result = try channel.callUnary(
+    allocator,
+    "/demo.EchoService/Echo",
+    protobuf_wire_bytes,
+    .{ .timeout_ns = 5 * std.time.ns_per_s },
+);
+defer result.deinit();
 ```
-include/grpc_lite/   Public C++ API (channel, server_builder, service, status)
-src/core/             HTTP/2 framing + libuv event-loop integration
-src/                  Runtime implementation (server, client_call, grpcpp compat)
-examples/             Smoke tests and reference wiring
-tests/                Wire-compatibility checks and protocol tests
-third_party/          struct_proto26, nghttp2, libuv, refl-cpp
-golden/               Upstream reference trees for comparison work
+
+`CallResult` owns its payload, status message, and response metadata.
+
+## Unary Server
+
+```zig
+var server = try grpc.Server.init(allocator, .{
+    .host = "127.0.0.1",
+    .port = 50051,
+});
+defer server.deinit();
+
+try server.registerUnary(
+    "/demo.EchoService/Echo",
+    grpc.UnaryHandler.bind(EchoService, &service, EchoService.echo),
+);
+try server.start();
+server.wait();
 ```
 
-The transport layer passes protobuf payloads as `std::string`. You can use
-`struct_proto26` to serialize plain C++ structs directly to proto3 wire bytes, or bring
-your own codec.
+See `examples/echo_server.zig` and `examples/echo_client.zig` for complete programs.
 
-## Documentation
+## Protobuf
 
-- [AGENTS.md](./AGENTS.md) — build constraints, CMake options, developer workflow, and
-  architecture details for contributors and AI agents.
+The optional `grpc_lite_protobuf` module integrates Arwalk/zig-protobuf while keeping
+the transport core raw-byte based. `proto/echo.proto` is generated into
+`.zig-cache/generated/demo.pb.zig` during the build.
 
-## Contributing
+Generated service VTables can be registered without manually specifying method paths:
 
-Issues and pull requests are welcome.
-Please ensure:
+```zig
+const demo = @import("demo_proto");
+const grpc_pb = @import("grpc_lite_protobuf");
 
-- Code follows the existing style (`clang-format` is enforced in CI).
-- All tests pass (`ctest --output-on-failure`).
-- Sanitizer builds remain clean if you touch transport code.
+const EchoApi = demo.EchoService(EchoState, EchoError);
+
+var registration = grpc_pb.ServiceRegistration(EchoApi).init(
+    allocator,
+    &state,
+    .{ .Echo = EchoState.echo },
+    .{
+        .map_error = mapError,
+        .context_hook = configureContext,
+    },
+);
+defer registration.deinit();
+
+try registration.register(&server);
+```
+
+The adapter derives `/demo.EchoService/Echo`, decodes `EchoRequest`, invokes the
+generated VTable, and encodes `EchoReply`. Registration and userdata must outlive the
+server. Returned response fields must be releasable with the registration allocator.
+
+Typed calls infer their request and response types from the same service:
+
+```zig
+var client = grpc_pb.ServiceClient(EchoApi).init(&channel);
+var result = try client.callUnary(
+    allocator,
+    "Echo",
+    demo.EchoRequest{ .message = "hello" },
+    .{},
+);
+defer result.deinit();
+```
+
+Business errors default to `INTERNAL`; an optional typed mapper can return another
+gRPC status. A context hook exposes request and response metadata. Generated streaming
+methods are rejected at compile time because the current transport is unary-only.
+
+## Dependencies
+
+- Zig 0.16.0
+- nghttp2 1.69.0
+- libuv 1.52.1
+- zig-protobuf 5.0.0
+- CMake and Ninja for the upstream C builds
+- mise for tool versions and project tasks
 
 ## License
 
-[MIT](https://opensource.org/licenses/MIT)
+MIT

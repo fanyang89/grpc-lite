@@ -1,0 +1,109 @@
+diff --git a/test/http2_test/http2_base_server.py b/test/http2_test/http2_base_server.py
+--- a/test/http2_test/http2_base_server.py
++++ b/test/http2_test/http2_base_server.py
+@@ -12,9 +12,14 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import collections
++import collections.abc
+ import logging
+ import struct
+ 
++for name in ("Iterable", "Mapping", "MutableMapping", "Sequence", "MutableSequence"):
++    setattr(collections, name, getattr(collections.abc, name))
++
+ import h2
+ import h2.connection
+ import messages_pb2
+@@ -73,7 +78,7 @@ class H2ProtocolBaseServer(twisted.internet.protocol.Protocol):
+         for event in events:
+             if isinstance(
+                 event, h2.events.RequestReceived
+-            ) and self._handlers.has_key("RequestReceived"):
++            ) and "RequestReceived" in self._handlers:
+                 logging.info(
+                     "RequestReceived Event for stream: %d" % event.stream_id
+                 )
+@@ -81,7 +86,7 @@ class H2ProtocolBaseServer(twisted.internet.protocol.Protocol):
+                 self._handlers["RequestReceived"](event)
+             elif isinstance(
+                 event, h2.events.DataReceived
+-            ) and self._handlers.has_key("DataReceived"):
++            ) and "DataReceived" in self._handlers:
+                 logging.info(
+                     "DataReceived Event for stream: %d" % event.stream_id
+                 )
+@@ -89,14 +94,14 @@ class H2ProtocolBaseServer(twisted.internet.protocol.Protocol):
+                 self._handlers["DataReceived"](event)
+             elif isinstance(
+                 event, h2.events.WindowUpdated
+-            ) and self._handlers.has_key("WindowUpdated"):
++            ) and "WindowUpdated" in self._handlers:
+                 logging.info(
+                     "WindowUpdated Event for stream: %d" % event.stream_id
+                 )
+                 self._handlers["WindowUpdated"](event)
+             elif isinstance(
+                 event, h2.events.PingAcknowledged
+-            ) and self._handlers.has_key("PingAcknowledged"):
++            ) and "PingAcknowledged" in self._handlers:
+                 logging.info("PingAcknowledged Event")
+                 self._handlers["PingAcknowledged"](event)
+         self.transport.write(self._conn.data_to_send())
+@@ -108,7 +113,7 @@ class H2ProtocolBaseServer(twisted.internet.protocol.Protocol):
+         self._recv_buffer[event.stream_id] += event.data
+ 
+     def on_request_received_default(self, event):
+-        self._recv_buffer[event.stream_id] = ""
++        self._recv_buffer[event.stream_id] = b""
+         self._stream_id = event.stream_id
+         self._stream_status[event.stream_id] = True
+         self._conn.send_headers(
+@@ -155,7 +160,7 @@ class H2ProtocolBaseServer(twisted.internet.protocol.Protocol):
+     def default_send(
+         self, stream_id, pad_length=None, read_chunk_size=_READ_CHUNK_SIZE
+     ):
+-        if not self._send_remaining.has_key(stream_id):
++        if stream_id not in self._send_remaining:
+             # not setup to send data yet
+             return
+ 
+diff --git a/test/http2_test/http2_test_server.py b/test/http2_test/http2_test_server.py
+--- a/test/http2_test/http2_test_server.py
++++ b/test/http2_test/http2_test_server.py
+@@ -54,7 +54,7 @@ class H2Factory(twisted.internet.protocol.Factory):
+     def buildProtocol(self, addr):
+         self._num_streams += 1
+         logging.info("New Connection: %d" % self._num_streams)
+-        if not _TEST_CASE_MAPPING.has_key(self._testcase):
++        if self._testcase not in _TEST_CASE_MAPPING:
+             logging.error("Unknown test case: %s" % self._testcase)
+             assert 0
+         else:
+diff --git a/test/http2_test/test_data_frame_padding.py b/test/http2_test/test_data_frame_padding.py
+--- a/test/http2_test/test_data_frame_padding.py
++++ b/test/http2_test/test_data_frame_padding.py
+@@ -61,7 +61,7 @@ class TestDataFramePadding:
+         if len(event.data) == 0:
+             return
+         sr = self._base_server.parse_received_data(event.stream_id)
+-        stream_bytes = ""
++        stream_bytes = b""
+         # Check if full grpc msg has been read into the recv buffer yet
+         if sr:
+             response_data = self._base_server.default_response_data(
+diff --git a/test/http2_test/test_rst_during_data.py b/test/http2_test/test_rst_during_data.py
+--- a/test/http2_test/test_rst_during_data.py
++++ b/test/http2_test/test_rst_during_data.py
+@@ -37,9 +37,9 @@ class TestcaseRstStreamDuringData:
+             response_data = self._base_server.default_response_data(
+                 sr.response_size
+             )
+             self._ready_to_send = True
+             response_len = len(response_data)
+-            truncated_response_data = response_data[0 : response_len / 2]
++            truncated_response_data = response_data[0 : response_len // 2]
+             self._base_server.setup_send(
+                 truncated_response_data, event.stream_id
+             )

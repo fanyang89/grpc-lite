@@ -1,0 +1,90 @@
+[tools]
+zig = "0.16.0"
+cmake = "4.3.4"
+ninja = "1.13.2"
+grpcurl = "1.9.3"
+go = "1.26.5"
+actionlint = "1.7.12"
+
+[tasks.bootstrap]
+description = "Initialize native dependency submodules"
+run = "git submodule update --init --depth 1 third_party/libuv third_party/nghttp2 third_party/grpc-proto"
+
+[tasks.build]
+description = "Build grpc-lite"
+run = "zig build"
+
+[tasks.test]
+description = "Run all tests"
+run = "zig build test --summary all"
+
+[tasks.test-release-safe]
+description = "Run all tests with ReleaseSafe optimization"
+run = "zig build test -Doptimize=ReleaseSafe --summary all"
+
+[tasks.gen-proto]
+description = "Generate Zig protobuf sources"
+run = "zig build gen-proto"
+
+[tasks.gen-interop-proto]
+description = "Generate official gRPC interop protobuf sources"
+run = "zig build gen-interop-proto"
+
+[tasks.fmt]
+description = "Format Zig sources"
+run = "zig fmt build.zig src examples tests"
+
+[tasks.fmt-check]
+description = "Check Zig formatting"
+run = "zig fmt --check build.zig src examples tests"
+
+[tasks.ci-lint]
+description = "Validate GitHub Actions workflows"
+run = "actionlint"
+
+[tasks.interop]
+description = "Run grpcurl against the Zig echo server"
+depends = ["build"]
+run = '''
+set -eu
+port=50091
+./zig-out/bin/grpc-lite-echo-server "$port" >.zig-cache/interop-server.log 2>&1 &
+server_pid=$!
+trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+
+attempt=0
+until output=$(grpcurl -plaintext -import-path proto -proto echo.proto \
+  -d '{"message":"hello grpc-lite"}' \
+  "127.0.0.1:$port" demo.EchoService/Echo 2>/dev/null); do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 30 ]; then
+    printf '%s\n' "grpcurl interoperability test failed" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+case "$output" in
+  *'"message": "hello grpc-lite"'*) ;;
+  *)
+    printf '%s\n' "$output" >&2
+    exit 1
+    ;;
+esac
+'''
+
+[tasks.interop-official]
+description = "Run official grpc-go unary interoperability tests"
+run = "tests/official/run_unary.sh"
+
+[tasks.interop-http2]
+description = "Run the official gRPC HTTP/2 framing suite"
+run = "tests/official/run_http2.sh"
+
+[tasks.interop-http2-edge]
+description = "Run official gRPC HTTP/2 edge-case server tests"
+run = "tests/official/run_http2_edge.sh"
+
+[tasks.check]
+description = "Run formatting and tests"
+run = "mise run fmt-check && mise run test && mise run interop"
