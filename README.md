@@ -10,14 +10,16 @@ from transport.
 
 - Standard unary gRPC over cleartext HTTP/2
 - Persistent multiplexed channels
-- Initial and trailing metadata
+- ASCII and binary initial and trailing metadata
 - Deadlines and HTTP/2 stream cancellation
+- Unary identity and gzip compression
+- GOAWAY connection replacement and graceful server draining
 - Explicit allocators and deterministic `deinit`
 - Raw protobuf wire APIs with no required message runtime
 - Optional typed APIs and service registration through zig-protobuf
 
-The first phase is IPv4-only. Streaming, TLS, DNS, retries, reconnect, compression,
-and server reflection are not implemented.
+The first phase is IPv4-only. Streaming, TLS, DNS, automatic RPC retries, and server
+reflection are not implemented.
 
 ## Development
 
@@ -34,8 +36,13 @@ mise run build
 mise run test
 mise run fmt
 mise run interop
+mise run interop-official
+mise run interop-http2
 mise run gen-proto
 ```
+
+See `tests/official/README.md` for the supported interoperability profile and current
+results.
 
 ## Unary Client
 
