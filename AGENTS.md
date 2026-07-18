@@ -15,6 +15,7 @@ mise run build
 mise run test
 mise run fmt
 mise run check
+mise run interop
 ```
 
 ## Architecture
@@ -24,6 +25,7 @@ mise run check
 - `nghttp2` owns HTTP/2 framing, HPACK, stream state, and flow control.
 - `libuv` owns socket and event-loop integration.
 - gRPC payloads remain raw protobuf wire bytes.
+- The first phase supports cleartext IPv4 unary RPC only.
 
 Keep C types private to transport modules. Do not add protobuf code generation,
 streaming, TLS, or grpcpp compatibility without expanding the project scope first.

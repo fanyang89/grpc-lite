@@ -1,0 +1,37 @@
+const std = @import("std");
+const grpc = @import("grpc_lite");
+
+const EchoService = struct {
+    fn echo(
+        _: *@This(),
+        allocator: std.mem.Allocator,
+        context: *grpc.ServerContext,
+        request: []const u8,
+    ) !grpc.UnaryResponse {
+        try context.addInitialMetadata("x-grpc-lite-service", "demo.EchoService");
+        try context.addTrailingMetadata("x-grpc-lite-method", "Echo");
+        return grpc.UnaryResponse.ok(allocator, request);
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const port = if (args.len > 1)
+        try std.fmt.parseInt(u16, args[1], 10)
+    else
+        50051;
+
+    var service = EchoService{};
+    var server = try grpc.Server.init(init.gpa, .{
+        .host = "127.0.0.1",
+        .port = port,
+    });
+    defer server.deinit();
+    try server.registerUnary(
+        "/demo.EchoService/Echo",
+        grpc.UnaryHandler.bind(EchoService, &service, EchoService.echo),
+    );
+    try server.start();
+    std.debug.print("grpc-lite echo server listening on 127.0.0.1:{d}\n", .{try server.port()});
+    server.wait();
+}

@@ -38,6 +38,44 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const echo_server = addExample(
+        b,
+        "grpc-lite-echo-server",
+        "examples/echo_server.zig",
+        grpc_lite,
+        native_deps,
+    );
+    const echo_client = addExample(
+        b,
+        "grpc-lite-echo-client",
+        "examples/echo_client.zig",
+        grpc_lite,
+        native_deps,
+    );
+    b.installArtifact(echo_server);
+    b.installArtifact(echo_client);
+}
+
+fn addExample(
+    b: *std.Build,
+    name: []const u8,
+    source: []const u8,
+    grpc_lite: *std.Build.Module,
+    native_deps: *std.Build.Step,
+) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .root_source_file = b.path(source),
+        .target = grpc_lite.resolved_target,
+        .optimize = grpc_lite.optimize,
+        .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
+    });
+    const executable = b.addExecutable(.{
+        .name = name,
+        .root_module = module,
+    });
+    executable.step.dependOn(native_deps);
+    return executable;
 }
 
 fn addNativeDependencies(b: *std.Build) *std.Build.Step {
