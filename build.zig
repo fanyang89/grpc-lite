@@ -165,6 +165,27 @@ pub fn build(b: *std.Build) void {
     echo_client.step.dependOn(&generate_proto.step);
     b.installArtifact(echo_server);
     b.installArtifact(echo_client);
+
+    const interop_server = addExample(
+        b,
+        "grpc-lite-interop-server",
+        "tests/official/interop_server.zig",
+        grpc_lite,
+        native_deps,
+    );
+    interop_server.root_module.addImport("grpc_testing", interop_proto);
+    interop_server.step.dependOn(&generate_interop_proto.step);
+    const interop_client = addExample(
+        b,
+        "grpc-lite-interop-client",
+        "tests/official/interop_client.zig",
+        grpc_lite,
+        native_deps,
+    );
+    interop_client.root_module.addImport("grpc_testing", interop_proto);
+    interop_client.step.dependOn(&generate_interop_proto.step);
+    b.installArtifact(interop_server);
+    b.installArtifact(interop_client);
 }
 
 fn addExample(

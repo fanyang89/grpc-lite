@@ -64,6 +64,10 @@ case "$output" in
 esac
 '''
 
+[tasks.interop-official]
+description = "Run official grpc-go unary interoperability tests"
+run = "tests/official/run_unary.sh"
+
 [tasks.check]
 description = "Run formatting and tests"
 run = "mise run fmt-check && mise run test && mise run interop"

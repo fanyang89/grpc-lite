@@ -43,9 +43,11 @@ pub const UnaryResponse = struct {
         response_status: status.Status,
         payload: []const u8,
     ) !UnaryResponse {
+        const owned_message = try allocator.dupe(u8, response_status.message);
+        errdefer allocator.free(owned_message);
         return .{
             .allocator = allocator,
-            .status = response_status,
+            .status = .{ .code = response_status.code, .message = owned_message },
             .payload = try allocator.dupe(u8, payload),
         };
     }
@@ -59,6 +61,7 @@ pub const UnaryResponse = struct {
     }
 
     pub fn deinit(self: *UnaryResponse) void {
+        self.allocator.free(self.status.message);
         self.allocator.free(self.payload);
         self.* = undefined;
     }
@@ -130,4 +133,16 @@ test "typed unary handler owns its response" {
 
     try std.testing.expectEqualStrings("echo:hello", response.payload);
     try std.testing.expectEqualStrings("echo", context.trailing_metadata.getFirst("x-handler").?);
+}
+
+test "unary response owns its status message" {
+    const message = try std.testing.allocator.dupe(u8, "dynamic status");
+    var response = try UnaryResponse.fail(
+        std.testing.allocator,
+        status.Status.init(.unknown, message),
+    );
+    std.testing.allocator.free(message);
+    defer response.deinit();
+
+    try std.testing.expectEqualStrings("dynamic status", response.status.message);
 }

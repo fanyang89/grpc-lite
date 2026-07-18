@@ -8,10 +8,10 @@ pub fn encode(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
     const frame = try allocator.alloc(u8, header_size + payload.len);
     frame[0] = 0;
     const length: u32 = @intCast(payload.len);
-    frame[1] = @intCast(length >> 24);
-    frame[2] = @intCast(length >> 16);
-    frame[3] = @intCast(length >> 8);
-    frame[4] = @intCast(length);
+    frame[1] = @truncate(length >> 24);
+    frame[2] = @truncate(length >> 16);
+    frame[3] = @truncate(length >> 8);
+    frame[4] = @truncate(length);
     @memcpy(frame[header_size..], payload);
     return frame;
 }
@@ -98,6 +98,18 @@ test "frame round trips empty and binary payloads" {
         defer std.testing.allocator.free(decoded);
         try std.testing.expectEqualSlices(u8, payload, decoded);
     }
+}
+
+test "frame round trips a multi-byte payload length" {
+    const payload = try std.testing.allocator.alloc(u8, 70_000);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0x5a);
+
+    const encoded = try encode(std.testing.allocator, payload);
+    defer std.testing.allocator.free(encoded);
+    const decoded = try decodeUnary(std.testing.allocator, encoded, payload.len);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, payload, decoded);
 }
 
 test "decoder accepts fragmented input and multiple messages" {
