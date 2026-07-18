@@ -4,6 +4,7 @@ const std = @import("std");
 
 const c = @import("c.zig");
 const deadline = @import("deadline.zig");
+const version_info = @import("version.zig");
 pub const message = @import("message.zig");
 
 pub const call = @import("call.zig");
@@ -31,10 +32,10 @@ pub const StatusCode = status.Code;
 pub const UnaryHandler = service.UnaryHandler;
 pub const UnaryResponse = service.UnaryResponse;
 
-pub const version = "0.1.0";
+pub const version = version_info.string;
 
 test "version is available" {
-    try std.testing.expectEqualStrings("0.1.0", version);
+    _ = try std.SemanticVersion.parse(version);
 }
 
 test {
@@ -49,4 +50,5 @@ test {
     _ = server;
     _ = service;
     _ = status;
+    _ = version_info;
 }

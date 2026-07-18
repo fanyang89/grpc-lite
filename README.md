@@ -6,6 +6,9 @@ A lightweight gRPC core runtime for Zig. HTTP/2 and event-loop behavior are dele
 to pinned upstream `nghttp2` and `libuv` submodules. Protobuf encoding remains separate
 from transport.
 
+The top-level types shown in this README form the stable public API. Lower-level module
+exports remain available for experimentation but may change before 1.0.
+
 ## Features
 
 - Standard unary gRPC over cleartext HTTP/2

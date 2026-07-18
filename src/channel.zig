@@ -7,9 +7,10 @@ const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
 const status = @import("status.zig");
+const version = @import("version.zig");
 
 const ChannelOptions = struct {
-    user_agent: []const u8 = "grpc-lite/0.1.0",
+    user_agent: []const u8 = version.user_agent,
 };
 
 pub const Options = ChannelOptions;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const protobuf_build = @import("protobuf");
+const manifest = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -12,6 +13,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const grpc_lite_options = b.addOptions();
+    grpc_lite_options.addOption([]const u8, "version", manifest.version);
 
     const generate_proto = protobuf_build.RunProtocStep.create(
         protobuf_dependency.builder,
@@ -64,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    grpc_lite.addOptions("grpc_lite_options", grpc_lite_options);
     grpc_lite.addIncludePath(b.path("third_party/libuv/include"));
     grpc_lite.addIncludePath(b.path("third_party/nghttp2/lib/includes"));
     grpc_lite.addIncludePath(b.path(b.fmt("{s}/lib/includes", .{nghttp2_build_dir})));
@@ -100,6 +104,18 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.step.dependOn(native_deps);
     const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    const public_api_tests = b.addTest(.{
+        .name = "public-api",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/public_api_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
+        }),
+    });
+    public_api_tests.step.dependOn(native_deps);
+    const run_public_api_tests = b.addRunArtifact(public_api_tests);
 
     const protobuf_tests = b.addTest(.{
         .name = "protobuf-integration",
@@ -144,6 +160,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_public_api_tests.step);
     test_step.dependOn(&run_protobuf_tests.step);
     test_step.dependOn(&run_protobuf_adapter_tests.step);
     test_step.dependOn(&run_official_proto_tests.step);
