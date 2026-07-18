@@ -49,7 +49,7 @@ change it before implementing a feature with a different decision.
 | Raw and typed unary RPC | Required | Client and server |
 | Official bidirectional unary interop profile | Required | Test against official grpc-go peers |
 | Large messages and HTTP/2 flow control | Required | Include padding and max-stream tests |
-| ASCII and binary metadata | Required | `-bin` values use standard base64 encoding |
+| ASCII and binary metadata | Required | Emit padded base64; accept padded, unpadded, and comma-joined `-bin` values |
 | Status codes and Unicode status messages | Required | Preserve percent-encoded UTF-8 bytes |
 | Deadlines | Required | No separate public cancellation API |
 | Unary gzip compression | Selected | Only `identity` and `gzip` |

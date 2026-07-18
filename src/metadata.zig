@@ -5,6 +5,8 @@ pub const Entry = struct {
     value: []const u8,
 };
 
+pub const IncomingResult = enum { appended, discarded };
+
 pub const Metadata = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry) = .empty,
@@ -23,8 +25,13 @@ pub const Metadata = struct {
     }
 
     pub fn append(self: *Metadata, key: []const u8, value: []const u8) !void {
-        if (!isValidKey(key)) return error.InvalidMetadataKey;
+        if (!isApplicationKey(key)) return error.InvalidMetadataKey;
+        if (!isBinaryKey(key) and !isValidAsciiValue(value)) return error.InvalidMetadataValue;
 
+        try self.appendOwned(key, value);
+    }
+
+    fn appendOwned(self: *Metadata, key: []const u8, value: []const u8) !void {
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
         const owned_value = try self.allocator.dupe(u8, value);
@@ -36,17 +43,33 @@ pub const Metadata = struct {
         });
     }
 
-    pub fn appendDecoded(self: *Metadata, key: []const u8, value: []const u8) !void {
-        if (!isBinaryKey(key)) return self.append(key, value);
+    pub fn appendDecoded(self: *Metadata, key: []const u8, value: []const u8) !IncomingResult {
+        if (!isApplicationKey(key)) return error.InvalidMetadataKey;
+        if (!isBinaryKey(key)) {
+            if (!isValidAsciiValue(value)) return .discarded;
+            try self.appendOwned(key, value);
+            return .appended;
+        }
 
-        const decoder = if (std.mem.endsWith(u8, value, "="))
-            std.base64.standard.Decoder
-        else
-            std.base64.standard_no_pad.Decoder;
-        const decoded = try self.allocator.alloc(u8, try decoder.calcSizeForSlice(value));
-        defer self.allocator.free(decoded);
-        try decoder.decode(decoded, value);
-        try self.append(key, decoded);
+        var decoded_values: std.ArrayList([]u8) = .empty;
+        defer {
+            for (decoded_values.items) |decoded| self.allocator.free(decoded);
+            decoded_values.deinit(self.allocator);
+        }
+        var values = std.mem.splitScalar(u8, value, ',');
+        while (values.next()) |encoded| {
+            const decoder = if (std.mem.endsWith(u8, encoded, "="))
+                std.base64.standard.Decoder
+            else
+                std.base64.standard_no_pad.Decoder;
+            const decoded = try self.allocator.alloc(u8, try decoder.calcSizeForSlice(encoded));
+            errdefer self.allocator.free(decoded);
+            try decoder.decode(decoded, encoded);
+            try decoded_values.append(self.allocator, decoded);
+        }
+
+        for (decoded_values.items) |decoded| try self.appendOwned(key, decoded);
+        return .appended;
     }
 
     pub fn getFirst(self: *const Metadata, key: []const u8) ?[]const u8 {
@@ -70,6 +93,16 @@ pub fn isValidKey(key: []const u8) bool {
     return true;
 }
 
+pub fn isApplicationKey(key: []const u8) bool {
+    return isValidKey(key) and !std.mem.startsWith(u8, key, "grpc-");
+}
+
+pub fn isValidAsciiValue(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (byte < 0x20 or byte > 0x7e) return false;
+    return true;
+}
+
 pub fn isBinaryKey(key: []const u8) bool {
     return std.mem.endsWith(u8, key, "-bin");
 }
@@ -86,7 +119,7 @@ fn testMetadataAllocations(allocator: std.mem.Allocator) !void {
     var metadata = Metadata.init(allocator);
     defer metadata.deinit();
     try metadata.append("x-request-id", "value");
-    try metadata.appendDecoded("trace-bin", "qw==");
+    _ = try metadata.appendDecoded("trace-bin", "qw==");
 
     const encoded = try encodeValue(allocator, "trace-bin", "binary");
     defer allocator.free(encoded);
@@ -135,6 +168,9 @@ test "metadata rejects invalid keys" {
     try std.testing.expectError(error.InvalidMetadataKey, metadata.append("", "value"));
     try std.testing.expectError(error.InvalidMetadataKey, metadata.append(":path", "value"));
     try std.testing.expectError(error.InvalidMetadataKey, metadata.append("Upper", "value"));
+    try std.testing.expectError(error.InvalidMetadataKey, metadata.append("grpc-future", "value"));
+    try std.testing.expectError(error.InvalidMetadataValue, metadata.append("x-empty", ""));
+    try std.testing.expectError(error.InvalidMetadataValue, metadata.append("x-control", "bad\nvalue"));
 }
 
 test "binary metadata codec emits padded base64 and accepts padded or unpadded input" {
@@ -145,9 +181,9 @@ test "binary metadata codec emits padded base64 and accepts padded or unpadded i
 
     var metadata = Metadata.init(std.testing.allocator);
     defer metadata.deinit();
-    try metadata.appendDecoded("trace-bin", "q6ur");
-    try metadata.appendDecoded("trace-bin", "qw==");
-    try metadata.appendDecoded("trace-bin", "qw");
+    _ = try metadata.appendDecoded("trace-bin", "q6ur");
+    _ = try metadata.appendDecoded("trace-bin", "qw==");
+    _ = try metadata.appendDecoded("trace-bin", "qw");
     try std.testing.expectEqualSlices(u8, &.{ 0xab, 0xab, 0xab }, metadata.items()[0].value);
     try std.testing.expectEqualSlices(u8, &raw, metadata.items()[1].value);
     try std.testing.expectEqualSlices(u8, &raw, metadata.items()[2].value);
@@ -164,4 +200,28 @@ test "binary metadata codec rejects invalid input without appending" {
     try std.testing.expectError(error.InvalidCharacter, metadata.appendDecoded("trace-bin", "not base64!"));
     try std.testing.expectError(error.InvalidPadding, metadata.appendDecoded("trace-bin", "A"));
     try std.testing.expectEqual(@as(usize, 0), metadata.items().len);
+}
+
+test "binary metadata splits comma-joined values atomically" {
+    var metadata = Metadata.init(std.testing.allocator);
+    defer metadata.deinit();
+
+    try std.testing.expectEqual(IncomingResult.appended, try metadata.appendDecoded("trace-bin", "qw==,q6ur,qw"));
+    try std.testing.expectEqual(@as(usize, 3), metadata.items().len);
+    try std.testing.expectEqualSlices(u8, &.{0xab}, metadata.items()[0].value);
+    try std.testing.expectEqualSlices(u8, &.{ 0xab, 0xab, 0xab }, metadata.items()[1].value);
+    try std.testing.expectEqualSlices(u8, &.{0xab}, metadata.items()[2].value);
+
+    try std.testing.expectError(error.InvalidCharacter, metadata.appendDecoded("trace-bin", "qw,not base64!"));
+    try std.testing.expectEqual(@as(usize, 3), metadata.items().len);
+}
+
+test "invalid incoming ASCII metadata is discarded" {
+    var metadata = Metadata.init(std.testing.allocator);
+    defer metadata.deinit();
+
+    try std.testing.expectEqual(IncomingResult.discarded, try metadata.appendDecoded("x-empty", ""));
+    try std.testing.expectEqual(IncomingResult.discarded, try metadata.appendDecoded("x-control", "bad\tvalue"));
+    try std.testing.expectEqual(IncomingResult.appended, try metadata.appendDecoded("x-visible", " ~"));
+    try std.testing.expectEqual(@as(usize, 1), metadata.items().len);
 }

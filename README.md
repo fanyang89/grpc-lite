@@ -75,6 +75,13 @@ defer result.deinit();
 
 `CallResult` owns its payload, status message, and response metadata.
 
+## Metadata
+
+Application metadata keys use lowercase gRPC header syntax. ASCII values must be visible
+ASCII when sent; invalid incoming ASCII fields are discarded as required by the gRPC
+protocol. Binary `-bin` values remain raw bytes in the API, accept padded, unpadded, and
+comma-joined base64 on the wire, and reject malformed input on only the affected RPC.
+
 ## Unary Server
 
 ```zig

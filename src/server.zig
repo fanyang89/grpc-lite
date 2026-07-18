@@ -232,6 +232,7 @@ const Stream = struct {
     timeout_seen: bool = false,
     timeout_invalid: bool = false,
     deadline: ?deadline.Deadline = null,
+    request_metadata_invalid: bool = false,
     header_too_large: bool = false,
     request_too_large: bool = false,
     responded: bool = false,
@@ -658,7 +659,15 @@ fn onHeader(
         }
         scheduleDeadlineTimer(connection.server);
     } else if (isRequestMetadata(name)) {
-        stream.request_metadata.appendDecoded(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        _ = stream.request_metadata.appendDecoded(name, value) catch |err| switch (err) {
+            error.OutOfMemory => return c.NGHTTP2_ERR_CALLBACK_FAILURE,
+            else => {
+                stream.request_metadata_invalid = true;
+                return 0;
+            },
+        };
+    } else if (isMalformedRequestMetadataName(name)) {
+        stream.request_metadata_invalid = true;
     }
     return 0;
 }
@@ -685,13 +694,19 @@ fn onDataChunk(
 
 fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
     const native_frame = received_frame.?;
+    const connection: *Connection = @ptrCast(@alignCast(user_data.?));
+    const stream = connection.streams.get(native_frame.*.hd.stream_id) orelse return 0;
+    if (native_frame.*.hd.type == c.NGHTTP2_HEADERS and stream.request_metadata_invalid and !stream.responded) {
+        stream.responded = true;
+        scheduleDeadlineTimer(connection.server);
+        submitFailure(session.?, stream, .invalid_argument, "invalid request metadata");
+        return 0;
+    }
     if ((native_frame.*.hd.type != c.NGHTTP2_HEADERS and native_frame.*.hd.type != c.NGHTTP2_DATA) or
         native_frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM == 0)
     {
         return 0;
     }
-    const connection: *Connection = @ptrCast(@alignCast(user_data.?));
-    const stream = connection.streams.get(native_frame.*.hd.stream_id) orelse return 0;
     if (!stream.responded) finishRequest(session.?, stream);
     return 0;
 }
@@ -705,6 +720,10 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
     }
     if (stream.timeout_invalid) {
         submitFailure(session, stream, .invalid_argument, "invalid grpc-timeout");
+        return;
+    }
+    if (stream.request_metadata_invalid) {
+        submitFailure(session, stream, .invalid_argument, "invalid request metadata");
         return;
     }
     if (stream.deadline) |value| {
@@ -970,12 +989,18 @@ fn acceptsEncoding(value: []const u8, encoding: Compression) bool {
 }
 
 fn isRequestMetadata(name: []const u8) bool {
-    if (name.len == 0 or name[0] == ':') return false;
-    const protocol_headers = [_][]const u8{
-        "content-type", "te", "grpc-encoding", "grpc-accept-encoding", "grpc-timeout", "user-agent",
-    };
-    for (protocol_headers) |header| if (std.mem.eql(u8, name, header)) return false;
-    return metadata.isValidKey(name);
+    return metadata.isApplicationKey(name) and !isReservedRequestHeader(name);
+}
+
+fn isReservedRequestHeader(name: []const u8) bool {
+    const protocol_headers = [_][]const u8{ "content-type", "te", "user-agent" };
+    for (protocol_headers) |header| if (std.mem.eql(u8, name, header)) return true;
+    return std.mem.startsWith(u8, name, "grpc-");
+}
+
+fn isMalformedRequestMetadataName(name: []const u8) bool {
+    if (name.len == 0 or name[0] == ':' or isReservedRequestHeader(name)) return false;
+    return !metadata.isValidKey(name);
 }
 
 fn isReservedResponseHeader(name: []const u8) bool {
@@ -1004,7 +1029,16 @@ fn appendTestHeader(block: *std.ArrayList(u8), name: []const u8, value: []const 
     try block.appendSlice(std.testing.allocator, value);
 }
 
-fn feedTestRequest(connection: *Connection, timeout_values: []const []const u8, end_stream: bool) !void {
+const TestRequestOptions = struct {
+    stream_id: i32 = 1,
+    include_preface: bool = true,
+    end_stream: bool = true,
+    body: ?[]const u8 = null,
+    timeout_values: []const []const u8 = &.{},
+    metadata_entries: []const metadata.Entry = &.{},
+};
+
+fn feedTestRequest(connection: *Connection, options: TestRequestOptions) !void {
     var header_block: std.ArrayList(u8) = .empty;
     defer header_block.deinit(std.testing.allocator);
     try header_block.appendSlice(std.testing.allocator, &.{ 0x83, 0x86, 0x04, 0x10 });
@@ -1012,25 +1046,46 @@ fn feedTestRequest(connection: *Connection, timeout_values: []const []const u8, 
     try header_block.appendSlice(std.testing.allocator, &.{ 0x01, 0x09 });
     try header_block.appendSlice(std.testing.allocator, "localhost");
     try appendTestHeader(&header_block, "content-type", "application/grpc");
-    for (timeout_values) |value| try appendTestHeader(&header_block, "grpc-timeout", value);
+    for (options.timeout_values) |value| try appendTestHeader(&header_block, "grpc-timeout", value);
+    for (options.metadata_entries) |entry| try appendTestHeader(&header_block, entry.key, entry.value);
 
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(std.testing.allocator);
-    try wire.appendSlice(std.testing.allocator, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-    try wire.appendSlice(std.testing.allocator, &.{ 0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0 });
+    if (options.include_preface) {
+        try wire.appendSlice(std.testing.allocator, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        try wire.appendSlice(std.testing.allocator, &.{ 0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0 });
+    }
+    const stream_id: u32 = @intCast(options.stream_id);
+    const headers_end_stream = options.end_stream and options.body == null;
     try wire.appendSlice(std.testing.allocator, &.{
         @intCast(header_block.items.len >> 16),
         @intCast(header_block.items.len >> 8),
         @intCast(header_block.items.len),
         c.NGHTTP2_HEADERS,
         @as(u8, @intCast(c.NGHTTP2_FLAG_END_HEADERS)) |
-            if (end_stream) @as(u8, @intCast(c.NGHTTP2_FLAG_END_STREAM)) else 0,
-        0,
-        0,
-        0,
-        1,
+            if (headers_end_stream) @as(u8, @intCast(c.NGHTTP2_FLAG_END_STREAM)) else 0,
+        @intCast((stream_id >> 24) & 0x7f),
+        @intCast(stream_id >> 16),
+        @intCast(stream_id >> 8),
+        @intCast(stream_id),
     });
     try wire.appendSlice(std.testing.allocator, header_block.items);
+    if (options.body) |body| {
+        const encoded = try frame.encode(std.testing.allocator, body);
+        defer std.testing.allocator.free(encoded);
+        try wire.appendSlice(std.testing.allocator, &.{
+            @intCast(encoded.len >> 16),
+            @intCast(encoded.len >> 8),
+            @intCast(encoded.len),
+            c.NGHTTP2_DATA,
+            if (options.end_stream) @as(u8, @intCast(c.NGHTTP2_FLAG_END_STREAM)) else 0,
+            @intCast((stream_id >> 24) & 0x7f),
+            @intCast(stream_id >> 16),
+            @intCast(stream_id >> 8),
+            @intCast(stream_id),
+        });
+        try wire.appendSlice(std.testing.allocator, encoded);
+    }
 
     const consumed = c.nghttp2_session_mem_recv2(connection.session, wire.items.ptr, wire.items.len);
     try std.testing.expectEqual(@as(c.nghttp2_ssize, @intCast(wire.items.len)), consumed);
@@ -1265,7 +1320,7 @@ test "expired and malformed grpc-timeout values fail only their stream" {
         var connection = Connection{ .server = server.impl };
         try connection.initializeSession();
         defer deinitTestConnection(&connection);
-        try feedTestRequest(&connection, case.values, true);
+        try feedTestRequest(&connection, .{ .timeout_values = case.values });
         const stream = connection.streams.get(1).?;
         try std.testing.expect(stream.timeout_seen);
         try std.testing.expect(stream.responded);
@@ -1288,11 +1343,75 @@ test "deadline expiration completes a stream before request body end" {
     try server.impl.connections.append(std.testing.allocator, &connection);
     defer _ = server.impl.connections.pop();
 
-    try feedTestRequest(&connection, &.{"0n"}, false);
+    try feedTestRequest(&connection, .{ .end_stream = false, .timeout_values = &.{"0n"} });
     const stream = connection.streams.get(1).?;
     try std.testing.expect(!stream.responded);
     expireDeadlines(server.impl, server.impl.clock.now());
     try std.testing.expect(stream.responded);
     try std.testing.expectEqual(status.Code.deadline_exceeded, stream.response_code);
+    try std.testing.expect(!connection.closing);
+}
+
+test "malformed request metadata rejects one stream and preserves the connection" {
+    const Handler = struct {
+        calls: usize = 0,
+        metadata_matches: bool = false,
+
+        fn handle(self: *@This(), allocator: std.mem.Allocator, context: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            self.calls += 1;
+            const entries = context.request_metadata.items();
+            self.metadata_matches = entries.len == 2 and
+                std.mem.eql(u8, entries[0].key, "trace-bin") and
+                std.mem.eql(u8, entries[0].value, &.{0xab}) and
+                std.mem.eql(u8, entries[1].key, "trace-bin") and
+                std.mem.eql(u8, entries[1].value, &.{ 0xab, 0xab, 0xab }) and
+                context.request_metadata.getFirst("x-control") == null and
+                context.request_metadata.getFirst("grpc-future") == null;
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    try server.registerUnary(
+        "/test.Echo/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer deinitTestConnection(&connection);
+
+    try feedTestRequest(&connection, .{ .metadata_entries = &.{.{
+        .key = "trace-bin",
+        .value = "not base64!",
+    }} });
+    const rejected = connection.streams.get(1).?;
+    try std.testing.expectEqual(status.Code.invalid_argument, rejected.response_code);
+    try std.testing.expect(!connection.closing);
+
+    try feedTestRequest(&connection, .{
+        .stream_id = 3,
+        .include_preface = false,
+        .metadata_entries = &.{.{ .key = "x!invalid", .value = "value" }},
+    });
+    const invalid_key = connection.streams.get(3).?;
+    try std.testing.expectEqual(status.Code.invalid_argument, invalid_key.response_code);
+    try std.testing.expect(!connection.closing);
+
+    try feedTestRequest(&connection, .{
+        .stream_id = 5,
+        .include_preface = false,
+        .body = "ping",
+        .metadata_entries = &.{
+            .{ .key = "trace-bin", .value = "qw==,q6ur" },
+            .{ .key = "x-control", .value = "bad\tvalue" },
+            .{ .key = "grpc-future", .value = "ignored" },
+        },
+    });
+    const accepted = connection.streams.get(5).?;
+    try std.testing.expectEqual(status.Code.ok, accepted.response_code);
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    try std.testing.expect(handler.metadata_matches);
     try std.testing.expect(!connection.closing);
 }

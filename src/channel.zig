@@ -218,6 +218,7 @@ const Operation = struct {
     response_payload: ?[]u8 = null,
     response_compression: Compression = .identity,
     response_encoding_invalid: bool = false,
+    response_metadata_invalid: bool = false,
     response_body: std.ArrayList(u8) = .empty,
     response_too_large: bool = false,
     saw_response_headers: bool = false,
@@ -719,8 +720,8 @@ fn onHeader(
             operation.response_encoding_invalid = true;
             return 0;
         };
-    } else if (isResponseMetadata(name)) {
-        operation.block_metadata.appendDecoded(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    } else {
+        processResponseMetadata(operation, name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     return 0;
 }
@@ -756,6 +757,14 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
     if (native_frame.*.hd.type != c.NGHTTP2_HEADERS) return 0;
     const operation: *Operation = @ptrCast(@alignCast(c.nghttp2_session_get_stream_user_data(session, native_frame.*.hd.stream_id) orelse return 0));
     operation.finishHeaderBlock() catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (operation.response_metadata_invalid and !operation.outcome_set) {
+        operation.setOutcome(.internal, "invalid response metadata") catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (native_frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM == 0 and
+            c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, native_frame.*.hd.stream_id, c.NGHTTP2_CANCEL) != 0)
+        {
+            return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+    }
     return 0;
 }
 
@@ -939,21 +948,41 @@ fn isValidMethodPath(path: []const u8) bool {
 }
 
 fn isRequestMetadata(name: []const u8) bool {
-    if (!metadata.isValidKey(name)) return false;
-    const reserved = [_][]const u8{
-        "content-type", "te", "grpc-encoding", "grpc-accept-encoding", "grpc-timeout", "user-agent",
-    };
-    for (reserved) |header| if (std.mem.eql(u8, name, header)) return false;
-    return true;
+    return metadata.isApplicationKey(name) and !isReservedRequestHeader(name);
 }
 
 fn isResponseMetadata(name: []const u8) bool {
-    if (!metadata.isValidKey(name)) return false;
-    const reserved = [_][]const u8{
-        "content-type", "grpc-encoding", "grpc-accept-encoding", "grpc-status", "grpc-message",
-    };
-    for (reserved) |header| if (std.mem.eql(u8, name, header)) return false;
-    return true;
+    return metadata.isApplicationKey(name) and !isReservedResponseHeader(name);
+}
+
+fn isReservedRequestHeader(name: []const u8) bool {
+    const protocol_headers = [_][]const u8{ "content-type", "te", "user-agent" };
+    for (protocol_headers) |header| if (std.mem.eql(u8, name, header)) return true;
+    return std.mem.startsWith(u8, name, "grpc-");
+}
+
+fn isReservedResponseHeader(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "content-type")) return true;
+    return std.mem.startsWith(u8, name, "grpc-");
+}
+
+fn isMalformedResponseMetadataName(name: []const u8) bool {
+    if (name.len == 0 or name[0] == ':' or isReservedResponseHeader(name)) return false;
+    return !metadata.isValidKey(name);
+}
+
+fn processResponseMetadata(operation: *Operation, name: []const u8, value: []const u8) error{OutOfMemory}!void {
+    if (isResponseMetadata(name)) {
+        _ = operation.block_metadata.appendDecoded(name, value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                operation.response_metadata_invalid = true;
+                return;
+            },
+        };
+    } else if (isMalformedResponseMetadataName(name)) {
+        operation.response_metadata_invalid = true;
+    }
 }
 
 fn httpStatusCode(http_status: u16) status.Code {
@@ -979,6 +1008,59 @@ test "target parsing" {
     try std.testing.expectEqual(@as(u16, 50051), target.port);
     try std.testing.expectError(error.InvalidTarget, parseTarget("localhost"));
     try std.testing.expectError(error.InvalidTarget, parseTarget("[::1]:50051"));
+}
+
+test "outbound metadata rejects invalid application values before queuing" {
+    var host = [_:0]u8{'x'};
+    var impl: Impl = .{
+        .allocator = std.testing.allocator,
+        .host = host[0..1 :0],
+        .port = 1,
+        .authority = &.{},
+        .user_agent = &.{},
+    };
+
+    try std.testing.expectError(error.InvalidMetadataValue, Operation.init(
+        &impl,
+        "/test.Echo/Unary",
+        "request",
+        .{ .metadata = &.{.{ .key = "x-control", .value = "bad\tvalue" }} },
+    ));
+    try std.testing.expectError(error.InvalidMetadataKey, Operation.init(
+        &impl,
+        "/test.Echo/Unary",
+        "request",
+        .{ .metadata = &.{.{ .key = "grpc-future", .value = "value" }} },
+    ));
+
+    var binary = try Operation.init(
+        &impl,
+        "/test.Echo/Unary",
+        "request",
+        .{ .metadata = &.{.{ .key = "trace-bin", .value = "\x00\xff" }} },
+    );
+    binary.deinit();
+}
+
+test "malformed binary response metadata marks only the operation invalid" {
+    var host = [_:0]u8{'x'};
+    var impl: Impl = .{
+        .allocator = std.testing.allocator,
+        .host = host[0..1 :0],
+        .port = 1,
+        .authority = &.{},
+        .user_agent = &.{},
+    };
+
+    const operation = try Operation.init(&impl, "/test.Echo/Unary", "request", .{});
+    defer operation.deinit();
+    try processResponseMetadata(operation, "grpc-future", "ignored");
+    try processResponseMetadata(operation, "x-control", "bad\tvalue");
+    try std.testing.expect(!operation.response_metadata_invalid);
+    try std.testing.expectEqual(@as(usize, 0), operation.block_metadata.items().len);
+    try processResponseMetadata(operation, "trace-bin", "qw,not base64!");
+    try std.testing.expect(operation.response_metadata_invalid);
+    try std.testing.expectEqual(@as(usize, 0), operation.block_metadata.items().len);
 }
 
 test "response headers with grpc-status are trailers-only metadata" {
@@ -1078,6 +1160,98 @@ test "binary request initial and trailing metadata round trip as raw duplicate v
     try std.testing.expectEqualSlices(u8, &binary_value, trailing[1].value);
     try std.testing.expectEqualSlices(u8, &second_value, trailing[2].value);
     try std.testing.expectEqualStrings(trailing[1].key, trailing[2].key);
+}
+
+test "malformed response metadata fails one call and preserves the channel" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        calls: usize = 0,
+
+        fn appendUnchecked(target: *metadata.Metadata, key: []const u8, value: []const u8) !void {
+            const owned_key = try target.allocator.dupe(u8, key);
+            errdefer target.allocator.free(owned_key);
+            const owned_value = try target.allocator.dupe(u8, value);
+            errdefer target.allocator.free(owned_value);
+            try target.entries.append(target.allocator, .{ .key = owned_key, .value = owned_value });
+        }
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            context: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            self.calls += 1;
+            if (std.mem.eql(u8, request, "bad-key")) {
+                try appendUnchecked(&context.initial_metadata, "x!invalid", "value");
+            } else if (std.mem.eql(u8, request, "bad-trailer")) {
+                try appendUnchecked(&context.trailing_metadata, "x!invalid", "value");
+            } else if (std.mem.eql(u8, request, "bad-ascii")) {
+                try appendUnchecked(&context.initial_metadata, "x-control", "bad\tvalue");
+            }
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Metadata/InvalidResponse",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    const Worker = struct {
+        channel: *Channel,
+        request: []const u8,
+        expected: status.Code,
+        succeeded: bool = false,
+
+        fn run(self: *@This()) void {
+            var result = self.channel.callUnary(
+                std.testing.allocator,
+                "/test.Metadata/InvalidResponse",
+                self.request,
+                .{},
+            ) catch return;
+            defer result.deinit();
+            self.succeeded = result.status.code == self.expected and
+                (self.expected != .ok or std.mem.eql(u8, self.request, result.payload));
+        }
+    };
+    var workers = [_]Worker{
+        .{ .channel = &channel, .request = "bad-key", .expected = .internal },
+        .{ .channel = &channel, .request = "concurrent", .expected = .ok },
+    };
+    var threads: [workers.len]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    for (&threads) |thread| thread.join();
+    for (&workers) |worker| try std.testing.expect(worker.succeeded);
+
+    var discarded = try channel.callUnary(std.testing.allocator, "/test.Metadata/InvalidResponse", "bad-ascii", .{});
+    defer discarded.deinit();
+    try std.testing.expect(discarded.status.isOk());
+    try std.testing.expectEqualStrings("bad-ascii", discarded.payload);
+    try std.testing.expect(discarded.initial_metadata.getFirst("x-control") == null);
+
+    var bad_trailer = try channel.callUnary(std.testing.allocator, "/test.Metadata/InvalidResponse", "bad-trailer", .{});
+    defer bad_trailer.deinit();
+    try std.testing.expectEqual(status.Code.internal, bad_trailer.status.code);
+
+    var reused = try channel.callUnary(std.testing.allocator, "/test.Metadata/InvalidResponse", "reused", .{});
+    defer reused.deinit();
+    try std.testing.expect(reused.status.isOk());
+    try std.testing.expectEqualStrings("reused", reused.payload);
+    try std.testing.expectEqual(@as(usize, 5), handler.calls);
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
 }
 
 test "channel and server exchange gzip-compressed unary messages" {

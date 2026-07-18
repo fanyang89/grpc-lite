@@ -67,7 +67,7 @@ fn testResultAllocations(allocator: std.mem.Allocator) !void {
     );
     defer result.deinit();
     try result.initial_metadata.append("x-initial", "value");
-    try result.trailing_metadata.appendDecoded("trace-bin", "qw==");
+    _ = try result.trailing_metadata.appendDecoded("trace-bin", "qw==");
 }
 
 test "call result owns payload status and metadata" {
