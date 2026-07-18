@@ -1,8 +1,33 @@
 const std = @import("std");
+const protobuf_build = @import("protobuf");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const protobuf_dependency = b.dependency("protobuf", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const generate_proto = protobuf_build.RunProtocStep.create(
+        protobuf_dependency.builder,
+        target,
+        .{
+            .destination_directory = b.path(".zig-cache/generated"),
+            .source_files = &.{b.path("proto/echo.proto")},
+            .include_directories = &.{b.path("proto")},
+        },
+    );
+    const generate_proto_step = b.step("gen-proto", "Generate Zig protobuf sources");
+    generate_proto_step.dependOn(&generate_proto.step);
+
+    const protobuf = protobuf_dependency.module("protobuf");
+    const demo_proto = b.createModule(.{
+        .root_source_file = b.path(".zig-cache/generated/demo.pb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "protobuf", .module = protobuf }},
+    });
 
     const grpc_lite = b.addModule("grpc_lite", .{
         .root_source_file = b.path("src/root.zig"),
@@ -36,8 +61,21 @@ pub fn build(b: *std.Build) void {
     unit_tests.step.dependOn(native_deps);
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    const protobuf_tests = b.addTest(.{
+        .name = "protobuf-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/protobuf_codegen_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "demo_proto", .module = demo_proto }},
+        }),
+    });
+    protobuf_tests.step.dependOn(&generate_proto.step);
+    const run_protobuf_tests = b.addRunArtifact(protobuf_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_protobuf_tests.step);
 
     const echo_server = addExample(
         b,

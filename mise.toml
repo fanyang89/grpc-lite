@@ -16,13 +16,17 @@ run = "zig build"
 description = "Run all tests"
 run = "zig build test --summary all"
 
+[tasks.gen-proto]
+description = "Generate Zig protobuf sources"
+run = "zig build gen-proto"
+
 [tasks.fmt]
 description = "Format Zig sources"
-run = "zig fmt build.zig src examples"
+run = "zig fmt build.zig src examples tests"
 
 [tasks.fmt-check]
 description = "Check Zig formatting"
-run = "zig fmt --check build.zig src examples"
+run = "zig fmt --check build.zig src examples tests"
 
 [tasks.interop]
 description = "Run grpcurl against the Zig echo server"
