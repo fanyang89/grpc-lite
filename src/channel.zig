@@ -131,6 +131,7 @@ pub const Channel = struct {
 };
 
 const State = enum { starting, running, stopping, stopped };
+const ConnectionState = enum { connecting, active, draining, closing };
 
 const Impl = struct {
     allocator: std.mem.Allocator,
@@ -155,6 +156,8 @@ const Impl = struct {
     async_initialized: bool = false,
     timer_initialized: bool = false,
     connected: bool = false,
+    connection_state: ConnectionState = .connecting,
+    connection_generation: usize = 0,
     stopping_on_loop: bool = false,
     connect_count: usize = 0,
 
@@ -261,7 +264,6 @@ const Operation = struct {
             if (!isRequestMetadata(entry.key)) return error.InvalidMetadataKey;
             try operation.request_metadata.append(entry.key, entry.value);
         }
-        if (options.timeout_ns) |timeout| operation.setTimeoutHeader(timeout);
         return operation;
     }
 
@@ -416,6 +418,7 @@ const WriteRequest = struct {
     request: c.uv_write_t = undefined,
     impl: *Impl,
     bytes: []u8,
+    generation: usize,
 };
 
 fn runLoop(impl: *Impl) void {
@@ -437,10 +440,6 @@ fn runLoop(impl: *Impl) void {
 }
 
 fn setupLoop(impl: *Impl) !void {
-    if (c.uv_tcp_init(&impl.loop, &impl.tcp) < 0) return error.TcpInitializationFailed;
-    impl.tcp_initialized = true;
-    impl.tcp.data = impl;
-
     if (c.uv_async_init(&impl.loop, &impl.async_handle, onAsync) < 0) return error.AsyncInitializationFailed;
     impl.async_initialized = true;
     impl.async_handle.data = impl;
@@ -448,6 +447,17 @@ fn setupLoop(impl: *Impl) !void {
     if (c.uv_timer_init(&impl.loop, &impl.deadline_timer) < 0) return error.TimerInitializationFailed;
     impl.timer_initialized = true;
     impl.deadline_timer.data = impl;
+
+    try startConnection(impl);
+}
+
+fn startConnection(impl: *Impl) !void {
+    if (c.uv_tcp_init(&impl.loop, &impl.tcp) < 0) return error.TcpInitializationFailed;
+    impl.tcp_initialized = true;
+    impl.tcp.data = impl;
+    impl.connected = false;
+    impl.connection_state = .connecting;
+    impl.connection_generation += 1;
 
     try initializeSession(impl);
     var address: c.struct_sockaddr_in = undefined;
@@ -476,6 +486,13 @@ fn onConnect(request: ?*c.uv_connect_t, connect_status: c_int) callconv(.c) void
         beginStop(impl, "connection failed");
         return;
     }
+    c.uv_mutex_lock(&impl.mutex);
+    const stopping = impl.state == .stopping or impl.state == .stopped;
+    c.uv_mutex_unlock(&impl.mutex);
+    if (stopping) {
+        beginStop(impl, "channel closed");
+        return;
+    }
     impl.connected = true;
     impl.connect_count += 1;
     flush(impl) catch {
@@ -483,7 +500,9 @@ fn onConnect(request: ?*c.uv_connect_t, connect_status: c_int) callconv(.c) void
         beginStop(impl, "connection failed");
         return;
     };
+    impl.connection_state = .active;
     impl.signalStartup(true);
+    processPending(impl);
 }
 
 fn onAsync(handle: ?*c.uv_async_t) callconv(.c) void {
@@ -495,10 +514,21 @@ fn onAsync(handle: ?*c.uv_async_t) callconv(.c) void {
         beginStop(impl, "channel closed");
         return;
     }
-    processPending(impl);
+    switch (impl.connection_state) {
+        .active => processPending(impl),
+        .draining => {
+            if (impl.operations.count() == 0) beginReconnect(impl);
+            scheduleDeadlineTimer(impl);
+        },
+        .connecting, .closing => scheduleDeadlineTimer(impl),
+    }
 }
 
 fn processPending(impl: *Impl) void {
+    if (impl.connection_state != .active) {
+        scheduleDeadlineTimer(impl);
+        return;
+    }
     var pending: std.ArrayList(*Operation) = .empty;
     c.uv_mutex_lock(&impl.mutex);
     std.mem.swap(std.ArrayList(*Operation), &pending, &impl.pending);
@@ -507,12 +537,14 @@ fn processPending(impl: *Impl) void {
 
     for (pending.items) |operation| {
         if (operation.deadline_ns) |deadline| {
-            if (deadline <= c.uv_hrtime()) {
+            const now = c.uv_hrtime();
+            if (deadline <= now) {
                 operation.deadline_expired = true;
                 operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
                 operation.complete();
                 continue;
             }
+            operation.setTimeoutHeader(deadline - now);
         }
         submitOperation(impl, operation) catch {
             operation.setOutcome(.unavailable, "request submission failed") catch {};
@@ -603,7 +635,11 @@ fn flush(impl: *Impl) !void {
         errdefer impl.allocator.destroy(write);
         const bytes = try impl.allocator.dupe(u8, data[0..@intCast(length)]);
         errdefer impl.allocator.free(bytes);
-        write.* = .{ .impl = impl, .bytes = bytes };
+        write.* = .{
+            .impl = impl,
+            .bytes = bytes,
+            .generation = impl.connection_generation,
+        };
         write.request.data = write;
         var buffer = c.uv_buf_init(@ptrCast(bytes.ptr), @intCast(bytes.len));
         if (c.uv_write(&write.request, @ptrCast(&impl.tcp), &buffer, 1, onWrite) < 0) return error.WriteFailed;
@@ -626,6 +662,11 @@ fn onRead(handle: ?*c.uv_stream_t, bytes_read: isize, buffer: ?*const c.uv_buf_t
         impl.allocator.free(bytes[0..buffer.?.*.len]);
     };
     if (bytes_read < 0) {
+        if (impl.connection_state == .closing) return;
+        if (impl.connection_state == .draining and impl.operations.count() == 0) {
+            beginReconnect(impl);
+            return;
+        }
         beginStop(impl, "connection closed");
         return;
     }
@@ -642,9 +683,12 @@ fn onRead(handle: ?*c.uv_stream_t, bytes_read: isize, buffer: ?*const c.uv_buf_t
 fn onWrite(request: ?*c.uv_write_t, write_status: c_int) callconv(.c) void {
     const write: *WriteRequest = @ptrCast(@alignCast(request.?.*.data.?));
     const impl = write.impl;
+    const generation = write.generation;
     impl.allocator.free(write.bytes);
     impl.allocator.destroy(write);
-    if (write_status < 0) beginStop(impl, "connection write failed");
+    if (write_status < 0 and generation == impl.connection_generation and impl.connection_state != .closing) {
+        beginStop(impl, "connection write failed");
+    }
 }
 
 fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, _: ?*anyopaque) callconv(.c) c_int {
@@ -713,8 +757,16 @@ fn onDataChunk(
     return 0;
 }
 
-fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, _: ?*anyopaque) callconv(.c) c_int {
+fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
     const native_frame = received_frame.?;
+    if (native_frame.*.hd.type == c.NGHTTP2_GOAWAY) {
+        const impl: *Impl = @ptrCast(@alignCast(user_data.?));
+        if (impl.connection_state == .active) {
+            impl.connection_state = .draining;
+            _ = c.uv_async_send(&impl.async_handle);
+        }
+        return 0;
+    }
     if (native_frame.*.hd.type != c.NGHTTP2_HEADERS) return 0;
     const operation: *Operation = @ptrCast(@alignCast(c.nghttp2_session_get_stream_user_data(session, native_frame.*.hd.stream_id) orelse return 0));
     operation.finishHeaderBlock() catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -726,6 +778,9 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_d
     if (impl.operations.fetchRemove(stream_id)) |entry| {
         entry.value.finalize(error_code);
         scheduleDeadlineTimer(impl);
+        if (impl.connection_state == .draining and impl.operations.count() == 0) {
+            _ = c.uv_async_send(&impl.async_handle);
+        }
     }
     return 0;
 }
@@ -741,6 +796,13 @@ fn scheduleDeadlineTimer(impl: *Impl) void {
             if (earliest == null or deadline < earliest.?) earliest = deadline;
         }
     }
+    c.uv_mutex_lock(&impl.mutex);
+    for (impl.pending.items) |operation| {
+        if (operation.deadline_ns) |deadline| {
+            if (earliest == null or deadline < earliest.?) earliest = deadline;
+        }
+    }
+    c.uv_mutex_unlock(&impl.mutex);
     if (earliest == null) {
         _ = c.uv_timer_stop(&impl.deadline_timer);
         return;
@@ -753,6 +815,21 @@ fn scheduleDeadlineTimer(impl: *Impl) void {
 fn onDeadlineTimer(handle: ?*c.uv_timer_t) callconv(.c) void {
     const impl: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
     const now = c.uv_hrtime();
+    c.uv_mutex_lock(&impl.mutex);
+    var pending_index: usize = 0;
+    while (pending_index < impl.pending.items.len) {
+        const operation = impl.pending.items[pending_index];
+        if (operation.deadline_ns != null and operation.deadline_ns.? <= now) {
+            _ = impl.pending.orderedRemove(pending_index);
+            operation.deadline_expired = true;
+            operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
+            operation.complete();
+        } else {
+            pending_index += 1;
+        }
+    }
+    c.uv_mutex_unlock(&impl.mutex);
+
     var iterator = impl.operations.valueIterator();
     while (iterator.next()) |operation_ptr| {
         const operation = operation_ptr.*;
@@ -768,11 +845,41 @@ fn onDeadlineTimer(handle: ?*c.uv_timer_t) callconv(.c) void {
             }
         }
     }
-    flush(impl) catch {
-        beginStop(impl, "connection failed");
-        return;
-    };
+    if (impl.connected) {
+        flush(impl) catch {
+            beginStop(impl, "connection failed");
+            return;
+        };
+    }
     scheduleDeadlineTimer(impl);
+}
+
+fn beginReconnect(impl: *Impl) void {
+    if (impl.connection_state != .draining or impl.operations.count() != 0) return;
+    impl.connection_state = .closing;
+    impl.connected = false;
+    _ = c.uv_read_stop(@ptrCast(&impl.tcp));
+    if (impl.session) |session| {
+        c.nghttp2_session_del(session);
+        impl.session = null;
+    }
+    if (c.uv_is_closing(@ptrCast(&impl.tcp)) == 0) {
+        c.uv_close(@ptrCast(&impl.tcp), onTcpClosed);
+    }
+}
+
+fn onTcpClosed(handle: ?*c.uv_handle_t) callconv(.c) void {
+    const impl: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
+    impl.tcp_initialized = false;
+    impl.connected = false;
+    if (impl.stopping_on_loop or impl.connection_state != .closing) return;
+
+    c.uv_mutex_lock(&impl.mutex);
+    const running = impl.state == .running;
+    c.uv_mutex_unlock(&impl.mutex);
+    if (!running) return;
+
+    startConnection(impl) catch beginStop(impl, "connection failed");
 }
 
 fn beginStop(impl: *Impl, reason: []const u8) void {
@@ -1040,6 +1147,63 @@ test "channel and server exchange gzip-compressed unary messages" {
     );
     defer limited.deinit();
     try std.testing.expectEqual(status.Code.resource_exhausted, limited.status.code);
+}
+
+test "channel replaces a connection after GOAWAY without replaying calls" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        server: *server.Server,
+        calls: usize = 0,
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            self.calls += 1;
+            if (self.calls == 1) {
+                const connection = self.server.impl.connections.items[0];
+                if (c.nghttp2_submit_goaway(
+                    connection.session,
+                    c.NGHTTP2_FLAG_NONE,
+                    1,
+                    c.NGHTTP2_NO_ERROR,
+                    null,
+                    0,
+                ) != 0) return error.GoAwaySubmissionFailed;
+            }
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    var handler = Handler{ .server = &test_server };
+    try test_server.registerUnary(
+        "/test.GoAway/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var first = try channel.callUnary(std.testing.allocator, "/test.GoAway/Unary", "first", .{});
+    defer first.deinit();
+    try std.testing.expect(first.status.isOk());
+    try std.testing.expectEqualStrings("first", first.payload);
+
+    var second = try channel.callUnary(std.testing.allocator, "/test.GoAway/Unary", "second", .{});
+    defer second.deinit();
+    try std.testing.expect(second.status.isOk());
+    try std.testing.expectEqualStrings("second", second.payload);
+    try std.testing.expectEqual(@as(usize, 2), channel.impl.connect_count);
+    try std.testing.expectEqual(@as(usize, 2), handler.calls);
 }
 
 test "channel performs reusable concurrent unary calls end to end" {
