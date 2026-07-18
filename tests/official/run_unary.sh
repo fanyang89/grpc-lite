@@ -12,6 +12,10 @@ official_cases=(
   unimplemented_method
   unimplemented_service
 )
+soak_cases=(
+  rpc_soak
+  channel_soak
+)
 compression_cases=(
   client_compressed_unary
   server_compressed_unary
@@ -96,6 +100,14 @@ for test_case in "${official_cases[@]}"; do
     --test_case="$test_case" \
     --use_tls=false
 done
+for test_case in "${soak_cases[@]}"; do
+  run_case 'grpc-go client -> grpc-lite server' "$test_case" \
+    "$work_dir/grpc-go-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$zig_server_port" \
+    --test_case="$test_case" \
+    --use_tls=false
+done
 stop_peer
 
 peer_log="$work_dir/grpc-go-server.log"
@@ -113,7 +125,7 @@ for test_case in "${official_cases[@]}"; do
 done
 stop_peer
 
-printf '%s\n' 'All 10 official unary interop runs passed.'
+printf '%s\n' 'All 10 bidirectional unary and 2 grpc-go soak runs passed.'
 
 printf '%s\n' 'grpc-go v1.82.1 does not expose the official compression cases; running grpc-lite compression integration separately.'
 peer_log="$work_dir/grpc-lite-compression-server.log"

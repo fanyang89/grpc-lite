@@ -19,7 +19,7 @@ mise run interop-http2
 | gRPC HTTP/2 framing | `TestSoonClientShortSettings`, `TestSoonClientPrefaceWithStreamId`, `TestSoonSmallMaxFrameSize` | Reported non-fatal failures by the upstream `TestSoon` suite |
 | gRPC HTTP/2 TLS framing | TLS application protocol, version, and cipher suite cases | Skipped; TLS is out of scope |
 | gRPC HTTP/2 edge-case server | reset, GOAWAY, ping, max-stream, and DATA padding cases | Not yet integrated |
-| grpc-go soak | `rpc_soak`, `channel_soak` | Not yet integrated |
+| grpc-go client to grpc-lite server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
 
 The HTTP/2 framing tool deliberately treats every `TestSoon*` failure as non-fatal and
 returns success unless a non-`TestSoon` case fails. `run_http2.sh` preserves that upstream
