@@ -70,6 +70,22 @@ jobs:
       - name: Test
         run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
 
+  package-consumer:
+    name: Package consumer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout without submodules
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install mise tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4
+
+      - name: Build raw package consumer
+        run: mise run test-consumer
+
   interop:
     name: Interop (${{ matrix.arch }})
     strategy:
@@ -123,6 +139,7 @@ jobs:
     needs:
       - workflow-lint
       - core-test
+      - package-consumer
       - interop
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -131,8 +148,10 @@ jobs:
         env:
           WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
           CORE_TEST_RESULT: ${{ needs.core-test.result }}
+          PACKAGE_CONSUMER_RESULT: ${{ needs.package-consumer.result }}
           INTEROP_RESULT: ${{ needs.interop.result }}
         run: |
           test "$WORKFLOW_LINT_RESULT" = success
           test "$CORE_TEST_RESULT" = success
+          test "$PACKAGE_CONSUMER_RESULT" = success
           test "$INTEROP_RESULT" = success

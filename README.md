@@ -38,6 +38,7 @@ Useful tasks:
 mise run build
 mise run test
 mise run test-release-safe
+mise run test-consumer
 mise run fmt
 mise run ci-lint
 mise run interop

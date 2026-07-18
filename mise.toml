@@ -22,6 +22,10 @@ run = "zig build test --summary all"
 description = "Run all tests with ReleaseSafe optimization"
 run = "zig build test -Doptimize=ReleaseSafe --summary all"
 
+[tasks.test-consumer]
+description = "Build a raw consumer from the package archive"
+run = "tests/consumer/run_raw.sh"
+
 [tasks.gen-proto]
 description = "Generate Zig protobuf sources"
 run = "zig build gen-proto"
