@@ -1,4 +1,5 @@
 pub const api = @cImport({
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("nghttp2/nghttp2.h");
     @cInclude("uv.h");
 });
