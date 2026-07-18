@@ -58,6 +58,18 @@ pub const Result = struct {
     }
 };
 
+fn testResultAllocations(allocator: std.mem.Allocator) !void {
+    var result = try Result.initWithCompression(
+        allocator,
+        status.Status.init(.invalid_argument, "bad request"),
+        "response",
+        .gzip,
+    );
+    defer result.deinit();
+    try result.initial_metadata.append("x-initial", "value");
+    try result.trailing_metadata.appendDecoded("trace-bin", "qw==");
+}
+
 test "call result owns payload status and metadata" {
     var result = try Result.init(
         std.testing.allocator,
@@ -70,4 +82,31 @@ test "call result owns payload status and metadata" {
     try std.testing.expectEqual(status.Code.invalid_argument, result.status.code);
     try std.testing.expectEqualStrings("bad request", result.status.message);
     try std.testing.expectEqualStrings("response", result.payload);
+}
+
+test "call result copies dynamic status and payload" {
+    const source_message = try std.testing.allocator.dupe(u8, "dynamic status");
+    defer std.testing.allocator.free(source_message);
+    const source_payload = try std.testing.allocator.dupe(u8, "dynamic payload");
+    defer std.testing.allocator.free(source_payload);
+
+    var result = try Result.init(
+        std.testing.allocator,
+        status.Status.init(.unknown, source_message),
+        source_payload,
+    );
+    defer result.deinit();
+    @memset(source_message, 'x');
+    @memset(source_payload, 'y');
+
+    try std.testing.expectEqualStrings("dynamic status", result.status.message);
+    try std.testing.expectEqualStrings("dynamic payload", result.payload);
+}
+
+test "call result handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testResultAllocations,
+        .{},
+    );
 }
