@@ -1,9 +1,12 @@
 const std = @import("std");
+const Compression = @import("compression.zig").Compression;
 const metadata = @import("metadata.zig");
 const status = @import("status.zig");
 
 pub const ServerContext = struct {
     allocator: std.mem.Allocator,
+    request_compression: Compression = .identity,
+    response_compression: Compression = .identity,
     request_metadata: metadata.Metadata,
     initial_metadata: metadata.Metadata,
     trailing_metadata: metadata.Metadata,
@@ -30,6 +33,10 @@ pub const ServerContext = struct {
 
     pub fn addTrailingMetadata(self: *ServerContext, key: []const u8, value: []const u8) !void {
         try self.trailing_metadata.append(key, value);
+    }
+
+    pub fn setResponseCompression(self: *ServerContext, response_compression: Compression) void {
+        self.response_compression = response_compression;
     }
 };
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig").api;
+const Compression = @import("compression.zig").Compression;
 const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
@@ -180,7 +181,8 @@ const Stream = struct {
     path: ?[]u8 = null,
     method_post: bool = false,
     content_type_grpc: bool = false,
-    identity_encoding: bool = true,
+    request_compression: ?Compression = .identity,
+    response_compression: Compression = .identity,
     header_too_large: bool = false,
     request_too_large: bool = false,
     responded: bool = false,
@@ -476,7 +478,7 @@ fn onHeader(
     } else if (std.mem.eql(u8, name, "content-type")) {
         stream.content_type_grpc = std.mem.startsWith(u8, value, "application/grpc");
     } else if (std.mem.eql(u8, name, "grpc-encoding")) {
-        stream.identity_encoding = std.mem.eql(u8, value, "identity");
+        stream.request_compression = Compression.parse(value);
     } else if (isRequestMetadata(name)) {
         stream.request_metadata.appendDecoded(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     }
@@ -493,7 +495,7 @@ fn onDataChunk(
 ) callconv(.c) c_int {
     const connection: *Connection = @ptrCast(@alignCast(user_data.?));
     const stream = connection.streams.get(stream_id) orelse return 0;
-    const body_limit = std.math.add(usize, connection.server.max_request_size, frame.header_size) catch std.math.maxInt(usize);
+    const body_limit = wireMessageLimit(connection.server.max_request_size);
     if (data_length > body_limit -| stream.request_body.items.len) {
         stream.request_too_large = true;
         return 0;
@@ -529,10 +531,10 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
         submitFailure(session, stream, .invalid_argument, "invalid content-type");
         return;
     }
-    if (!stream.identity_encoding) {
-        submitFailure(session, stream, .unimplemented, "compression is not supported");
+    const request_compression = stream.request_compression orelse {
+        submitFailure(session, stream, .unimplemented, "request compression is not supported");
         return;
-    }
+    };
     const path = stream.path orelse {
         submitFailure(session, stream, .unimplemented, "method path missing");
         return;
@@ -541,10 +543,14 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
         submitFailure(session, stream, .unimplemented, "method not found");
         return;
     };
-    const request = frame.decodeUnary(stream.allocator, stream.request_body.items, stream.connection.server.max_request_size) catch |err| {
+    const request = frame.decodeUnaryWithCompression(
+        stream.allocator,
+        stream.request_body.items,
+        stream.connection.server.max_request_size,
+        request_compression,
+    ) catch |err| {
         switch (err) {
             error.MessageTooLarge => submitFailure(session, stream, .resource_exhausted, "request message too large"),
-            error.CompressionUnsupported => submitFailure(session, stream, .unimplemented, "compression is not supported"),
             else => submitFailure(session, stream, .invalid_argument, "malformed unary request"),
         }
         return;
@@ -553,6 +559,7 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
 
     var context = service.ServerContext.init(stream.allocator);
     defer context.deinit();
+    context.request_compression = if (stream.request_body.items[0] == 1) .gzip else .identity;
     for (stream.request_metadata.items()) |entry| context.request_metadata.append(entry.key, entry.value) catch {
         submitFailure(session, stream, .internal, "metadata allocation failed");
         return;
@@ -562,13 +569,18 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
         return;
     };
     defer response.deinit();
+    stream.response_compression = context.response_compression;
     for (context.trailing_metadata.items()) |entry| stream.trailing_metadata.append(entry.key, entry.value) catch {
         submitFailure(session, stream, .internal, "metadata allocation failed");
         return;
     };
 
     if (response.status.isOk()) {
-        stream.response_body = frame.encode(stream.allocator, response.payload) catch {
+        stream.response_body = frame.encodeWithCompression(
+            stream.allocator,
+            response.payload,
+            stream.response_compression,
+        ) catch {
             submitFailure(session, stream, .internal, "response allocation failed");
             return;
         };
@@ -598,7 +610,8 @@ fn submitResponse(session: *c.nghttp2_session, stream: *Stream, initial_metadata
     }
     try headers.append(stream.allocator, nativeHeader(":status", "200"));
     try headers.append(stream.allocator, nativeHeader("content-type", "application/grpc"));
-    try headers.append(stream.allocator, nativeHeader("grpc-encoding", "identity"));
+    try headers.append(stream.allocator, nativeHeader("grpc-encoding", stream.response_compression.name()));
+    try headers.append(stream.allocator, nativeHeader("grpc-accept-encoding", "identity,gzip"));
     for (initial_metadata) |entry| {
         if (!isReservedResponseHeader(entry.key)) {
             const value = try metadata.encodeValue(stream.allocator, entry.key, entry.value);
@@ -706,8 +719,15 @@ fn isRequestMetadata(name: []const u8) bool {
 fn isReservedResponseHeader(name: []const u8) bool {
     return std.mem.eql(u8, name, "content-type") or
         std.mem.eql(u8, name, "grpc-encoding") or
+        std.mem.eql(u8, name, "grpc-accept-encoding") or
         std.mem.eql(u8, name, "grpc-status") or
         std.mem.eql(u8, name, "grpc-message");
+}
+
+fn wireMessageLimit(max_message_size: usize) usize {
+    const overhead = std.math.add(usize, max_message_size / 8, 1024) catch return std.math.maxInt(usize);
+    const total_overhead = std.math.add(usize, overhead, frame.header_size) catch return std.math.maxInt(usize);
+    return std.math.add(usize, max_message_size, total_overhead) catch std.math.maxInt(usize);
 }
 
 fn isReservedTrailer(name: []const u8) bool {

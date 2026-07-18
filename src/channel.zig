@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig").api;
 const call = @import("call.zig");
+const Compression = @import("compression.zig").Compression;
 const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
@@ -80,10 +81,11 @@ pub const Channel = struct {
         if (!queued) operation.complete();
         operation.wait();
 
-        var result = try call.Result.init(
+        var result = try call.Result.initWithCompression(
             allocator,
             .init(operation.response_code, operation.response_message),
             if (operation.response_payload) |payload| payload else &.{},
+            operation.response_compression,
         );
         errdefer result.deinit();
         try copyMetadata(&result.initial_metadata, &operation.initial_metadata);
@@ -191,6 +193,7 @@ const Operation = struct {
     request_frame: []u8,
     request_offset: usize = 0,
     request_metadata: metadata.Metadata,
+    request_compression: Compression,
     max_response_size: usize,
     deadline_ns: ?u64,
     timeout_header: [16]u8 = undefined,
@@ -205,6 +208,8 @@ const Operation = struct {
     response_message: []u8 = &.{},
     response_message_owned: bool = false,
     response_payload: ?[]u8 = null,
+    response_compression: Compression = .identity,
+    response_encoding_invalid: bool = false,
     response_body: std.ArrayList(u8) = .empty,
     response_too_large: bool = false,
     saw_response_headers: bool = false,
@@ -224,7 +229,11 @@ const Operation = struct {
         errdefer impl.allocator.destroy(operation);
         const owned_path = try impl.allocator.dupe(u8, path);
         errdefer impl.allocator.free(owned_path);
-        const request_frame = try frame.encode(impl.allocator, payload);
+        const request_frame = try frame.encodeWithCompression(
+            impl.allocator,
+            payload,
+            options.request_compression,
+        );
         errdefer impl.allocator.free(request_frame);
 
         operation.* = .{
@@ -232,6 +241,7 @@ const Operation = struct {
             .path = owned_path,
             .request_frame = request_frame,
             .request_metadata = metadata.Metadata.init(impl.allocator),
+            .request_compression = options.request_compression,
             .max_response_size = options.max_response_size,
             .deadline_ns = if (options.timeout_ns) |timeout| c.uv_hrtime() +| timeout else null,
             .initial_metadata = metadata.Metadata.init(impl.allocator),
@@ -360,6 +370,8 @@ const Operation = struct {
             self.setOutcome(.unknown, "invalid gRPC content-type") catch {};
         } else if (self.grpc_status == null) {
             self.setOutcome(.unknown, "missing grpc-status") catch {};
+        } else if (self.response_encoding_invalid) {
+            self.setOutcome(.unimplemented, "response compression is not supported") catch {};
         } else if (self.response_too_large) {
             self.setOutcome(.resource_exhausted, "response message too large") catch {};
         } else {
@@ -376,10 +388,14 @@ const Operation = struct {
             if (code != .ok) {
                 self.setOutcome(code, if (decoded_message) |value| value else "") catch {};
             } else {
-                const payload = frame.decodeUnary(self.impl.allocator, self.response_body.items, self.max_response_size) catch |err| {
+                const payload = frame.decodeUnaryWithCompression(
+                    self.impl.allocator,
+                    self.response_body.items,
+                    self.max_response_size,
+                    self.response_compression,
+                ) catch |err| {
                     const outcome: status.Status = switch (err) {
                         error.MessageTooLarge => .init(.resource_exhausted, "response message too large"),
-                        error.CompressionUnsupported => .init(.unimplemented, "response compression is not supported"),
                         else => .init(.internal, "malformed unary response"),
                     };
                     self.setOutcome(outcome.code, outcome.message) catch {};
@@ -387,6 +403,7 @@ const Operation = struct {
                     return;
                 };
                 self.response_payload = payload;
+                self.response_compression = if (self.response_body.items[0] == 1) .gzip else .identity;
                 self.setOutcome(.ok, if (decoded_message) |value| value else "") catch {};
             }
         }
@@ -525,8 +542,8 @@ fn submitOperation(impl: *Impl, operation: *Operation) !void {
     try headers.append(impl.allocator, nativeHeader(":authority", impl.authority));
     try headers.append(impl.allocator, nativeHeader("content-type", "application/grpc"));
     try headers.append(impl.allocator, nativeHeader("te", "trailers"));
-    try headers.append(impl.allocator, nativeHeader("grpc-encoding", "identity"));
-    try headers.append(impl.allocator, nativeHeader("grpc-accept-encoding", "identity"));
+    try headers.append(impl.allocator, nativeHeader("grpc-encoding", operation.request_compression.name()));
+    try headers.append(impl.allocator, nativeHeader("grpc-accept-encoding", "identity,gzip"));
     try headers.append(impl.allocator, nativeHeader("user-agent", impl.user_agent));
     if (operation.timeout_header_len != 0) {
         try headers.append(impl.allocator, nativeHeader("grpc-timeout", operation.timeout_header[0..operation.timeout_header_len]));
@@ -667,6 +684,11 @@ fn onHeader(
     } else if (std.mem.eql(u8, name, "grpc-message")) {
         if (operation.block_grpc_message) |old| operation.impl.allocator.free(old);
         operation.block_grpc_message = operation.impl.allocator.dupe(u8, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    } else if (std.mem.eql(u8, name, "grpc-encoding")) {
+        operation.response_compression = Compression.parse(value) orelse {
+            operation.response_encoding_invalid = true;
+            return 0;
+        };
     } else if (isResponseMetadata(name)) {
         operation.block_metadata.appendDecoded(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     }
@@ -682,7 +704,7 @@ fn onDataChunk(
     _: ?*anyopaque,
 ) callconv(.c) c_int {
     const operation: *Operation = @ptrCast(@alignCast(c.nghttp2_session_get_stream_user_data(session, stream_id) orelse return 0));
-    const limit = std.math.add(usize, operation.max_response_size, frame.header_size) catch std.math.maxInt(usize);
+    const limit = wireMessageLimit(operation.max_response_size);
     if (data_length > limit -| operation.response_body.items.len) {
         operation.response_too_large = true;
         return 0;
@@ -852,6 +874,12 @@ fn httpStatusCode(http_status: u16) status.Code {
     };
 }
 
+fn wireMessageLimit(max_message_size: usize) usize {
+    const overhead = std.math.add(usize, max_message_size / 8, 1024) catch return std.math.maxInt(usize);
+    const total_overhead = std.math.add(usize, overhead, frame.header_size) catch return std.math.maxInt(usize);
+    return std.math.add(usize, max_message_size, total_overhead) catch std.math.maxInt(usize);
+}
+
 test "target and timeout formatting" {
     const target = try parseTarget("127.0.0.1:50051");
     try std.testing.expectEqualStrings("127.0.0.1", target.host);
@@ -957,6 +985,61 @@ test "binary request initial and trailing metadata round trip as raw duplicate v
     try std.testing.expectEqualSlices(u8, &binary_value, trailing[1].value);
     try std.testing.expectEqualSlices(u8, &second_value, trailing[2].value);
     try std.testing.expectEqualStrings(trailing[1].key, trailing[2].key);
+}
+
+test "channel and server exchange gzip-compressed unary messages" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        saw_gzip_request: bool = false,
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            context: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            self.saw_gzip_request = context.request_compression == .gzip;
+            context.setResponseCompression(.gzip);
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Compression/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var result = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Compression/Unary",
+        "compressible compressible compressible",
+        .{ .request_compression = .gzip },
+    );
+    defer result.deinit();
+    try std.testing.expect(result.status.isOk());
+    try std.testing.expect(handler.saw_gzip_request);
+    try std.testing.expectEqual(Compression.gzip, result.response_compression);
+    try std.testing.expectEqualStrings("compressible compressible compressible", result.payload);
+
+    var limited = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Compression/Unary",
+        "123456789",
+        .{ .request_compression = .gzip, .max_response_size = 8 },
+    );
+    defer limited.deinit();
+    try std.testing.expectEqual(status.Code.resource_exhausted, limited.status.code);
 }
 
 test "channel performs reusable concurrent unary calls end to end" {

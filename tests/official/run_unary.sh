@@ -5,12 +5,16 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work_dir="$project_root/.zig-cache/official"
 zig_server_port=${ZIG_SERVER_PORT:-$((20000 + $$ % 10000))}
 go_server_port=${GO_SERVER_PORT:-$((zig_server_port + 1))}
-cases=(
+official_cases=(
   empty_unary
   large_unary
   special_status_message
   unimplemented_method
   unimplemented_service
+)
+compression_cases=(
+  client_compressed_unary
+  server_compressed_unary
 )
 
 peer_pid=
@@ -84,7 +88,7 @@ peer_log="$work_dir/grpc-lite-server.log"
   --port="$zig_server_port" --use_tls=false >"$peer_log" 2>&1 &
 peer_pid=$!
 wait_for_peer "$zig_server_port"
-for test_case in "${cases[@]}"; do
+for test_case in "${official_cases[@]}"; do
   run_case 'grpc-go client -> grpc-lite server' "$test_case" \
     "$work_dir/grpc-go-interop-client" \
     --server_host=127.0.0.1 \
@@ -99,7 +103,7 @@ peer_log="$work_dir/grpc-go-server.log"
   --port="$go_server_port" --use_tls=false >"$peer_log" 2>&1 &
 peer_pid=$!
 wait_for_peer "$go_server_port"
-for test_case in "${cases[@]}"; do
+for test_case in "${official_cases[@]}"; do
   run_case 'grpc-lite client -> grpc-go server' "$test_case" \
     "$project_root/zig-out/bin/grpc-lite-interop-client" \
     --server_host=127.0.0.1 \
@@ -110,3 +114,21 @@ done
 stop_peer
 
 printf '%s\n' 'All 10 official unary interop runs passed.'
+
+printf '%s\n' 'grpc-go v1.82.1 does not expose the official compression cases; running grpc-lite compression integration separately.'
+peer_log="$work_dir/grpc-lite-compression-server.log"
+"$project_root/zig-out/bin/grpc-lite-interop-server" \
+  --port="$zig_server_port" --use_tls=false >"$peer_log" 2>&1 &
+peer_pid=$!
+wait_for_peer "$zig_server_port"
+for test_case in "${compression_cases[@]}"; do
+  run_case 'grpc-lite client -> grpc-lite server (compression integration)' "$test_case" \
+    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$zig_server_port" \
+    --test_case="$test_case" \
+    --use_tls=false
+done
+stop_peer
+
+printf '%s\n' 'All 2 grpc-lite compression integration runs passed.'

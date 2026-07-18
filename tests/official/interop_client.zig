@@ -36,6 +36,10 @@ pub fn main(init: std.process.Init) !void {
         try emptyUnary(init.gpa, &channel);
     } else if (std.mem.eql(u8, config.test_case, "large_unary")) {
         try largeUnary(init.gpa, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "client_compressed_unary")) {
+        try clientCompressedUnary(init.gpa, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "server_compressed_unary")) {
+        try serverCompressedUnary(init.gpa, &channel);
     } else if (std.mem.eql(u8, config.test_case, "special_status_message")) {
         try specialStatusMessage(init.gpa, &channel);
     } else if (std.mem.eql(u8, config.test_case, "unimplemented_method")) {
@@ -83,8 +87,65 @@ fn largeUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
         request,
     );
     defer result.deinit();
-    try expectStatus(&result, .ok, "");
+    try expectLargeResponse(allocator, &result);
+}
 
+fn clientCompressedUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
+    const body = try allocator.alloc(u8, large_request_size);
+    defer allocator.free(body);
+    @memset(body, 0);
+    const request: testing.SimpleRequest = .{
+        .response_type = .COMPRESSABLE,
+        .response_size = large_response_size,
+        .payload = .{
+            .type = .COMPRESSABLE,
+            .body = body,
+        },
+        .expect_compressed = .{ .value = true },
+    };
+    var rejected = try callMessage(
+        allocator,
+        channel,
+        "/grpc.testing.TestService/UnaryCall",
+        request,
+    );
+    defer rejected.deinit();
+    if (rejected.status.code != .invalid_argument) return error.UnexpectedRpcStatus;
+
+    var result = try callMessageWithOptions(
+        allocator,
+        channel,
+        "/grpc.testing.TestService/UnaryCall",
+        request,
+        .{
+            .timeout_ns = 10 * std.time.ns_per_s,
+            .request_compression = .gzip,
+        },
+    );
+    defer result.deinit();
+    try expectLargeResponse(allocator, &result);
+    if (result.response_compression != .identity) return error.UnexpectedResponseCompression;
+}
+
+fn serverCompressedUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
+    const request: testing.SimpleRequest = .{
+        .response_type = .COMPRESSABLE,
+        .response_size = large_response_size,
+        .response_compressed = .{ .value = true },
+    };
+    var result = try callMessage(
+        allocator,
+        channel,
+        "/grpc.testing.TestService/UnaryCall",
+        request,
+    );
+    defer result.deinit();
+    try expectLargeResponse(allocator, &result);
+    if (result.response_compression != .gzip) return error.UnexpectedResponseCompression;
+}
+
+fn expectLargeResponse(allocator: std.mem.Allocator, result: *const grpc.CallResult) !void {
+    try expectStatus(result, .ok, "");
     var reader: std.Io.Reader = .fixed(result.payload);
     var response = try testing.SimpleResponse.decode(&reader, allocator);
     defer response.deinit(allocator);
@@ -135,12 +196,22 @@ fn callMessage(
     path: []const u8,
     request: anytype,
 ) !grpc.CallResult {
+    return callMessageWithOptions(allocator, channel, path, request, .{
+        .timeout_ns = 10 * std.time.ns_per_s,
+    });
+}
+
+fn callMessageWithOptions(
+    allocator: std.mem.Allocator,
+    channel: *grpc.Channel,
+    path: []const u8,
+    request: anytype,
+    options: grpc.CallOptions,
+) !grpc.CallResult {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
     try request.encode(&writer.writer, allocator);
-    return channel.callUnary(allocator, path, writer.written(), .{
-        .timeout_ns = 10 * std.time.ns_per_s,
-    });
+    return channel.callUnary(allocator, path, writer.written(), options);
 }
 
 fn expectStatus(result: *const grpc.CallResult, code: grpc.StatusCode, message: []const u8) !void {

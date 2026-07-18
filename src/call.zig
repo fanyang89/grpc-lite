@@ -1,4 +1,5 @@
 const std = @import("std");
+const Compression = @import("compression.zig").Compression;
 const metadata = @import("metadata.zig");
 const status = @import("status.zig");
 
@@ -8,12 +9,14 @@ pub const Options = struct {
     metadata: []const metadata.Entry = &.{},
     timeout_ns: ?u64 = null,
     max_response_size: usize = default_max_message_size,
+    request_compression: Compression = .identity,
 };
 
 pub const Result = struct {
     allocator: std.mem.Allocator,
     status: status.Status,
     payload: []u8,
+    response_compression: Compression,
     initial_metadata: metadata.Metadata,
     trailing_metadata: metadata.Metadata,
 
@@ -21,6 +24,15 @@ pub const Result = struct {
         allocator: std.mem.Allocator,
         result_status: status.Status,
         payload: []const u8,
+    ) !Result {
+        return initWithCompression(allocator, result_status, payload, .identity);
+    }
+
+    pub fn initWithCompression(
+        allocator: std.mem.Allocator,
+        result_status: status.Status,
+        payload: []const u8,
+        response_compression: Compression,
     ) !Result {
         const owned_message = try allocator.dupe(u8, result_status.message);
         errdefer allocator.free(owned_message);
@@ -31,6 +43,7 @@ pub const Result = struct {
             .allocator = allocator,
             .status = .{ .code = result_status.code, .message = owned_message },
             .payload = owned_payload,
+            .response_compression = response_compression,
             .initial_metadata = metadata.Metadata.init(allocator),
             .trailing_metadata = metadata.Metadata.init(allocator),
         };

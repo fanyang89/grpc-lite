@@ -28,7 +28,7 @@ const Service = struct {
     fn unaryCall(
         _: *@This(),
         allocator: std.mem.Allocator,
-        _: *grpc.ServerContext,
+        context: *grpc.ServerContext,
         request_bytes: []const u8,
     ) !grpc.UnaryResponse {
         var reader: std.Io.Reader = .fixed(request_bytes);
@@ -39,6 +39,19 @@ const Service = struct {
             );
         };
         defer request.deinit(allocator);
+
+        if (request.expect_compressed) |expected| {
+            const compressed = context.request_compression == .gzip;
+            if (expected.value != compressed) {
+                return grpc.UnaryResponse.fail(
+                    allocator,
+                    .init(.invalid_argument, "request compression did not match expectation"),
+                );
+            }
+        }
+        if (request.response_compressed) |compressed| {
+            context.setResponseCompression(if (compressed.value) .gzip else .identity);
+        }
 
         if (request.response_status) |response_status| {
             const code = if (response_status.code >= 0)
