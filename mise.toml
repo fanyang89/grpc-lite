@@ -4,6 +4,7 @@ cmake = "4.3.4"
 ninja = "1.13.2"
 grpcurl = "1.9.3"
 go = "1.26.5"
+actionlint = "1.7.12"
 
 [tasks.bootstrap]
 description = "Initialize native dependency submodules"
@@ -36,6 +37,10 @@ run = "zig fmt build.zig src examples tests"
 [tasks.fmt-check]
 description = "Check Zig formatting"
 run = "zig fmt --check build.zig src examples tests"
+
+[tasks.ci-lint]
+description = "Validate GitHub Actions workflows"
+run = "actionlint"
 
 [tasks.interop]
 description = "Run grpcurl against the Zig echo server"

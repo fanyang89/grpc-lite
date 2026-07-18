@@ -1,0 +1,56 @@
+name: Soak
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Iterations per soak case
+        required: true
+        type: number
+        default: 1000
+      timeout_seconds:
+        description: Timeout per soak case
+        required: true
+        type: number
+        default: 900
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: Official unary soak (x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOAK_ITERATIONS: ${{ inputs.iterations || '1000' }}
+      SOAK_MAX_FAILURES: "0"
+      SOAK_OVERALL_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds || '900' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install mise tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4
+
+      - name: Run official unary soak
+        run: mise run interop-official
+
+      - name: Upload soak logs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: official-unary-soak
+          path: .zig-cache/official/*.log
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14

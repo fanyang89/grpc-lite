@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -9,35 +11,91 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  check:
+  workflow-lint:
+    name: Workflow lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          submodules: true
+          persist-credentials: false
 
       - name: Install mise tools
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4
 
-      - name: Check
-        run: mise run check
+      - name: Check formatting
+        run: mise run fmt-check
 
-  official-interop:
-    runs-on: ubuntu-24.04
-    needs: check
+      - name: Validate workflows
+        run: mise run ci-lint
+
+  core-test:
+    name: Core (${{ matrix.arch }}, ${{ matrix.optimize }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+            optimize: Debug
+          - runner: ubuntu-24.04
+            arch: x64
+            optimize: ReleaseSafe
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            optimize: Debug
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            optimize: ReleaseSafe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           submodules: true
+          persist-credentials: false
 
       - name: Install mise tools
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4
+
+      - name: Build
+        run: zig build -Doptimize=${{ matrix.optimize }}
+
+      - name: Test
+        run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+
+  interop:
+    name: Interop (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+            run_edge: true
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            run_edge: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install mise tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4
+
+      - name: Run grpcurl interop
+        run: mise run interop
 
       - name: Run official unary interop
         run: mise run interop-official
@@ -46,14 +104,35 @@ jobs:
         run: mise run interop-http2
 
       - name: Run official HTTP/2 edge cases
+        if: matrix.run_edge
         run: mise run interop-http2-edge
 
-      - name: Upload HTTP/2 reports
-        uses: actions/upload-artifact@v4
+      - name: Upload interop reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
-          name: official-http2-reports
-          path: |
-            .zig-cache/official/http2-framing.log
-            .zig-cache/official/http2-edge-server.log
+          name: interop-reports-${{ matrix.arch }}
+          path: .zig-cache/official/*.log
           if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 7
+
+  required:
+    name: Required
+    if: always()
+    needs:
+      - workflow-lint
+      - core-test
+      - interop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify required jobs
+        env:
+          WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
+          CORE_TEST_RESULT: ${{ needs.core-test.result }}
+          INTEROP_RESULT: ${{ needs.interop.result }}
+        run: |
+          test "$WORKFLOW_LINT_RESULT" = success
+          test "$CORE_TEST_RESULT" = success
+          test "$INTEROP_RESULT" = success

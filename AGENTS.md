@@ -15,6 +15,7 @@ mise run build
 mise run test
 mise run test-release-safe
 mise run fmt
+mise run ci-lint
 mise run check
 mise run interop
 mise run interop-official

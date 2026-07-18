@@ -36,6 +36,7 @@ mise run build
 mise run test
 mise run test-release-safe
 mise run fmt
+mise run ci-lint
 mise run interop
 mise run interop-official
 mise run interop-http2
@@ -45,6 +46,11 @@ mise run gen-proto
 
 See `tests/official/README.md` for the supported interoperability profile and current
 results.
+
+CI runs the core build and test suite on Linux x64 and arm64 in Debug and ReleaseSafe
+modes. Runtime interoperability runs on both architectures; the official HTTP/2
+edge-case container runs on x64 because its pinned image is amd64-only. A scheduled x64
+workflow runs extended official unary soak tests.
 
 ## Unary Client
 

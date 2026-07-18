@@ -35,4 +35,6 @@ soak settings for scheduled runs.
 The edge-case server sources and container image are pinned to the same grpc commit.
 The upstream server still contains Python 2 idioms, so the harness applies
 `http2-test-python3.patch`, which only updates Python compatibility without changing test
-behavior. Docker is required for this suite.
+behavior. Docker is required for this suite. The pinned image is amd64-only, so CI runs
+this suite on x64 while running the remaining interoperability suites on both x64 and
+arm64.
