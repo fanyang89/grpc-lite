@@ -1,0 +1,15 @@
+.{
+    .name = .grpc_lite,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xa8480adad018cc05,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "proto",
+        "LICENSE",
+        "README.md",
+    },
+}

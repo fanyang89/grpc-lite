@@ -1,0 +1,29 @@
+[tools]
+zig = "0.16.0"
+cmake = "4.3.4"
+ninja = "1.13.2"
+grpcurl = "1.9.3"
+
+[tasks.bootstrap]
+description = "Initialize native dependency submodules"
+run = "git submodule update --init --depth 1 third_party/libuv third_party/nghttp2"
+
+[tasks.build]
+description = "Build grpc-lite"
+run = "zig build"
+
+[tasks.test]
+description = "Run all tests"
+run = "zig build test --summary all"
+
+[tasks.fmt]
+description = "Format Zig sources"
+run = "zig fmt build.zig src"
+
+[tasks.fmt-check]
+description = "Check Zig formatting"
+run = "zig fmt --check build.zig src"
+
+[tasks.check]
+description = "Run formatting and tests"
+depends = ["fmt-check", "test"]
