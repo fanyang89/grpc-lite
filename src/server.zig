@@ -71,7 +71,7 @@ pub const Server = struct {
         const impl = self.impl;
         impl.lock();
         defer impl.unlock();
-        if (impl.state != .running and impl.state != .stopping) return error.ServerNotRunning;
+        if (impl.state != .running and impl.state != .draining and impl.state != .stopping) return error.ServerNotRunning;
         return .{
             .host = impl.local_host[0..impl.local_host_len],
             .port = impl.local_port,
@@ -88,11 +88,38 @@ pub const Server = struct {
         defer impl.unlock();
         switch (impl.state) {
             .initialized => impl.state = .stopped,
+            .starting => impl.shutdown_request = .immediate,
             .running => {
+                impl.shutdown_request = .immediate;
                 impl.state = .stopping;
                 _ = c.uv_async_send(&impl.shutdown_async);
             },
-            .starting, .stopping, .stopped => {},
+            .draining => {
+                impl.shutdown_request = .immediate;
+                impl.state = .stopping;
+                _ = c.uv_async_send(&impl.shutdown_async);
+            },
+            .stopping, .stopped => {},
+        }
+    }
+
+    pub fn shutdownGracefully(self: *Server, timeout_ns: u64) void {
+        const impl = self.impl;
+        impl.lock();
+        defer impl.unlock();
+        switch (impl.state) {
+            .initialized => impl.state = .stopped,
+            .starting => if (impl.shutdown_request == .none) {
+                impl.shutdown_request = .graceful;
+                impl.drain_timeout_ns = timeout_ns;
+            },
+            .running => {
+                impl.shutdown_request = .graceful;
+                impl.drain_timeout_ns = timeout_ns;
+                impl.state = .draining;
+                _ = c.uv_async_send(&impl.shutdown_async);
+            },
+            .draining, .stopping, .stopped => {},
         }
     }
 
@@ -123,7 +150,8 @@ pub const Server = struct {
     }
 };
 
-const State = enum { initialized, starting, running, stopping, stopped };
+const State = enum { initialized, starting, running, draining, stopping, stopped };
+const ShutdownRequest = enum { none, graceful, immediate };
 const StartupError = error{
     LoopInitializationFailed,
     InvalidAddress,
@@ -132,6 +160,7 @@ const StartupError = error{
     ListenFailed,
     AddressQueryFailed,
     AsyncInitializationFailed,
+    TimerInitializationFailed,
 };
 
 const Impl = struct {
@@ -144,11 +173,15 @@ const Impl = struct {
     mutex: c.uv_mutex_t = undefined,
     condition: c.uv_cond_t = undefined,
     state: State = .initialized,
+    shutdown_request: ShutdownRequest = .none,
+    drain_timeout_ns: u64 = 0,
     startup_error: ?StartupError = null,
     thread: ?std.Thread = null,
     loop: c.uv_loop_t = undefined,
     listener: c.uv_tcp_t = undefined,
     shutdown_async: c.uv_async_t = undefined,
+    drain_timer: c.uv_timer_t = undefined,
+    drain_started: bool = false,
     local_host: [15]u8 = undefined,
     local_host_len: usize = 0,
     local_port: u16 = 0,
@@ -167,10 +200,18 @@ const Impl = struct {
 
     fn signalStarted(self: *Impl, result: ?StartupError) void {
         self.lock();
-        defer self.unlock();
         self.startup_error = result;
-        self.state = if (result == null) .running else .stopped;
+        self.state = if (result != null)
+            .stopped
+        else switch (self.shutdown_request) {
+            .none => .running,
+            .graceful => .draining,
+            .immediate => .stopping,
+        };
         c.uv_cond_broadcast(&self.condition);
+        const should_shutdown = result == null and self.shutdown_request != .none;
+        self.unlock();
+        if (should_shutdown) _ = c.uv_async_send(&self.shutdown_async);
     }
 };
 
@@ -232,6 +273,9 @@ const Connection = struct {
     tcp: c.uv_tcp_t = undefined,
     session: ?*c.nghttp2_session = null,
     streams: std.AutoHashMapUnmanaged(i32, *Stream) = .empty,
+    highest_accepted_stream_id: i32 = 0,
+    pending_writes: usize = 0,
+    draining: bool = false,
     closing: bool = false,
 
     fn initializeSession(self: *Connection) !void {
@@ -262,7 +306,9 @@ const Connection = struct {
             write.* = .{ .connection = self, .bytes = bytes };
             write.req.data = write;
             var buffer = c.uv_buf_init(@ptrCast(bytes.ptr), @intCast(bytes.len));
+            self.pending_writes += 1;
             if (c.uv_write(&write.req, @ptrCast(&self.tcp), &buffer, 1, onWrite) < 0) {
+                self.pending_writes -= 1;
                 self.server.allocator.free(bytes);
                 self.server.allocator.destroy(write);
                 return error.WriteFailed;
@@ -303,13 +349,18 @@ fn setupLoop(server: *Impl) StartupError!void {
     if (c.uv_loop_init(&server.loop) < 0) return error.LoopInitializationFailed;
     errdefer _ = c.uv_loop_close(&server.loop);
 
-    if (c.uv_tcp_init(&server.loop, &server.listener) < 0) return error.ListenerInitializationFailed;
-    var listener_initialized = true;
-    errdefer if (listener_initialized) {
-        c.uv_close(@ptrCast(&server.listener), null);
+    var listener_initialized = false;
+    var async_initialized = false;
+    var timer_initialized = false;
+    errdefer {
+        if (timer_initialized) c.uv_close(@ptrCast(&server.drain_timer), null);
+        if (async_initialized) c.uv_close(@ptrCast(&server.shutdown_async), null);
+        if (listener_initialized) c.uv_close(@ptrCast(&server.listener), null);
         _ = c.uv_run(&server.loop, c.UV_RUN_DEFAULT);
-        listener_initialized = false;
-    };
+    }
+
+    if (c.uv_tcp_init(&server.loop, &server.listener) < 0) return error.ListenerInitializationFailed;
+    listener_initialized = true;
     server.listener.data = server;
 
     var bind_address: c.struct_sockaddr_in = undefined;
@@ -328,13 +379,22 @@ fn setupLoop(server: *Impl) StartupError!void {
     server.local_port = std.mem.bigToNative(u16, local_address.sin_port);
 
     if (c.uv_async_init(&server.loop, &server.shutdown_async, onShutdown) < 0) return error.AsyncInitializationFailed;
+    async_initialized = true;
     server.shutdown_async.data = server;
-    listener_initialized = false;
+
+    if (c.uv_timer_init(&server.loop, &server.drain_timer) < 0) return error.TimerInitializationFailed;
+    timer_initialized = true;
+    server.drain_timer.data = server;
 }
 
 fn onConnection(listener: ?*c.uv_stream_t, connection_status: c_int) callconv(.c) void {
     if (connection_status < 0) return;
     const server: *Impl = @ptrCast(@alignCast(listener.?.*.data.?));
+    server.lock();
+    const accepting = server.state == .running;
+    server.unlock();
+    if (!accepting) return;
+
     const connection = server.allocator.create(Connection) catch return;
     connection.* = .{ .server = server };
 
@@ -396,9 +456,14 @@ fn onRead(stream_handle: ?*c.uv_stream_t, bytes_read: isize, buffer: ?*const c.u
 fn onWrite(request: ?*c.uv_write_t, write_status: c_int) callconv(.c) void {
     const write: *WriteRequest = @ptrCast(@alignCast(request.?.*.data.?));
     const connection = write.connection;
+    connection.pending_writes -= 1;
     connection.server.allocator.free(write.bytes);
     connection.server.allocator.destroy(write);
-    if (write_status < 0) connection.close();
+    if (write_status < 0) {
+        connection.close();
+    } else {
+        maybeCloseDrainedConnection(connection);
+    }
 }
 
 fn onConnectionClosed(handle: ?*c.uv_handle_t) callconv(.c) void {
@@ -418,19 +483,96 @@ fn onConnectionClosed(handle: ?*c.uv_handle_t) callconv(.c) void {
         }
     }
     server.allocator.destroy(connection);
+    finishDrainIfIdle(server);
 }
 
 fn onShutdown(async_handle: ?*c.uv_async_t) callconv(.c) void {
     const server: *Impl = @ptrCast(@alignCast(async_handle.?.*.data.?));
+    server.lock();
+    const state = server.state;
+    server.unlock();
+    switch (state) {
+        .draining => beginDrain(server),
+        .stopping => stopImmediately(server),
+        else => {},
+    }
+}
+
+fn beginDrain(server: *Impl) void {
+    if (!server.drain_started) {
+        server.drain_started = true;
+        if (c.uv_is_closing(@ptrCast(&server.listener)) == 0) c.uv_close(@ptrCast(&server.listener), null);
+
+        const timeout_ms = if (server.drain_timeout_ns == 0)
+            0
+        else
+            std.math.divCeil(u64, server.drain_timeout_ns, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        _ = c.uv_timer_start(&server.drain_timer, onDrainTimeout, timeout_ms, 0);
+
+        for (server.connections.items) |connection| {
+            if (connection.closing or connection.session == null) continue;
+            connection.draining = true;
+            if (c.nghttp2_submit_goaway(
+                connection.session,
+                c.NGHTTP2_FLAG_NONE,
+                connection.highest_accepted_stream_id,
+                c.NGHTTP2_NO_ERROR,
+                null,
+                0,
+            ) != 0) {
+                connection.close();
+                continue;
+            }
+            connection.flush() catch connection.close();
+        }
+    }
+
+    for (server.connections.items) |connection| maybeCloseDrainedConnection(connection);
+    finishDrainIfIdle(server);
+}
+
+fn maybeCloseDrainedConnection(connection: *Connection) void {
+    if (connection.draining and !connection.closing and connection.streams.count() == 0 and connection.pending_writes == 0) {
+        connection.close();
+    }
+}
+
+fn finishDrainIfIdle(server: *Impl) void {
+    server.lock();
+    const draining = server.state == .draining;
+    server.unlock();
+    if (!draining or server.connections.items.len != 0) return;
+    closeControlHandles(server);
+}
+
+fn onDrainTimeout(handle: ?*c.uv_timer_t) callconv(.c) void {
+    const server: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
+    server.lock();
+    if (server.state == .draining) server.state = .stopping;
+    server.unlock();
+    stopImmediately(server);
+}
+
+fn stopImmediately(server: *Impl) void {
     if (c.uv_is_closing(@ptrCast(&server.listener)) == 0) c.uv_close(@ptrCast(&server.listener), null);
     for (server.connections.items) |connection| connection.close();
+    closeControlHandles(server);
+}
+
+fn closeControlHandles(server: *Impl) void {
+    _ = c.uv_timer_stop(&server.drain_timer);
+    if (c.uv_is_closing(@ptrCast(&server.drain_timer)) == 0) c.uv_close(@ptrCast(&server.drain_timer), null);
     if (c.uv_is_closing(@ptrCast(&server.shutdown_async)) == 0) c.uv_close(@ptrCast(&server.shutdown_async), null);
 }
 
-fn onBeginHeaders(_: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
+fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
     const native_frame = received_frame.?;
     if (native_frame.*.hd.type != c.NGHTTP2_HEADERS or native_frame.*.headers.cat != c.NGHTTP2_HCAT_REQUEST) return 0;
     const connection: *Connection = @ptrCast(@alignCast(user_data.?));
+    if (connection.draining) {
+        _ = c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, native_frame.*.hd.stream_id, c.NGHTTP2_REFUSED_STREAM);
+        return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
     const stream = connection.server.allocator.create(Stream) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     stream.* = Stream.init(connection.server.allocator, connection, native_frame.*.hd.stream_id);
     connection.streams.put(connection.server.allocator, stream.id, stream) catch {
@@ -438,6 +580,7 @@ fn onBeginHeaders(_: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_fram
         connection.server.allocator.destroy(stream);
         return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     };
+    connection.highest_accepted_stream_id = @max(connection.highest_accepted_stream_id, stream.id);
     return 0;
 }
 
@@ -688,6 +831,7 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, _: u32, user_data: ?*an
         entry.value.deinit();
         connection.server.allocator.destroy(entry.value);
     }
+    if (connection.draining) _ = c.uv_async_send(&connection.server.shutdown_async);
     return 0;
 }
 
@@ -755,6 +899,31 @@ test "server validates registration and has deterministic lifecycle" {
     try std.testing.expectEqual(address.port, try server.port());
     server.shutdown();
     server.wait();
+}
+
+test "graceful shutdown exits when idle and is idempotent" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    try server.start();
+
+    server.shutdownGracefully(std.time.ns_per_s);
+    const address = try server.localAddress();
+    try std.testing.expect(address.port != 0);
+    server.shutdownGracefully(0);
+    server.wait();
+
+    server.shutdownGracefully(0);
+    server.shutdown();
+}
+
+test "graceful shutdown before start is idempotent" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    server.shutdownGracefully(0);
+    server.shutdownGracefully(std.time.ns_per_s);
+    server.shutdown();
+    server.wait();
+    try std.testing.expectError(error.ServerAlreadyStarted, server.start());
 }
 
 test "raw HTTP/2 request routes unary data and ends with trailers" {

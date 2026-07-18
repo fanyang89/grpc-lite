@@ -1206,6 +1206,137 @@ test "channel replaces a connection after GOAWAY without replaying calls" {
     try std.testing.expectEqual(@as(usize, 2), handler.calls);
 }
 
+test "server drain finishes an accepted RPC and rejects a replacement connection" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        server: *server.Server,
+        local_address_available: bool = false,
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            self.server.shutdownGracefully(5 * std.time.ns_per_s);
+            _ = try self.server.localAddress();
+            self.local_address_available = true;
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    var handler = Handler{ .server = &test_server };
+    try test_server.registerUnary(
+        "/test.Drain/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var accepted = try channel.callUnary(std.testing.allocator, "/test.Drain/Unary", "accepted", .{});
+    defer accepted.deinit();
+    try std.testing.expect(accepted.status.isOk());
+    try std.testing.expectEqualStrings("accepted", accepted.payload);
+    try std.testing.expect(handler.local_address_available);
+
+    var rejected = try channel.callUnary(std.testing.allocator, "/test.Drain/Unary", "later", .{});
+    defer rejected.deinit();
+    try std.testing.expectEqual(status.Code.unavailable, rejected.status.code);
+    try std.testing.expectEqual(@as(usize, 2), channel.impl.connection_generation);
+    test_server.wait();
+}
+
+test "server drain timeout closes a transport-active stream" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        server: *server.Server,
+        called: bool = false,
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            _: []const u8,
+        ) !service.UnaryResponse {
+            self.called = true;
+            const payload = try allocator.alloc(u8, 8 * 1024 * 1024);
+            defer allocator.free(payload);
+            @memset(payload, 'x');
+            self.server.shutdownGracefully(0);
+            return service.UnaryResponse.ok(allocator, payload);
+        }
+    };
+
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    var handler = Handler{ .server = &test_server };
+    try test_server.registerUnary(
+        "/test.Drain/Timeout",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var result = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Drain/Timeout",
+        "request",
+        .{ .max_response_size = 16 * 1024 * 1024 },
+    );
+    defer result.deinit();
+    try std.testing.expect(handler.called);
+    try std.testing.expectEqual(status.Code.unavailable, result.status.code);
+    test_server.wait();
+}
+
+test "immediate shutdown escalates an active graceful drain" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        fn handle(_: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Drain/Escalate",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    test_server.shutdownGracefully(std.time.ns_per_hour);
+    test_server.shutdown();
+    test_server.shutdown();
+    test_server.wait();
+
+    var result = try channel.callUnary(std.testing.allocator, "/test.Drain/Escalate", "later", .{});
+    defer result.deinit();
+    try std.testing.expectEqual(status.Code.unavailable, result.status.code);
+}
+
 test "channel performs reusable concurrent unary calls end to end" {
     const server = @import("server.zig");
     const service = @import("service.zig");
