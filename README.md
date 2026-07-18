@@ -13,10 +13,11 @@ from transport.
 - Initial and trailing metadata
 - Deadlines and HTTP/2 stream cancellation
 - Explicit allocators and deterministic `deinit`
-- Raw protobuf wire payloads with no code generation dependency
+- Raw protobuf wire APIs with no required message runtime
+- Optional typed APIs and service registration through zig-protobuf
 
 The first phase is IPv4-only. Streaming, TLS, DNS, retries, reconnect, compression,
-reflection, and generated protobuf code are not implemented.
+and server reflection are not implemented.
 
 ## Development
 
@@ -33,6 +34,7 @@ mise run build
 mise run test
 mise run fmt
 mise run interop
+mise run gen-proto
 ```
 
 ## Unary Client
@@ -74,11 +76,61 @@ server.wait();
 
 See `examples/echo_server.zig` and `examples/echo_client.zig` for complete programs.
 
+## Protobuf
+
+The optional `grpc_lite_protobuf` module integrates Arwalk/zig-protobuf while keeping
+the transport core raw-byte based. `proto/echo.proto` is generated into
+`.zig-cache/generated/demo.pb.zig` during the build.
+
+Generated service VTables can be registered without manually specifying method paths:
+
+```zig
+const demo = @import("demo_proto");
+const grpc_pb = @import("grpc_lite_protobuf");
+
+const EchoApi = demo.EchoService(EchoState, EchoError);
+
+var registration = grpc_pb.ServiceRegistration(EchoApi).init(
+    allocator,
+    &state,
+    .{ .Echo = EchoState.echo },
+    .{
+        .map_error = mapError,
+        .context_hook = configureContext,
+    },
+);
+defer registration.deinit();
+
+try registration.register(&server);
+```
+
+The adapter derives `/demo.EchoService/Echo`, decodes `EchoRequest`, invokes the
+generated VTable, and encodes `EchoReply`. Registration and userdata must outlive the
+server. Returned response fields must be releasable with the registration allocator.
+
+Typed calls infer their request and response types from the same service:
+
+```zig
+var client = grpc_pb.ServiceClient(EchoApi).init(&channel);
+var result = try client.callUnary(
+    allocator,
+    "Echo",
+    demo.EchoRequest{ .message = "hello" },
+    .{},
+);
+defer result.deinit();
+```
+
+Business errors default to `INTERNAL`; an optional typed mapper can return another
+gRPC status. A context hook exposes request and response metadata. Generated streaming
+methods are rejected at compile time because the current transport is unary-only.
+
 ## Dependencies
 
 - Zig 0.16.0
 - nghttp2 1.69.0
 - libuv 1.52.1
+- zig-protobuf 5.0.0
 - CMake and Ninja for the upstream C builds
 - mise for tool versions and project tasks
 

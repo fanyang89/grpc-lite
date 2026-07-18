@@ -1,6 +1,11 @@
+//! Typed protobuf adapters for grpc-lite's raw unary transport.
+
 const std = @import("std");
 const grpc = @import("grpc_lite");
 
+pub const runtime = @import("protobuf");
+
+/// A decoded protobuf response paired with the underlying gRPC result.
 pub fn TypedResult(comptime Response: type) type {
     return struct {
         allocator: std.mem.Allocator,
@@ -15,6 +20,7 @@ pub fn TypedResult(comptime Response: type) type {
     };
 }
 
+/// Creates a typed unary client from a generated zig-protobuf service type.
 pub fn ServiceClient(comptime Service: type) type {
     comptime validateService(Service);
 
@@ -59,6 +65,8 @@ pub fn ServiceClient(comptime Service: type) type {
     };
 }
 
+/// Adapts and registers every unary method in a generated service VTable.
+/// The registration and userdata must outlive the server and all active calls.
 pub fn ServiceRegistration(comptime Service: type) type {
     comptime validateService(Service);
     const UserData = UserDataType(Service);
@@ -164,17 +172,20 @@ pub fn ServiceRegistration(comptime Service: type) type {
     };
 }
 
+/// Returns the canonical gRPC method path for a generated service method.
 pub fn methodPath(comptime Service: type, comptime method: []const u8) []const u8 {
     comptime validateMethod(Service, method);
     if (Service.package.len == 0) return "/" ++ Service.service_name ++ "/" ++ method;
     return "/" ++ Service.package ++ "." ++ Service.service_name ++ "/" ++ method;
 }
 
+/// Returns the generated protobuf request type for a service method.
 pub fn RequestType(comptime Service: type, comptime method: []const u8) type {
     const function = MethodFunction(Service, method);
     return @typeInfo(function).@"fn".params[1].type.?;
 }
 
+/// Returns the generated protobuf response type for a service method.
 pub fn ResponseType(comptime Service: type, comptime method: []const u8) type {
     const function = MethodFunction(Service, method);
     const return_type = @typeInfo(function).@"fn".return_type.?;
