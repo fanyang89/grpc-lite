@@ -3,7 +3,7 @@
 /.mise.local.toml
 /.opencode/
 /.vscode/
-/.zig-cache/
+**/.zig-cache/
 /golden/
 /opencode.json
 /third_party/struct_proto26/
