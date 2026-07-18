@@ -30,7 +30,7 @@ mise run gen-proto
 - `nghttp2` owns HTTP/2 framing, HPACK, stream state, and flow control.
 - `libuv` owns socket and event-loop integration.
 - gRPC payloads remain raw protobuf wire bytes.
-- Generated protobuf sources live in `.zig-cache/generated` and are not committed.
+- Generated protobuf sources live under `.zig-cache` and are not committed.
 - The first phase supports cleartext IPv4 unary RPC only.
 
 Keep C types private to transport modules. Keep protobuf out of `src/root.zig` so the

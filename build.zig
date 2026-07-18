@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
         protobuf_dependency.builder,
         target,
         .{
-            .destination_directory = b.path(".zig-cache/generated/interop"),
+            .destination_directory = b.path(".zig-cache/generated-interop"),
             .source_files = &.{
                 b.path("third_party/grpc-proto/grpc/testing/empty.proto"),
                 b.path("third_party/grpc-proto/grpc/testing/messages.proto"),
@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "protobuf", .module = protobuf }},
     });
     const interop_proto = b.createModule(.{
-        .root_source_file = b.path(".zig-cache/generated/interop/grpc/testing.pb.zig"),
+        .root_source_file = b.path(".zig-cache/generated-interop/grpc/testing.pb.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "protobuf", .module = protobuf }},
@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     });
     grpc_lite.addIncludePath(b.path("third_party/libuv/include"));
     grpc_lite.addIncludePath(b.path("third_party/nghttp2/lib/includes"));
+    grpc_lite.addIncludePath(b.path(".zig-cache/native/nghttp2/lib/includes"));
     grpc_lite.addObjectFile(b.path(".zig-cache/native/libuv/libuv.a"));
     grpc_lite.addObjectFile(b.path(".zig-cache/native/nghttp2/lib/libnghttp2.a"));
 
