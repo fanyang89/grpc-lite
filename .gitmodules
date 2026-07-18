@@ -4,3 +4,6 @@
 [submodule "third_party/nghttp2"]
 	path = third_party/nghttp2
 	url = https://github.com/nghttp2/nghttp2.git
+[submodule "third_party/grpc-proto"]
+	path = third_party/grpc-proto
+	url = https://github.com/grpc/grpc-proto.git

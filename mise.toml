@@ -3,10 +3,11 @@ zig = "0.16.0"
 cmake = "4.3.4"
 ninja = "1.13.2"
 grpcurl = "1.9.3"
+go = "1.26.5"
 
 [tasks.bootstrap]
 description = "Initialize native dependency submodules"
-run = "git submodule update --init --depth 1 third_party/libuv third_party/nghttp2"
+run = "git submodule update --init --depth 1 third_party/libuv third_party/nghttp2 third_party/grpc-proto"
 
 [tasks.build]
 description = "Build grpc-lite"
@@ -19,6 +20,10 @@ run = "zig build test --summary all"
 [tasks.gen-proto]
 description = "Generate Zig protobuf sources"
 run = "zig build gen-proto"
+
+[tasks.gen-interop-proto]
+description = "Generate official gRPC interop protobuf sources"
+run = "zig build gen-interop-proto"
 
 [tasks.fmt]
 description = "Format Zig sources"

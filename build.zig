@@ -21,9 +21,34 @@ pub fn build(b: *std.Build) void {
     const generate_proto_step = b.step("gen-proto", "Generate Zig protobuf sources");
     generate_proto_step.dependOn(&generate_proto.step);
 
+    const generate_interop_proto = protobuf_build.RunProtocStep.create(
+        protobuf_dependency.builder,
+        target,
+        .{
+            .destination_directory = b.path(".zig-cache/generated/interop"),
+            .source_files = &.{
+                b.path("third_party/grpc-proto/grpc/testing/empty.proto"),
+                b.path("third_party/grpc-proto/grpc/testing/messages.proto"),
+                b.path("third_party/grpc-proto/grpc/testing/test.proto"),
+            },
+            .include_directories = &.{b.path("third_party/grpc-proto")},
+        },
+    );
+    const generate_interop_proto_step = b.step(
+        "gen-interop-proto",
+        "Generate official gRPC interop protobuf sources",
+    );
+    generate_interop_proto_step.dependOn(&generate_interop_proto.step);
+
     const protobuf = protobuf_dependency.module("protobuf");
     const demo_proto = b.createModule(.{
         .root_source_file = b.path(".zig-cache/generated/demo.pb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "protobuf", .module = protobuf }},
+    });
+    const interop_proto = b.createModule(.{
+        .root_source_file = b.path(".zig-cache/generated/interop/grpc/testing.pb.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "protobuf", .module = protobuf }},
@@ -100,10 +125,23 @@ pub fn build(b: *std.Build) void {
     protobuf_adapter_tests.step.dependOn(native_deps);
     const run_protobuf_adapter_tests = b.addRunArtifact(protobuf_adapter_tests);
 
+    const official_proto_tests = b.addTest(.{
+        .name = "official-protobuf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/official/protobuf_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "grpc_testing", .module = interop_proto }},
+        }),
+    });
+    official_proto_tests.step.dependOn(&generate_interop_proto.step);
+    const run_official_proto_tests = b.addRunArtifact(official_proto_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_protobuf_tests.step);
     test_step.dependOn(&run_protobuf_adapter_tests.step);
+    test_step.dependOn(&run_official_proto_tests.step);
 
     const echo_server = addExample(
         b,
