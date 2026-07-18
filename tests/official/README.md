@@ -22,11 +22,15 @@ mise run interop-http2-edge
 | gRPC HTTP/2 edge-case server | reset, GOAWAY, ping, max-stream, and DATA padding cases | Pass |
 | grpc-go client to grpc-lite server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
 
-The HTTP/2 framing tool deliberately treats every `TestSoon*` failure as non-fatal and
-returns success unless a non-`TestSoon` case fails. `run_http2.sh` preserves that upstream
-exit behavior and stores the complete report in
+The HTTP/2 framing tool deliberately treats every `TestSoon*` failure as non-fatal.
+`run_http2.sh` validates required passes, expected TLS skips, and the exact known-failure
+allowlist before succeeding. The complete report is stored in
 `.zig-cache/official/http2-framing.log`; completion must not be presented as all cases
-passing.
+passing while known failures remain.
+
+The unary harness defaults to 10 iterations for each soak case. Set `SOAK_ITERATIONS`,
+`SOAK_MAX_FAILURES`, and `SOAK_OVERALL_TIMEOUT_SECONDS` to override the official grpc-go
+soak settings for scheduled runs.
 
 The edge-case server sources and container image are pinned to the same grpc commit.
 The upstream server still contains Python 2 idioms, so the harness applies

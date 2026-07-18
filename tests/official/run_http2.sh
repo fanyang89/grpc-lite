@@ -42,4 +42,5 @@ output_file="$work_dir/http2-framing.log"
     -server_port="$server_port" \
     -use_tls=false \
     -test_case=framing) 2>&1 | tee "$output_file"
+python3 "$project_root/tests/official/validate_http2_report.py" "$output_file"
 printf '%s\n' '[ COMPLETE ] official gRPC HTTP/2 framing report'

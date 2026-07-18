@@ -5,6 +5,9 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work_dir="$project_root/.zig-cache/official"
 zig_server_port=${ZIG_SERVER_PORT:-$((20000 + $$ % 10000))}
 go_server_port=${GO_SERVER_PORT:-$((zig_server_port + 1))}
+soak_iterations=${SOAK_ITERATIONS:-10}
+soak_max_failures=${SOAK_MAX_FAILURES:-0}
+soak_overall_timeout_seconds=${SOAK_OVERALL_TIMEOUT_SECONDS:-10}
 official_cases=(
   empty_unary
   large_unary
@@ -106,6 +109,9 @@ for test_case in "${soak_cases[@]}"; do
     --server_host=127.0.0.1 \
     --server_port="$zig_server_port" \
     --test_case="$test_case" \
+    --soak_iterations="$soak_iterations" \
+    --soak_max_failures="$soak_max_failures" \
+    --soak_overall_timeout_seconds="$soak_overall_timeout_seconds" \
     --use_tls=false
 done
 stop_peer
@@ -125,7 +131,7 @@ for test_case in "${official_cases[@]}"; do
 done
 stop_peer
 
-printf '%s\n' 'All 10 bidirectional unary and 2 grpc-go soak runs passed.'
+printf '%s\n' "All 10 bidirectional unary and 2 grpc-go soak runs passed ($soak_iterations iteration(s) each)."
 
 printf '%s\n' 'grpc-go v1.82.1 does not expose the official compression cases; running grpc-lite compression integration separately.'
 peer_log="$work_dir/grpc-lite-compression-server.log"
