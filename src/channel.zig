@@ -514,6 +514,11 @@ fn submitOperation(impl: *Impl, operation: *Operation) !void {
     try impl.operations.ensureUnusedCapacity(impl.allocator, 1);
     var headers: std.ArrayList(c.nghttp2_nv) = .empty;
     defer headers.deinit(impl.allocator);
+    var encoded_values: std.ArrayList([]u8) = .empty;
+    defer {
+        for (encoded_values.items) |value| impl.allocator.free(value);
+        encoded_values.deinit(impl.allocator);
+    }
     try headers.append(impl.allocator, nativeHeader(":method", "POST"));
     try headers.append(impl.allocator, nativeHeader(":scheme", "http"));
     try headers.append(impl.allocator, nativeHeader(":path", operation.path));
@@ -526,7 +531,14 @@ fn submitOperation(impl: *Impl, operation: *Operation) !void {
     if (operation.timeout_header_len != 0) {
         try headers.append(impl.allocator, nativeHeader("grpc-timeout", operation.timeout_header[0..operation.timeout_header_len]));
     }
-    for (operation.request_metadata.items()) |entry| try headers.append(impl.allocator, nativeHeader(entry.key, entry.value));
+    for (operation.request_metadata.items()) |entry| {
+        const value = try metadata.encodeValue(impl.allocator, entry.key, entry.value);
+        encoded_values.append(impl.allocator, value) catch |err| {
+            impl.allocator.free(value);
+            return err;
+        };
+        try headers.append(impl.allocator, nativeHeader(entry.key, value));
+    }
 
     var provider: c.nghttp2_data_provider2 = .{
         .source = .{ .ptr = operation },
@@ -656,7 +668,7 @@ fn onHeader(
         if (operation.block_grpc_message) |old| operation.impl.allocator.free(old);
         operation.block_grpc_message = operation.impl.allocator.dupe(u8, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     } else if (isResponseMetadata(name)) {
-        operation.block_metadata.append(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        operation.block_metadata.appendDecoded(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     return 0;
 }
@@ -868,6 +880,83 @@ test "response headers with grpc-status are trailers-only metadata" {
     try std.testing.expectEqual(@as(usize, 0), operation.initial_metadata.items().len);
     try std.testing.expectEqualStrings("present", operation.trailing_metadata.getFirst("x-trailers-only").?);
     try std.testing.expectEqual(@as(?u32, @intFromEnum(status.Code.not_found)), operation.grpc_status);
+}
+
+test "binary request initial and trailing metadata round trip as raw duplicate values" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const binary_value = [_]u8{ 0xab, 0xab, 0xab };
+    const second_value = [_]u8{0xab};
+
+    const Handler = struct {
+        request_matches: bool = false,
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            context: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            const entries = context.request_metadata.items();
+            self.request_matches = entries.len == 3 and
+                std.mem.eql(u8, entries[0].key, "x-request") and
+                std.mem.eql(u8, entries[0].value, "plain") and
+                std.mem.eql(u8, entries[1].key, "x-request-bin") and
+                std.mem.eql(u8, entries[1].value, &binary_value) and
+                std.mem.eql(u8, entries[2].key, "x-request-bin") and
+                std.mem.eql(u8, entries[2].value, &second_value);
+
+            try context.addInitialMetadata("x-initial", "plain");
+            try context.addInitialMetadata("x-initial-bin", &binary_value);
+            try context.addInitialMetadata("x-initial-bin", &second_value);
+            try context.addTrailingMetadata("x-trailing", "plain");
+            try context.addTrailingMetadata("x-trailing-bin", &binary_value);
+            try context.addTrailingMetadata("x-trailing-bin", &second_value);
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Metadata/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var result = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Metadata/Unary",
+        "payload",
+        .{ .metadata = &.{
+            .{ .key = "x-request", .value = "plain" },
+            .{ .key = "x-request-bin", .value = &binary_value },
+            .{ .key = "x-request-bin", .value = &second_value },
+        } },
+    );
+    defer result.deinit();
+
+    try std.testing.expect(result.status.isOk());
+    try std.testing.expect(handler.request_matches);
+    const initial = result.initial_metadata.items();
+    try std.testing.expectEqual(@as(usize, 3), initial.len);
+    try std.testing.expectEqualStrings("plain", initial[0].value);
+    try std.testing.expectEqualSlices(u8, &binary_value, initial[1].value);
+    try std.testing.expectEqualSlices(u8, &second_value, initial[2].value);
+    try std.testing.expectEqualStrings(initial[1].key, initial[2].key);
+
+    const trailing = result.trailing_metadata.items();
+    try std.testing.expectEqual(@as(usize, 3), trailing.len);
+    try std.testing.expectEqualStrings("plain", trailing[0].value);
+    try std.testing.expectEqualSlices(u8, &binary_value, trailing[1].value);
+    try std.testing.expectEqualSlices(u8, &second_value, trailing[2].value);
+    try std.testing.expectEqualStrings(trailing[1].key, trailing[2].key);
 }
 
 test "channel performs reusable concurrent unary calls end to end" {

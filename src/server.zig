@@ -478,7 +478,7 @@ fn onHeader(
     } else if (std.mem.eql(u8, name, "grpc-encoding")) {
         stream.identity_encoding = std.mem.eql(u8, value, "identity");
     } else if (isRequestMetadata(name)) {
-        stream.request_metadata.append(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        stream.request_metadata.appendDecoded(name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     return 0;
 }
@@ -591,11 +591,23 @@ fn submitFailure(session: *c.nghttp2_session, stream: *Stream, code: status.Code
 fn submitResponse(session: *c.nghttp2_session, stream: *Stream, initial_metadata: []const metadata.Entry) !void {
     var headers: std.ArrayList(c.nghttp2_nv) = .empty;
     defer headers.deinit(stream.allocator);
+    var encoded_values: std.ArrayList([]u8) = .empty;
+    defer {
+        for (encoded_values.items) |value| stream.allocator.free(value);
+        encoded_values.deinit(stream.allocator);
+    }
     try headers.append(stream.allocator, nativeHeader(":status", "200"));
     try headers.append(stream.allocator, nativeHeader("content-type", "application/grpc"));
     try headers.append(stream.allocator, nativeHeader("grpc-encoding", "identity"));
     for (initial_metadata) |entry| {
-        if (!isReservedResponseHeader(entry.key)) try headers.append(stream.allocator, nativeHeader(entry.key, entry.value));
+        if (!isReservedResponseHeader(entry.key)) {
+            const value = try metadata.encodeValue(stream.allocator, entry.key, entry.value);
+            encoded_values.append(stream.allocator, value) catch |err| {
+                stream.allocator.free(value);
+                return err;
+            };
+            try headers.append(stream.allocator, nativeHeader(entry.key, value));
+        }
     }
     var provider: c.nghttp2_data_provider2 = .{
         .source = .{ .ptr = stream },
@@ -633,8 +645,20 @@ fn readResponseData(
 fn submitTrailers(session: *c.nghttp2_session, stream: *Stream) !void {
     var trailers: std.ArrayList(c.nghttp2_nv) = .empty;
     defer trailers.deinit(stream.allocator);
+    var encoded_values: std.ArrayList([]u8) = .empty;
+    defer {
+        for (encoded_values.items) |value| stream.allocator.free(value);
+        encoded_values.deinit(stream.allocator);
+    }
     for (stream.trailing_metadata.items()) |entry| {
-        if (!isReservedTrailer(entry.key)) try trailers.append(stream.allocator, nativeHeader(entry.key, entry.value));
+        if (!isReservedTrailer(entry.key)) {
+            const value = try metadata.encodeValue(stream.allocator, entry.key, entry.value);
+            encoded_values.append(stream.allocator, value) catch |err| {
+                stream.allocator.free(value);
+                return err;
+            };
+            try trailers.append(stream.allocator, nativeHeader(entry.key, value));
+        }
     }
     var code_buffer: [3]u8 = undefined;
     const code = try std.fmt.bufPrint(&code_buffer, "{d}", .{@intFromEnum(stream.response_code)});
