@@ -63,6 +63,7 @@ pub const Channel = struct {
         return .{ .impl = impl };
     }
 
+    /// May be called concurrently. Input slices are borrowed until this function returns.
     pub fn callUnary(
         self: *Channel,
         allocator: std.mem.Allocator,
@@ -93,6 +94,7 @@ pub const Channel = struct {
         return result;
     }
 
+    /// May be called concurrently with active calls and causes them to finish promptly.
     pub fn shutdown(self: *Channel) void {
         const impl = self.impl;
         c.uv_mutex_lock(&impl.mutex);
@@ -103,6 +105,7 @@ pub const Channel = struct {
         c.uv_mutex_unlock(&impl.mutex);
     }
 
+    /// Waits for the channel event loop after shutdown.
     pub fn wait(self: *Channel) void {
         const impl = self.impl;
         c.uv_mutex_lock(&impl.mutex);
@@ -112,6 +115,7 @@ pub const Channel = struct {
         if (thread) |running_thread| running_thread.join();
     }
 
+    /// Requires exclusive access after all concurrent calls have returned.
     pub fn deinit(self: *Channel) void {
         const impl = self.impl;
         self.shutdown();
@@ -1335,6 +1339,75 @@ test "immediate shutdown escalates an active graceful drain" {
     var result = try channel.callUnary(std.testing.allocator, "/test.Drain/Escalate", "later", .{});
     defer result.deinit();
     try std.testing.expectEqual(status.Code.unavailable, result.status.code);
+}
+
+test "channel shutdown safely completes an active call before exclusive deinit" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        entered: std.Io.Semaphore = .{},
+        release: std.Io.Semaphore = .{},
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            self.entered.post(std.testing.io);
+            self.release.waitUncancelable(std.testing.io);
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Lifecycle/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    const Worker = struct {
+        channel: *Channel,
+        done: std.Io.Semaphore = .{},
+        code: status.Code = .unknown,
+        returned_result: bool = false,
+
+        fn run(self: *@This()) void {
+            var result = self.channel.callUnary(
+                std.testing.allocator,
+                "/test.Lifecycle/Unary",
+                "request",
+                .{},
+            ) catch {
+                self.done.post(std.testing.io);
+                return;
+            };
+            defer result.deinit();
+            self.code = result.status.code;
+            self.returned_result = true;
+            self.done.post(std.testing.io);
+        }
+    };
+
+    var worker = Worker{ .channel = &channel };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    handler.entered.waitUncancelable(std.testing.io);
+    channel.shutdown();
+    worker.done.waitUncancelable(std.testing.io);
+    handler.release.post(std.testing.io);
+    thread.join();
+
+    try std.testing.expect(worker.returned_result);
+    try std.testing.expectEqual(status.Code.unavailable, worker.code);
 }
 
 test "channel performs reusable concurrent unary calls end to end" {
