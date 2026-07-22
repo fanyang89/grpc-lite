@@ -14,6 +14,8 @@ Run `mise install` followed by `mise run bootstrap` before the first build.
 mise run build
 mise run test
 mise run test-release-safe
+mise run test-tsan
+mise run test-ubsan
 mise run test-consumer
 mise run fmt
 mise run ci-lint

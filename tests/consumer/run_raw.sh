@@ -57,6 +57,11 @@ cat >"$consumer/build.zig.zon" <<EOF
 EOF
 
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" --summary all
+ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
+    -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe \
+    -Dsanitize-thread=true -Dsanitize-c=false --summary all
+ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
+    -Doptimize=Debug -Dsanitize-thread=false -Dsanitize-c=true --summary all
 
 protobuf_path="$consumer/zig-pkg/protobuf-5.0.0-0e82avKUKAAVwTWJzTIEZ14Fu0zC11_lElR8tE6H__y1"
 if [[ -e "$protobuf_path" || -L "$protobuf_path" ]]; then

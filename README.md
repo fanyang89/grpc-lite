@@ -38,6 +38,8 @@ Useful tasks:
 mise run build
 mise run test
 mise run test-release-safe
+mise run test-tsan
+mise run test-ubsan
 mise run test-consumer
 mise run fmt
 mise run ci-lint
@@ -52,9 +54,10 @@ See `tests/official/README.md` for the supported interoperability profile and cu
 results.
 
 CI runs the core build and test suite on Linux x64 and arm64 in Debug and ReleaseSafe
-modes. Runtime interoperability runs on both architectures; the official HTTP/2
-edge-case container runs on x64 because its pinned image is amd64-only. A scheduled x64
-workflow runs extended official unary soak tests.
+modes. Required x64 jobs instrument Zig, libuv, and nghttp2 with ThreadSanitizer and C
+undefined behavior detection. Runtime interoperability runs on both architectures; the
+official HTTP/2 edge-case container runs on x64 because its pinned image is amd64-only.
+A scheduled x64 workflow runs extended official unary soak tests.
 
 ## Unary Client
 

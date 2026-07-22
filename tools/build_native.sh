@@ -6,13 +6,29 @@ source_dir=$2
 build_dir=$3
 build_type=$4
 cc=$5
+sanitize_thread=$6
+sanitize_c=$7
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+c_flags=()
+if [[ "$sanitize_thread" == true ]]; then
+    c_flags+=(-fsanitize=thread "-I$script_dir/sanitizer-compat")
+fi
+if [[ "$sanitize_c" == true ]]; then
+    c_flags+=(-fsanitize=undefined -fno-sanitize-recover=undefined)
+else
+    c_flags+=(-fno-sanitize=undefined)
+fi
+if [[ "$sanitize_thread" == true || "$sanitize_c" == true ]]; then
+    c_flags+=(-fno-omit-frame-pointer -g)
+fi
 
 common_options=(
     -S "$source_dir"
     -B "$build_dir"
     -G Ninja
     "-DCMAKE_BUILD_TYPE=$build_type"
-    -DCMAKE_C_FLAGS=-fno-sanitize=undefined
+    "-DCMAKE_C_FLAGS=${c_flags[*]}"
     -DBUILD_SHARED_LIBS=OFF
 )
 

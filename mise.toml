@@ -22,6 +22,14 @@ run = "zig build test --summary all"
 description = "Run all tests with ReleaseSafe optimization"
 run = "zig build test -Doptimize=ReleaseSafe --summary all"
 
+[tasks.test-tsan]
+description = "Run all tests with ThreadSanitizer"
+run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all"
+
+[tasks.test-ubsan]
+description = "Run all tests with C undefined behavior detection"
+run = "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Doptimize=Debug -Dsanitize-thread=false -Dsanitize-c=true --summary all"
+
 [tasks.test-consumer]
 description = "Build a raw consumer from the package archive"
 run = "tests/consumer/run_raw.sh"

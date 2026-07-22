@@ -4,6 +4,13 @@ const manifest = @import("build.zig.zon");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const sanitizers: Sanitizers = .{
+        .thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer"),
+        .c = if (b.option(bool, "sanitize-c", "Enable full C undefined behavior detection")) |enabled|
+            if (enabled) .full else .off
+        else
+            null,
+    };
     const libuv_dependency = b.dependency("libuv", .{});
     const nghttp2_dependency = b.dependency("nghttp2", .{});
     const enable_protobuf = b.option(
@@ -17,7 +24,9 @@ pub fn build(b: *std.Build) void {
         b,
         libuv_dependency.path(""),
         nghttp2_dependency.path(""),
+        target,
         optimize,
+        sanitizers,
     );
 
     const grpc_lite = b.addModule("grpc_lite", .{
@@ -26,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    applySanitizers(grpc_lite, sanitizers);
     grpc_lite.addOptions("grpc_lite_options", grpc_lite_options);
     grpc_lite.addIncludePath(libuv_dependency.path("include"));
     grpc_lite.addIncludePath(nghttp2_dependency.path("lib/includes"));
@@ -50,14 +60,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    const public_api_module = b.createModule(.{
+        .root_source_file = b.path("tests/public_api_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
+    });
+    applySanitizers(public_api_module, sanitizers);
     const public_api_tests = b.addTest(.{
         .name = "public-api",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/public_api_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
-        }),
+        .root_module = public_api_module,
     });
     const run_public_api_tests = b.addRunArtifact(public_api_tests);
 
@@ -79,7 +91,23 @@ pub fn build(b: *std.Build) void {
         test_step,
         target,
         optimize,
+        sanitizers,
     );
+}
+
+const Sanitizers = struct {
+    thread: ?bool,
+    c: ?std.zig.SanitizeC,
+
+    fn enabled(self: Sanitizers) bool {
+        return self.thread == true or self.c == .full;
+    }
+};
+
+fn applySanitizers(module: *std.Build.Module, sanitizers: Sanitizers) void {
+    module.sanitize_thread = sanitizers.thread;
+    module.sanitize_c = sanitizers.c;
+    if (sanitizers.enabled()) module.omit_frame_pointer = false;
 }
 
 fn addProtobufSupport(
@@ -90,6 +118,7 @@ fn addProtobufSupport(
     test_step: *std.Build.Step,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    sanitizers: Sanitizers,
 ) void {
     const generate_proto = protobuf_build.RunProtocStep.create(
         protobuf_dependency.builder,
@@ -123,18 +152,21 @@ fn addProtobufSupport(
     generate_interop_proto_step.dependOn(&generate_interop_proto.step);
 
     const protobuf = protobuf_dependency.module("protobuf");
+    applySanitizers(protobuf, sanitizers);
     const demo_proto = b.createModule(.{
         .root_source_file = b.path(".zig-cache/generated/demo.pb.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "protobuf", .module = protobuf }},
     });
+    applySanitizers(demo_proto, sanitizers);
     const interop_proto = b.createModule(.{
         .root_source_file = b.path(".zig-cache/generated-interop/grpc/testing.pb.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "protobuf", .module = protobuf }},
     });
+    applySanitizers(interop_proto, sanitizers);
     const grpc_lite_protobuf = b.addModule("grpc_lite_protobuf", .{
         .root_source_file = b.path("src/protobuf_adapter.zig"),
         .target = target,
@@ -144,43 +176,50 @@ fn addProtobufSupport(
             .{ .name = "protobuf", .module = protobuf },
         },
     });
+    applySanitizers(grpc_lite_protobuf, sanitizers);
 
+    const protobuf_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/protobuf_codegen_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "demo_proto", .module = demo_proto }},
+    });
+    applySanitizers(protobuf_test_module, sanitizers);
     const protobuf_tests = b.addTest(.{
         .name = "protobuf-integration",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/protobuf_codegen_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "demo_proto", .module = demo_proto }},
-        }),
+        .root_module = protobuf_test_module,
     });
     protobuf_tests.step.dependOn(&generate_proto.step);
     const run_protobuf_tests = b.addRunArtifact(protobuf_tests);
 
+    const protobuf_adapter_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/protobuf_adapter_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "grpc_lite", .module = grpc_lite },
+            .{ .name = "grpc_lite_protobuf", .module = grpc_lite_protobuf },
+            .{ .name = "demo_proto", .module = demo_proto },
+        },
+    });
+    applySanitizers(protobuf_adapter_test_module, sanitizers);
     const protobuf_adapter_tests = b.addTest(.{
         .name = "protobuf-adapter",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/protobuf_adapter_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "grpc_lite", .module = grpc_lite },
-                .{ .name = "grpc_lite_protobuf", .module = grpc_lite_protobuf },
-                .{ .name = "demo_proto", .module = demo_proto },
-            },
-        }),
+        .root_module = protobuf_adapter_test_module,
     });
     protobuf_adapter_tests.step.dependOn(&generate_proto.step);
     const run_protobuf_adapter_tests = b.addRunArtifact(protobuf_adapter_tests);
 
+    const official_proto_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/official/protobuf_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "grpc_testing", .module = interop_proto }},
+    });
+    applySanitizers(official_proto_test_module, sanitizers);
     const official_proto_tests = b.addTest(.{
         .name = "official-protobuf",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/official/protobuf_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "grpc_testing", .module = interop_proto }},
-        }),
+        .root_module = official_proto_test_module,
     });
     official_proto_tests.step.dependOn(&generate_interop_proto.step);
     const run_official_proto_tests = b.addRunArtifact(official_proto_tests);
@@ -232,6 +271,9 @@ fn addExample(
         .optimize = grpc_lite.optimize,
         .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
     });
+    module.sanitize_thread = grpc_lite.sanitize_thread;
+    module.sanitize_c = grpc_lite.sanitize_c;
+    module.omit_frame_pointer = grpc_lite.omit_frame_pointer;
     const executable = b.addExecutable(.{
         .name = name,
         .root_module = module,
@@ -249,9 +291,12 @@ fn addNativeDependencies(
     b: *std.Build,
     libuv_source_dir: std.Build.LazyPath,
     nghttp2_source_dir: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    sanitizers: Sanitizers,
 ) NativeDependencies {
-    const cc = b.fmt("{s} cc", .{b.graph.zig_exe});
+    const target_triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
+    const cc = b.fmt("{s} cc -target {s}", .{ b.graph.zig_exe, target_triple });
     const cmake_build_type = switch (optimize) {
         .Debug => "Debug",
         .ReleaseSafe => "RelWithDebInfo",
@@ -264,6 +309,7 @@ fn addNativeDependencies(
         libuv_source_dir,
         cmake_build_type,
         cc,
+        sanitizers,
     );
     const build_nghttp2 = addNativeBuild(
         b,
@@ -271,6 +317,7 @@ fn addNativeDependencies(
         nghttp2_source_dir,
         cmake_build_type,
         cc,
+        sanitizers,
     );
 
     return .{
@@ -286,12 +333,18 @@ fn addNativeBuild(
     source_dir: std.Build.LazyPath,
     cmake_build_type: []const u8,
     cc: []const u8,
+    sanitizers: Sanitizers,
 ) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{"bash"});
     run.addFileArg(b.path("tools/build_native.sh"));
     run.addArg(name);
     run.addDirectoryArg(source_dir);
     const output = run.addOutputDirectoryArg(name);
-    run.addArgs(&.{ cmake_build_type, cc });
+    run.addArgs(&.{
+        cmake_build_type,
+        cc,
+        if (sanitizers.thread == true) "true" else "false",
+        if (sanitizers.c == .full) "true" else "false",
+    });
     return output;
 }
