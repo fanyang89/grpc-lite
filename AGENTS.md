@@ -16,6 +16,10 @@ mise run test
 mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
+mise run test-libuv-asan
+mise run test-libuv-msan
+mise run test-libuv-tsan
+mise run test-libuv-ubsan
 mise run test-consumer
 mise run fmt
 mise run ci-lint

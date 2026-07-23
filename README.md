@@ -40,6 +40,10 @@ mise run test
 mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
+mise run test-libuv-asan
+mise run test-libuv-msan
+mise run test-libuv-tsan
+mise run test-libuv-ubsan
 mise run test-consumer
 mise run fmt
 mise run ci-lint
@@ -55,9 +59,11 @@ results.
 
 CI runs the core build and test suite on Linux x64 and arm64 in Debug and ReleaseSafe
 modes. Required x64 jobs instrument Zig, libuv, and nghttp2 with ThreadSanitizer and C
-undefined behavior detection. Runtime interoperability runs on both architectures; the
-official HTTP/2 edge-case container runs on x64 because its pinned image is amd64-only.
-A scheduled x64 workflow runs extended official unary soak tests.
+undefined behavior detection. A separate required matrix runs libuv's complete native
+test suite with AddressSanitizer, MemorySanitizer, ThreadSanitizer, and undefined behavior
+detection. Runtime interoperability runs on both architectures; the official HTTP/2
+edge-case container runs on x64 because its pinned image is amd64-only. A scheduled x64
+workflow runs extended official unary soak tests.
 
 ## Unary Client
 

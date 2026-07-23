@@ -111,6 +111,39 @@ jobs:
       - name: Run sanitizer tests
         run: mise run ${{ matrix.task }}
 
+  libuv-sanitizer:
+    name: libuv sanitizer (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ASan
+            mode: asan
+          - name: MSan
+            mode: msan
+          - name: TSan
+            mode: tsan
+          - name: UBSan
+            mode: ubsan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install mise tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4
+
+      - name: Disable ASLR
+        if: matrix.mode == 'asan' || matrix.mode == 'msan'
+        run: sudo sysctl -w kernel.randomize_va_space=0
+
+      - name: Run libuv sanitizer tests
+        run: mise run test-libuv-${{ matrix.mode }}
+
   interop:
     name: Interop (${{ matrix.arch }})
     strategy:
@@ -166,6 +199,7 @@ jobs:
       - core-test
       - package-consumer
       - sanitizer
+      - libuv-sanitizer
       - interop
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -176,10 +210,12 @@ jobs:
           CORE_TEST_RESULT: ${{ needs.core-test.result }}
           PACKAGE_CONSUMER_RESULT: ${{ needs.package-consumer.result }}
           SANITIZER_RESULT: ${{ needs.sanitizer.result }}
+          LIBUV_SANITIZER_RESULT: ${{ needs.libuv-sanitizer.result }}
           INTEROP_RESULT: ${{ needs.interop.result }}
         run: |
           test "$WORKFLOW_LINT_RESULT" = success
           test "$CORE_TEST_RESULT" = success
           test "$PACKAGE_CONSUMER_RESULT" = success
           test "$SANITIZER_RESULT" = success
+          test "$LIBUV_SANITIZER_RESULT" = success
           test "$INTEROP_RESULT" = success

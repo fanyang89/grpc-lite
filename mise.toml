@@ -30,6 +30,22 @@ run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dtarget=x86_64-l
 description = "Run all tests with C undefined behavior detection"
 run = "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Doptimize=Debug -Dsanitize-thread=false -Dsanitize-c=true --summary all"
 
+[tasks.test-libuv-asan]
+description = "Run libuv tests with AddressSanitizer"
+run = "bash tools/test_libuv_sanitizer.sh asan"
+
+[tasks.test-libuv-msan]
+description = "Run libuv tests with MemorySanitizer"
+run = "bash tools/test_libuv_sanitizer.sh msan"
+
+[tasks.test-libuv-tsan]
+description = "Run libuv tests with ThreadSanitizer"
+run = "bash tools/test_libuv_sanitizer.sh tsan"
+
+[tasks.test-libuv-ubsan]
+description = "Run libuv tests with UndefinedBehaviorSanitizer"
+run = "bash tools/test_libuv_sanitizer.sh ubsan"
+
 [tasks.test-consumer]
 description = "Build a raw consumer from the package archive"
 run = "tests/consumer/run_raw.sh"
