@@ -54,7 +54,7 @@ authoritative: change it before implementing a feature with a different decision
 | Raw client streaming | Required | Explicit client half-close |
 | Raw server streaming | Required | Bounded response backpressure |
 | Raw bidirectional streaming | Required | Independent full-duplex message flow |
-| Typed streaming | Selected | Follows raw transport incrementally; not claimed complete |
+| Typed streaming | Selected | Event-driven zig-protobuf adapters cover all streaming cardinalities |
 | Official insecure unary and streaming interop profile | Required | Test against official grpc-go peers |
 | Large messages and HTTP/2 flow control | Required | Include padding and max-stream tests |
 | ASCII and binary metadata | Required | Emit padded base64; accept padded, unpadded, and comma-joined `-bin` values |

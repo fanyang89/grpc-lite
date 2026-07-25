@@ -28,8 +28,8 @@ remain out of scope.
 
 The compatibility target is `grpc-lite-streaming-insecure-v2`: raw unary,
 client-streaming, server-streaming, and bidirectional streaming over cleartext HTTP/2.
-Raw streaming is implemented and verified against grpc-go. Typed streaming will follow
-the raw transport incrementally and is not claimed complete.
+Raw streaming is implemented and verified against grpc-go. The optional zig-protobuf
+adapter provides event-driven typed clients and servers for every streaming cardinality.
 
 The raw API is entirely event-driven. Application callbacks run on transport
 loop threads and must not block. It provides explicit half-close and streaming-only
@@ -155,9 +155,8 @@ var registration = grpc_pb.ServiceRegistration(EchoApi).init(
         .context_hook = configureContext,
     },
 );
-defer registration.deinit();
-
 try registration.register(&server);
+// Call registration.deinit() after server.deinit().
 ```
 
 The adapter derives `/demo.EchoService/Echo`, decodes `EchoRequest`, invokes the
@@ -178,9 +177,49 @@ defer result.deinit();
 ```
 
 Business errors default to `INTERNAL`; an optional typed mapper can return another
-gRPC status. A context hook exposes request and response metadata. Typed streaming is
-planned to follow the raw transport and may remain unsupported while that work is
-ongoing.
+gRPC status. A context hook exposes request and response metadata.
+
+Typed streaming derives message types and identifies cardinality from the generated
+service while preserving the raw event-driven transport:
+
+```zig
+const StreamingApi = demo.StreamingEchoService(AppState, AppError);
+
+var registration = grpc_pb.StreamRegistration(StreamingApi, "Chat").init(
+    allocator,
+    .{
+        .context = &state,
+        .on_start = AppState.onStart,
+        .on_message = AppState.onMessage,
+        .on_remote_end = AppState.onRemoteEnd,
+    },
+);
+try registration.register(&server);
+// Call registration.deinit() after server.deinit().
+
+var client = grpc_pb.ServiceClient(StreamingApi).init(&channel);
+var call = try client.openStream(
+    callback_allocator,
+    "Chat",
+    .{},
+    callbacks,
+);
+defer call.deinit();
+try call.send(send_allocator, demo.EchoRequest{ .message = "hello" }, .{});
+try call.closeSend();
+```
+
+Typed callbacks run on transport loop threads and must not block. Decoded callback
+messages are borrowed until the callback returns. `send` encodes into a temporary
+buffer and propagates raw `WouldBlock`, pause/resume, cancellation, and compression
+semantics without adding an unbounded queue. The generated blocking `std.Io.Queue`
+service handlers are not executed by this adapter.
+
+The callback allocator must remain valid through stream `deinit`; if `deinit` runs in a
+callback, it must remain valid until that callback returns. An allocator shared across
+application and callback threads must be thread-safe. Stream registrations, handler
+contexts, and their allocators must remain at stable addresses until the server and all
+active streams have stopped.
 
 ## Dependencies
 

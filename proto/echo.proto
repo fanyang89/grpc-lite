@@ -13,3 +13,9 @@ message EchoReply {
 service EchoService {
   rpc Echo(EchoRequest) returns (EchoReply);
 }
+
+service StreamingEchoService {
+  rpc ServerEcho(EchoRequest) returns (stream EchoReply);
+  rpc ClientEcho(stream EchoRequest) returns (EchoReply);
+  rpc Chat(stream EchoRequest) returns (stream EchoReply);
+}
