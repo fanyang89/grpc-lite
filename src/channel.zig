@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig").api;
+const xev = @import("xev");
 const call = @import("call.zig");
 const Compression = @import("compression.zig").Compression;
 const deadline_wire = @import("deadline.zig");
@@ -32,29 +33,32 @@ pub const Channel = struct {
         const user_agent = try allocator.dupe(u8, options.user_agent);
         errdefer allocator.free(user_agent);
 
+        var async_handle = try xev.Async.init();
+        errdefer async_handle.deinit();
+        var deadline_timer = try xev.Timer.init();
+        errdefer deadline_timer.deinit();
+
         impl.* = .{
             .allocator = allocator,
             .host = host,
             .port = parsed.port,
             .authority = authority,
             .user_agent = user_agent,
+            .async_handle = async_handle,
+            .deadline_timer = deadline_timer,
         };
-        if (c.uv_mutex_init(&impl.mutex) < 0) return error.SynchronizationInitializationFailed;
-        errdefer c.uv_mutex_destroy(&impl.mutex);
-        if (c.uv_cond_init(&impl.condition) < 0) return error.SynchronizationInitializationFailed;
-        errdefer c.uv_cond_destroy(&impl.condition);
         impl.thread = try std.Thread.spawn(.{}, runLoop, .{impl});
 
-        c.uv_mutex_lock(&impl.mutex);
-        while (impl.state == .starting) c.uv_cond_wait(&impl.condition, &impl.mutex);
+        impl.mutex.lockUncancelable(syncIo());
+        while (impl.state == .starting) impl.condition.waitUncancelable(syncIo(), &impl.mutex);
         const running = impl.state == .running;
-        c.uv_mutex_unlock(&impl.mutex);
+        impl.mutex.unlock(syncIo());
         if (!running) {
             impl.thread.?.join();
             impl.thread = null;
             impl.pending.deinit(allocator);
-            c.uv_cond_destroy(&impl.condition);
-            c.uv_mutex_destroy(&impl.mutex);
+            impl.async_handle.deinit();
+            impl.deadline_timer.deinit();
             allocator.free(user_agent);
             allocator.free(authority);
             allocator.free(host);
@@ -99,21 +103,23 @@ pub const Channel = struct {
     /// May be called concurrently with active calls and causes them to finish promptly.
     pub fn shutdown(self: *Channel) void {
         const impl = self.impl;
-        c.uv_mutex_lock(&impl.mutex);
+        impl.mutex.lockUncancelable(syncIo());
+        var notify = false;
         if (impl.state == .running) {
             impl.state = .stopping;
-            _ = c.uv_async_send(&impl.async_handle);
+            notify = true;
         }
-        c.uv_mutex_unlock(&impl.mutex);
+        impl.mutex.unlock(syncIo());
+        if (notify) impl.async_handle.notify() catch {};
     }
 
     /// Waits for the channel event loop after shutdown.
     pub fn wait(self: *Channel) void {
         const impl = self.impl;
-        c.uv_mutex_lock(&impl.mutex);
+        impl.mutex.lockUncancelable(syncIo());
         const thread = impl.thread;
         impl.thread = null;
-        c.uv_mutex_unlock(&impl.mutex);
+        impl.mutex.unlock(syncIo());
         if (thread) |running_thread| running_thread.join();
     }
 
@@ -125,8 +131,9 @@ pub const Channel = struct {
 
         impl.pending.deinit(impl.allocator);
         impl.operations.deinit(impl.allocator);
-        c.uv_cond_destroy(&impl.condition);
-        c.uv_mutex_destroy(&impl.mutex);
+        impl.writes.deinit(impl.allocator);
+        impl.async_handle.deinit();
+        impl.deadline_timer.deinit();
         impl.allocator.free(impl.user_agent);
         impl.allocator.free(impl.authority);
         impl.allocator.free(impl.host);
@@ -145,34 +152,41 @@ const Impl = struct {
     port: u16,
     authority: []u8,
     user_agent: []u8,
-    mutex: c.uv_mutex_t = undefined,
-    condition: c.uv_cond_t = undefined,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     state: State = .starting,
     thread: ?std.Thread = null,
     pending: std.ArrayList(*Operation) = .empty,
     operations: std.AutoHashMapUnmanaged(i32, *Operation) = .empty,
-    loop: c.uv_loop_t = undefined,
-    tcp: c.uv_tcp_t = undefined,
-    connect_request: c.uv_connect_t = undefined,
-    async_handle: c.uv_async_t = undefined,
-    deadline_timer: c.uv_timer_t = undefined,
+    loop: xev.Loop = undefined,
+    tcp: xev.TCP = undefined,
+    connect_completion: xev.Completion = .{},
+    read_completion: xev.Completion = .{},
+    close_completion: xev.Completion = .{},
+    async_handle: xev.Async,
+    async_completion: xev.Completion = .{},
+    deadline_timer: xev.Timer,
+    deadline_completion: xev.Completion = .{},
     session: ?*c.nghttp2_session = null,
     loop_initialized: bool = false,
     tcp_initialized: bool = false,
-    async_initialized: bool = false,
-    timer_initialized: bool = false,
+    socket_close_scheduled: bool = false,
+    deadline_timer_armed: bool = false,
     connected: bool = false,
     connection_state: ConnectionState = .connecting,
     connection_generation: usize = 0,
     stopping_on_loop: bool = false,
     connect_count: usize = 0,
+    read_buffer: [16 * 1024]u8 = undefined,
+    write_queue: xev.WriteQueue = .{},
+    writes: std.AutoHashMapUnmanaged(*WriteRequest, void) = .empty,
 
     fn enqueue(self: *Impl, operation: *Operation) !bool {
-        c.uv_mutex_lock(&self.mutex);
-        defer c.uv_mutex_unlock(&self.mutex);
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
         if (self.state != .running) return false;
         try self.pending.append(self.allocator, operation);
-        if (c.uv_async_send(&self.async_handle) < 0) {
+        if (self.async_handle.notify()) |_| {} else |_| {
             _ = self.pending.pop();
             return false;
         }
@@ -180,17 +194,17 @@ const Impl = struct {
     }
 
     fn signalStartup(self: *Impl, succeeded: bool) void {
-        c.uv_mutex_lock(&self.mutex);
+        self.mutex.lockUncancelable(syncIo());
         if (self.state == .starting) self.state = if (succeeded) .running else .stopping;
-        c.uv_cond_broadcast(&self.condition);
-        c.uv_mutex_unlock(&self.mutex);
+        self.condition.broadcast(syncIo());
+        self.mutex.unlock(syncIo());
     }
 
     fn markStopped(self: *Impl) void {
-        c.uv_mutex_lock(&self.mutex);
+        self.mutex.lockUncancelable(syncIo());
         self.state = .stopped;
-        c.uv_cond_broadcast(&self.condition);
-        c.uv_mutex_unlock(&self.mutex);
+        self.condition.broadcast(syncIo());
+        self.mutex.unlock(syncIo());
     }
 };
 
@@ -208,8 +222,8 @@ const Operation = struct {
     timeout_header: [16]u8 = undefined,
     timeout_header_len: usize = 0,
     stream_id: i32 = -1,
-    mutex: c.uv_mutex_t = undefined,
-    condition: c.uv_cond_t = undefined,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     done: bool = false,
     outcome_set: bool = false,
     deadline_expired: bool = false,
@@ -253,15 +267,11 @@ const Operation = struct {
             .request_metadata = metadata.Metadata.init(impl.allocator),
             .request_compression = options.request_compression,
             .max_response_size = options.max_response_size,
-            .deadline_ns = if (options.timeout_ns) |timeout| c.uv_hrtime() +| timeout else null,
+            .deadline_ns = if (options.timeout_ns) |timeout| nowNs() +| timeout else null,
             .initial_metadata = metadata.Metadata.init(impl.allocator),
             .trailing_metadata = metadata.Metadata.init(impl.allocator),
             .block_metadata = metadata.Metadata.init(impl.allocator),
         };
-        if (c.uv_mutex_init(&operation.mutex) < 0) return error.SynchronizationInitializationFailed;
-        errdefer c.uv_mutex_destroy(&operation.mutex);
-        if (c.uv_cond_init(&operation.condition) < 0) return error.SynchronizationInitializationFailed;
-        errdefer c.uv_cond_destroy(&operation.condition);
         errdefer operation.request_metadata.deinit();
         errdefer operation.initial_metadata.deinit();
         errdefer operation.trailing_metadata.deinit();
@@ -287,8 +297,6 @@ const Operation = struct {
         self.initial_metadata.deinit();
         self.trailing_metadata.deinit();
         self.block_metadata.deinit();
-        c.uv_cond_destroy(&self.condition);
-        c.uv_mutex_destroy(&self.mutex);
         allocator.destroy(self);
     }
 
@@ -303,16 +311,16 @@ const Operation = struct {
     }
 
     fn complete(self: *Operation) void {
-        c.uv_mutex_lock(&self.mutex);
+        self.mutex.lockUncancelable(syncIo());
         self.done = true;
-        c.uv_cond_broadcast(&self.condition);
-        c.uv_mutex_unlock(&self.mutex);
+        self.condition.broadcast(syncIo());
+        self.mutex.unlock(syncIo());
     }
 
     fn wait(self: *Operation) void {
-        c.uv_mutex_lock(&self.mutex);
-        while (!self.done) c.uv_cond_wait(&self.condition, &self.mutex);
-        c.uv_mutex_unlock(&self.mutex);
+        self.mutex.lockUncancelable(syncIo());
+        while (!self.done) self.condition.waitUncancelable(syncIo(), &self.mutex);
+        self.mutex.unlock(syncIo());
     }
 
     fn resetHeaderBlock(self: *Operation, kind: HeaderKind) void {
@@ -403,55 +411,44 @@ const Operation = struct {
 };
 
 const WriteRequest = struct {
-    request: c.uv_write_t = undefined,
+    request: xev.WriteRequest = undefined,
     impl: *Impl,
     bytes: []u8,
     generation: usize,
 };
 
 fn runLoop(impl: *Impl) void {
-    if (c.uv_loop_init(&impl.loop) < 0) {
+    impl.loop = xev.Loop.init(.{}) catch {
         impl.signalStartup(false);
         impl.markStopped();
         return;
-    }
+    };
     impl.loop_initialized = true;
-
-    setupLoop(impl) catch {
+    impl.async_handle.wait(&impl.loop, &impl.async_completion, Impl, impl, onAsync);
+    startConnection(impl) catch {
         impl.signalStartup(false);
         beginStop(impl, "connection failed");
     };
-    _ = c.uv_run(&impl.loop, c.UV_RUN_DEFAULT);
-    _ = c.uv_loop_close(&impl.loop);
+    impl.loop.run(.until_done) catch beginStop(impl, "event loop failed");
+    discardWrites(impl);
+    if (impl.session) |session| c.nghttp2_session_del(session);
+    impl.session = null;
+    impl.loop.deinit();
     impl.loop_initialized = false;
     impl.markStopped();
 }
 
-fn setupLoop(impl: *Impl) !void {
-    if (c.uv_async_init(&impl.loop, &impl.async_handle, onAsync) < 0) return error.AsyncInitializationFailed;
-    impl.async_initialized = true;
-    impl.async_handle.data = impl;
-
-    if (c.uv_timer_init(&impl.loop, &impl.deadline_timer) < 0) return error.TimerInitializationFailed;
-    impl.timer_initialized = true;
-    impl.deadline_timer.data = impl;
-
-    try startConnection(impl);
-}
-
 fn startConnection(impl: *Impl) !void {
-    if (c.uv_tcp_init(&impl.loop, &impl.tcp) < 0) return error.TcpInitializationFailed;
+    const address = try std.Io.net.IpAddress.parseIp4(impl.host, impl.port);
+    impl.tcp = try xev.TCP.init(address);
     impl.tcp_initialized = true;
-    impl.tcp.data = impl;
+    impl.socket_close_scheduled = false;
     impl.connected = false;
     impl.connection_state = .connecting;
     impl.connection_generation += 1;
 
     try initializeSession(impl);
-    var address: c.struct_sockaddr_in = undefined;
-    if (c.uv_ip4_addr(impl.host.ptr, impl.port, &address) < 0) return error.InvalidAddress;
-    impl.connect_request.data = impl;
-    if (c.uv_tcp_connect(&impl.connect_request, &impl.tcp, @ptrCast(&address), onConnect) < 0) return error.ConnectFailed;
+    impl.tcp.connect(&impl.loop, &impl.connect_completion, address, Impl, impl, onConnect);
 }
 
 fn initializeSession(impl: *Impl) !void {
@@ -467,40 +464,46 @@ fn initializeSession(impl: *Impl) !void {
     if (c.nghttp2_submit_settings(impl.session, c.NGHTTP2_FLAG_NONE, null, 0) != 0) return error.NativeFailure;
 }
 
-fn onConnect(request: ?*c.uv_connect_t, connect_status: c_int) callconv(.c) void {
-    const impl: *Impl = @ptrCast(@alignCast(request.?.*.data.?));
-    if (connect_status < 0 or c.uv_read_start(@ptrCast(&impl.tcp), allocateReadBuffer, onRead) < 0) {
+fn onConnect(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, result: xev.ConnectError!void) xev.CallbackAction {
+    const impl = impl_.?;
+    result catch {
         impl.signalStartup(false);
         beginStop(impl, "connection failed");
-        return;
-    }
-    c.uv_mutex_lock(&impl.mutex);
+        return .disarm;
+    };
+    impl.mutex.lockUncancelable(syncIo());
     const stopping = impl.state == .stopping or impl.state == .stopped;
-    c.uv_mutex_unlock(&impl.mutex);
+    impl.mutex.unlock(syncIo());
     if (stopping) {
         beginStop(impl, "channel closed");
-        return;
+        return .disarm;
     }
     impl.connected = true;
     impl.connect_count += 1;
+    impl.tcp.read(&impl.loop, &impl.read_completion, .{ .slice = &impl.read_buffer }, Impl, impl, onRead);
     flush(impl) catch {
         impl.signalStartup(false);
         beginStop(impl, "connection failed");
-        return;
+        return .disarm;
     };
     impl.connection_state = .active;
     impl.signalStartup(true);
     processPending(impl);
+    return .disarm;
 }
 
-fn onAsync(handle: ?*c.uv_async_t) callconv(.c) void {
-    const impl: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
-    c.uv_mutex_lock(&impl.mutex);
+fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
+    const impl = impl_.?;
+    result catch {
+        beginStop(impl, "channel wakeup failed");
+        return .disarm;
+    };
+    impl.mutex.lockUncancelable(syncIo());
     const stopping = impl.state != .running;
-    c.uv_mutex_unlock(&impl.mutex);
+    impl.mutex.unlock(syncIo());
     if (stopping) {
         beginStop(impl, "channel closed");
-        return;
+        return .disarm;
     }
     switch (impl.connection_state) {
         .active => processPending(impl),
@@ -510,6 +513,7 @@ fn onAsync(handle: ?*c.uv_async_t) callconv(.c) void {
         },
         .connecting, .closing => scheduleDeadlineTimer(impl),
     }
+    return .rearm;
 }
 
 fn processPending(impl: *Impl) void {
@@ -518,14 +522,14 @@ fn processPending(impl: *Impl) void {
         return;
     }
     var pending: std.ArrayList(*Operation) = .empty;
-    c.uv_mutex_lock(&impl.mutex);
+    impl.mutex.lockUncancelable(syncIo());
     std.mem.swap(std.ArrayList(*Operation), &pending, &impl.pending);
-    c.uv_mutex_unlock(&impl.mutex);
+    impl.mutex.unlock(syncIo());
     defer pending.deinit(impl.allocator);
 
     for (pending.items) |operation| {
         if (operation.deadline_ns) |deadline| {
-            const now = c.uv_hrtime();
+            const now = nowNs();
             if (deadline <= now) {
                 operation.deadline_expired = true;
                 operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
@@ -628,55 +632,59 @@ fn flush(impl: *Impl) !void {
             .bytes = bytes,
             .generation = impl.connection_generation,
         };
-        write.request.data = write;
-        var buffer = c.uv_buf_init(@ptrCast(bytes.ptr), @intCast(bytes.len));
-        if (c.uv_write(&write.request, @ptrCast(&impl.tcp), &buffer, 1, onWrite) < 0) return error.WriteFailed;
+        try impl.writes.put(impl.allocator, write, {});
+        impl.tcp.queueWrite(
+            &impl.loop,
+            &impl.write_queue,
+            &write.request,
+            .{ .slice = bytes },
+            WriteRequest,
+            write,
+            onWrite,
+        );
     }
 }
 
-fn allocateReadBuffer(handle: ?*c.uv_handle_t, suggested_size: usize, buffer: ?*c.uv_buf_t) callconv(.c) void {
-    const impl: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
-    const bytes = impl.allocator.alloc(u8, @max(suggested_size, 1)) catch {
-        buffer.?.* = c.uv_buf_init(null, 0);
-        return;
-    };
-    buffer.?.* = c.uv_buf_init(@ptrCast(bytes.ptr), @intCast(bytes.len));
-}
-
-fn onRead(handle: ?*c.uv_stream_t, bytes_read: isize, buffer: ?*const c.uv_buf_t) callconv(.c) void {
-    const impl: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
-    defer if (buffer.?.*.base != null) {
-        const bytes: [*]u8 = @ptrCast(buffer.?.*.base);
-        impl.allocator.free(bytes[0..buffer.?.*.len]);
-    };
-    if (bytes_read < 0) {
-        if (impl.connection_state == .closing) return;
+fn onRead(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.ReadBuffer, result: xev.ReadError!usize) xev.CallbackAction {
+    const impl = impl_.?;
+    const bytes_read = result catch {
+        if (impl.connection_state == .closing or impl.stopping_on_loop) return .disarm;
         if (impl.connection_state == .draining and impl.operations.count() == 0) {
             beginReconnect(impl);
-            return;
+            return .disarm;
         }
         beginStop(impl, "connection closed");
-        return;
+        return .disarm;
+    };
+    if (bytes_read == 0) {
+        beginStop(impl, "connection closed");
+        return .disarm;
     }
-    if (bytes_read == 0) return;
-    const input: [*]const u8 = @ptrCast(buffer.?.*.base);
-    const consumed = c.nghttp2_session_mem_recv2(impl.session, input, @intCast(bytes_read));
-    if (consumed < 0 or consumed != bytes_read) {
+    if (impl.connection_state == .closing or impl.stopping_on_loop) return .disarm;
+    const consumed = c.nghttp2_session_mem_recv2(impl.session, impl.read_buffer[0..bytes_read].ptr, bytes_read);
+    if (consumed < 0 or consumed != @as(c.nghttp2_ssize, @intCast(bytes_read))) {
         beginStop(impl, "HTTP/2 connection failed");
-        return;
+        return .disarm;
     }
-    flush(impl) catch beginStop(impl, "connection failed");
+    flush(impl) catch {
+        beginStop(impl, "connection failed");
+        return .disarm;
+    };
+    return .rearm;
 }
 
-fn onWrite(request: ?*c.uv_write_t, write_status: c_int) callconv(.c) void {
-    const write: *WriteRequest = @ptrCast(@alignCast(request.?.*.data.?));
+fn onWrite(write_: ?*WriteRequest, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.WriteBuffer, result: xev.WriteError!usize) xev.CallbackAction {
+    const write = write_.?;
     const impl = write.impl;
     const generation = write.generation;
+    _ = impl.writes.remove(write);
     impl.allocator.free(write.bytes);
     impl.allocator.destroy(write);
-    if (write_status < 0 and generation == impl.connection_generation and impl.connection_state != .closing) {
+    if (result) |_| {} else |_| if (generation == impl.connection_generation and impl.connection_state != .closing) {
         beginStop(impl, "connection write failed");
     }
+    if (impl.connection_state == .closing and impl.writes.count() == 0) closeConnection(impl);
+    return .disarm;
 }
 
 fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, _: ?*anyopaque) callconv(.c) c_int {
@@ -751,7 +759,7 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
         const impl: *Impl = @ptrCast(@alignCast(user_data.?));
         if (impl.connection_state == .active) {
             impl.connection_state = .draining;
-            _ = c.uv_async_send(&impl.async_handle);
+            impl.async_handle.notify() catch {};
         }
         return 0;
     }
@@ -775,43 +783,46 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_d
         entry.value.finalize(error_code);
         scheduleDeadlineTimer(impl);
         if (impl.connection_state == .draining and impl.operations.count() == 0) {
-            _ = c.uv_async_send(&impl.async_handle);
+            impl.async_handle.notify() catch {};
         }
     }
     return 0;
 }
 
 fn scheduleDeadlineTimer(impl: *Impl) void {
-    if (!impl.timer_initialized or impl.stopping_on_loop) return;
-    var earliest: ?u64 = null;
+    if (impl.stopping_on_loop or impl.deadline_timer_armed) return;
+    var has_deadline = false;
     var iterator = impl.operations.valueIterator();
     while (iterator.next()) |operation_ptr| {
         const operation = operation_ptr.*;
         if (operation.deadline_expired) continue;
         if (operation.deadline_ns) |deadline| {
-            if (earliest == null or deadline < earliest.?) earliest = deadline;
+            _ = deadline;
+            has_deadline = true;
         }
     }
-    c.uv_mutex_lock(&impl.mutex);
+    impl.mutex.lockUncancelable(syncIo());
     for (impl.pending.items) |operation| {
         if (operation.deadline_ns) |deadline| {
-            if (earliest == null or deadline < earliest.?) earliest = deadline;
+            _ = deadline;
+            has_deadline = true;
         }
     }
-    c.uv_mutex_unlock(&impl.mutex);
-    if (earliest == null) {
-        _ = c.uv_timer_stop(&impl.deadline_timer);
-        return;
-    }
-    const remaining = earliest.? -| c.uv_hrtime();
-    const timeout_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining, std.time.ns_per_ms) catch 1);
-    _ = c.uv_timer_start(&impl.deadline_timer, onDeadlineTimer, timeout_ms, 0);
+    impl.mutex.unlock(syncIo());
+    if (!has_deadline) return;
+    impl.deadline_timer_armed = true;
+    impl.deadline_timer.run(&impl.loop, &impl.deadline_completion, 1, Impl, impl, onDeadlineTimer);
 }
 
-fn onDeadlineTimer(handle: ?*c.uv_timer_t) callconv(.c) void {
-    const impl: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
-    const now = c.uv_hrtime();
-    c.uv_mutex_lock(&impl.mutex);
+fn onDeadlineTimer(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+    const impl = impl_.?;
+    impl.deadline_timer_armed = false;
+    result catch {
+        beginStop(impl, "deadline timer failed");
+        return .disarm;
+    };
+    const now = nowNs();
+    impl.mutex.lockUncancelable(syncIo());
     var pending_index: usize = 0;
     while (pending_index < impl.pending.items.len) {
         const operation = impl.pending.items[pending_index];
@@ -824,7 +835,7 @@ fn onDeadlineTimer(handle: ?*c.uv_timer_t) callconv(.c) void {
             pending_index += 1;
         }
     }
-    c.uv_mutex_unlock(&impl.mutex);
+    impl.mutex.unlock(syncIo());
 
     var iterator = impl.operations.valueIterator();
     while (iterator.next()) |operation_ptr| {
@@ -836,7 +847,7 @@ fn onDeadlineTimer(handle: ?*c.uv_timer_t) callconv(.c) void {
                 operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
                 if (c.nghttp2_submit_rst_stream(impl.session, c.NGHTTP2_FLAG_NONE, operation.stream_id, c.NGHTTP2_CANCEL) != 0) {
                     beginStop(impl, "deadline cancellation failed");
-                    return;
+                    return .disarm;
                 }
             }
         }
@@ -844,53 +855,64 @@ fn onDeadlineTimer(handle: ?*c.uv_timer_t) callconv(.c) void {
     if (impl.connected) {
         flush(impl) catch {
             beginStop(impl, "connection failed");
-            return;
+            return .disarm;
         };
     }
-    scheduleDeadlineTimer(impl);
+    impl.async_handle.notify() catch {};
+    return .disarm;
 }
 
 fn beginReconnect(impl: *Impl) void {
     if (impl.connection_state != .draining or impl.operations.count() != 0) return;
     impl.connection_state = .closing;
     impl.connected = false;
-    _ = c.uv_read_stop(@ptrCast(&impl.tcp));
     if (impl.session) |session| {
         c.nghttp2_session_del(session);
         impl.session = null;
     }
-    if (c.uv_is_closing(@ptrCast(&impl.tcp)) == 0) {
-        c.uv_close(@ptrCast(&impl.tcp), onTcpClosed);
-    }
+    if (impl.writes.count() == 0) closeConnection(impl);
 }
 
-fn onTcpClosed(handle: ?*c.uv_handle_t) callconv(.c) void {
-    const impl: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
+fn closeConnection(impl: *Impl) void {
+    if (!impl.tcp_initialized or impl.socket_close_scheduled) return;
+    impl.socket_close_scheduled = true;
+    impl.tcp.close(&impl.loop, &impl.close_completion, Impl, impl, onTcpClosed);
+}
+
+fn onTcpClosed(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.CloseError!void) xev.CallbackAction {
+    const impl = impl_.?;
     impl.tcp_initialized = false;
     impl.connected = false;
-    if (impl.stopping_on_loop or impl.connection_state != .closing) return;
+    if (impl.stopping_on_loop) {
+        loop.stop();
+        return .disarm;
+    }
+    if (impl.connection_state != .closing) return .disarm;
 
-    c.uv_mutex_lock(&impl.mutex);
+    impl.mutex.lockUncancelable(syncIo());
     const running = impl.state == .running;
-    c.uv_mutex_unlock(&impl.mutex);
-    if (!running) return;
+    impl.mutex.unlock(syncIo());
+    if (!running) return .disarm;
 
     startConnection(impl) catch beginStop(impl, "connection failed");
+    return .disarm;
 }
 
 fn beginStop(impl: *Impl, reason: []const u8) void {
     if (impl.stopping_on_loop) return;
     impl.stopping_on_loop = true;
-    c.uv_mutex_lock(&impl.mutex);
+    impl.connection_state = .closing;
+    impl.connected = false;
+    impl.mutex.lockUncancelable(syncIo());
     if (impl.state == .starting) {
         impl.state = .stopping;
-        c.uv_cond_broadcast(&impl.condition);
+        impl.condition.broadcast(syncIo());
     } else if (impl.state == .running) {
         impl.state = .stopping;
     }
     var pending: std.ArrayList(*Operation) = .empty;
     std.mem.swap(std.ArrayList(*Operation), &pending, &impl.pending);
-    c.uv_mutex_unlock(&impl.mutex);
+    impl.mutex.unlock(syncIo());
 
     for (pending.items) |operation| {
         operation.setOutcome(.unavailable, reason) catch {};
@@ -910,13 +932,29 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     }
     impl.operations.clearRetainingCapacity();
 
-    if (impl.timer_initialized) {
-        _ = c.uv_timer_stop(&impl.deadline_timer);
-        if (c.uv_is_closing(@ptrCast(&impl.deadline_timer)) == 0) c.uv_close(@ptrCast(&impl.deadline_timer), null);
+    if (impl.tcp_initialized and impl.writes.count() == 0) {
+        closeConnection(impl);
+    } else if (!impl.tcp_initialized) {
+        impl.loop.stop();
     }
-    if (impl.connected) _ = c.uv_read_stop(@ptrCast(&impl.tcp));
-    if (impl.tcp_initialized and c.uv_is_closing(@ptrCast(&impl.tcp)) == 0) c.uv_close(@ptrCast(&impl.tcp), null);
-    if (impl.async_initialized and c.uv_is_closing(@ptrCast(&impl.async_handle)) == 0) c.uv_close(@ptrCast(&impl.async_handle), null);
+}
+
+fn discardWrites(impl: *Impl) void {
+    var iterator = impl.writes.keyIterator();
+    while (iterator.next()) |write_ptr| {
+        const write = write_ptr.*;
+        impl.allocator.free(write.bytes);
+        impl.allocator.destroy(write);
+    }
+    impl.writes.clearRetainingCapacity();
+}
+
+fn syncIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(syncIo()).nanoseconds);
 }
 
 fn nativeHeader(name: []const u8, value: []const u8) c.nghttp2_nv {
@@ -1663,7 +1701,7 @@ test "channel performs reusable concurrent unary calls end to end" {
                     .init(.invalid_argument, "bad % value\n"),
                 );
             }
-            if (std.mem.eql(u8, request, "slow")) c.uv_sleep(50);
+            if (std.mem.eql(u8, request, "slow")) try std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake);
             return service.UnaryResponse.ok(allocator, request);
         }
     };
