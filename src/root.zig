@@ -15,6 +15,7 @@ pub const metadata = @import("metadata.zig");
 pub const server = @import("server.zig");
 pub const service = @import("service.zig");
 pub const status = @import("status.zig");
+pub const stream = @import("stream.zig");
 
 pub const CallOptions = call.Options;
 pub const CallResult = call.Result;
@@ -29,6 +30,14 @@ pub const ServerLocalAddress = server.LocalAddress;
 pub const ServerContext = service.ServerContext;
 pub const Status = status.Status;
 pub const StatusCode = status.Code;
+pub const StreamBufferLimits = stream.BufferLimits;
+pub const StreamOptions = stream.Options;
+pub const StreamSendOptions = stream.SendOptions;
+pub const StreamReceiveAction = stream.ReceiveAction;
+pub const ClientStream = stream.ClientStream;
+pub const ClientStreamCallbacks = stream.ClientCallbacks;
+pub const ServerStream = stream.ServerStream;
+pub const ServerStreamHandler = stream.ServerHandler;
 pub const UnaryHandler = service.UnaryHandler;
 pub const UnaryResponse = service.UnaryResponse;
 
@@ -50,5 +59,6 @@ test {
     _ = server;
     _ = service;
     _ = status;
+    _ = stream;
     _ = version_info;
 }

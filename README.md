@@ -14,15 +14,27 @@ exports remain available for experimentation but may change before 1.0.
 - Standard unary gRPC over cleartext HTTP/2
 - Persistent multiplexed channels
 - ASCII and binary initial and trailing metadata
-- Deadlines and HTTP/2 stream cancellation
+- Deadlines and deadline-driven HTTP/2 stream cancellation
 - Unary identity and gzip compression
 - GOAWAY connection replacement and graceful server draining
 - Explicit allocators and deterministic `deinit`
 - Raw protobuf wire APIs with no required message runtime
 - Optional typed APIs and service registration through zig-protobuf
 
-The first phase is IPv4-only. Streaming, TLS, DNS, automatic RPC retries, and server
-reflection are not implemented.
+The transport remains IPv4-only. TLS, DNS, automatic RPC retries, and server reflection
+remain out of scope.
+
+## Streaming Target
+
+The compatibility target is `grpc-lite-streaming-insecure-v2`: raw unary,
+client-streaming, server-streaming, and bidirectional streaming over cleartext HTTP/2.
+Streaming implementation and interoperability work is ongoing. Typed streaming will
+follow the raw transport incrementally and is not claimed complete.
+
+The planned raw API is entirely event-driven. Application callbacks run on transport
+loop threads and must not block. It provides explicit half-close and streaming-only
+explicit cancellation, explicit allocators and deterministic `deinit`, bounded
+backpressure in both directions, and per-message `identity` or `gzip` compression.
 
 ## Development
 
@@ -166,8 +178,9 @@ defer result.deinit();
 ```
 
 Business errors default to `INTERNAL`; an optional typed mapper can return another
-gRPC status. A context hook exposes request and response metadata. Generated streaming
-methods are rejected at compile time because the current transport is unary-only.
+gRPC status. A context hook exposes request and response metadata. Typed streaming is
+planned to follow the raw transport and may remain unsupported while that work is
+ongoing.
 
 ## Dependencies
 

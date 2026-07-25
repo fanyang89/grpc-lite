@@ -18,6 +18,14 @@ test "stable public API compiles for downstream consumers" {
         _ = grpc.Status;
         _ = grpc.StatusCode;
         _ = grpc.Compression;
+        _ = grpc.StreamBufferLimits;
+        _ = grpc.StreamOptions;
+        _ = grpc.StreamSendOptions;
+        _ = grpc.StreamReceiveAction;
+        _ = grpc.ClientStream;
+        _ = grpc.ClientStreamCallbacks;
+        _ = grpc.ServerStream;
+        _ = grpc.ServerStreamHandler;
     }
 
     _ = try std.SemanticVersion.parse(grpc.version);

@@ -44,6 +44,14 @@ fn encodePayload(allocator: std.mem.Allocator, payload: []const u8, compressed: 
 }
 
 pub const Decoder = struct {
+    pub const DecodedMessage = struct {
+        /// Allocated by the decoder allocator and owned by the caller.
+        payload: []u8,
+        /// Complete wire size, including the five-byte message header.
+        consumed_bytes: usize,
+        compressed: bool,
+    };
+
     allocator: std.mem.Allocator,
     max_message_size: usize,
     compression: Compression,
@@ -72,6 +80,16 @@ pub const Decoder = struct {
     }
 
     pub fn feed(self: *Decoder, bytes: []const u8) !void {
+        return self.feedBounded(bytes, std.math.maxInt(usize));
+    }
+
+    /// Appends bytes only when the total unconsumed wire data remains within limit.
+    pub fn feedBounded(self: *Decoder, bytes: []const u8, max_buffered_bytes: usize) !void {
+        const buffered = self.bufferedBytes();
+        if (buffered > max_buffered_bytes or bytes.len > max_buffered_bytes - buffered) {
+            return error.BufferLimitExceeded;
+        }
+
         if (self.offset == self.buffer.items.len) {
             self.buffer.clearRetainingCapacity();
             self.offset = 0;
@@ -84,7 +102,12 @@ pub const Decoder = struct {
         try self.buffer.appendSlice(self.allocator, bytes);
     }
 
-    pub fn next(self: *Decoder) !?[]u8 {
+    /// Returns the exact number of unconsumed wire bytes held by the decoder.
+    pub fn bufferedBytes(self: *const Decoder) usize {
+        return self.buffer.items.len - self.offset;
+    }
+
+    pub fn nextMessage(self: *Decoder) !?DecodedMessage {
         const available = self.buffer.items[self.offset..];
         if (available.len < header_size) return null;
         if (available[0] > 1) return error.InvalidCompressedFlag;
@@ -109,11 +132,20 @@ pub const Decoder = struct {
         else
             try self.allocator.dupe(u8, available[header_size..end]);
         self.offset += end;
-        return payload;
+        return .{
+            .payload = payload,
+            .consumed_bytes = end,
+            .compressed = compressed,
+        };
+    }
+
+    pub fn next(self: *Decoder) !?[]u8 {
+        const message = try self.nextMessage() orelse return null;
+        return message.payload;
     }
 
     pub fn finish(self: *const Decoder) !void {
-        if (self.offset != self.buffer.items.len) return error.TruncatedFrame;
+        if (self.bufferedBytes() != 0) return error.TruncatedFrame;
     }
 };
 
@@ -256,6 +288,72 @@ test "decoder accepts fragmented input and multiple messages" {
     try decoder.finish();
 }
 
+test "streaming decoder reports wire consumption and compression" {
+    const identity = try encode(std.testing.allocator, "first");
+    defer std.testing.allocator.free(identity);
+    const gzip = try encodeWithCompression(std.testing.allocator, "second second second", .gzip);
+    defer std.testing.allocator.free(gzip);
+    const empty = try encode(std.testing.allocator, "");
+    defer std.testing.allocator.free(empty);
+
+    var decoder = Decoder.initWithCompression(std.testing.allocator, 1024, .gzip);
+    defer decoder.deinit();
+
+    try decoder.feed(identity[0..2]);
+    try std.testing.expectEqual(@as(usize, 2), decoder.bufferedBytes());
+    try std.testing.expectEqual(@as(?Decoder.DecodedMessage, null), try decoder.nextMessage());
+    try decoder.feed(identity[2..6]);
+    try std.testing.expectEqual(@as(?Decoder.DecodedMessage, null), try decoder.nextMessage());
+    try decoder.feed(identity[6..]);
+    try decoder.feed(gzip[0..header_size]);
+    try decoder.feed(gzip[header_size .. gzip.len - 1]);
+
+    const first = (try decoder.nextMessage()).?;
+    defer std.testing.allocator.free(first.payload);
+    try std.testing.expectEqualStrings("first", first.payload);
+    try std.testing.expectEqual(identity.len, first.consumed_bytes);
+    try std.testing.expect(!first.compressed);
+    try std.testing.expectEqual(gzip.len - 1, decoder.bufferedBytes());
+    try std.testing.expectEqual(@as(?Decoder.DecodedMessage, null), try decoder.nextMessage());
+
+    try decoder.feed(gzip[gzip.len - 1 ..]);
+    try decoder.feed(empty);
+    const second = (try decoder.nextMessage()).?;
+    defer std.testing.allocator.free(second.payload);
+    try std.testing.expectEqualStrings("second second second", second.payload);
+    try std.testing.expectEqual(gzip.len, second.consumed_bytes);
+    try std.testing.expect(second.compressed);
+
+    const third = (try decoder.nextMessage()).?;
+    defer std.testing.allocator.free(third.payload);
+    try std.testing.expectEqual(@as(usize, 0), third.payload.len);
+    try std.testing.expectEqual(header_size, third.consumed_bytes);
+    try std.testing.expect(!third.compressed);
+    try std.testing.expectEqual(@as(usize, 0), decoder.bufferedBytes());
+    try decoder.finish();
+}
+
+test "decoder enforces buffered byte admission atomically" {
+    var decoder = Decoder.init(std.testing.allocator, 1024);
+    defer decoder.deinit();
+
+    try decoder.feedBounded(&.{ 0, 0, 0 }, header_size);
+    try std.testing.expectEqual(@as(usize, 3), decoder.bufferedBytes());
+    try std.testing.expectError(error.BufferLimitExceeded, decoder.feedBounded(&.{ 0, 0, 0 }, header_size));
+    try std.testing.expectEqual(@as(usize, 3), decoder.bufferedBytes());
+    try decoder.feedBounded(&.{ 0, 0 }, header_size);
+
+    const first = (try decoder.nextMessage()).?;
+    defer std.testing.allocator.free(first.payload);
+    try std.testing.expectEqual(@as(usize, 0), decoder.bufferedBytes());
+
+    try decoder.feedBounded(&.{ 0, 0, 0, 0, 0 }, header_size);
+    const second = (try decoder.nextMessage()).?;
+    defer std.testing.allocator.free(second.payload);
+    try std.testing.expectEqual(@as(usize, 0), decoder.bufferedBytes());
+    try decoder.finish();
+}
+
 test "decoder reports malformed frames" {
     var decoder = Decoder.init(std.testing.allocator, 3);
     defer decoder.deinit();
@@ -267,6 +365,39 @@ test "decoder reports malformed frames" {
     decoder.offset = 0;
     try decoder.feed(&.{ 0, 0, 0, 0, 4 });
     try std.testing.expectError(error.MessageTooLarge, decoder.next());
+
+    decoder.buffer.clearRetainingCapacity();
+    decoder.offset = 0;
+    try decoder.feed(&.{ 2, 0, 0, 0, 0 });
+    try std.testing.expectError(error.InvalidCompressedFlag, decoder.next());
+}
+
+test "decoder enforces decompressed size limits" {
+    const payload = try std.testing.allocator.alloc(u8, 4096);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'a');
+    const encoded = try encodeWithCompression(std.testing.allocator, payload, .gzip);
+    defer std.testing.allocator.free(encoded);
+    const compressed_length = encoded.len - header_size;
+    try std.testing.expect(compressed_length < payload.len);
+
+    var decompressed_decoder = Decoder.initWithCompression(std.testing.allocator, compressed_length, .gzip);
+    defer decompressed_decoder.deinit();
+    try decompressed_decoder.feed(encoded);
+    try std.testing.expectError(error.MessageTooLarge, decompressed_decoder.nextMessage());
+}
+
+test "decoder finish rejects fragmented header and payload" {
+    var header_decoder = Decoder.init(std.testing.allocator, 1024);
+    defer header_decoder.deinit();
+    try header_decoder.feed(&.{ 0, 0, 0, 0 });
+    try std.testing.expectError(error.TruncatedFrame, header_decoder.finish());
+
+    var payload_decoder = Decoder.init(std.testing.allocator, 1024);
+    defer payload_decoder.deinit();
+    try payload_decoder.feed(&.{ 0, 0, 0, 0, 2, 'a' });
+    try std.testing.expectEqual(@as(?Decoder.DecodedMessage, null), try payload_decoder.nextMessage());
+    try std.testing.expectError(error.TruncatedFrame, payload_decoder.finish());
 }
 
 test "unary decoding rejects truncated and repeated messages" {
