@@ -145,12 +145,6 @@ pub const Channel = struct {
             impl.thread.?.join();
             impl.thread = null;
             impl.pending.deinit(impl.allocator);
-            impl.async_handle.deinit();
-            impl.deadline_timer.deinit();
-            impl.allocator.free(user_agent);
-            impl.allocator.free(authority);
-            impl.allocator.free(host);
-            allocator.destroy(impl);
             return error.ConnectionFailed;
         }
 
@@ -1588,6 +1582,34 @@ test "response headers with grpc-status are trailers-only metadata" {
     try std.testing.expectEqual(@as(usize, 0), operation.initial_metadata.items().len);
     try std.testing.expectEqualStrings("present", operation.trailing_metadata.getFirst("x-trailers-only").?);
     try std.testing.expectEqual(@as(?u32, @intFromEnum(status.Code.not_found)), operation.grpc_status);
+}
+
+test "channel connection refusal cleans up startup resources" {
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const socket = try xev.TCP.init(address);
+    defer _ = std.posix.system.close(socket.fd);
+    try socket.bind(address);
+
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        socket.fd,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(
+        &target_buffer,
+        "127.0.0.1:{d}",
+        .{std.mem.bigToNative(u16, local_address.port)},
+    );
+    for (0..4) |_| {
+        try std.testing.expectError(
+            error.ConnectionFailed,
+            Channel.init(std.testing.allocator, target, .{}),
+        );
+    }
 }
 
 test "binary request initial and trailing metadata round trip as raw duplicate values" {

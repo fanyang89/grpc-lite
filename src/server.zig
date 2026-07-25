@@ -1356,6 +1356,30 @@ test "server validates registration and has deterministic lifecycle" {
     server.wait();
 }
 
+test "server occupied port startup cleans up deterministically" {
+    const listen_address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try listen_address.listen(std.testing.io, .{});
+    defer listener.deinit(std.testing.io);
+
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        listener.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+
+    var server = try Server.init(std.testing.allocator, .{
+        .port = std.mem.bigToNative(u16, local_address.port),
+    });
+    defer server.deinit();
+    try std.testing.expectError(error.BindFailed, server.start());
+    server.shutdown();
+    server.wait();
+    server.shutdown();
+    server.wait();
+}
+
 test "graceful shutdown exits when idle and is idempotent" {
     var server = try Server.init(std.testing.allocator, .{});
     defer server.deinit();
