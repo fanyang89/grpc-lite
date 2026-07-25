@@ -5,6 +5,7 @@ const testing = @import("grpc_testing");
 
 const large_request_size = 271828;
 const large_response_size = 314159;
+const max_rpc_timeout_ns = 60 * std.time.ns_per_s;
 const special_status_message = "\t\ntest with whitespace\r\nand Unicode BMP \xE2\x98\xBA and non-BMP \xF0\x9F\x98\x88\t\n";
 
 const Config = struct {
@@ -51,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, config.test_case, "empty_unary")) {
         try emptyUnary(init.gpa, &channel);
     } else if (std.mem.eql(u8, config.test_case, "large_unary")) {
-        try largeUnary(init.gpa, &channel);
+        try largeUnary(init.gpa, &channel, max_rpc_timeout_ns);
     } else if (std.mem.eql(u8, config.test_case, "client_compressed_unary")) {
         try clientCompressedUnary(init.gpa, &channel);
     } else if (std.mem.eql(u8, config.test_case, "server_compressed_unary")) {
@@ -73,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         std.mem.eql(u8, config.test_case, "data_frame_padding") or
         std.mem.eql(u8, config.test_case, "no_df_padding_sanity_test"))
     {
-        try largeUnary(init.gpa, &channel);
+        try largeUnary(init.gpa, &channel, max_rpc_timeout_ns);
     } else if (std.mem.eql(u8, config.test_case, "max_streams")) {
         try maxStreams(init.gpa, &channel);
     } else {
@@ -85,15 +86,16 @@ pub fn main(init: std.process.Init) !void {
 
 fn rpcSoak(init: std.process.Init, target: []const u8, config: Config) !void {
     const deadline = soakDeadline(init.io, config.soak_overall_timeout_seconds);
+    try checkSoakDeadline(init.io, deadline);
     var channel = try grpc.Channel.init(init.gpa, target, .{});
     defer channel.deinit();
+    try checkSoakDeadline(init.io, deadline);
 
     var failures: usize = 0;
     for (0..config.soak_iterations) |iteration| {
-        try checkSoakDeadline(init.io, deadline);
-        largeUnary(init.gpa, &channel) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            try recordSoakFailure(&failures, config.soak_max_failures, iteration, err);
+        const timeout_ns = try soakRpcTimeout(init.io, deadline);
+        largeUnary(init.gpa, &channel, timeout_ns) catch |err| {
+            try handleSoakFailure(&failures, config.soak_max_failures, iteration, err);
         };
         try checkSoakDeadline(init.io, deadline);
     }
@@ -103,19 +105,21 @@ fn channelSoak(init: std.process.Init, target: []const u8, config: Config) !void
     const deadline = soakDeadline(init.io, config.soak_overall_timeout_seconds);
     var failures: usize = 0;
     for (0..config.soak_iterations) |iteration| {
-        try checkSoakDeadline(init.io, deadline);
-        const iteration_error: ?anyerror = block: {
-            var channel = try grpc.Channel.init(init.gpa, target, .{});
-            defer channel.deinit();
-            largeUnary(init.gpa, &channel) catch |err| break :block err;
-            break :block null;
-        };
+        const iteration_error = try channelSoakIteration(init.gpa, init.io, target, deadline);
         if (iteration_error) |err| {
-            if (err == error.OutOfMemory) return err;
-            try recordSoakFailure(&failures, config.soak_max_failures, iteration, err);
+            try handleSoakFailure(&failures, config.soak_max_failures, iteration, err);
         }
         try checkSoakDeadline(init.io, deadline);
     }
+}
+
+fn channelSoakIteration(allocator: std.mem.Allocator, io: std.Io, target: []const u8, deadline: i96) !?anyerror {
+    try checkSoakDeadline(io, deadline);
+    var channel = grpc.Channel.init(allocator, target, .{}) catch |err| return @as(?anyerror, err);
+    defer channel.deinit();
+    const timeout_ns = try soakRpcTimeout(io, deadline);
+    largeUnary(allocator, &channel, timeout_ns) catch |err| return @as(?anyerror, err);
+    return null;
 }
 
 fn soakDeadline(io: std.Io, timeout_seconds: u64) i96 {
@@ -127,6 +131,25 @@ fn checkSoakDeadline(io: std.Io, deadline: i96) !void {
     if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) {
         return error.SoakOverallTimeout;
     }
+}
+
+fn soakRpcTimeout(io: std.Io, deadline: i96) !u64 {
+    return remainingSoakRpcTimeout(std.Io.Clock.awake.now(io).nanoseconds, deadline);
+}
+
+fn remainingSoakRpcTimeout(now: i96, deadline: i96) !u64 {
+    if (now >= deadline) return error.SoakOverallTimeout;
+    return @intCast(@min(deadline -| now, @as(i96, max_rpc_timeout_ns)));
+}
+
+fn handleSoakFailure(
+    failures: *usize,
+    max_failures: usize,
+    iteration: usize,
+    err: anyerror,
+) !void {
+    if (err == error.OutOfMemory) return err;
+    try recordSoakFailure(failures, max_failures, iteration, err);
 }
 
 fn recordSoakFailure(
@@ -157,13 +180,13 @@ fn emptyUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
     defer response.deinit(allocator);
 }
 
-fn largeUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
-    var result = try callLargeUnary(allocator, channel);
+fn largeUnary(allocator: std.mem.Allocator, channel: *grpc.Channel, timeout_ns: u64) !void {
+    var result = try callLargeUnary(allocator, channel, timeout_ns);
     defer result.deinit();
     try expectLargeResponse(allocator, &result);
 }
 
-fn callLargeUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !grpc.CallResult {
+fn callLargeUnary(allocator: std.mem.Allocator, channel: *grpc.Channel, timeout_ns: u64) !grpc.CallResult {
     const body = try allocator.alloc(u8, large_request_size);
     defer allocator.free(body);
     @memset(body, 0);
@@ -180,31 +203,31 @@ fn callLargeUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !grpc.Ca
         channel,
         "/grpc.testing.TestService/UnaryCall",
         request,
-        .{ .timeout_ns = 60 * std.time.ns_per_s },
+        .{ .timeout_ns = timeout_ns },
     );
 }
 
 fn expectLargeUnaryFailure(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
-    var result = callLargeUnary(allocator, channel) catch return;
+    var result = callLargeUnary(allocator, channel, max_rpc_timeout_ns) catch return;
     defer result.deinit();
     if (result.status.isOk()) return error.ExpectedRpcFailure;
 }
 
 fn goaway(init: std.process.Init, channel: *grpc.Channel) !void {
-    try largeUnary(init.gpa, channel);
+    try largeUnary(init.gpa, channel, max_rpc_timeout_ns);
     try std.Io.sleep(init.io, .fromSeconds(1), .awake);
-    try largeUnary(init.gpa, channel);
+    try largeUnary(init.gpa, channel, max_rpc_timeout_ns);
 }
 
 fn maxStreams(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
-    try largeUnary(allocator, channel);
+    try largeUnary(allocator, channel, max_rpc_timeout_ns);
 
     const Worker = struct {
         channel: *grpc.Channel,
         succeeded: bool = false,
 
         fn run(self: *@This()) void {
-            largeUnary(std.heap.page_allocator, self.channel) catch return;
+            largeUnary(std.heap.page_allocator, self.channel, max_rpc_timeout_ns) catch return;
             self.succeeded = true;
         }
     };
@@ -516,4 +539,37 @@ test "soak controls fail on exceeded budget and elapsed deadline" {
         error.SoakOverallTimeout,
         checkSoakDeadline(std.testing.io, std.math.minInt(i96)),
     );
+}
+
+test "soak RPC timeout uses the remaining overall deadline" {
+    const now: i96 = 100 * std.time.ns_per_s;
+    try std.testing.expectEqual(
+        @as(u64, 5 * std.time.ns_per_s),
+        try remainingSoakRpcTimeout(now, now + 5 * std.time.ns_per_s),
+    );
+    try std.testing.expectEqual(
+        @as(u64, max_rpc_timeout_ns),
+        try remainingSoakRpcTimeout(now, now + 61 * std.time.ns_per_s),
+    );
+    try std.testing.expectError(error.SoakOverallTimeout, remainingSoakRpcTimeout(now, now));
+}
+
+test "channel soak counts init failures and preserves OOM" {
+    const deadline = soakDeadline(std.testing.io, 1);
+    const init_error = (try channelSoakIteration(
+        std.testing.allocator,
+        std.testing.io,
+        "invalid-target",
+        deadline,
+    )).?;
+    try std.testing.expectEqual(error.InvalidTarget, init_error);
+
+    var failures: usize = 0;
+    try handleSoakFailure(&failures, 1, 0, init_error);
+    try std.testing.expectEqual(@as(usize, 1), failures);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        handleSoakFailure(&failures, 1, 1, error.OutOfMemory),
+    );
+    try std.testing.expectEqual(@as(usize, 1), failures);
 }
