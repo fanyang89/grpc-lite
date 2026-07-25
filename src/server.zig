@@ -367,7 +367,8 @@ const Connection = struct {
     }
 
     fn closeTerminatedSession(self: *Connection, loop: *xev.Loop) void {
-        if (self.closing or
+        if (self.highest_accepted_stream_id != 0 or
+            self.closing or
             c.nghttp2_session_want_read(self.session) != 0 or
             c.nghttp2_session_want_write(self.session) != 0) return;
         self.close_after_writes = true;
