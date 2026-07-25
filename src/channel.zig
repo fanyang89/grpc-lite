@@ -243,6 +243,9 @@ const TestObserver = if (builtin.is_test) struct {
     connect_observed_sem: std.Io.Semaphore = .{},
     connect_release: std.Io.Semaphore = .{},
     connect_cancel_confirmed: std.atomic.Value(bool) = .init(false),
+    deadline_timer_callbacks: std.atomic.Value(usize) = .init(0),
+    deadline_timer_armed: std.atomic.Value(bool) = .init(false),
+    deadline_timer_target_ns: std.atomic.Value(u64) = .init(0),
 } else struct {};
 
 const Impl = struct {
@@ -271,6 +274,7 @@ const Impl = struct {
     async_completion: xev.Completion = .{},
     deadline_timer: xev.Timer = undefined,
     deadline_completion: xev.Completion = .{},
+    deadline_reset_completion: xev.Completion = .{},
     session: ?*c.nghttp2_session = null,
     loop_initialized: bool = false,
     tcp_initialized: bool = false,
@@ -282,6 +286,7 @@ const Impl = struct {
     close_submitted: bool = false,
     close_completed: bool = false,
     deadline_timer_armed: bool = false,
+    deadline_timer_deadline_ns: ?u64 = null,
     connected: bool = false,
     connection_state: ConnectionState = .connecting,
     connection_generation: usize = 0,
@@ -916,38 +921,109 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_d
 }
 
 fn scheduleDeadlineTimer(impl: *Impl) void {
-    if (impl.stopping_on_loop or impl.deadline_timer_armed) return;
-    var has_deadline = false;
+    if (impl.stopping_on_loop) return;
+    while (earliestDeadline(impl)) |earliest| {
+        const delay_ms = deadlineDelayMs(earliest, nowNs()) orelse {
+            expireDeadlines(impl, nowNs()) catch |err| {
+                beginStop(impl, if (err == error.DeadlineCancellationFailed)
+                    "deadline cancellation failed"
+                else
+                    "connection failed");
+                return;
+            };
+            continue;
+        };
+        if (!impl.deadline_timer_armed) {
+            impl.deadline_timer_armed = true;
+            impl.deadline_timer_deadline_ns = earliest;
+            observeDeadlineTimerScheduled(impl, earliest);
+            impl.deadline_timer.run(
+                &impl.loop,
+                &impl.deadline_completion,
+                delay_ms,
+                Impl,
+                impl,
+                onDeadlineTimer,
+            );
+        } else if (impl.deadline_timer_deadline_ns != earliest) {
+            impl.deadline_timer_deadline_ns = earliest;
+            observeDeadlineTimerScheduled(impl, earliest);
+            impl.deadline_timer.reset(
+                &impl.loop,
+                &impl.deadline_completion,
+                &impl.deadline_reset_completion,
+                delay_ms,
+                Impl,
+                impl,
+                onDeadlineTimer,
+            );
+        }
+        return;
+    }
+}
+
+fn earliestDeadline(impl: *Impl) ?u64 {
+    var earliest: ?u64 = null;
     var iterator = impl.operations.valueIterator();
     while (iterator.next()) |operation_ptr| {
         const operation = operation_ptr.*;
         if (operation.deadline_expired) continue;
-        if (operation.deadline_ns) |deadline| {
-            _ = deadline;
-            has_deadline = true;
-        }
+        includeEarlierDeadline(&earliest, operation.deadline_ns);
     }
     impl.mutex.lockUncancelable(syncIo());
     for (impl.pending.items) |operation| {
-        if (operation.deadline_ns) |deadline| {
-            _ = deadline;
-            has_deadline = true;
-        }
+        if (operation.deadline_expired) continue;
+        includeEarlierDeadline(&earliest, operation.deadline_ns);
     }
     impl.mutex.unlock(syncIo());
-    if (!has_deadline) return;
-    impl.deadline_timer_armed = true;
-    impl.deadline_timer.run(&impl.loop, &impl.deadline_completion, 1, Impl, impl, onDeadlineTimer);
+    return earliest;
+}
+
+fn includeEarlierDeadline(earliest: *?u64, candidate: ?u64) void {
+    const deadline = candidate orelse return;
+    if (earliest.* == null or deadline < earliest.*.?) earliest.* = deadline;
+}
+
+fn deadlineDelayMs(deadline_ns: u64, now_ns: u64) ?u64 {
+    const remaining_ns = deadline_ns -| now_ns;
+    if (remaining_ns == 0) return null;
+    return @max(
+        @as(u64, 1),
+        std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1,
+    );
 }
 
 fn onDeadlineTimer(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
     const impl = impl_.?;
     impl.deadline_timer_armed = false;
-    result catch {
-        beginStop(impl, "deadline timer failed");
+    impl.deadline_timer_deadline_ns = null;
+    if (comptime builtin.is_test) {
+        _ = impl.test_observer.deadline_timer_callbacks.fetchAdd(1, .release);
+        impl.test_observer.deadline_timer_target_ns.store(0, .release);
+        impl.test_observer.deadline_timer_armed.store(false, .release);
+    }
+    result catch |err| switch (err) {
+        error.Canceled => {
+            scheduleDeadlineTimer(impl);
+            return .disarm;
+        },
+        else => {
+            beginStop(impl, "deadline timer failed");
+            return .disarm;
+        },
+    };
+    expireDeadlines(impl, nowNs()) catch |err| {
+        beginStop(impl, if (err == error.DeadlineCancellationFailed)
+            "deadline cancellation failed"
+        else
+            "connection failed");
         return .disarm;
     };
-    const now = nowNs();
+    scheduleDeadlineTimer(impl);
+    return .disarm;
+}
+
+fn expireDeadlines(impl: *Impl, now: u64) !void {
     impl.mutex.lockUncancelable(syncIo());
     var pending_index: usize = 0;
     while (pending_index < impl.pending.items.len) {
@@ -972,20 +1048,12 @@ fn onDeadlineTimer(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.
                 operation.deadline_expired = true;
                 operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
                 if (c.nghttp2_submit_rst_stream(impl.session, c.NGHTTP2_FLAG_NONE, operation.stream_id, c.NGHTTP2_CANCEL) != 0) {
-                    beginStop(impl, "deadline cancellation failed");
-                    return .disarm;
+                    return error.DeadlineCancellationFailed;
                 }
             }
         }
     }
-    if (impl.connected) {
-        flush(impl) catch {
-            beginStop(impl, "connection failed");
-            return .disarm;
-        };
-    }
-    impl.async_handle.notify() catch {};
-    return .disarm;
+    if (impl.connected) try flush(impl);
 }
 
 fn beginReconnect(impl: *Impl) void {
@@ -1180,6 +1248,13 @@ fn observeTestIo(impl: *Impl) void {
     }
 }
 
+fn observeDeadlineTimerScheduled(impl: *Impl, deadline_ns: u64) void {
+    if (comptime builtin.is_test) {
+        impl.test_observer.deadline_timer_target_ns.store(deadline_ns, .release);
+        impl.test_observer.deadline_timer_armed.store(true, .release);
+    }
+}
+
 fn syncIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -1279,6 +1354,35 @@ fn wireMessageLimit(max_message_size: usize) usize {
     const overhead = std.math.add(usize, max_message_size / 8, 1024) catch return std.math.maxInt(usize);
     const total_overhead = std.math.add(usize, overhead, frame.header_size) catch return std.math.maxInt(usize);
     return std.math.add(usize, max_message_size, total_overhead) catch std.math.maxInt(usize);
+}
+
+test "earliest deadline selection is order independent" {
+    var earliest: ?u64 = null;
+    includeEarlierDeadline(&earliest, null);
+    try std.testing.expectEqual(@as(?u64, null), earliest);
+
+    includeEarlierDeadline(&earliest, 300);
+    includeEarlierDeadline(&earliest, 100);
+    includeEarlierDeadline(&earliest, 200);
+    try std.testing.expectEqual(@as(?u64, 100), earliest);
+
+    earliest = null;
+    includeEarlierDeadline(&earliest, 200);
+    includeEarlierDeadline(&earliest, 300);
+    includeEarlierDeadline(&earliest, 100);
+    try std.testing.expectEqual(@as(?u64, 100), earliest);
+}
+
+test "deadline timer delay rounds up and handles boundaries" {
+    try std.testing.expectEqual(@as(?u64, null), deadlineDelayMs(100, 100));
+    try std.testing.expectEqual(@as(?u64, null), deadlineDelayMs(99, 100));
+    try std.testing.expectEqual(@as(?u64, 1), deadlineDelayMs(101, 100));
+    try std.testing.expectEqual(@as(?u64, 1), deadlineDelayMs(std.time.ns_per_ms, 0));
+    try std.testing.expectEqual(@as(?u64, 2), deadlineDelayMs(std.time.ns_per_ms + 1, 0));
+    try std.testing.expectEqual(
+        @as(?u64, std.math.divCeil(u64, std.math.maxInt(u64), std.time.ns_per_ms) catch unreachable),
+        deadlineDelayMs(std.math.maxInt(u64), 0),
+    );
 }
 
 test "serialized allocator forwards every vtable operation" {
@@ -2258,6 +2362,276 @@ test "server context observes a wire deadline and overrides a late handler respo
     try std.testing.expectEqualStrings("reused", reused.payload);
     try std.testing.expect(handler.saw_no_deadline);
     try std.testing.expectEqual(@as(usize, 2), handler.calls);
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
+}
+
+test "channel deadline timer does not poll before a distant deadline" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        entered: std.Io.Semaphore = .{},
+        release: std.Io.Semaphore = .{},
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            self.entered.post(std.testing.io);
+            self.release.waitUncancelable(std.testing.io);
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Worker = struct {
+        channel: *Channel,
+        returned_result: bool = false,
+        code: status.Code = .unknown,
+
+        fn run(self: *@This()) void {
+            var result = self.channel.callUnary(
+                std.testing.allocator,
+                "/test.Deadline/NoPolling",
+                "request",
+                .{ .timeout_ns = 2 * std.time.ns_per_s },
+            ) catch return;
+            defer result.deinit();
+            self.returned_result = true;
+            self.code = result.status.code;
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Deadline/NoPolling",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var worker = Worker{ .channel = &channel };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    handler.entered.waitUncancelable(std.testing.io);
+    const armed = waitForTestFlag(
+        &channel.impl.test_observer.deadline_timer_armed,
+        5 * std.time.ns_per_s,
+    );
+    const baseline = channel.impl.test_observer.deadline_timer_callbacks.load(.acquire);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+    const observed = channel.impl.test_observer.deadline_timer_callbacks.load(.acquire);
+    handler.release.post(std.testing.io);
+    thread.join();
+
+    try std.testing.expect(armed);
+    try std.testing.expectEqual(@as(usize, 0), observed - baseline);
+    try std.testing.expect(worker.returned_result);
+    try std.testing.expectEqual(status.Code.ok, worker.code);
+}
+
+test "channel resets its timer when an earlier deadline is added" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        entered: std.Io.Semaphore = .{},
+        release: std.Io.Semaphore = .{},
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            if (std.mem.eql(u8, request, "first")) {
+                self.entered.post(std.testing.io);
+                self.release.waitUncancelable(std.testing.io);
+            }
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Worker = struct {
+        channel: *Channel,
+        request: []const u8,
+        timeout_ns: u64,
+        returned_result: bool = false,
+        code: status.Code = .unknown,
+
+        fn run(self: *@This()) void {
+            var result = self.channel.callUnary(
+                std.testing.allocator,
+                "/test.Deadline/Earlier",
+                self.request,
+                .{ .timeout_ns = self.timeout_ns },
+            ) catch return;
+            defer result.deinit();
+            self.returned_result = true;
+            self.code = result.status.code;
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Deadline/Earlier",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var first = Worker{
+        .channel = &channel,
+        .request = "first",
+        .timeout_ns = 10 * std.time.ns_per_s,
+    };
+    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
+    handler.entered.waitUncancelable(std.testing.io);
+    const initially_armed = waitForTestFlag(
+        &channel.impl.test_observer.deadline_timer_armed,
+        5 * std.time.ns_per_s,
+    );
+    const first_target = channel.impl.test_observer.deadline_timer_target_ns.load(.acquire);
+    if (!initially_armed or first_target == 0) {
+        handler.release.post(std.testing.io);
+        first_thread.join();
+        try std.testing.expect(initially_armed and first_target != 0);
+        return;
+    }
+
+    var second = Worker{
+        .channel = &channel,
+        .request = "second",
+        .timeout_ns = 200 * std.time.ns_per_ms,
+    };
+    const second_thread = std.Thread.spawn(.{}, Worker.run, .{&second}) catch |err| {
+        handler.release.post(std.testing.io);
+        first_thread.join();
+        return err;
+    };
+    const reset_observe_deadline = nowNs() +| 5 * std.time.ns_per_s;
+    var reset_observed = false;
+    while (nowNs() < reset_observe_deadline) {
+        const current_target = channel.impl.test_observer.deadline_timer_target_ns.load(.acquire);
+        if (current_target != 0 and current_target < first_target) {
+            reset_observed = true;
+            break;
+        }
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch break;
+    }
+    if (!reset_observed) {
+        handler.release.post(std.testing.io);
+        first_thread.join();
+        second_thread.join();
+        try std.testing.expect(reset_observed);
+        return;
+    }
+
+    second_thread.join();
+    handler.release.post(std.testing.io);
+    first_thread.join();
+
+    try std.testing.expect(second.returned_result);
+    try std.testing.expectEqual(status.Code.deadline_exceeded, second.code);
+    try std.testing.expect(first.returned_result);
+    try std.testing.expectEqual(status.Code.ok, first.code);
+}
+
+test "completed deadline leaves at most one stale timer callback" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        entered: std.Io.Semaphore = .{},
+        release: std.Io.Semaphore = .{},
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            if (std.mem.eql(u8, request, "deadline")) {
+                self.entered.post(std.testing.io);
+                self.release.waitUncancelable(std.testing.io);
+            }
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Worker = struct {
+        channel: *Channel,
+        returned_result: bool = false,
+        code: status.Code = .unknown,
+
+        fn run(self: *@This()) void {
+            var result = self.channel.callUnary(
+                std.testing.allocator,
+                "/test.Deadline/Stale",
+                "deadline",
+                .{ .timeout_ns = std.time.ns_per_s },
+            ) catch return;
+            defer result.deinit();
+            self.returned_result = true;
+            self.code = result.status.code;
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Deadline/Stale",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var worker = Worker{ .channel = &channel };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    handler.entered.waitUncancelable(std.testing.io);
+    const armed = waitForTestFlag(
+        &channel.impl.test_observer.deadline_timer_armed,
+        5 * std.time.ns_per_s,
+    );
+    handler.release.post(std.testing.io);
+    thread.join();
+
+    const baseline = channel.impl.test_observer.deadline_timer_callbacks.load(.acquire);
+    const stale_wait_deadline = nowNs() +| 5 * std.time.ns_per_s;
+    while (channel.impl.test_observer.deadline_timer_armed.load(.acquire) and
+        nowNs() < stale_wait_deadline)
+    {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch break;
+    }
+    const after_stale = channel.impl.test_observer.deadline_timer_callbacks.load(.acquire);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+    const after_observation = channel.impl.test_observer.deadline_timer_callbacks.load(.acquire);
+
+    var reused = try channel.callUnary(std.testing.allocator, "/test.Deadline/Stale", "reused", .{});
+    defer reused.deinit();
+
+    try std.testing.expect(armed);
+    try std.testing.expect(worker.returned_result);
+    try std.testing.expectEqual(status.Code.ok, worker.code);
+    try std.testing.expect(!channel.impl.test_observer.deadline_timer_armed.load(.acquire));
+    try std.testing.expect(after_stale - baseline <= 1);
+    try std.testing.expectEqual(after_stale, after_observation);
+    try std.testing.expect(reused.status.isOk());
+    try std.testing.expectEqualStrings("reused", reused.payload);
     try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
 }
 
