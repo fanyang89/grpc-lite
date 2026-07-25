@@ -26,19 +26,30 @@ prefetch_package() {
     fi
 }
 
-prefetch_libxev() {
+prefetch_url_package() {
     local url=$1
     local expected_hash=$2
-    local dependency_archive="$work_dir/libxev.tar.gz"
+    local archive_name=$3
+    local dependency_archive="$work_dir/$archive_name"
+    local package_dir="$global_cache/p/$expected_hash"
 
     curl --fail --location --silent --show-error --output "$dependency_archive" "$url"
-    ZIG_GLOBAL_CACHE_DIR="$global_cache" zigfetch "$url" >/dev/null
-    cp "$dependency_archive" "$global_cache/p/$expected_hash.tar.gz"
+    local actual_hash
+    actual_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zig fetch "$dependency_archive")
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+        printf 'package hash mismatch for %s: expected %s, got %s\n' \
+            "$archive_name" "$expected_hash" "$actual_hash" >&2
+        exit 1
+    fi
+    mkdir -p "$package_dir"
+    tar --extract --gzip --file "$dependency_archive" --strip-components=1 --directory "$package_dir"
+    tar --create --gzip --file "$global_cache/p/$expected_hash.tar.gz" --directory "$package_dir" .
 }
 
-prefetch_libxev \
+prefetch_url_package \
     'https://codeload.github.com/mitchellh/libxev/tar.gz/b0650f082458226860ed7ab0fc7c9c73823c8950' \
-    'libxev-0.0.0-86vtcxkOFACqPXUTAPuq5i0xpDYWU5G5RfrYQXxlUT26'
+    'libxev-0.0.0-86vtcxkOFACqPXUTAPuq5i0xpDYWU5G5RfrYQXxlUT26' \
+    'libxev.tar.gz'
 prefetch_package \
     'https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99' \
     'N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX' \
