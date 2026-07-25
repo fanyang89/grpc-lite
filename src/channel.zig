@@ -17,6 +17,84 @@ const ChannelOptions = struct {
 
 pub const Options = ChannelOptions;
 
+const AllocatorOperation = enum { alloc, resize, remap, free };
+
+const SerializedAllocator = struct {
+    backing: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    test_hook_context: if (builtin.is_test) std.atomic.Value(?*anyopaque) else void = if (builtin.is_test) .init(null) else {},
+    test_before_lock: if (builtin.is_test) std.atomic.Value(?*const fn (?*anyopaque, AllocatorOperation) void) else void = if (builtin.is_test) .init(null) else {},
+
+    fn init(backing: std.mem.Allocator) SerializedAllocator {
+        return .{ .backing = backing };
+    }
+
+    fn allocator(self: *SerializedAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn lock(self: *SerializedAllocator, operation: AllocatorOperation) void {
+        if (comptime builtin.is_test) {
+            if (self.test_before_lock.load(.acquire)) |hook| {
+                hook(self.test_hook_context.load(.acquire), operation);
+            }
+        }
+        self.mutex.lockUncancelable(syncIo());
+    }
+
+    fn unlock(self: *SerializedAllocator) void {
+        self.mutex.unlock(syncIo());
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.lock(.alloc);
+        defer self.unlock();
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.lock(.resize);
+        defer self.unlock();
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.lock(.remap);
+        defer self.unlock();
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.lock(.free);
+        defer self.unlock();
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 pub const Channel = struct {
     pub const Options = ChannelOptions;
 
@@ -27,27 +105,36 @@ pub const Channel = struct {
         const impl = try allocator.create(Impl);
         errdefer allocator.destroy(impl);
 
-        const host = try allocator.dupeZ(u8, parsed.host);
-        errdefer allocator.free(host);
-        const authority = try allocator.dupe(u8, target);
-        errdefer allocator.free(authority);
-        const user_agent = try allocator.dupe(u8, options.user_agent);
-        errdefer allocator.free(user_agent);
+        impl.* = .{
+            .backing_allocator = allocator,
+            .serialized_allocator = .init(allocator),
+            .allocator = undefined,
+            .host = undefined,
+            .port = parsed.port,
+            .authority = undefined,
+            .user_agent = undefined,
+            .async_handle = undefined,
+            .deadline_timer = undefined,
+        };
+        impl.allocator = impl.serialized_allocator.allocator();
+
+        const host = try impl.allocator.dupeZ(u8, parsed.host);
+        errdefer impl.allocator.free(host);
+        const authority = try impl.allocator.dupe(u8, target);
+        errdefer impl.allocator.free(authority);
+        const user_agent = try impl.allocator.dupe(u8, options.user_agent);
+        errdefer impl.allocator.free(user_agent);
 
         var async_handle = try xev.Async.init();
         errdefer async_handle.deinit();
         var deadline_timer = try xev.Timer.init();
         errdefer deadline_timer.deinit();
 
-        impl.* = .{
-            .allocator = allocator,
-            .host = host,
-            .port = parsed.port,
-            .authority = authority,
-            .user_agent = user_agent,
-            .async_handle = async_handle,
-            .deadline_timer = deadline_timer,
-        };
+        impl.host = host;
+        impl.authority = authority;
+        impl.user_agent = user_agent;
+        impl.async_handle = async_handle;
+        impl.deadline_timer = deadline_timer;
         impl.thread = try std.Thread.spawn(.{}, runLoop, .{impl});
 
         impl.mutex.lockUncancelable(syncIo());
@@ -57,12 +144,12 @@ pub const Channel = struct {
         if (!running) {
             impl.thread.?.join();
             impl.thread = null;
-            impl.pending.deinit(allocator);
+            impl.pending.deinit(impl.allocator);
             impl.async_handle.deinit();
             impl.deadline_timer.deinit();
-            allocator.free(user_agent);
-            allocator.free(authority);
-            allocator.free(host);
+            impl.allocator.free(user_agent);
+            impl.allocator.free(authority);
+            impl.allocator.free(host);
             allocator.destroy(impl);
             return error.ConnectionFailed;
         }
@@ -138,8 +225,8 @@ pub const Channel = struct {
         impl.allocator.free(impl.user_agent);
         impl.allocator.free(impl.authority);
         impl.allocator.free(impl.host);
-        const allocator = impl.allocator;
-        allocator.destroy(impl);
+        const backing_allocator = impl.backing_allocator;
+        backing_allocator.destroy(impl);
         self.* = undefined;
     }
 };
@@ -159,6 +246,8 @@ const TestObserver = if (builtin.is_test) struct {
 } else struct {};
 
 const Impl = struct {
+    backing_allocator: std.mem.Allocator,
+    serialized_allocator: SerializedAllocator,
     allocator: std.mem.Allocator,
     host: [:0]u8,
     port: u16,
@@ -1192,6 +1281,119 @@ fn wireMessageLimit(max_message_size: usize) usize {
     return std.math.add(usize, max_message_size, total_overhead) catch std.math.maxInt(usize);
 }
 
+test "serialized allocator forwards every vtable operation" {
+    const OperationKind = enum { none, alloc, resize, remap, free };
+    const Probe = struct {
+        storage: [64]u8 align(16) = undefined,
+        operation: OperationKind = .none,
+        len: usize = 0,
+        memory_address: usize = 0,
+        alignment: std.mem.Alignment = .@"1",
+        new_len: usize = 0,
+        ret_addr: usize = 0,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .alloc = alloc,
+                    .resize = resize,
+                    .remap = remap,
+                    .free = free,
+                },
+            };
+        }
+
+        fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.operation = .alloc;
+            self.len = len;
+            self.alignment = alignment;
+            self.ret_addr = ret_addr;
+            return self.storage[0..].ptr;
+        }
+
+        fn resize(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            ret_addr: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.operation = .resize;
+            self.memory_address = @intFromPtr(memory.ptr);
+            self.len = memory.len;
+            self.alignment = alignment;
+            self.new_len = new_len;
+            self.ret_addr = ret_addr;
+            return true;
+        }
+
+        fn remap(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            ret_addr: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.operation = .remap;
+            self.memory_address = @intFromPtr(memory.ptr);
+            self.len = memory.len;
+            self.alignment = alignment;
+            self.new_len = new_len;
+            self.ret_addr = ret_addr;
+            return self.storage[16..].ptr;
+        }
+
+        fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.operation = .free;
+            self.memory_address = @intFromPtr(memory.ptr);
+            self.len = memory.len;
+            self.alignment = alignment;
+            self.ret_addr = ret_addr;
+        }
+    };
+
+    var probe = Probe{};
+    var serialized = SerializedAllocator.init(probe.allocator());
+    const allocator = serialized.allocator();
+    const memory = probe.storage[0..8];
+
+    const allocated = allocator.rawAlloc(8, .@"16", 11).?;
+    try std.testing.expectEqual(@intFromPtr(probe.storage[0..].ptr), @intFromPtr(allocated));
+    try std.testing.expectEqual(OperationKind.alloc, probe.operation);
+    try std.testing.expectEqual(@as(usize, 8), probe.len);
+    try std.testing.expectEqual(std.mem.Alignment.@"16", probe.alignment);
+    try std.testing.expectEqual(@as(usize, 11), probe.ret_addr);
+
+    try std.testing.expect(allocator.rawResize(memory, .@"8", 12, 22));
+    try std.testing.expectEqual(OperationKind.resize, probe.operation);
+    try std.testing.expectEqual(@intFromPtr(memory.ptr), probe.memory_address);
+    try std.testing.expectEqual(memory.len, probe.len);
+    try std.testing.expectEqual(std.mem.Alignment.@"8", probe.alignment);
+    try std.testing.expectEqual(@as(usize, 12), probe.new_len);
+    try std.testing.expectEqual(@as(usize, 22), probe.ret_addr);
+
+    const remapped = allocator.rawRemap(memory, .@"4", 24, 33).?;
+    try std.testing.expectEqual(@intFromPtr(probe.storage[16..].ptr), @intFromPtr(remapped));
+    try std.testing.expectEqual(OperationKind.remap, probe.operation);
+    try std.testing.expectEqual(@intFromPtr(memory.ptr), probe.memory_address);
+    try std.testing.expectEqual(memory.len, probe.len);
+    try std.testing.expectEqual(std.mem.Alignment.@"4", probe.alignment);
+    try std.testing.expectEqual(@as(usize, 24), probe.new_len);
+    try std.testing.expectEqual(@as(usize, 33), probe.ret_addr);
+
+    allocator.rawFree(memory, .@"2", 44);
+    try std.testing.expectEqual(OperationKind.free, probe.operation);
+    try std.testing.expectEqual(@intFromPtr(memory.ptr), probe.memory_address);
+    try std.testing.expectEqual(memory.len, probe.len);
+    try std.testing.expectEqual(std.mem.Alignment.@"2", probe.alignment);
+    try std.testing.expectEqual(@as(usize, 44), probe.ret_addr);
+}
+
 test "target parsing" {
     const target = try parseTarget("127.0.0.1:50051");
     try std.testing.expectEqualStrings("127.0.0.1", target.host);
@@ -1203,12 +1405,15 @@ test "target parsing" {
 test "outbound metadata rejects invalid application values before queuing" {
     var host = [_:0]u8{'x'};
     var impl: Impl = .{
-        .allocator = std.testing.allocator,
+        .backing_allocator = std.testing.allocator,
+        .serialized_allocator = .init(std.testing.allocator),
+        .allocator = undefined,
         .host = host[0..1 :0],
         .port = 1,
         .authority = &.{},
         .user_agent = &.{},
     };
+    impl.allocator = impl.serialized_allocator.allocator();
 
     try std.testing.expectError(error.InvalidMetadataValue, Operation.init(
         &impl,
@@ -1235,12 +1440,15 @@ test "outbound metadata rejects invalid application values before queuing" {
 test "malformed binary response metadata marks only the operation invalid" {
     var host = [_:0]u8{'x'};
     var impl: Impl = .{
-        .allocator = std.testing.allocator,
+        .backing_allocator = std.testing.allocator,
+        .serialized_allocator = .init(std.testing.allocator),
+        .allocator = undefined,
         .host = host[0..1 :0],
         .port = 1,
         .authority = &.{},
         .user_agent = &.{},
     };
+    impl.allocator = impl.serialized_allocator.allocator();
 
     const operation = try Operation.init(&impl, "/test.Echo/Unary", "request", .{});
     defer operation.deinit();
@@ -1256,12 +1464,15 @@ test "malformed binary response metadata marks only the operation invalid" {
 test "response headers with grpc-status are trailers-only metadata" {
     var host = [_:0]u8{'x'};
     var impl: Impl = .{
-        .allocator = std.testing.allocator,
+        .backing_allocator = std.testing.allocator,
+        .serialized_allocator = .init(std.testing.allocator),
+        .allocator = undefined,
         .host = host[0..1 :0],
         .port = 1,
         .authority = &.{},
         .user_agent = &.{},
     };
+    impl.allocator = impl.serialized_allocator.allocator();
     const operation = try Operation.init(&impl, "/test.Echo/Unary", "", .{});
     defer operation.deinit();
 
@@ -2048,6 +2259,197 @@ test "server context observes a wire deadline and overrides a late handler respo
     try std.testing.expect(handler.saw_no_deadline);
     try std.testing.expectEqual(@as(usize, 2), handler.calls);
     try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
+}
+
+test "channel serializes a non-thread-safe backing allocator" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Probe = struct {
+        backing: std.mem.Allocator,
+        armed: std.atomic.Value(bool) = .init(false),
+        active: std.atomic.Value(usize) = .init(0),
+        max_active: std.atomic.Value(usize) = .init(0),
+        alloc_count: std.atomic.Value(usize) = .init(0),
+        first_alloc_blocked: std.atomic.Value(bool) = .init(false),
+        first_alloc_entered: std.Io.Semaphore = .{},
+        first_alloc_release: std.Io.Semaphore = .{},
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .alloc = alloc,
+                    .resize = resize,
+                    .remap = remap,
+                    .free = free,
+                },
+            };
+        }
+
+        fn resetAndArm(self: *@This()) void {
+            self.active.store(0, .release);
+            self.max_active.store(0, .release);
+            self.alloc_count.store(0, .release);
+            self.first_alloc_blocked.store(false, .release);
+            self.armed.store(true, .release);
+        }
+
+        fn enter(self: *@This(), is_alloc: bool) bool {
+            if (!self.armed.load(.acquire)) return false;
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            _ = self.max_active.fetchMax(active, .acq_rel);
+            if (is_alloc and self.alloc_count.fetchAdd(1, .acq_rel) == 0) {
+                self.first_alloc_blocked.store(true, .release);
+                self.first_alloc_entered.post(std.testing.io);
+                self.first_alloc_release.waitUncancelable(std.testing.io);
+            }
+            return true;
+        }
+
+        fn leave(self: *@This()) void {
+            _ = self.active.fetchSub(1, .acq_rel);
+        }
+
+        fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const tracked = self.enter(true);
+            defer if (tracked) self.leave();
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+
+        fn resize(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            ret_addr: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const tracked = self.enter(false);
+            defer if (tracked) self.leave();
+            return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+        }
+
+        fn remap(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            ret_addr: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const tracked = self.enter(false);
+            defer if (tracked) self.leave();
+            return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+        }
+
+        fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const tracked = self.enter(false);
+            defer if (tracked) self.leave();
+            self.backing.rawFree(memory, alignment, ret_addr);
+        }
+    };
+    const LockHook = struct {
+        probe: *Probe,
+        notified: std.atomic.Value(bool) = .init(false),
+        second_before_lock: std.Io.Semaphore = .{},
+
+        fn beforeLock(context: ?*anyopaque, operation: AllocatorOperation) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (operation == .alloc and
+                self.probe.first_alloc_blocked.load(.acquire) and
+                !self.notified.swap(true, .acq_rel))
+            {
+                self.second_before_lock.post(std.testing.io);
+            }
+        }
+    };
+    const Handler = struct {
+        fn handle(
+            _: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Worker = struct {
+        channel: *Channel,
+        index: usize,
+        succeeded: bool = false,
+        result_allocator_ok: bool = false,
+
+        fn run(self: *@This()) void {
+            var result_allocator: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
+            defer self.result_allocator_ok = result_allocator.deinit() == .ok;
+            var request_buffer: [16]u8 = undefined;
+            const request = std.fmt.bufPrint(&request_buffer, "request-{d}", .{self.index}) catch return;
+            var result = self.channel.callUnary(
+                result_allocator.allocator(),
+                "/test.Allocator/Unary",
+                request,
+                .{},
+            ) catch return;
+            defer result.deinit();
+            self.succeeded = result.status.isOk() and std.mem.eql(u8, request, result.payload);
+        }
+    };
+
+    var backing_allocator: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
+    var backing_allocator_active = true;
+    defer if (backing_allocator_active) {
+        std.testing.expectEqual(std.heap.Check.ok, backing_allocator.deinit()) catch @panic("backing allocator leak");
+    };
+    var probe = Probe{ .backing = backing_allocator.allocator() };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Allocator/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(probe.allocator(), target, .{});
+    var channel_active = true;
+    defer if (channel_active) channel.deinit();
+
+    var lock_hook = LockHook{ .probe = &probe };
+    channel.impl.serialized_allocator.test_hook_context.store(&lock_hook, .release);
+    channel.impl.serialized_allocator.test_before_lock.store(LockHook.beforeLock, .release);
+    probe.resetAndArm();
+
+    var workers: [8]Worker = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&workers, 0..) |*worker, index| worker.* = .{ .channel = &channel, .index = index };
+
+    threads[0] = try std.Thread.spawn(.{}, Worker.run, .{&workers[0]});
+    probe.first_alloc_entered.waitUncancelable(std.testing.io);
+    for (threads[1..], workers[1..]) |*thread, *worker| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    }
+    lock_hook.second_before_lock.waitUncancelable(std.testing.io);
+    probe.first_alloc_release.post(std.testing.io);
+
+    for (&threads) |*thread| thread.join();
+    for (&workers) |worker| {
+        try std.testing.expect(worker.succeeded);
+        try std.testing.expect(worker.result_allocator_ok);
+    }
+
+    channel.deinit();
+    channel_active = false;
+    try std.testing.expect(lock_hook.notified.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), probe.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), probe.max_active.load(.acquire));
+    try std.testing.expectEqual(std.heap.Check.ok, backing_allocator.deinit());
+    backing_allocator_active = false;
 }
 
 test "channel performs reusable concurrent unary calls end to end" {

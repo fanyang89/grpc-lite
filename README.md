@@ -63,6 +63,7 @@ A scheduled x64 workflow runs extended official unary soak tests.
 
 `Channel.callUnary` supports concurrent callers. `Channel.shutdown` may run while calls
 are active; join those caller threads before giving `Channel.deinit` exclusive access.
+The channel serializes access to the allocator passed to `Channel.init`.
 
 ```zig
 const std = @import("std");
@@ -80,7 +81,10 @@ var result = try channel.callUnary(
 defer result.deinit();
 ```
 
-`CallResult` owns its payload, status message, and response metadata.
+Each `CallResult` owns its payload, status message, and response metadata through the
+result allocator passed to `callUnary`. Callers must ensure thread safety when sharing
+one result allocator across threads. A non-thread-safe result allocator must not alias
+the channel backing allocator while the channel is active.
 
 ## Metadata
 
