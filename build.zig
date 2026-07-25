@@ -11,7 +11,10 @@ pub fn build(b: *std.Build) void {
         else
             null,
     };
-    const libuv_dependency = b.dependency("libuv", .{});
+    const libxev_dependency = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const nghttp2_dependency = b.dependency("nghttp2", .{});
     const enable_protobuf = b.option(
         bool,
@@ -22,7 +25,6 @@ pub fn build(b: *std.Build) void {
     grpc_lite_options.addOption([]const u8, "version", manifest.version);
     const native = addNativeDependencies(
         b,
-        libuv_dependency.path(""),
         nghttp2_dependency.path(""),
         target,
         optimize,
@@ -36,12 +38,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     applySanitizers(grpc_lite, sanitizers);
+    const xev = libxev_dependency.module("xev");
+    applySanitizers(xev, sanitizers);
     grpc_lite.addOptions("grpc_lite_options", grpc_lite_options);
-    grpc_lite.addIncludePath(libuv_dependency.path("include"));
     grpc_lite.addIncludePath(nghttp2_dependency.path("lib/includes"));
     grpc_lite.addIncludePath(native.nghttp2_include);
-    grpc_lite.addObjectFile(native.libuv_archive);
     grpc_lite.addObjectFile(native.nghttp2_archive);
+    grpc_lite.addImport("xev", xev);
 
     if (target.result.os.tag == .linux) {
         grpc_lite.linkSystemLibrary("pthread", .{});
@@ -282,14 +285,12 @@ fn addExample(
 }
 
 const NativeDependencies = struct {
-    libuv_archive: std.Build.LazyPath,
     nghttp2_archive: std.Build.LazyPath,
     nghttp2_include: std.Build.LazyPath,
 };
 
 fn addNativeDependencies(
     b: *std.Build,
-    libuv_source_dir: std.Build.LazyPath,
     nghttp2_source_dir: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -303,14 +304,6 @@ fn addNativeDependencies(
         .ReleaseFast, .ReleaseSmall => "Release",
     };
 
-    const build_libuv = addNativeBuild(
-        b,
-        "libuv",
-        libuv_source_dir,
-        cmake_build_type,
-        cc,
-        sanitizers,
-    );
     const build_nghttp2 = addNativeBuild(
         b,
         "nghttp2",
@@ -321,7 +314,6 @@ fn addNativeDependencies(
     );
 
     return .{
-        .libuv_archive = build_libuv.path(b, "libuv.a"),
         .nghttp2_archive = build_nghttp2.path(b, "lib/libnghttp2.a"),
         .nghttp2_include = build_nghttp2.path(b, "lib/includes"),
     };

@@ -27,9 +27,9 @@ prefetch_package() {
 }
 
 prefetch_package \
-    'https://codeload.github.com/libuv/libuv/tar.gz/1cfa32ff59c076ffb6ed735bbc8c18361558661f' \
-    'N-V-__8AACwTRQDmmfDj0GPrcObUmVnktArTdpjkEvRZXTx0' \
-    'libuv.tar.gz'
+    'https://codeload.github.com/mitchellh/libxev/tar.gz/b0650f082458226860ed7ab0fc7c9c73823c8950' \
+    'libxev-0.0.0-86vtcxkOFACqPXUTAPuq5i0xpDYWU5G5RfrYQXxlUT26' \
+    'libxev.tar.gz'
 prefetch_package \
     'https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99' \
     'N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX' \

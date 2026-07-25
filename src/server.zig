@@ -308,8 +308,13 @@ const Connection = struct {
     draining: bool = false,
     closing: bool = false,
     read_active: bool = false,
+    read_cancel_submitted: bool = false,
+    write_cancel_submitted: bool = false,
+    close_submitted: bool = false,
     close_completed: bool = false,
     read_completion: xev.Completion = .{},
+    read_cancel_completion: xev.Completion = .{},
+    write_cancel_completion: xev.Completion = .{},
     close_completion: xev.Completion = .{},
     write_queue: xev.WriteQueue = .{},
     read_buffer: []u8 = &.{},
@@ -371,11 +376,50 @@ const Connection = struct {
     fn closeOnLoop(self: *Connection, loop: *xev.Loop) void {
         if (self.closing) return;
         self.closing = true;
+        if (self.read_active) {
+            self.read_cancel_submitted = true;
+            loop.cancel(
+                &self.read_completion,
+                &self.read_cancel_completion,
+                Connection,
+                self,
+                onReadCanceled,
+            );
+        }
+        if (self.write_queue.head) |request| {
+            if (request.completion.state() == .active) {
+                self.write_cancel_submitted = true;
+                loop.cancel(
+                    &request.completion,
+                    &self.write_cancel_completion,
+                    Connection,
+                    self,
+                    onWriteCanceled,
+                );
+            } else {
+                self.discardQueuedWrites();
+            }
+        }
+        self.submitCloseIfReady(loop);
+    }
+
+    fn submitCloseIfReady(self: *Connection, loop: *xev.Loop) void {
+        if (self.close_submitted or self.read_active or self.pending_writes != 0) return;
+        self.close_submitted = true;
         self.tcp.close(loop, &self.close_completion, Connection, self, onConnectionClosed);
     }
 
+    fn discardQueuedWrites(self: *Connection) void {
+        while (self.write_queue.pop()) |request| {
+            const write: *WriteRequest = @fieldParentPtr("request", request);
+            self.pending_writes -= 1;
+            self.server.allocator.free(write.bytes);
+            self.server.allocator.destroy(write);
+        }
+    }
+
     fn finishCloseIfReady(self: *Connection) void {
-        if (!self.close_completed or self.read_active or self.pending_writes != 0) return;
+        if (!self.close_completed or self.read_active or self.pending_writes != 0 or self.read_cancel_submitted or self.write_cancel_submitted) return;
         const server = self.server;
         if (self.session) |session| c.nghttp2_session_del(session);
         var iterator = self.streams.iterator();
@@ -393,6 +437,7 @@ const Connection = struct {
         }
         server.allocator.destroy(self);
         finishDrainIfIdle(server);
+        maybeStopLoop(server);
     }
 };
 
@@ -497,6 +542,7 @@ fn onRead(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.
     conn.read_active = false;
     const length = result catch {
         conn.closeOnLoop(loop);
+        conn.submitCloseIfReady(loop);
         conn.finishCloseIfReady();
         return .disarm;
     };
@@ -511,6 +557,7 @@ fn onRead(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.
         conn.flush() catch conn.closeOnLoop(loop);
         conn.startRead(loop) catch conn.closeOnLoop(loop);
     }
+    if (conn.closing) conn.submitCloseIfReady(loop);
     conn.finishCloseIfReady();
     return .disarm;
 }
@@ -521,6 +568,12 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
     connection.pending_writes -= 1;
     connection.server.allocator.free(request.bytes);
     connection.server.allocator.destroy(request);
+    if (connection.closing) {
+        connection.discardQueuedWrites();
+        connection.submitCloseIfReady(loop);
+        connection.finishCloseIfReady();
+        return .disarm;
+    }
     _ = result catch {
         connection.closeOnLoop(loop);
         connection.finishCloseIfReady();
@@ -528,6 +581,22 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
     };
     maybeCloseDrainedConnection(connection);
     connection.finishCloseIfReady();
+    return .disarm;
+}
+
+fn onReadCanceled(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.CancelError!void) xev.CallbackAction {
+    const conn = connection orelse return .disarm;
+    conn.read_cancel_submitted = false;
+    conn.submitCloseIfReady(loop);
+    conn.finishCloseIfReady();
+    return .disarm;
+}
+
+fn onWriteCanceled(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.CancelError!void) xev.CallbackAction {
+    const conn = connection orelse return .disarm;
+    conn.write_cancel_submitted = false;
+    conn.submitCloseIfReady(loop);
+    conn.finishCloseIfReady();
     return .disarm;
 }
 

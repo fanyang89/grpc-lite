@@ -16,10 +16,6 @@ mise run test
 mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
-mise run test-libuv-asan
-mise run test-libuv-msan
-mise run test-libuv-tsan
-mise run test-libuv-ubsan
 mise run test-consumer
 mise run fmt
 mise run ci-lint
@@ -37,7 +33,7 @@ mise run gen-proto
 - `src/protobuf_adapter.zig` is the optional typed zig-protobuf integration.
 - Public APIs use explicit allocators and deterministic `deinit` methods.
 - `nghttp2` owns HTTP/2 framing, HPACK, stream state, and flow control.
-- `libuv` owns socket and event-loop integration.
+- `libxev` owns socket and event-loop integration.
 - gRPC payloads remain raw protobuf wire bytes.
 - Generated protobuf sources live under `.zig-cache` and are not committed.
 - The first phase supports cleartext IPv4 unary RPC only.

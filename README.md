@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/fanyang89/grpc-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/fanyang89/grpc-lite/actions/workflows/ci.yml)
 
-A lightweight gRPC core runtime for Zig. HTTP/2 and event-loop behavior are delegated
-to pinned upstream `nghttp2` and `libuv` submodules. Protobuf encoding remains separate
-from transport.
+A lightweight gRPC core runtime for Zig. HTTP/2 behavior is delegated to pinned upstream
+`nghttp2`; sockets and the event loop use native Zig through `libxev`. Protobuf encoding
+remains separate from transport.
 
 The top-level types shown in this README form the stable public API. Lower-level module
 exports remain available for experimentation but may change before 1.0.
@@ -40,10 +40,6 @@ mise run test
 mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
-mise run test-libuv-asan
-mise run test-libuv-msan
-mise run test-libuv-tsan
-mise run test-libuv-ubsan
 mise run test-consumer
 mise run fmt
 mise run ci-lint
@@ -58,12 +54,10 @@ See `tests/official/README.md` for the supported interoperability profile and cu
 results.
 
 CI runs the core build and test suite on Linux x64 and arm64 in Debug and ReleaseSafe
-modes. Required x64 jobs instrument Zig, libuv, and nghttp2 with ThreadSanitizer and C
-undefined behavior detection. A separate required matrix runs libuv's complete native
-test suite with AddressSanitizer, MemorySanitizer, ThreadSanitizer, and undefined behavior
-detection. Runtime interoperability runs on both architectures; the official HTTP/2
-edge-case container runs on x64 because its pinned image is amd64-only. A scheduled x64
-workflow runs extended official unary soak tests.
+modes. Required x64 jobs instrument Zig, libxev, and nghttp2 with ThreadSanitizer and C
+undefined behavior detection. Runtime interoperability runs on both architectures; the
+official HTTP/2 edge-case container runs on x64 because its pinned image is amd64-only.
+A scheduled x64 workflow runs extended official unary soak tests.
 
 ## Unary Client
 
@@ -175,7 +169,7 @@ methods are rejected at compile time because the current transport is unary-only
 
 - Zig 0.16.0
 - nghttp2 1.69.0
-- libuv 1.52.1
+- libxev b0650f0
 - zig-protobuf 5.0.0
 - CMake and Ninja for the upstream C builds
 - mise for tool versions and project tasks

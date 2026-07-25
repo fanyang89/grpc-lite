@@ -8,37 +8,24 @@ build_type=$4
 cc=$5
 sanitize_thread=$6
 sanitize_c=$7
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 c_flags=()
-libuv_options=()
 
 if [[ "$sanitize_thread" == true && "$sanitize_c" == true ]]; then
     printf 'ThreadSanitizer and UndefinedBehaviorSanitizer are mutually exclusive\n' >&2
     exit 1
 fi
 
-if [[ "$library" == libuv ]]; then
-    if [[ "$sanitize_thread" == true ]]; then
-        c_flags+=("-I$script_dir/sanitizer-compat")
-        libuv_options+=(-DTSAN=ON)
-    elif [[ "$sanitize_c" == true ]]; then
-        libuv_options+=(-DUBSAN=ON)
-    else
-        c_flags+=(-fno-sanitize=undefined)
-    fi
+if [[ "$sanitize_thread" == true ]]; then
+    c_flags+=(-fsanitize=thread)
+fi
+if [[ "$sanitize_c" == true ]]; then
+    c_flags+=(-fsanitize=undefined -fno-sanitize-recover=undefined)
 else
-    if [[ "$sanitize_thread" == true ]]; then
-        c_flags+=(-fsanitize=thread)
-    fi
-    if [[ "$sanitize_c" == true ]]; then
-        c_flags+=(-fsanitize=undefined -fno-sanitize-recover=undefined)
-    else
-        c_flags+=(-fno-sanitize=undefined)
-    fi
-    if [[ "$sanitize_thread" == true || "$sanitize_c" == true ]]; then
-        c_flags+=(-fno-omit-frame-pointer)
-    fi
+    c_flags+=(-fno-sanitize=undefined)
+fi
+if [[ "$sanitize_thread" == true || "$sanitize_c" == true ]]; then
+    c_flags+=(-fno-omit-frame-pointer)
 fi
 
 if [[ "$sanitize_thread" == true || "$sanitize_c" == true ]]; then
@@ -55,13 +42,6 @@ common_options=(
 )
 
 case "$library" in
-    libuv)
-        CC="$cc" cmake "${common_options[@]}" \
-            -DLIBUV_BUILD_SHARED=OFF \
-            -DLIBUV_BUILD_TESTS=OFF \
-            -DLIBUV_BUILD_BENCH=OFF \
-            "${libuv_options[@]}"
-        ;;
     nghttp2)
         CC="$cc" cmake "${common_options[@]}" \
             -DENABLE_LIB_ONLY=ON \
