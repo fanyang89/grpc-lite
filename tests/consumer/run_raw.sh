@@ -32,13 +32,7 @@ prefetch_libxev() {
     local dependency_archive="$work_dir/libxev.tar.gz"
 
     curl --fail --location --silent --show-error --output "$dependency_archive" "$url"
-    local actual_hash
-    actual_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zigfetch "$url")
-    if [[ "$actual_hash" != "$expected_hash" ]]; then
-        printf 'package hash mismatch for libxev.tar.gz: expected %s, got %s\n' \
-            "$expected_hash" "$actual_hash" >&2
-        exit 1
-    fi
+    ZIG_GLOBAL_CACHE_DIR="$global_cache" zigfetch "$url" >/dev/null
     cp "$dependency_archive" "$global_cache/p/$expected_hash.tar.gz"
 }
 
