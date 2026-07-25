@@ -30,6 +30,8 @@ pub const Options = struct {
     metadata: []const metadata.Entry = &.{},
     timeout_ns: ?u64 = null,
     limits: BufferLimits = .{},
+    /// Algorithm advertised for compressed outbound messages; individual messages may remain identity.
+    send_compression: Compression = .identity,
 };
 
 pub const SendOptions = struct {

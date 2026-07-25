@@ -15,6 +15,17 @@ official_cases=(
   unimplemented_method
   unimplemented_service
 )
+streaming_cases=(
+  client_streaming
+  server_streaming
+  ping_pong
+  empty_stream
+)
+stream_lifecycle_cases=(
+  cancel_after_begin
+  cancel_after_first_response
+  timeout_on_sleeping_server
+)
 soak_cases=(
   rpc_soak
   channel_soak
@@ -88,7 +99,8 @@ printf '%s\n' 'Building grpc-lite interop binaries...'
 printf '%s\n' 'Building grpc-go v1.82.1 interop binaries...'
 (cd "$project_root/tests/official" && \
   go build -mod=readonly -o "$work_dir/grpc-go-interop-client" google.golang.org/grpc/interop/client && \
-  go build -mod=readonly -o "$work_dir/grpc-go-interop-server" google.golang.org/grpc/interop/server)
+  go build -mod=readonly -o "$work_dir/grpc-go-interop-server" google.golang.org/grpc/interop/server && \
+  go build -mod=readonly -o "$work_dir/grpc-go-half-duplex-client" half_duplex_client.go)
 
 peer_log="$work_dir/grpc-lite-server.log"
 "$project_root/zig-out/bin/grpc-lite-interop-server" \
@@ -96,6 +108,26 @@ peer_log="$work_dir/grpc-lite-server.log"
 peer_pid=$!
 wait_for_peer "$zig_server_port"
 for test_case in "${official_cases[@]}"; do
+  run_case 'grpc-go client -> grpc-lite server' "$test_case" \
+    "$work_dir/grpc-go-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$zig_server_port" \
+    --test_case="$test_case" \
+    --use_tls=false
+done
+for test_case in "${streaming_cases[@]}"; do
+  run_case 'grpc-go client -> grpc-lite server' "$test_case" \
+    "$work_dir/grpc-go-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$zig_server_port" \
+    --test_case="$test_case" \
+    --use_tls=false
+done
+run_case 'grpc-go client -> grpc-lite server' 'half_duplex' \
+  "$work_dir/grpc-go-half-duplex-client" \
+  --server_host=127.0.0.1 \
+  --server_port="$zig_server_port"
+for test_case in "${stream_lifecycle_cases[@]}"; do
   run_case 'grpc-go client -> grpc-lite server' "$test_case" \
     "$work_dir/grpc-go-interop-client" \
     --server_host=127.0.0.1 \
@@ -129,6 +161,22 @@ for test_case in "${official_cases[@]}"; do
     --test_case="$test_case" \
     --use_tls=false
 done
+for test_case in "${streaming_cases[@]}"; do
+  run_case 'grpc-lite client -> grpc-go server' "$test_case" \
+    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$go_server_port" \
+    --test_case="$test_case" \
+    --use_tls=false
+done
+for test_case in "${stream_lifecycle_cases[@]}"; do
+  run_case 'grpc-lite client -> grpc-go server' "$test_case" \
+    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$go_server_port" \
+    --test_case="$test_case" \
+    --use_tls=false
+done
 for test_case in "${soak_cases[@]}"; do
   run_case 'grpc-lite client -> grpc-go server' "$test_case" \
     "$project_root/zig-out/bin/grpc-lite-interop-client" \
@@ -143,6 +191,9 @@ done
 stop_peer
 
 printf '%s\n' "All 10 bidirectional unary runs passed."
+printf '%s\n' "All 8 bidirectional streaming runs passed."
+printf '%s\n' "The dedicated grpc-go half-duplex run passed."
+printf '%s\n' "All 6 bidirectional streaming cancellation and deadline runs passed."
 printf '%s\n' "All 4 bidirectional soak runs passed: rpc_soak and channel_soak in each direction ($soak_iterations iteration(s) each)."
 
 printf '%s\n' 'grpc-go v1.82.1 does not expose the official compression cases; running grpc-lite compression integration separately.'

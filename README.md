@@ -28,10 +28,10 @@ remain out of scope.
 
 The compatibility target is `grpc-lite-streaming-insecure-v2`: raw unary,
 client-streaming, server-streaming, and bidirectional streaming over cleartext HTTP/2.
-Streaming implementation and interoperability work is ongoing. Typed streaming will
-follow the raw transport incrementally and is not claimed complete.
+Raw streaming is implemented and verified against grpc-go. Typed streaming will follow
+the raw transport incrementally and is not claimed complete.
 
-The planned raw API is entirely event-driven. Application callbacks run on transport
+The raw API is entirely event-driven. Application callbacks run on transport
 loop threads and must not block. It provides explicit half-close and streaming-only
 explicit cancellation, explicit allocators and deterministic `deinit`, bounded
 backpressure in both directions, and per-message `identity` or `gzip` compression.

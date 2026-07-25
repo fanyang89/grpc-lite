@@ -415,6 +415,7 @@ const ClientStreamState = struct {
     request_metadata: metadata.Metadata,
     callbacks: stream.ClientCallbacks,
     limits: stream.BufferLimits,
+    request_compression: Compression,
     deadline_ns: ?u64,
     timeout_header: [16]u8 = undefined,
     timeout_header_len: usize = 0,
@@ -485,6 +486,7 @@ const ClientStreamState = struct {
             .request_metadata = metadata.Metadata.init(impl.allocator),
             .callbacks = callbacks,
             .limits = options.limits,
+            .request_compression = options.send_compression,
             .deadline_ns = if (options.timeout_ns) |timeout| nowNs() +| timeout else null,
             .decoder = frame.Decoder.init(impl.allocator, options.limits.max_message_size),
             .initial_metadata = metadata.Metadata.init(impl.allocator),
@@ -595,8 +597,13 @@ fn wakeClientStreamLocked(client_stream: *ClientStreamState) void {
 fn clientStreamSend(context: *anyopaque, payload: []const u8, options: stream.SendOptions) !void {
     const client_stream: *ClientStreamState = @ptrCast(@alignCast(context));
     if (payload.len > client_stream.limits.max_message_size) return error.MessageTooLarge;
+    if (options.compression != .identity and options.compression != client_stream.request_compression) {
+        return error.CompressionNotConfigured;
+    }
     client_stream.mutex.lockUncancelable(syncIo());
-    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or client_stream.terminal) {
+    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or
+        client_stream.cancel_requested or client_stream.terminal)
+    {
         client_stream.mutex.unlock(syncIo());
         return error.StreamClosed;
     }
@@ -608,7 +615,8 @@ fn clientStreamSend(context: *anyopaque, payload: []const u8, options: stream.Se
 
     client_stream.mutex.lockUncancelable(syncIo());
     defer client_stream.mutex.unlock(syncIo());
-    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or client_stream.terminal) return error.StreamClosed;
+    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or
+        client_stream.cancel_requested or client_stream.terminal) return error.StreamClosed;
     if (!client_stream.send_open) return error.SendClosed;
     if (encoded.len > client_stream.limits.max_outbound_buffer_size) return error.OutboundBufferLimitExceeded;
     if (encoded.len > client_stream.limits.max_outbound_buffer_size - client_stream.outbound_buffered) {
@@ -625,7 +633,8 @@ fn clientStreamCloseSend(context: *anyopaque) !void {
     const client_stream: *ClientStreamState = @ptrCast(@alignCast(context));
     client_stream.mutex.lockUncancelable(syncIo());
     defer client_stream.mutex.unlock(syncIo());
-    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or client_stream.terminal) return error.StreamClosed;
+    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or
+        client_stream.cancel_requested or client_stream.terminal) return error.StreamClosed;
     if (!client_stream.send_open) return error.SendClosed;
     client_stream.send_open = false;
     wakeClientStreamLocked(client_stream);
@@ -644,7 +653,8 @@ fn clientStreamResumeReceive(context: *anyopaque) !void {
     const client_stream: *ClientStreamState = @ptrCast(@alignCast(context));
     client_stream.mutex.lockUncancelable(syncIo());
     defer client_stream.mutex.unlock(syncIo());
-    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or client_stream.terminal) return error.StreamClosed;
+    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or
+        client_stream.cancel_requested or client_stream.terminal) return error.StreamClosed;
     client_stream.resume_requested = true;
     wakeClientStreamLocked(client_stream);
 }
@@ -1112,7 +1122,7 @@ fn submitClientStream(impl: *Impl, client_stream: *ClientStreamState) !void {
     try headers.append(impl.allocator, nativeHeader(":authority", impl.authority));
     try headers.append(impl.allocator, nativeHeader("content-type", "application/grpc"));
     try headers.append(impl.allocator, nativeHeader("te", "trailers"));
-    try headers.append(impl.allocator, nativeHeader("grpc-encoding", "gzip"));
+    try headers.append(impl.allocator, nativeHeader("grpc-encoding", client_stream.request_compression.name()));
     try headers.append(impl.allocator, nativeHeader("grpc-accept-encoding", "identity,gzip"));
     try headers.append(impl.allocator, nativeHeader("user-agent", impl.user_agent));
     if (client_stream.timeout_header_len != 0) {
@@ -1261,7 +1271,8 @@ fn setForcedStreamStatus(client_stream: *ClientStreamState, value: status.Status
 fn callbacksEnabled(client_stream: *ClientStreamState) bool {
     client_stream.mutex.lockUncancelable(syncIo());
     defer client_stream.mutex.unlock(syncIo());
-    return client_stream.app_owned and !client_stream.app_released and !client_stream.terminal;
+    return client_stream.app_owned and !client_stream.app_released and
+        !client_stream.cancel_requested and !client_stream.terminal;
 }
 
 fn beginClientCallback(client_stream: *ClientStreamState) bool {
@@ -1361,7 +1372,12 @@ fn releaseStreamLoopOwnership(client_stream: *ClientStreamState) void {
     client_stream.impl = null;
     const destroy = !client_stream.app_owned;
     client_stream.mutex.unlock(syncIo());
-    if (destroy) client_stream.destroy();
+    if (destroy) {
+        // Synchronize with an application release that still touches callback_mutex.
+        client_stream.callback_mutex.lockUncancelable(syncIo());
+        client_stream.callback_mutex.unlock(syncIo());
+        client_stream.destroy();
+    }
 }
 
 fn queueInboundMessage(client_stream: *ClientStreamState, decoded: frame.Decoder.DecodedMessage) !void {
@@ -2635,6 +2651,73 @@ test "client stream handle outlives channel teardown" {
     try std.testing.expectError(error.StreamClosed, client_stream.resumeReceive());
     client_stream.cancel();
     client_stream.deinit();
+}
+
+test "client stream cancellation closes command surface" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Stream/Cancel",
+        .{},
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    client_stream.loop_owned = false;
+    var handle = client_stream.handle();
+    defer handle.deinit();
+
+    handle.cancel();
+    try std.testing.expectError(error.StreamClosed, handle.send("late", .{}));
+    try std.testing.expectError(error.StreamClosed, handle.closeSend());
+    try std.testing.expectError(error.StreamClosed, handle.resumeReceive());
+}
+
+test "client stream requires configured message compression" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var received: usize = 0;
+
+    const identity_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Stream/Identity",
+        .{},
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    identity_stream.loop_owned = false;
+    var identity_handle = identity_stream.handle();
+    defer identity_handle.deinit();
+    try std.testing.expectError(
+        error.CompressionNotConfigured,
+        identity_handle.send("compressed", .{ .compression = .gzip }),
+    );
+
+    const gzip_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Stream/Gzip",
+        .{ .send_compression = .gzip },
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    gzip_stream.loop_owned = false;
+    var gzip_handle = gzip_stream.handle();
+    defer gzip_handle.deinit();
+    try gzip_handle.send("compressed", .{ .compression = .gzip });
 }
 
 test "GOAWAY rejects only unaccepted client stream IDs" {

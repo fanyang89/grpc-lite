@@ -6,6 +6,9 @@ const testing = @import("grpc_testing");
 const large_request_size = 271828;
 const large_response_size = 314159;
 const max_rpc_timeout_ns = 60 * std.time.ns_per_s;
+const streaming_request_sizes = [_]usize{ 27182, 8, 1828, 45904 };
+const streaming_response_sizes = [_]usize{ 31415, 9, 2653, 58979 };
+const zero_streaming_body = [_]u8{0} ** streaming_request_sizes[streaming_request_sizes.len - 1];
 const special_status_message = "\t\ntest with whitespace\r\nand Unicode BMP \xE2\x98\xBA and non-BMP \xF0\x9F\x98\x88\t\n";
 
 const Config = struct {
@@ -57,6 +60,20 @@ pub fn main(init: std.process.Init) !void {
         try clientCompressedUnary(init.gpa, &channel);
     } else if (std.mem.eql(u8, config.test_case, "server_compressed_unary")) {
         try serverCompressedUnary(init.gpa, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "client_streaming")) {
+        try clientStreaming(init.gpa, init.io, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "server_streaming")) {
+        try serverStreaming(init.gpa, init.io, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "ping_pong")) {
+        try pingPong(init.gpa, init.io, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "empty_stream")) {
+        try emptyStream(init.io, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "cancel_after_begin")) {
+        try cancelAfterBegin(init.io, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "cancel_after_first_response")) {
+        try cancelAfterFirstResponse(init.gpa, init.io, &channel);
+    } else if (std.mem.eql(u8, config.test_case, "timeout_on_sleeping_server")) {
+        try timeoutOnSleepingServer(init.gpa, init.io, &channel);
     } else if (std.mem.eql(u8, config.test_case, "special_status_message")) {
         try specialStatusMessage(init.gpa, &channel);
     } else if (std.mem.eql(u8, config.test_case, "unimplemented_method")) {
@@ -246,6 +263,476 @@ fn maxStreams(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
     for (&workers) |worker| {
         if (!worker.succeeded) return error.ConcurrentRpcFailed;
     }
+}
+
+const StreamCompletion = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    callback_error: ?anyerror = null,
+    terminal_status: grpc.StatusCode = .unknown,
+    terminal_message_buffer: [256]u8 = undefined,
+    terminal_message_len: usize = 0,
+    terminal_count: usize = 0,
+
+    fn fail(self: *@This(), stream: grpc.ClientStream, err: anyerror) void {
+        if (self.callback_error == null) self.callback_error = err;
+        stream.cancel();
+    }
+
+    fn terminal(self: *@This(), status: grpc.Status) void {
+        self.terminal_count += 1;
+        if (self.terminal_count == 1) {
+            self.terminal_status = status.code;
+            self.terminal_message_len = @min(status.message.len, self.terminal_message_buffer.len);
+            @memcpy(
+                self.terminal_message_buffer[0..self.terminal_message_len],
+                status.message[0..self.terminal_message_len],
+            );
+        } else if (self.callback_error == null) {
+            self.callback_error = error.MultipleTerminalCallbacks;
+        }
+        self.done.store(true, .release);
+    }
+};
+
+const ClientStreamingState = struct {
+    completion: StreamCompletion = .{},
+    response_count: usize = 0,
+    aggregated_payload_size: i32 = 0,
+    scratch: [1024]u8 = undefined,
+
+    fn onMessage(
+        context: ?*anyopaque,
+        stream: grpc.ClientStream,
+        payload: []const u8,
+        _: grpc.Compression,
+    ) grpc.StreamReceiveAction {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        var fixed = std.heap.FixedBufferAllocator.init(&self.scratch);
+        var reader: std.Io.Reader = .fixed(payload);
+        var response = testing.StreamingInputCallResponse.decode(&reader, fixed.allocator()) catch |err| {
+            self.completion.fail(stream, err);
+            return .continue_receiving;
+        };
+        defer response.deinit(fixed.allocator());
+        if (self.response_count != 0) {
+            self.completion.fail(stream, error.UnexpectedResponseCount);
+            return .continue_receiving;
+        }
+        self.response_count = 1;
+        self.aggregated_payload_size = response.aggregated_payload_size;
+        return .continue_receiving;
+    }
+
+    fn onTerminal(
+        context: ?*anyopaque,
+        _: grpc.ClientStream,
+        status: grpc.Status,
+        _: *const grpc.Metadata,
+    ) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.completion.terminal(status);
+    }
+};
+
+const OutputStreamingState = struct {
+    completion: StreamCompletion = .{},
+    response_count: usize = 0,
+    scratch: [64 * 1024]u8 = undefined,
+
+    fn onMessage(
+        context: ?*anyopaque,
+        stream: grpc.ClientStream,
+        payload: []const u8,
+        _: grpc.Compression,
+    ) grpc.StreamReceiveAction {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.response_count >= streaming_response_sizes.len) {
+            self.completion.fail(stream, error.UnexpectedResponseCount);
+            return .continue_receiving;
+        }
+        const size = decodeStreamingOutputSize(payload, &self.scratch) catch |err| {
+            self.completion.fail(stream, err);
+            return .continue_receiving;
+        };
+        if (size != streaming_response_sizes[self.response_count]) {
+            self.completion.fail(stream, error.UnexpectedPayloadSize);
+            return .continue_receiving;
+        }
+        self.response_count += 1;
+        return .continue_receiving;
+    }
+
+    fn onTerminal(
+        context: ?*anyopaque,
+        _: grpc.ClientStream,
+        status: grpc.Status,
+        _: *const grpc.Metadata,
+    ) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.completion.terminal(status);
+    }
+};
+
+const PingPongState = struct {
+    completion: StreamCompletion = .{},
+    response_count: usize = 0,
+    scratch: [1024 * 1024]u8 = undefined,
+
+    fn onMessage(
+        context: ?*anyopaque,
+        stream: grpc.ClientStream,
+        payload: []const u8,
+        _: grpc.Compression,
+    ) grpc.StreamReceiveAction {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.response_count >= streaming_response_sizes.len) {
+            self.completion.fail(stream, error.UnexpectedResponseCount);
+            return .continue_receiving;
+        }
+        var fixed = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const size = decodeStreamingOutputSizeWithAllocator(payload, fixed.allocator()) catch |err| {
+            self.completion.fail(stream, err);
+            return .continue_receiving;
+        };
+        if (size != streaming_response_sizes[self.response_count]) {
+            self.completion.fail(stream, error.UnexpectedPayloadSize);
+            return .continue_receiving;
+        }
+
+        self.response_count += 1;
+        if (self.response_count == streaming_response_sizes.len) {
+            stream.closeSend() catch |err| self.completion.fail(stream, err);
+        } else {
+            fixed = std.heap.FixedBufferAllocator.init(&self.scratch);
+            sendStreamingOutputRequest(
+                fixed.allocator(),
+                stream,
+                streaming_request_sizes[self.response_count],
+                streaming_response_sizes[self.response_count],
+            ) catch |err| self.completion.fail(stream, err);
+        }
+        return .continue_receiving;
+    }
+
+    fn onTerminal(
+        context: ?*anyopaque,
+        _: grpc.ClientStream,
+        status: grpc.Status,
+        _: *const grpc.Metadata,
+    ) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.completion.terminal(status);
+    }
+};
+
+const EmptyStreamState = struct {
+    completion: StreamCompletion = .{},
+    response_count: usize = 0,
+
+    fn onMessage(
+        context: ?*anyopaque,
+        stream: grpc.ClientStream,
+        _: []const u8,
+        _: grpc.Compression,
+    ) grpc.StreamReceiveAction {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.response_count += 1;
+        self.completion.fail(stream, error.UnexpectedResponseCount);
+        return .continue_receiving;
+    }
+
+    fn onTerminal(
+        context: ?*anyopaque,
+        _: grpc.ClientStream,
+        status: grpc.Status,
+        _: *const grpc.Metadata,
+    ) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.completion.terminal(status);
+    }
+};
+
+const CancellationState = struct {
+    completion: StreamCompletion = .{},
+    response_count: usize = 0,
+    cancel_on_message: bool = false,
+
+    fn onMessage(
+        context: ?*anyopaque,
+        stream: grpc.ClientStream,
+        _: []const u8,
+        _: grpc.Compression,
+    ) grpc.StreamReceiveAction {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.response_count += 1;
+        if (self.cancel_on_message) stream.cancel();
+        return .continue_receiving;
+    }
+
+    fn onTerminal(
+        context: ?*anyopaque,
+        _: grpc.ClientStream,
+        status: grpc.Status,
+        _: *const grpc.Metadata,
+    ) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.completion.terminal(status);
+    }
+};
+
+fn clientStreaming(allocator: std.mem.Allocator, io: std.Io, channel: *grpc.Channel) !void {
+    var state: ClientStreamingState = .{};
+    var stream = try channel.openStream(
+        "/grpc.testing.TestService/StreamingInputCall",
+        .{ .timeout_ns = max_rpc_timeout_ns },
+        .{
+            .context = &state,
+            .on_message = ClientStreamingState.onMessage,
+            .on_terminal = ClientStreamingState.onTerminal,
+        },
+    );
+    defer stream.deinit();
+
+    for (streaming_request_sizes) |size| {
+        try sendStreamingInputRequest(allocator, stream, size);
+    }
+    try stream.closeSend();
+    try waitForStream(io, &state.completion, stream);
+    if (state.response_count != 1) return error.UnexpectedResponseCount;
+    if (state.aggregated_payload_size != 74922) return error.UnexpectedAggregatedPayloadSize;
+}
+
+fn serverStreaming(allocator: std.mem.Allocator, io: std.Io, channel: *grpc.Channel) !void {
+    var state: OutputStreamingState = .{};
+    var stream = try channel.openStream(
+        "/grpc.testing.TestService/StreamingOutputCall",
+        .{ .timeout_ns = max_rpc_timeout_ns },
+        .{
+            .context = &state,
+            .on_message = OutputStreamingState.onMessage,
+            .on_terminal = OutputStreamingState.onTerminal,
+        },
+    );
+    defer stream.deinit();
+
+    try sendServerStreamingRequest(allocator, stream);
+    try stream.closeSend();
+    try waitForStream(io, &state.completion, stream);
+    if (state.response_count != streaming_response_sizes.len) return error.UnexpectedResponseCount;
+}
+
+fn pingPong(allocator: std.mem.Allocator, io: std.Io, channel: *grpc.Channel) !void {
+    const state = try allocator.create(PingPongState);
+    defer allocator.destroy(state);
+    state.* = .{};
+    var stream = try channel.openStream(
+        "/grpc.testing.TestService/FullDuplexCall",
+        .{ .timeout_ns = max_rpc_timeout_ns },
+        .{
+            .context = state,
+            .on_message = PingPongState.onMessage,
+            .on_terminal = PingPongState.onTerminal,
+        },
+    );
+    defer stream.deinit();
+
+    try sendStreamingOutputRequest(
+        allocator,
+        stream,
+        streaming_request_sizes[0],
+        streaming_response_sizes[0],
+    );
+    try waitForStream(io, &state.completion, stream);
+    if (state.response_count != streaming_response_sizes.len) return error.UnexpectedResponseCount;
+}
+
+fn emptyStream(io: std.Io, channel: *grpc.Channel) !void {
+    var state: EmptyStreamState = .{};
+    var stream = try channel.openStream(
+        "/grpc.testing.TestService/FullDuplexCall",
+        .{ .timeout_ns = max_rpc_timeout_ns },
+        .{
+            .context = &state,
+            .on_message = EmptyStreamState.onMessage,
+            .on_terminal = EmptyStreamState.onTerminal,
+        },
+    );
+    defer stream.deinit();
+
+    try stream.closeSend();
+    try waitForStream(io, &state.completion, stream);
+    if (state.response_count != 0) return error.UnexpectedResponseCount;
+}
+
+fn cancelAfterBegin(io: std.Io, channel: *grpc.Channel) !void {
+    var state: CancellationState = .{};
+    var stream = try channel.openStream(
+        "/grpc.testing.TestService/StreamingInputCall",
+        .{ .timeout_ns = max_rpc_timeout_ns },
+        .{
+            .context = &state,
+            .on_message = CancellationState.onMessage,
+            .on_terminal = CancellationState.onTerminal,
+        },
+    );
+    defer stream.deinit();
+
+    stream.cancel();
+    try waitForStreamStatus(io, &state.completion, stream, .cancelled);
+    if (state.response_count != 0) return error.UnexpectedResponseCount;
+}
+
+fn cancelAfterFirstResponse(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    channel: *grpc.Channel,
+) !void {
+    var state: CancellationState = .{ .cancel_on_message = true };
+    var stream = try channel.openStream(
+        "/grpc.testing.TestService/FullDuplexCall",
+        .{ .timeout_ns = max_rpc_timeout_ns },
+        .{
+            .context = &state,
+            .on_message = CancellationState.onMessage,
+            .on_terminal = CancellationState.onTerminal,
+        },
+    );
+    defer stream.deinit();
+
+    try sendStreamingOutputRequest(allocator, stream, 27182, 31415);
+    try waitForStreamStatus(io, &state.completion, stream, .cancelled);
+    if (state.response_count != 1) return error.UnexpectedResponseCount;
+}
+
+fn timeoutOnSleepingServer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    channel: *grpc.Channel,
+) !void {
+    var state: CancellationState = .{};
+    var stream = try channel.openStream(
+        "/grpc.testing.TestService/FullDuplexCall",
+        .{ .timeout_ns = std.time.ns_per_ms },
+        .{
+            .context = &state,
+            .on_message = CancellationState.onMessage,
+            .on_terminal = CancellationState.onTerminal,
+        },
+    );
+    defer stream.deinit();
+
+    const request: testing.StreamingOutputCallRequest = .{
+        .response_type = .COMPRESSABLE,
+        .payload = .{
+            .type = .COMPRESSABLE,
+            .body = zero_streaming_body[0..27182],
+        },
+    };
+    sendStreamMessage(allocator, stream, request) catch |err| {
+        if (err != error.StreamClosed) return err;
+    };
+    try waitForStreamStatus(io, &state.completion, stream, .deadline_exceeded);
+    if (state.response_count != 0) return error.UnexpectedResponseCount;
+}
+
+fn waitForStream(io: std.Io, completion: *StreamCompletion, stream: grpc.ClientStream) !void {
+    try waitForStreamStatus(io, completion, stream, .ok);
+}
+
+fn waitForStreamStatus(
+    io: std.Io,
+    completion: *StreamCompletion,
+    stream: grpc.ClientStream,
+    expected_status: grpc.StatusCode,
+) !void {
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds +| max_rpc_timeout_ns;
+    while (!completion.done.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) {
+            stream.cancel();
+            return error.StreamingRpcTimeout;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    if (completion.terminal_count != 1) return error.UnexpectedTerminalCount;
+    if (completion.callback_error) |err| return err;
+    if (completion.terminal_status != expected_status) {
+        std.debug.print("unexpected streaming RPC status: {t}: {s}\n", .{
+            completion.terminal_status,
+            completion.terminal_message_buffer[0..completion.terminal_message_len],
+        });
+        return error.UnexpectedRpcStatus;
+    }
+}
+
+fn sendStreamingInputRequest(
+    allocator: std.mem.Allocator,
+    stream: grpc.ClientStream,
+    request_size: usize,
+) !void {
+    const request: testing.StreamingInputCallRequest = .{
+        .payload = .{
+            .type = .COMPRESSABLE,
+            .body = zero_streaming_body[0..request_size],
+        },
+    };
+    try sendStreamMessage(allocator, stream, request);
+}
+
+fn sendServerStreamingRequest(allocator: std.mem.Allocator, stream: grpc.ClientStream) !void {
+    var parameters: std.ArrayList(testing.ResponseParameters) = .empty;
+    defer parameters.deinit(allocator);
+    for (streaming_response_sizes) |size| {
+        try parameters.append(allocator, .{ .size = @intCast(size) });
+    }
+    const request: testing.StreamingOutputCallRequest = .{
+        .response_type = .COMPRESSABLE,
+        .response_parameters = parameters,
+    };
+    try sendStreamMessage(allocator, stream, request);
+}
+
+fn sendStreamingOutputRequest(
+    allocator: std.mem.Allocator,
+    stream: grpc.ClientStream,
+    request_size: usize,
+    response_size: usize,
+) !void {
+    var parameters: std.ArrayList(testing.ResponseParameters) = .empty;
+    defer parameters.deinit(allocator);
+    try parameters.append(allocator, .{ .size = @intCast(response_size) });
+    const request: testing.StreamingOutputCallRequest = .{
+        .response_type = .COMPRESSABLE,
+        .response_parameters = parameters,
+        .payload = .{
+            .type = .COMPRESSABLE,
+            .body = zero_streaming_body[0..request_size],
+        },
+    };
+    try sendStreamMessage(allocator, stream, request);
+}
+
+fn sendStreamMessage(allocator: std.mem.Allocator, stream: grpc.ClientStream, message: anytype) !void {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try message.encode(&writer.writer, allocator);
+    try stream.send(writer.written(), .{});
+}
+
+fn decodeStreamingOutputSize(payload: []const u8, scratch: []u8) !usize {
+    var fixed = std.heap.FixedBufferAllocator.init(scratch);
+    return decodeStreamingOutputSizeWithAllocator(payload, fixed.allocator());
+}
+
+fn decodeStreamingOutputSizeWithAllocator(
+    payload: []const u8,
+    allocator: std.mem.Allocator,
+) !usize {
+    var reader: std.Io.Reader = .fixed(payload);
+    var response = try testing.StreamingOutputCallResponse.decode(&reader, allocator);
+    defer response.deinit(allocator);
+    const response_payload = response.payload orelse return error.MissingPayload;
+    if (response_payload.type != .COMPRESSABLE) return error.UnexpectedPayloadType;
+    return response_payload.body.len;
 }
 
 fn clientCompressedUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {

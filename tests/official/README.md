@@ -15,6 +15,11 @@ mise run interop-http2-edge
 | --- | --- | --- |
 | grpc-go client to grpc-lite server | `empty_unary`, `large_unary`, `special_status_message`, `unimplemented_method`, `unimplemented_service` | Pass |
 | grpc-lite client to grpc-go server | `empty_unary`, `large_unary`, `special_status_message`, `unimplemented_method`, `unimplemented_service` | Pass |
+| grpc-go client to grpc-lite server | `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
+| grpc-lite client to grpc-go server | `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
+| dedicated grpc-go client to grpc-lite server | `half_duplex` | Pass; responses begin after the client half-closes |
+| grpc-go client to grpc-lite server | `cancel_after_begin`, `cancel_after_first_response`, `timeout_on_sleeping_server` | Pass |
+| grpc-lite client to grpc-go server | `cancel_after_begin`, `cancel_after_first_response`, `timeout_on_sleeping_server` | Pass |
 | grpc-lite compression integration | `client_compressed_unary`, `server_compressed_unary` | Pass; grpc-go v1.82.1 does not expose these cases through its interop client |
 | gRPC HTTP/2 framing | `TestSoonClientShortSettings`, `TestSoonShortPreface`, `TestSoonUnknownFrameType`, `TestSoonClientPrefaceWithStreamId`, `TestSoonAllSettingsFramesAcked` | Pass |
 | gRPC HTTP/2 framing | `TestSoonSmallMaxFrameSize` | Server GOAWAY passes the repository test; pinned upstream parser cannot recognize GOAWAY frames |
@@ -32,7 +37,7 @@ upstream report is stored in `.zig-cache/official/http2-framing.log`; the offici
 framing suite is not reported as fully passing while the pinned parser limitation
 remains.
 
-The unary harness defaults to 10 iterations for each soak case. Set `SOAK_ITERATIONS`,
+The official harness defaults to 10 iterations for each soak case. Set `SOAK_ITERATIONS`,
 `SOAK_MAX_FAILURES`, and `SOAK_OVERALL_TIMEOUT_SECONDS` to override both directions'
 soak settings for scheduled runs. The scheduled soak covers grpc-lite Server reuse and
 grpc-lite Channel reuse and recreation.
