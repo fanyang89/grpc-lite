@@ -6,7 +6,7 @@
     .dependencies = .{
         .libxev = .{
             .url = "https://codeload.github.com/mitchellh/libxev/tar.gz/b0650f082458226860ed7ab0fc7c9c73823c8950",
-            .hash = "libxev-0.0.0-86vtcxkOFACqPXUTAPuq5i0xpDYWU5G5RfrYQXxlUT26",
+            .hash = "libxev-0.0.0-86vtc6P3RwJ-Ozif0m5VzoiXrhdY8lXPvckiDJng8-0F",
         },
         .nghttp2 = .{
             .url = "https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99",
