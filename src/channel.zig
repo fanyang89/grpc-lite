@@ -1853,14 +1853,7 @@ test "channel replaces a connection after GOAWAY without replaying calls" {
             self.calls += 1;
             if (self.calls == 1) {
                 const connection = self.server.impl.connections.items[0];
-                if (c.nghttp2_submit_goaway(
-                    connection.session,
-                    c.NGHTTP2_FLAG_NONE,
-                    1,
-                    c.NGHTTP2_NO_ERROR,
-                    null,
-                    0,
-                ) != 0) return error.GoAwaySubmissionFailed;
+                try connection.submitGoAway(1, c.NGHTTP2_NO_ERROR);
             }
             return service.UnaryResponse.ok(allocator, request);
         }
@@ -2237,14 +2230,7 @@ test "channel shutdown drains an active reconnect completion" {
             request: []const u8,
         ) !service.UnaryResponse {
             const connection = self.server.impl.connections.items[0];
-            if (c.nghttp2_submit_goaway(
-                connection.session,
-                c.NGHTTP2_FLAG_NONE,
-                1,
-                c.NGHTTP2_NO_ERROR,
-                null,
-                0,
-            ) != 0) return error.GoAwaySubmissionFailed;
+            try connection.submitGoAway(1, c.NGHTTP2_NO_ERROR);
             return service.UnaryResponse.ok(allocator, request);
         }
     };

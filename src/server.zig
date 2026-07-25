@@ -304,6 +304,7 @@ const Connection = struct {
     session: ?*c.nghttp2_session = null,
     streams: std.AutoHashMapUnmanaged(i32, *Stream) = .empty,
     highest_accepted_stream_id: i32 = 0,
+    local_goaway_submitted: bool = false,
     pending_writes: usize = 0,
     draining: bool = false,
     close_after_writes: bool = false,
@@ -367,12 +368,24 @@ const Connection = struct {
     }
 
     fn closeTerminatedSession(self: *Connection, loop: *xev.Loop) void {
-        if (self.highest_accepted_stream_id != 0 or
+        if (self.local_goaway_submitted or
             self.closing or
             c.nghttp2_session_want_read(self.session) != 0 or
             c.nghttp2_session_want_write(self.session) != 0) return;
         self.close_after_writes = true;
         if (self.pending_writes == 0) self.closeOnLoop(loop);
+    }
+
+    pub fn submitGoAway(self: *Connection, last_stream_id: i32, error_code: u32) !void {
+        self.local_goaway_submitted = true;
+        if (c.nghttp2_submit_goaway(
+            self.session,
+            c.NGHTTP2_FLAG_NONE,
+            last_stream_id,
+            error_code,
+            null,
+            0,
+        ) != 0) return error.NativeFailure;
     }
 
     fn close(self: *Connection) void {
@@ -650,17 +663,13 @@ fn beginDrain(server: *Impl) void {
         for (server.connections.items) |connection| {
             if (connection.closing or connection.session == null) continue;
             connection.draining = true;
-            if (c.nghttp2_submit_goaway(
-                connection.session,
-                c.NGHTTP2_FLAG_NONE,
+            connection.submitGoAway(
                 connection.highest_accepted_stream_id,
                 c.NGHTTP2_NO_ERROR,
-                null,
-                0,
-            ) != 0) {
+            ) catch {
                 connection.closeOnLoop(&server.loop);
                 continue;
-            }
+            };
             connection.flush() catch connection.closeOnLoop(&server.loop);
         }
     }
@@ -1295,6 +1304,116 @@ test "malformed HTTP/2 settings close the connection promptly" {
         const output = try exchangeRawHttp2(&server, input);
         defer std.testing.allocator.free(output);
         try std.testing.expect(output.len != 0);
+    }
+}
+
+test "malformed HTTP/2 settings close after a completed unary stream" {
+    const Handler = struct {
+        fn handle(_: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    try server.registerUnary(
+        "/test.Echo/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try server.start();
+
+    const header_block = [_]u8{
+        0x83, 0x86, // :method POST, :scheme http
+        0x04, 0x10,
+    } ++ "/test.Echo/Unary" ++ [_]u8{
+        0x01, 0x09,
+    } ++ "localhost" ++ [_]u8{
+        0x0f, 0x10, 0x10,
+    } ++ "application/grpc";
+    const headers_frame = [_]u8{
+        @intCast(header_block.len >> 16),
+        @intCast(header_block.len >> 8),
+        @intCast(header_block.len),
+        c.NGHTTP2_HEADERS,
+        c.NGHTTP2_FLAG_END_HEADERS,
+        0,
+        0,
+        0,
+        1,
+    } ++ header_block;
+    const data_frame = [_]u8{
+        0, 0, 9, c.NGHTTP2_DATA, c.NGHTTP2_FLAG_END_STREAM, 0, 0, 0, 1,
+        0, 0, 0, 0,              4,
+    } ++ "ping";
+    const input = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{
+        0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0,
+    } ++ headers_frame ++ data_frame;
+
+    const local_address = try server.localAddress();
+    const address = try std.Io.net.IpAddress.parseIp4(local_address.host, local_address.port);
+    var io_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+    const stream = try address.connect(io, .{
+        .mode = .stream,
+        .timeout = .none,
+    });
+    defer stream.close(io);
+
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    writer.interface.writeAll(input) catch |err| return writer.err orelse err;
+    writer.interface.flush() catch |err| return writer.err orelse err;
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    var read_buffer: [256]u8 = undefined;
+    var parsed: usize = 0;
+    var unary_complete = false;
+    while (!unary_complete) {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&poll_fds, 1000) == 0) return error.TestTimeout;
+        const length = try std.posix.read(stream.socket.handle, &read_buffer);
+        if (length == 0) return error.UnexpectedEof;
+        try output.appendSlice(std.testing.allocator, read_buffer[0..length]);
+        while (parsed + 9 <= output.items.len) {
+            const payload_length = (@as(usize, output.items[parsed]) << 16) |
+                (@as(usize, output.items[parsed + 1]) << 8) |
+                output.items[parsed + 2];
+            const end = parsed + 9 + payload_length;
+            if (end > output.items.len) break;
+            const stream_id = (@as(u32, output.items[parsed + 5] & 0x7f) << 24) |
+                (@as(u32, output.items[parsed + 6]) << 16) |
+                (@as(u32, output.items[parsed + 7]) << 8) |
+                output.items[parsed + 8];
+            if (stream_id == 1 and
+                output.items[parsed + 3] == c.NGHTTP2_HEADERS and
+                output.items[parsed + 4] & c.NGHTTP2_FLAG_END_STREAM != 0)
+            {
+                unary_complete = true;
+            }
+            parsed = end;
+        }
+    }
+    const malformed_settings = [_]u8{
+        0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 1,
+    };
+    writer.interface.writeAll(&malformed_settings) catch |err| return writer.err orelse err;
+    writer.interface.flush() catch |err| return writer.err orelse err;
+    while (true) {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&poll_fds, 1000) == 0) return error.TestTimeout;
+        const length = try std.posix.read(stream.socket.handle, &read_buffer);
+        if (length == 0) break;
     }
 }
 
