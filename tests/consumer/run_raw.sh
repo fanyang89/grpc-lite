@@ -8,7 +8,7 @@ trap 'rm -rf "$work_dir"' EXIT
 archive="$work_dir/grpc-lite.tar.gz"
 consumer="$work_dir/consumer"
 global_cache="$work_dir/global-cache"
-mkdir -p "$consumer/src" "$global_cache"
+mkdir -p "$consumer/src" "$global_cache/p"
 
 prefetch_package() {
     local url=$1
@@ -26,10 +26,25 @@ prefetch_package() {
     fi
 }
 
-prefetch_package \
+prefetch_libxev() {
+    local url=$1
+    local expected_hash=$2
+    local dependency_archive="$work_dir/libxev.tar.gz"
+
+    curl --fail --location --silent --show-error --output "$dependency_archive" "$url"
+    local actual_hash
+    actual_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zigfetch "$url")
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+        printf 'package hash mismatch for libxev.tar.gz: expected %s, got %s\n' \
+            "$expected_hash" "$actual_hash" >&2
+        exit 1
+    fi
+    cp "$dependency_archive" "$global_cache/p/$expected_hash.tar.gz"
+}
+
+prefetch_libxev \
     'https://codeload.github.com/mitchellh/libxev/tar.gz/b0650f082458226860ed7ab0fc7c9c73823c8950' \
-    'libxev-0.0.0-86vtc6P3RwJ-Ozif0m5VzoiXrhdY8lXPvckiDJng8-0F' \
-    'libxev.tar.gz'
+    'libxev-0.0.0-86vtcxkOFACqPXUTAPuq5i0xpDYWU5G5RfrYQXxlUT26'
 prefetch_package \
     'https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99' \
     'N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX' \
