@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c.zig").api;
 const xev = @import("xev");
 const call = @import("call.zig");
@@ -146,6 +147,17 @@ pub const Channel = struct {
 const State = enum { starting, running, stopping, stopped };
 const ConnectionState = enum { connecting, active, draining, closing };
 
+const TestObserver = if (builtin.is_test) struct {
+    write_requested: std.atomic.Value(bool) = .init(false),
+    write_observed: std.atomic.Value(bool) = .init(false),
+    write_observed_sem: std.Io.Semaphore = .{},
+    connect_requested: std.atomic.Value(bool) = .init(false),
+    connect_observed: std.atomic.Value(bool) = .init(false),
+    connect_observed_sem: std.Io.Semaphore = .{},
+    connect_release: std.Io.Semaphore = .{},
+    connect_cancel_confirmed: std.atomic.Value(bool) = .init(false),
+} else struct {};
+
 const Impl = struct {
     allocator: std.mem.Allocator,
     host: [:0]u8,
@@ -161,7 +173,10 @@ const Impl = struct {
     loop: xev.Loop = undefined,
     tcp: xev.TCP = undefined,
     connect_completion: xev.Completion = .{},
+    connect_cancel_completion: xev.Completion = .{},
     read_completion: xev.Completion = .{},
+    read_cancel_completion: xev.Completion = .{},
+    write_cancel_completion: xev.Completion = .{},
     close_completion: xev.Completion = .{},
     async_handle: xev.Async = undefined,
     async_completion: xev.Completion = .{},
@@ -170,7 +185,13 @@ const Impl = struct {
     session: ?*c.nghttp2_session = null,
     loop_initialized: bool = false,
     tcp_initialized: bool = false,
-    socket_close_scheduled: bool = false,
+    connect_active: bool = false,
+    connect_cancel_submitted: bool = false,
+    read_active: bool = false,
+    read_cancel_submitted: bool = false,
+    write_cancel_submitted: bool = false,
+    close_submitted: bool = false,
+    close_completed: bool = false,
     deadline_timer_armed: bool = false,
     connected: bool = false,
     connection_state: ConnectionState = .connecting,
@@ -180,6 +201,7 @@ const Impl = struct {
     read_buffer: [16 * 1024]u8 = undefined,
     write_queue: xev.WriteQueue = .{},
     writes: std.AutoHashMapUnmanaged(*WriteRequest, void) = .empty,
+    test_observer: TestObserver = .{},
 
     fn enqueue(self: *Impl, operation: *Operation) !bool {
         self.mutex.lockUncancelable(syncIo());
@@ -429,8 +451,12 @@ fn runLoop(impl: *Impl) void {
         impl.signalStartup(false);
         beginStop(impl, "connection failed");
     };
-    impl.loop.run(.until_done) catch beginStop(impl, "event loop failed");
-    discardWrites(impl);
+    impl.loop.run(.until_done) catch {
+        beginStop(impl, "event loop failed");
+        impl.loop.run(.until_done) catch @panic("event loop failed while stopping");
+    };
+    std.debug.assert(impl.writes.count() == 0);
+    std.debug.assert(impl.write_queue.head == null);
     if (impl.session) |session| c.nghttp2_session_del(session);
     impl.session = null;
     impl.loop.deinit();
@@ -442,13 +468,16 @@ fn startConnection(impl: *Impl) !void {
     const address = try std.Io.net.IpAddress.parseIp4(impl.host, impl.port);
     impl.tcp = try xev.TCP.init(address);
     impl.tcp_initialized = true;
-    impl.socket_close_scheduled = false;
+    impl.close_submitted = false;
+    impl.close_completed = false;
     impl.connected = false;
     impl.connection_state = .connecting;
     impl.connection_generation += 1;
 
     try initializeSession(impl);
+    impl.connect_active = true;
     impl.tcp.connect(&impl.loop, &impl.connect_completion, address, Impl, impl, onConnect);
+    observeTestIo(impl);
 }
 
 fn initializeSession(impl: *Impl) !void {
@@ -464,8 +493,10 @@ fn initializeSession(impl: *Impl) !void {
     if (c.nghttp2_submit_settings(impl.session, c.NGHTTP2_FLAG_NONE, null, 0) != 0) return error.NativeFailure;
 }
 
-fn onConnect(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, result: xev.ConnectError!void) xev.CallbackAction {
+fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, result: xev.ConnectError!void) xev.CallbackAction {
     const impl = impl_.?;
+    impl.connect_active = false;
+    defer submitCloseIfReady(impl, loop);
     result catch {
         impl.signalStartup(false);
         beginStop(impl, "connection failed");
@@ -480,6 +511,7 @@ fn onConnect(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, result
     }
     impl.connected = true;
     impl.connect_count += 1;
+    impl.read_active = true;
     impl.tcp.read(&impl.loop, &impl.read_completion, .{ .slice = &impl.read_buffer }, Impl, impl, onRead);
     flush(impl) catch {
         impl.signalStartup(false);
@@ -498,6 +530,7 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
         beginStop(impl, "channel wakeup failed");
         return .disarm;
     };
+    observeTestIo(impl);
     impl.mutex.lockUncancelable(syncIo());
     const stopping = impl.state != .running;
     impl.mutex.unlock(syncIo());
@@ -645,8 +678,10 @@ fn flush(impl: *Impl) !void {
     }
 }
 
-fn onRead(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.ReadBuffer, result: xev.ReadError!usize) xev.CallbackAction {
+fn onRead(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.ReadBuffer, result: xev.ReadError!usize) xev.CallbackAction {
     const impl = impl_.?;
+    impl.read_active = false;
+    defer submitCloseIfReady(impl, loop);
     const bytes_read = result catch {
         if (impl.connection_state == .closing or impl.stopping_on_loop) return .disarm;
         if (impl.connection_state == .draining and impl.operations.count() == 0) {
@@ -670,10 +705,11 @@ fn onRead(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.Re
         beginStop(impl, "connection failed");
         return .disarm;
     };
+    impl.read_active = true;
     return .rearm;
 }
 
-fn onWrite(write_: ?*WriteRequest, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.WriteBuffer, result: xev.WriteError!usize) xev.CallbackAction {
+fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.WriteBuffer, result: xev.WriteError!usize) xev.CallbackAction {
     const write = write_.?;
     const impl = write.impl;
     const generation = write.generation;
@@ -683,7 +719,8 @@ fn onWrite(write_: ?*WriteRequest, _: *xev.Loop, _: *xev.Completion, _: xev.TCP,
     if (result) |_| {} else |_| if (generation == impl.connection_generation and impl.connection_state != .closing) {
         beginStop(impl, "connection write failed");
     }
-    if (impl.connection_state == .closing and impl.writes.count() == 0) closeConnection(impl);
+    if (impl.stopping_on_loop) discardQueuedWrites(impl);
+    submitCloseIfReady(impl, loop);
     return .disarm;
 }
 
@@ -870,17 +907,47 @@ fn beginReconnect(impl: *Impl) void {
         c.nghttp2_session_del(session);
         impl.session = null;
     }
-    if (impl.writes.count() == 0) closeConnection(impl);
+    if (impl.read_active and !impl.read_cancel_submitted) {
+        impl.read_cancel_submitted = true;
+        impl.loop.cancel(
+            &impl.read_completion,
+            &impl.read_cancel_completion,
+            Impl,
+            impl,
+            onReadCanceled,
+        );
+    }
+    submitCloseIfReady(impl, &impl.loop);
 }
 
-fn closeConnection(impl: *Impl) void {
-    if (!impl.tcp_initialized or impl.socket_close_scheduled) return;
-    impl.socket_close_scheduled = true;
-    impl.tcp.close(&impl.loop, &impl.close_completion, Impl, impl, onTcpClosed);
+fn submitCloseIfReady(impl: *Impl, loop: *xev.Loop) void {
+    if (!impl.tcp_initialized) {
+        if (impl.stopping_on_loop and
+            !impl.connect_active and
+            !impl.connect_cancel_submitted and
+            !impl.read_active and
+            !impl.read_cancel_submitted and
+            !impl.write_cancel_submitted and
+            impl.writes.count() == 0)
+        {
+            loop.stop();
+        }
+        return;
+    }
+    if (impl.close_submitted or
+        impl.connect_active or
+        impl.connect_cancel_submitted or
+        impl.read_active or
+        impl.read_cancel_submitted or
+        impl.write_cancel_submitted or
+        impl.writes.count() != 0) return;
+    impl.close_submitted = true;
+    impl.tcp.close(loop, &impl.close_completion, Impl, impl, onTcpClosed);
 }
 
 fn onTcpClosed(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.CloseError!void) xev.CallbackAction {
     const impl = impl_.?;
+    impl.close_completed = true;
     impl.tcp_initialized = false;
     impl.connected = false;
     if (impl.stopping_on_loop) {
@@ -895,6 +962,28 @@ fn onTcpClosed(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _
     if (!running) return .disarm;
 
     startConnection(impl) catch beginStop(impl, "connection failed");
+    return .disarm;
+}
+
+fn onConnectCanceled(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.CancelError!void) xev.CallbackAction {
+    const impl = impl_.?;
+    impl.connect_cancel_submitted = false;
+    if (comptime builtin.is_test) impl.test_observer.connect_cancel_confirmed.store(true, .release);
+    submitCloseIfReady(impl, loop);
+    return .disarm;
+}
+
+fn onReadCanceled(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.CancelError!void) xev.CallbackAction {
+    const impl = impl_.?;
+    impl.read_cancel_submitted = false;
+    submitCloseIfReady(impl, loop);
+    return .disarm;
+}
+
+fn onWriteCanceled(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.CancelError!void) xev.CallbackAction {
+    const impl = impl_.?;
+    impl.write_cancel_submitted = false;
+    submitCloseIfReady(impl, loop);
     return .disarm;
 }
 
@@ -932,21 +1021,74 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     }
     impl.operations.clearRetainingCapacity();
 
-    if (impl.tcp_initialized and impl.writes.count() == 0) {
-        closeConnection(impl);
-    } else if (!impl.tcp_initialized) {
-        impl.loop.stop();
+    if (impl.connect_active and !impl.connect_cancel_submitted) {
+        impl.connect_cancel_submitted = true;
+        impl.loop.cancel(
+            &impl.connect_completion,
+            &impl.connect_cancel_completion,
+            Impl,
+            impl,
+            onConnectCanceled,
+        );
     }
+    if (impl.read_active and !impl.read_cancel_submitted) {
+        impl.read_cancel_submitted = true;
+        impl.loop.cancel(
+            &impl.read_completion,
+            &impl.read_cancel_completion,
+            Impl,
+            impl,
+            onReadCanceled,
+        );
+    }
+    if (impl.write_queue.head) |request| {
+        if (request.completion.state() == .active) {
+            if (!impl.write_cancel_submitted) {
+                impl.write_cancel_submitted = true;
+                impl.loop.cancel(
+                    &request.completion,
+                    &impl.write_cancel_completion,
+                    Impl,
+                    impl,
+                    onWriteCanceled,
+                );
+            }
+        } else {
+            discardQueuedWrites(impl);
+        }
+    }
+    submitCloseIfReady(impl, &impl.loop);
 }
 
-fn discardWrites(impl: *Impl) void {
-    var iterator = impl.writes.keyIterator();
-    while (iterator.next()) |write_ptr| {
-        const write = write_ptr.*;
+fn discardQueuedWrites(impl: *Impl) void {
+    while (impl.write_queue.pop()) |request| {
+        const write: *WriteRequest = @fieldParentPtr("request", request);
+        _ = impl.writes.remove(write);
         impl.allocator.free(write.bytes);
         impl.allocator.destroy(write);
     }
-    impl.writes.clearRetainingCapacity();
+}
+
+fn observeTestIo(impl: *Impl) void {
+    if (comptime builtin.is_test) {
+        if (impl.test_observer.write_requested.swap(false, .acq_rel)) {
+            if (impl.write_queue.head) |request| {
+                if (request.completion.state() == .active) {
+                    impl.test_observer.write_observed.store(true, .release);
+                    impl.test_observer.write_observed_sem.post(std.testing.io);
+                }
+            }
+        }
+        if (impl.test_observer.connect_requested.load(.acquire) and
+            impl.connect_active and
+            impl.connect_completion.state() == .active)
+        {
+            impl.test_observer.connect_requested.store(false, .release);
+            impl.test_observer.connect_observed.store(true, .release);
+            impl.test_observer.connect_observed_sem.post(std.testing.io);
+            impl.test_observer.connect_release.waitUncancelable(std.testing.io);
+        }
+    }
 }
 
 fn syncIo() std.Io {
@@ -955,6 +1097,15 @@ fn syncIo() std.Io {
 
 fn nowNs() u64 {
     return @intCast(std.Io.Clock.awake.now(syncIo()).nanoseconds);
+}
+
+fn waitForTestFlag(flag: *const std.atomic.Value(bool), timeout_ns: u64) bool {
+    const deadline = nowNs() +| timeout_ns;
+    while (!flag.load(.acquire)) {
+        if (nowNs() >= deadline) return false;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch return false;
+    }
+    return true;
 }
 
 fn nativeHeader(name: []const u8, value: []const u8) c.nghttp2_nv {
@@ -1603,6 +1754,230 @@ test "channel shutdown safely completes an active call before exclusive deinit" 
 
     try std.testing.expect(worker.returned_result);
     try std.testing.expectEqual(status.Code.unavailable, worker.code);
+}
+
+test "channel shutdown cancels an active blocked write" {
+    var listen_address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try listen_address.listen(std.testing.io, .{});
+    defer listener.deinit(std.testing.io);
+
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        listener.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(
+        &target_buffer,
+        "127.0.0.1:{d}",
+        .{std.mem.bigToNative(u16, local_address.port)},
+    );
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    var peer = try listener.accept(std.testing.io);
+    var peer_open = true;
+    defer if (peer_open) peer.close(std.testing.io);
+
+    const send_buffer: c_int = 4096;
+    try std.posix.setsockopt(
+        channel.impl.tcp.fd,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.SNDBUF,
+        std.mem.asBytes(&send_buffer),
+    );
+
+    const flow_control_frames = [_]u8{
+        // SETTINGS_INITIAL_WINDOW_SIZE = 16 MiB - 1.
+        0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x04, 0x00, 0xff, 0xff, 0xff,
+        // Increase the connection window by another 16 MiB - 1.
+        0x00, 0x00, 0x04,
+        0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+        0xff,
+    };
+    var peer_write_buffer: [64]u8 = undefined;
+    var peer_writer = peer.writer(std.testing.io, &peer_write_buffer);
+    try peer_writer.interface.writeAll(&flow_control_frames);
+    try peer_writer.interface.flush();
+
+    const payload = try std.testing.allocator.alloc(u8, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+
+    const Worker = struct {
+        channel: *Channel,
+        payload: []const u8,
+        done: std.atomic.Value(bool) = .init(false),
+        code: status.Code = .unknown,
+        returned_result: bool = false,
+
+        fn run(self: *@This()) void {
+            var result = self.channel.callUnary(
+                std.testing.allocator,
+                "/test.Lifecycle/BlockedWrite",
+                self.payload,
+                .{},
+            ) catch {
+                self.done.store(true, .release);
+                return;
+            };
+            defer result.deinit();
+            self.code = result.status.code;
+            self.returned_result = true;
+            self.done.store(true, .release);
+        }
+    };
+    const Waiter = struct {
+        channel: *Channel,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.channel.wait();
+            self.done.store(true, .release);
+        }
+    };
+
+    var worker = Worker{ .channel = &channel, .payload = payload };
+    const worker_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+
+    const observe_deadline = nowNs() +| 5 * std.time.ns_per_s;
+    while (!channel.impl.test_observer.write_observed.load(.acquire) and nowNs() < observe_deadline) {
+        channel.impl.test_observer.write_requested.store(true, .release);
+        channel.impl.async_handle.notify() catch break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch break;
+    }
+    const write_observed = channel.impl.test_observer.write_observed.load(.acquire);
+    if (!write_observed) {
+        channel.shutdown();
+        peer.close(std.testing.io);
+        peer_open = false;
+        worker_thread.join();
+        channel.wait();
+        try std.testing.expect(write_observed);
+        return;
+    }
+    channel.impl.test_observer.write_observed_sem.waitUncancelable(std.testing.io);
+
+    channel.shutdown();
+    var waiter = Waiter{ .channel = &channel };
+    const waiter_thread = std.Thread.spawn(.{}, Waiter.run, .{&waiter}) catch |err| {
+        peer.close(std.testing.io);
+        peer_open = false;
+        worker_thread.join();
+        channel.wait();
+        return err;
+    };
+    const worker_finished = waitForTestFlag(&worker.done, 5 * std.time.ns_per_s);
+    const waiter_finished = waitForTestFlag(&waiter.done, 5 * std.time.ns_per_s);
+    if (!worker_finished or !waiter_finished) {
+        peer.close(std.testing.io);
+        peer_open = false;
+    }
+    worker_thread.join();
+    waiter_thread.join();
+
+    try std.testing.expect(worker_finished);
+    try std.testing.expect(waiter_finished);
+    try std.testing.expect(worker.returned_result);
+    try std.testing.expectEqual(status.Code.unavailable, worker.code);
+}
+
+test "channel shutdown drains an active reconnect completion" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        server: *server.Server,
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            const connection = self.server.impl.connections.items[0];
+            if (c.nghttp2_submit_goaway(
+                connection.session,
+                c.NGHTTP2_FLAG_NONE,
+                1,
+                c.NGHTTP2_NO_ERROR,
+                null,
+                0,
+            ) != 0) return error.GoAwaySubmissionFailed;
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Waiter = struct {
+        channel: *Channel,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.channel.wait();
+            self.done.store(true, .release);
+        }
+    };
+
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    var handler = Handler{ .server = &test_server };
+    try test_server.registerUnary(
+        "/test.Lifecycle/Reconnect",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+
+    channel.impl.test_observer.connect_requested.store(true, .release);
+    var connect_released = false;
+    defer if (!connect_released) channel.impl.test_observer.connect_release.post(std.testing.io);
+    var result = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Lifecycle/Reconnect",
+        "request",
+        .{},
+    );
+    defer result.deinit();
+    try std.testing.expect(result.status.isOk());
+
+    const connect_observed = waitForTestFlag(
+        &channel.impl.test_observer.connect_observed,
+        5 * std.time.ns_per_s,
+    );
+    if (!connect_observed) {
+        channel.shutdown();
+        channel.impl.test_observer.connect_release.post(std.testing.io);
+        connect_released = true;
+        channel.wait();
+        try std.testing.expect(connect_observed);
+        return;
+    }
+    channel.impl.test_observer.connect_observed_sem.waitUncancelable(std.testing.io);
+
+    channel.shutdown();
+    channel.impl.test_observer.connect_release.post(std.testing.io);
+    connect_released = true;
+    var waiter = Waiter{ .channel = &channel };
+    const waiter_thread = std.Thread.spawn(.{}, Waiter.run, .{&waiter}) catch |err| {
+        channel.wait();
+        return err;
+    };
+    const waiter_finished = waitForTestFlag(&waiter.done, 5 * std.time.ns_per_s);
+    if (!waiter_finished) test_server.shutdown();
+    waiter_thread.join();
+
+    try std.testing.expect(waiter_finished);
+    try std.testing.expect(channel.impl.test_observer.connect_cancel_confirmed.load(.acquire));
+    try std.testing.expect(!channel.impl.connect_active);
+    try std.testing.expect(!channel.impl.connect_cancel_submitted);
+    try std.testing.expect(channel.impl.close_completed);
 }
 
 test "server context observes a wire deadline and overrides a late handler response" {
