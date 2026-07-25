@@ -306,6 +306,7 @@ const Connection = struct {
     highest_accepted_stream_id: i32 = 0,
     pending_writes: usize = 0,
     draining: bool = false,
+    close_after_writes: bool = false,
     closing: bool = false,
     read_active: bool = false,
     read_cancel_submitted: bool = false,
@@ -359,10 +360,18 @@ const Connection = struct {
     }
 
     fn startRead(self: *Connection, loop: *xev.Loop) !void {
-        if (self.closing or self.read_active) return;
+        if (self.close_after_writes or self.closing or self.read_active) return;
         if (self.read_buffer.len == 0) self.read_buffer = try self.server.allocator.alloc(u8, 16 * 1024);
         self.read_active = true;
         self.tcp.read(loop, &self.read_completion, .{ .slice = self.read_buffer }, Connection, self, onRead);
+    }
+
+    fn closeTerminatedSession(self: *Connection, loop: *xev.Loop) void {
+        if (self.closing or
+            c.nghttp2_session_want_read(self.session) != 0 or
+            c.nghttp2_session_want_write(self.session) != 0) return;
+        self.close_after_writes = true;
+        if (self.pending_writes == 0) self.closeOnLoop(loop);
     }
 
     fn close(self: *Connection) void {
@@ -555,7 +564,8 @@ fn onRead(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.
         conn.closeOnLoop(loop);
     } else {
         conn.flush() catch conn.closeOnLoop(loop);
-        conn.startRead(loop) catch conn.closeOnLoop(loop);
+        conn.closeTerminatedSession(loop);
+        if (!conn.close_after_writes) conn.startRead(loop) catch conn.closeOnLoop(loop);
     }
     if (conn.closing) conn.submitCloseIfReady(loop);
     conn.finishCloseIfReady();
@@ -579,6 +589,11 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
         connection.finishCloseIfReady();
         return .disarm;
     };
+    if (connection.close_after_writes and connection.pending_writes == 0) {
+        connection.closeOnLoop(loop);
+        connection.finishCloseIfReady();
+        return .disarm;
+    }
     maybeCloseDrainedConnection(connection);
     connection.finishCloseIfReady();
     return .disarm;
@@ -1228,6 +1243,93 @@ fn deinitTestConnection(connection: *Connection) void {
         std.testing.allocator.destroy(entry.value_ptr.*);
     }
     connection.streams.deinit(std.testing.allocator);
+}
+
+fn exchangeRawHttp2(server: *Server, input: []const u8) ![]u8 {
+    const local_address = try server.localAddress();
+    const address = try std.Io.net.IpAddress.parseIp4(local_address.host, local_address.port);
+    var io_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+    const stream = try address.connect(io, .{
+        .mode = .stream,
+        .timeout = .none,
+    });
+    defer stream.close(io);
+
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    writer.interface.writeAll(input) catch |err| return writer.err orelse err;
+    writer.interface.flush() catch |err| return writer.err orelse err;
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(std.testing.allocator);
+    var read_buffer: [256]u8 = undefined;
+    var reader = stream.reader(io, &.{});
+    while (true) {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&poll_fds, 1000) == 0) return error.TestTimeout;
+        const length = reader.interface.readSliceShort(&read_buffer) catch return reader.err.?;
+        try output.appendSlice(std.testing.allocator, read_buffer[0..length]);
+        if (length == 0) break;
+    }
+    return output.toOwnedSlice(std.testing.allocator);
+}
+
+test "malformed HTTP/2 settings close the connection promptly" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    try server.start();
+
+    const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const cases = [_][]const u8{
+        preface ++ [_]u8{ 0, 0, 1, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0, 0 },
+        preface ++ [_]u8{ 0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 1 },
+    };
+    for (cases) |input| {
+        const output = try exchangeRawHttp2(&server, input);
+        defer std.testing.allocator.free(output);
+        try std.testing.expect(output.len != 0);
+    }
+}
+
+test "invalid HTTP/2 max frame size emits protocol error GOAWAY" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    try server.start();
+
+    const input = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{
+        0, 0,                                 6, c.NGHTTP2_SETTINGS, 0,    0,    0, 0, 0,
+        0, c.NGHTTP2_SETTINGS_MAX_FRAME_SIZE, 0, 0,                  0x3f, 0xff,
+    };
+    const output = try exchangeRawHttp2(&server, input);
+    defer std.testing.allocator.free(output);
+
+    var saw_protocol_error_goaway = false;
+    var offset: usize = 0;
+    while (offset + 9 <= output.len) {
+        const payload_length = (@as(usize, output[offset]) << 16) |
+            (@as(usize, output[offset + 1]) << 8) |
+            output[offset + 2];
+        const end = offset + 9 + payload_length;
+        try std.testing.expect(end <= output.len);
+        if (output[offset + 3] == c.NGHTTP2_GOAWAY and payload_length >= 8) {
+            const payload = output[offset + 9 .. end];
+            const error_code = (@as(u32, payload[4]) << 24) |
+                (@as(u32, payload[5]) << 16) |
+                (@as(u32, payload[6]) << 8) |
+                payload[7];
+            try std.testing.expectEqual(@as(u32, c.NGHTTP2_PROTOCOL_ERROR), error_code);
+            saw_protocol_error_goaway = true;
+        }
+        offset = end;
+    }
+    try std.testing.expectEqual(output.len, offset);
+    try std.testing.expect(saw_protocol_error_goaway);
 }
 
 test "server validates registration and has deterministic lifecycle" {

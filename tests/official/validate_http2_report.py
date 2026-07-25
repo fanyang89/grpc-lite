@@ -6,13 +6,13 @@ from pathlib import Path
 
 
 REQUIRED_PASSES = {
+    "TestSoonClientPrefaceWithStreamId",
+    "TestSoonClientShortSettings",
     "TestSoonShortPreface",
     "TestSoonUnknownFrameType",
     "TestSoonAllSettingsFramesAcked",
 }
-KNOWN_FAILURES = {
-    "TestSoonClientShortSettings",
-    "TestSoonClientPrefaceWithStreamId",
+UPSTREAM_HARNESS_LIMITATIONS = {
     "TestSoonSmallMaxFrameSize",
 }
 EXPECTED_SKIPS = {
@@ -35,7 +35,7 @@ def validate(report: dict) -> list[str]:
         return ["HTTP/2 report does not contain a cases list"]
 
     cases = {entry.get("name"): entry for entry in entries}
-    expected = REQUIRED_PASSES | KNOWN_FAILURES | EXPECTED_SKIPS
+    expected = REQUIRED_PASSES | UPSTREAM_HARNESS_LIMITATIONS | EXPECTED_SKIPS
     errors = [
         f"missing expected case: {name}" for name in sorted(expected - cases.keys())
     ]
@@ -45,9 +45,14 @@ def validate(report: dict) -> list[str]:
         if not case.get("passed") or case.get("skipped"):
             errors.append(f"required framing case did not pass: {name}")
 
-    for name in sorted(KNOWN_FAILURES & cases.keys()):
-        if cases[name].get("skipped"):
-            errors.append(f"known framing case was unexpectedly skipped: {name}")
+    for name in sorted(UPSTREAM_HARNESS_LIMITATIONS & cases.keys()):
+        case = cases[name]
+        if case.get("skipped"):
+            errors.append(
+                f"upstream harness limitation was unexpectedly skipped: {name}"
+            )
+        if case.get("passed"):
+            errors.append(f"upstream harness limitation unexpectedly passed: {name}")
 
     for name in sorted(EXPECTED_SKIPS & cases.keys()):
         if not cases[name].get("skipped"):
@@ -78,13 +83,10 @@ def main() -> int:
             print(error, file=sys.stderr)
         return 1
 
-    remaining = [
-        case["name"]
-        for case in report["cases"]
-        if case["name"] in KNOWN_FAILURES and not case.get("passed")
-    ]
+    limitations = sorted(UPSTREAM_HARNESS_LIMITATIONS)
     print(
-        f"HTTP/2 framing baseline validated; known failures remaining: {len(remaining)}"
+        "HTTP/2 framing report validated; upstream harness limitations: "
+        + ", ".join(limitations)
     )
     return 0
 
