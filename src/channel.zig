@@ -9,6 +9,7 @@ const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
 const status = @import("status.zig");
+const stream = @import("stream.zig");
 const version = @import("version.zig");
 
 const ChannelOptions = struct {
@@ -22,6 +23,7 @@ const AllocatorOperation = enum { alloc, resize, remap, free };
 const SerializedAllocator = struct {
     backing: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
+    references: std.atomic.Value(usize) = .init(1),
     test_hook_context: if (builtin.is_test) std.atomic.Value(?*anyopaque) else void = if (builtin.is_test) .init(null) else {},
     test_before_lock: if (builtin.is_test) std.atomic.Value(?*const fn (?*anyopaque, AllocatorOperation) void) else void = if (builtin.is_test) .init(null) else {},
 
@@ -39,6 +41,17 @@ const SerializedAllocator = struct {
                 .free = free,
             },
         };
+    }
+
+    fn retain(self: *SerializedAllocator) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *SerializedAllocator) void {
+        if (self.references.fetchSub(1, .acq_rel) == 1) {
+            const backing = self.backing;
+            backing.destroy(self);
+        }
     }
 
     fn lock(self: *SerializedAllocator, operation: AllocatorOperation) void {
@@ -104,10 +117,13 @@ pub const Channel = struct {
         const parsed = try parseTarget(target);
         const impl = try allocator.create(Impl);
         errdefer allocator.destroy(impl);
+        const serialized_allocator = try allocator.create(SerializedAllocator);
+        errdefer allocator.destroy(serialized_allocator);
+        serialized_allocator.* = .init(allocator);
 
         impl.* = .{
             .backing_allocator = allocator,
-            .serialized_allocator = .init(allocator),
+            .serialized_allocator = serialized_allocator,
             .allocator = undefined,
             .host = undefined,
             .port = parsed.port,
@@ -116,7 +132,7 @@ pub const Channel = struct {
             .async_handle = undefined,
             .deadline_timer = undefined,
         };
-        impl.allocator = impl.serialized_allocator.allocator();
+        impl.allocator = serialized_allocator.allocator();
 
         const host = try impl.allocator.dupeZ(u8, parsed.host);
         errdefer impl.allocator.free(host);
@@ -182,6 +198,39 @@ pub const Channel = struct {
         return result;
     }
 
+    /// Opens an event-driven raw duplex stream. Input slices are copied before return.
+    pub fn openStream(
+        self: *Channel,
+        full_method_path: []const u8,
+        options: stream.Options,
+        callbacks: stream.ClientCallbacks,
+    ) !stream.ClientStream {
+        if (!isValidMethodPath(full_method_path)) return error.InvalidMethodPath;
+        try options.limits.validate();
+
+        const client_stream = try ClientStreamState.init(
+            self.impl,
+            full_method_path,
+            options,
+            callbacks,
+        );
+        errdefer client_stream.destroyUnqueued();
+
+        self.impl.mutex.lockUncancelable(syncIo());
+        defer self.impl.mutex.unlock(syncIo());
+        if (self.impl.state != .running or !self.impl.accepting_streams) {
+            return error.ChannelUnavailable;
+        }
+        try self.impl.stream_states.put(self.impl.allocator, client_stream, {});
+        errdefer _ = self.impl.stream_states.remove(client_stream);
+        appendStreamWake(self.impl, client_stream);
+        self.impl.async_handle.notify() catch {
+            removeStreamWake(self.impl, client_stream);
+            return error.ChannelUnavailable;
+        };
+        return client_stream.handle();
+    }
+
     /// May be called concurrently with active calls and causes them to finish promptly.
     pub fn shutdown(self: *Channel) void {
         const impl = self.impl;
@@ -213,6 +262,8 @@ pub const Channel = struct {
 
         impl.pending.deinit(impl.allocator);
         impl.operations.deinit(impl.allocator);
+        impl.stream_states.deinit(impl.allocator);
+        impl.streams.deinit(impl.allocator);
         impl.writes.deinit(impl.allocator);
         impl.async_handle.deinit();
         impl.deadline_timer.deinit();
@@ -220,7 +271,9 @@ pub const Channel = struct {
         impl.allocator.free(impl.authority);
         impl.allocator.free(impl.host);
         const backing_allocator = impl.backing_allocator;
+        const serialized_allocator = impl.serialized_allocator;
         backing_allocator.destroy(impl);
+        serialized_allocator.release();
         self.* = undefined;
     }
 };
@@ -244,7 +297,7 @@ const TestObserver = if (builtin.is_test) struct {
 
 const Impl = struct {
     backing_allocator: std.mem.Allocator,
-    serialized_allocator: SerializedAllocator,
+    serialized_allocator: *SerializedAllocator,
     allocator: std.mem.Allocator,
     host: [:0]u8,
     port: u16,
@@ -256,6 +309,11 @@ const Impl = struct {
     thread: ?std.Thread = null,
     pending: std.ArrayList(*Operation) = .empty,
     operations: std.AutoHashMapUnmanaged(i32, *Operation) = .empty,
+    stream_states: std.AutoHashMapUnmanaged(*ClientStreamState, void) = .empty,
+    streams: std.AutoHashMapUnmanaged(i32, *ClientStreamState) = .empty,
+    stream_wake_head: ?*ClientStreamState = null,
+    stream_wake_tail: ?*ClientStreamState = null,
+    accepting_streams: bool = false,
     loop: xev.Loop = undefined,
     tcp: xev.TCP = undefined,
     connect_completion: xev.Completion = .{},
@@ -317,6 +375,276 @@ const Impl = struct {
         self.mutex.unlock(syncIo());
     }
 };
+
+const OutboundMessage = struct {
+    frame_bytes: []u8,
+    offset: usize = 0,
+};
+
+const InboundMessage = struct {
+    payload: []u8,
+    compression: Compression,
+    buffered_size: usize,
+};
+
+threadlocal var active_client_callback: ?*ClientStreamState = null;
+
+const ClientStreamState = struct {
+    impl: ?*Impl,
+    allocator: std.mem.Allocator,
+    allocator_owner: *SerializedAllocator,
+    path: []u8,
+    request_metadata: metadata.Metadata,
+    callbacks: stream.ClientCallbacks,
+    limits: stream.BufferLimits,
+    deadline_ns: ?u64,
+    timeout_header: [16]u8 = undefined,
+    timeout_header_len: usize = 0,
+    mutex: std.Io.Mutex = .init,
+    callback_mutex: std.Io.Mutex = .init,
+    app_owned: bool = true,
+    loop_owned: bool = true,
+    app_released: bool = false,
+    terminal: bool = false,
+    send_open: bool = true,
+    cancel_requested: bool = false,
+    resume_requested: bool = false,
+    backpressure_requested: bool = false,
+    outbound: std.ArrayList(OutboundMessage) = .empty,
+    outbound_head: usize = 0,
+    outbound_buffered: usize = 0,
+    stream_id: i32 = -1,
+    wake_queued: bool = false,
+    wake_next: ?*ClientStreamState = null,
+    provider_deferred: bool = false,
+    provider_eof: bool = false,
+    rst_submitted: bool = false,
+    deadline_expired: bool = false,
+    receive_paused: bool = false,
+    inbound: std.ArrayList(InboundMessage) = .empty,
+    inbound_head: usize = 0,
+    inbound_buffered: usize = 0,
+    decoder: frame.Decoder,
+    response_compression: Compression = .identity,
+    response_encoding_invalid: bool = false,
+    response_metadata_invalid: bool = false,
+    saw_response_headers: bool = false,
+    headers_called: bool = false,
+    remote_end_seen: bool = false,
+    remote_end_called: bool = false,
+    transport_closed: bool = false,
+    stream_error: u32 = c.NGHTTP2_NO_ERROR,
+    http_status: ?u16 = null,
+    content_type_grpc: bool = false,
+    grpc_status: ?u32 = null,
+    grpc_message: ?[]u8 = null,
+    initial_metadata: metadata.Metadata,
+    trailing_metadata: metadata.Metadata,
+    block_kind: HeaderKind = .none,
+    block_metadata: metadata.Metadata,
+    block_grpc_status: ?u32 = null,
+    block_grpc_message: ?[]u8 = null,
+    forced_status: ?status.Status = null,
+
+    fn init(
+        impl: *Impl,
+        path: []const u8,
+        options: stream.Options,
+        callbacks: stream.ClientCallbacks,
+    ) !*ClientStreamState {
+        const self = try impl.allocator.create(ClientStreamState);
+        errdefer impl.allocator.destroy(self);
+        impl.serialized_allocator.retain();
+        errdefer impl.serialized_allocator.release();
+        const owned_path = try impl.allocator.dupe(u8, path);
+        errdefer impl.allocator.free(owned_path);
+        self.* = .{
+            .impl = impl,
+            .allocator = impl.allocator,
+            .allocator_owner = impl.serialized_allocator,
+            .path = owned_path,
+            .request_metadata = metadata.Metadata.init(impl.allocator),
+            .callbacks = callbacks,
+            .limits = options.limits,
+            .deadline_ns = if (options.timeout_ns) |timeout| nowNs() +| timeout else null,
+            .decoder = frame.Decoder.init(impl.allocator, options.limits.max_message_size),
+            .initial_metadata = metadata.Metadata.init(impl.allocator),
+            .trailing_metadata = metadata.Metadata.init(impl.allocator),
+            .block_metadata = metadata.Metadata.init(impl.allocator),
+        };
+        errdefer self.request_metadata.deinit();
+        errdefer self.decoder.deinit();
+        errdefer self.initial_metadata.deinit();
+        errdefer self.trailing_metadata.deinit();
+        errdefer self.block_metadata.deinit();
+        for (options.metadata) |entry| {
+            if (!isRequestMetadata(entry.key)) return error.InvalidMetadataKey;
+            try self.request_metadata.append(entry.key, entry.value);
+        }
+        return self;
+    }
+
+    fn handle(self: *ClientStreamState) stream.ClientStream {
+        return stream.ClientStream.init(
+            self,
+            clientStreamSend,
+            clientStreamCloseSend,
+            clientStreamCancel,
+            clientStreamResumeReceive,
+            clientStreamRelease,
+        );
+    }
+
+    fn destroyUnqueued(self: *ClientStreamState) void {
+        self.app_owned = false;
+        self.loop_owned = false;
+        self.destroy();
+    }
+
+    fn destroy(self: *ClientStreamState) void {
+        const allocator = self.allocator;
+        const allocator_owner = self.allocator_owner;
+        allocator.free(self.path);
+        self.request_metadata.deinit();
+        for (self.outbound.items[self.outbound_head..]) |item| allocator.free(item.frame_bytes);
+        self.outbound.deinit(allocator);
+        for (self.inbound.items[self.inbound_head..]) |item| allocator.free(item.payload);
+        self.inbound.deinit(allocator);
+        self.decoder.deinit();
+        if (self.grpc_message) |value| allocator.free(value);
+        if (self.block_grpc_message) |value| allocator.free(value);
+        self.initial_metadata.deinit();
+        self.trailing_metadata.deinit();
+        self.block_metadata.deinit();
+        allocator.destroy(self);
+        allocator_owner.release();
+    }
+
+    fn resetHeaderBlock(self: *ClientStreamState, kind: HeaderKind) void {
+        self.block_metadata.deinit();
+        self.block_metadata = metadata.Metadata.init(self.allocator);
+        if (self.block_grpc_message) |value| self.allocator.free(value);
+        self.block_grpc_message = null;
+        self.block_grpc_status = null;
+        self.block_kind = kind;
+    }
+};
+
+fn appendStreamWake(impl: *Impl, client_stream: *ClientStreamState) void {
+    std.debug.assert(!client_stream.wake_queued);
+    client_stream.wake_queued = true;
+    client_stream.wake_next = null;
+    if (impl.stream_wake_tail) |tail| {
+        tail.wake_next = client_stream;
+    } else {
+        impl.stream_wake_head = client_stream;
+    }
+    impl.stream_wake_tail = client_stream;
+}
+
+fn removeStreamWake(impl: *Impl, client_stream: *ClientStreamState) void {
+    var previous: ?*ClientStreamState = null;
+    var current = impl.stream_wake_head;
+    while (current) |item| : (current = item.wake_next) {
+        if (item != client_stream) {
+            previous = item;
+            continue;
+        }
+        if (previous) |before| {
+            before.wake_next = item.wake_next;
+        } else {
+            impl.stream_wake_head = item.wake_next;
+        }
+        if (impl.stream_wake_tail == item) impl.stream_wake_tail = previous;
+        item.wake_queued = false;
+        item.wake_next = null;
+        return;
+    }
+}
+
+fn wakeClientStreamLocked(client_stream: *ClientStreamState) void {
+    const impl = client_stream.impl orelse return;
+    if (!client_stream.loop_owned) return;
+    impl.mutex.lockUncancelable(syncIo());
+    if (impl.stream_states.contains(client_stream) and !client_stream.wake_queued) {
+        appendStreamWake(impl, client_stream);
+    }
+    impl.mutex.unlock(syncIo());
+    impl.async_handle.notify() catch {};
+}
+
+fn clientStreamSend(context: *anyopaque, payload: []const u8, options: stream.SendOptions) !void {
+    const client_stream: *ClientStreamState = @ptrCast(@alignCast(context));
+    if (payload.len > client_stream.limits.max_message_size) return error.MessageTooLarge;
+    client_stream.mutex.lockUncancelable(syncIo());
+    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or client_stream.terminal) {
+        client_stream.mutex.unlock(syncIo());
+        return error.StreamClosed;
+    }
+    client_stream.mutex.unlock(syncIo());
+
+    const encoded = try frame.encodeWithCompression(client_stream.allocator, payload, options.compression);
+    var owned = true;
+    defer if (owned) client_stream.allocator.free(encoded);
+
+    client_stream.mutex.lockUncancelable(syncIo());
+    defer client_stream.mutex.unlock(syncIo());
+    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or client_stream.terminal) return error.StreamClosed;
+    if (!client_stream.send_open) return error.SendClosed;
+    if (encoded.len > client_stream.limits.max_outbound_buffer_size) return error.OutboundBufferLimitExceeded;
+    if (encoded.len > client_stream.limits.max_outbound_buffer_size - client_stream.outbound_buffered) {
+        client_stream.backpressure_requested = true;
+        return error.WouldBlock;
+    }
+    try client_stream.outbound.append(client_stream.allocator, .{ .frame_bytes = encoded });
+    client_stream.outbound_buffered += encoded.len;
+    owned = false;
+    wakeClientStreamLocked(client_stream);
+}
+
+fn clientStreamCloseSend(context: *anyopaque) !void {
+    const client_stream: *ClientStreamState = @ptrCast(@alignCast(context));
+    client_stream.mutex.lockUncancelable(syncIo());
+    defer client_stream.mutex.unlock(syncIo());
+    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or client_stream.terminal) return error.StreamClosed;
+    if (!client_stream.send_open) return error.SendClosed;
+    client_stream.send_open = false;
+    wakeClientStreamLocked(client_stream);
+}
+
+fn clientStreamCancel(context: *anyopaque) void {
+    const client_stream: *ClientStreamState = @ptrCast(@alignCast(context));
+    client_stream.mutex.lockUncancelable(syncIo());
+    defer client_stream.mutex.unlock(syncIo());
+    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or client_stream.terminal) return;
+    client_stream.cancel_requested = true;
+    wakeClientStreamLocked(client_stream);
+}
+
+fn clientStreamResumeReceive(context: *anyopaque) !void {
+    const client_stream: *ClientStreamState = @ptrCast(@alignCast(context));
+    client_stream.mutex.lockUncancelable(syncIo());
+    defer client_stream.mutex.unlock(syncIo());
+    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or client_stream.terminal) return error.StreamClosed;
+    client_stream.resume_requested = true;
+    wakeClientStreamLocked(client_stream);
+}
+
+fn clientStreamRelease(context: *anyopaque) void {
+    const client_stream: *ClientStreamState = @ptrCast(@alignCast(context));
+    const called_from_callback = active_client_callback == client_stream;
+    if (!called_from_callback) client_stream.callback_mutex.lockUncancelable(syncIo());
+    client_stream.mutex.lockUncancelable(syncIo());
+    std.debug.assert(client_stream.app_owned);
+    client_stream.app_owned = false;
+    client_stream.app_released = true;
+    client_stream.cancel_requested = true;
+    const loop_owned = client_stream.loop_owned;
+    if (loop_owned) wakeClientStreamLocked(client_stream);
+    client_stream.mutex.unlock(syncIo());
+    if (!called_from_callback) client_stream.callback_mutex.unlock(syncIo());
+    if (!loop_owned) client_stream.destroy();
+}
 
 const HeaderKind = enum { none, response, trailers };
 
@@ -442,8 +770,12 @@ const Operation = struct {
         self.block_kind = kind;
     }
 
-    fn finishHeaderBlock(self: *Operation) !void {
+    fn finishHeaderBlock(self: *Operation, end_stream: bool) !bool {
         const trailers_only = self.block_kind == .response and self.block_grpc_status != null;
+        if (trailers_only and !end_stream) {
+            self.block_kind = .none;
+            return false;
+        }
         const destination = if (self.block_kind == .trailers or trailers_only)
             &self.trailing_metadata
         else
@@ -456,6 +788,7 @@ const Operation = struct {
             self.block_grpc_message = null;
         }
         self.block_kind = .none;
+        return true;
     }
 
     fn finalize(self: *Operation, stream_error: u32) void {
@@ -464,7 +797,8 @@ const Operation = struct {
             return;
         }
         if (stream_error != c.NGHTTP2_NO_ERROR) {
-            self.setOutcome(.unavailable, "stream closed") catch {};
+            const mapped = streamErrorStatus(stream_error);
+            self.setOutcome(mapped.code, mapped.message) catch {};
             self.complete();
             return;
         }
@@ -607,6 +941,9 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
         return .disarm;
     };
     impl.connection_state = .active;
+    impl.mutex.lockUncancelable(syncIo());
+    impl.accepting_streams = true;
+    impl.mutex.unlock(syncIo());
     impl.signalStartup(true);
     processPending(impl);
     return .disarm;
@@ -626,10 +963,11 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
         beginStop(impl, "channel closed");
         return .disarm;
     }
+    processStreamWakes(impl);
     switch (impl.connection_state) {
         .active => processPending(impl),
         .draining => {
-            if (impl.operations.count() == 0) beginReconnect(impl);
+            if (impl.operations.count() == 0 and impl.streams.count() == 0) beginReconnect(impl);
             scheduleDeadlineTimer(impl);
         },
         .connecting, .closing => scheduleDeadlineTimer(impl),
@@ -670,6 +1008,434 @@ fn processPending(impl: *Impl) void {
         return;
     };
     scheduleDeadlineTimer(impl);
+}
+
+fn popStreamWake(impl: *Impl) ?*ClientStreamState {
+    impl.mutex.lockUncancelable(syncIo());
+    defer impl.mutex.unlock(syncIo());
+    const client_stream = impl.stream_wake_head orelse return null;
+    impl.stream_wake_head = client_stream.wake_next;
+    if (impl.stream_wake_head == null) impl.stream_wake_tail = null;
+    client_stream.wake_queued = false;
+    client_stream.wake_next = null;
+    return client_stream;
+}
+
+fn processStreamWakes(impl: *Impl) void {
+    while (popStreamWake(impl)) |client_stream| {
+        if (client_stream.stream_id < 0) {
+            client_stream.mutex.lockUncancelable(syncIo());
+            const canceled = client_stream.cancel_requested or client_stream.app_released;
+            client_stream.mutex.unlock(syncIo());
+            if (canceled) {
+                terminalizeStream(client_stream, .init(.cancelled, "stream cancelled"));
+                releaseStreamLoopOwnership(client_stream);
+                continue;
+            }
+            if (client_stream.deadline_ns) |deadline| {
+                const now = nowNs();
+                if (deadline <= now) {
+                    client_stream.deadline_expired = true;
+                    terminalizeStream(client_stream, .init(.deadline_exceeded, "deadline exceeded"));
+                    releaseStreamLoopOwnership(client_stream);
+                    continue;
+                }
+                client_stream.timeout_header_len = deadline_wire.formatTimeout(
+                    &client_stream.timeout_header,
+                    deadline - now,
+                ).len;
+            }
+            if (impl.connection_state != .active) {
+                terminalizeStream(client_stream, .init(.unavailable, "connection is unavailable"));
+                releaseStreamLoopOwnership(client_stream);
+                continue;
+            }
+            submitClientStream(impl, client_stream) catch {
+                terminalizeStream(client_stream, .init(.unavailable, "stream submission failed"));
+                releaseStreamLoopOwnership(client_stream);
+                continue;
+            };
+        }
+        processClientStreamCommands(client_stream) catch {
+            beginStop(impl, "stream command failed");
+            return;
+        };
+    }
+    if (impl.connected) flush(impl) catch {
+        beginStop(impl, "connection failed");
+        return;
+    };
+    scheduleDeadlineTimer(impl);
+}
+
+fn submitClientStream(impl: *Impl, client_stream: *ClientStreamState) !void {
+    try impl.streams.ensureUnusedCapacity(impl.allocator, 1);
+    var headers: std.ArrayList(c.nghttp2_nv) = .empty;
+    defer headers.deinit(impl.allocator);
+    var encoded_values: std.ArrayList([]u8) = .empty;
+    defer {
+        for (encoded_values.items) |value| impl.allocator.free(value);
+        encoded_values.deinit(impl.allocator);
+    }
+    try headers.append(impl.allocator, nativeHeader(":method", "POST"));
+    try headers.append(impl.allocator, nativeHeader(":scheme", "http"));
+    try headers.append(impl.allocator, nativeHeader(":path", client_stream.path));
+    try headers.append(impl.allocator, nativeHeader(":authority", impl.authority));
+    try headers.append(impl.allocator, nativeHeader("content-type", "application/grpc"));
+    try headers.append(impl.allocator, nativeHeader("te", "trailers"));
+    try headers.append(impl.allocator, nativeHeader("grpc-encoding", "gzip"));
+    try headers.append(impl.allocator, nativeHeader("grpc-accept-encoding", "identity,gzip"));
+    try headers.append(impl.allocator, nativeHeader("user-agent", impl.user_agent));
+    if (client_stream.timeout_header_len != 0) {
+        try headers.append(impl.allocator, nativeHeader(
+            "grpc-timeout",
+            client_stream.timeout_header[0..client_stream.timeout_header_len],
+        ));
+    }
+    for (client_stream.request_metadata.items()) |entry| {
+        const value = try metadata.encodeValue(impl.allocator, entry.key, entry.value);
+        encoded_values.append(impl.allocator, value) catch |err| {
+            impl.allocator.free(value);
+            return err;
+        };
+        try headers.append(impl.allocator, nativeHeader(entry.key, value));
+    }
+
+    var provider: c.nghttp2_data_provider2 = .{
+        .source = .{ .ptr = client_stream },
+        .read_callback = readClientStreamData,
+    };
+    const stream_id = c.nghttp2_submit_request2(
+        impl.session,
+        null,
+        headers.items.ptr,
+        headers.items.len,
+        &provider,
+        client_stream,
+    );
+    if (stream_id < 0) return error.NativeFailure;
+    client_stream.stream_id = stream_id;
+    impl.streams.putAssumeCapacity(stream_id, client_stream);
+}
+
+fn processClientStreamCommands(client_stream: *ClientStreamState) !void {
+    const impl = client_stream.impl orelse return;
+    client_stream.mutex.lockUncancelable(syncIo());
+    const app_released = client_stream.app_released;
+    const cancel_requested = client_stream.cancel_requested or app_released;
+    const should_resume_data = client_stream.provider_deferred and
+        (client_stream.outbound_head < client_stream.outbound.items.len or !client_stream.send_open);
+    const resume_receive = client_stream.resume_requested;
+    client_stream.resume_requested = false;
+    if (should_resume_data) client_stream.provider_deferred = false;
+    client_stream.mutex.unlock(syncIo());
+
+    if (client_stream.transport_closed) {
+        if (cancel_requested) {
+            terminalizeStream(client_stream, .init(.cancelled, "stream cancelled"));
+            releaseStreamLoopOwnership(client_stream);
+        } else if (resume_receive) {
+            try deliverInboundMessages(client_stream);
+        }
+        return;
+    }
+
+    if (cancel_requested and !client_stream.rst_submitted) {
+        if (!app_released) setForcedStreamStatus(client_stream, .init(.cancelled, "stream cancelled"));
+        if (c.nghttp2_submit_rst_stream(
+            impl.session,
+            c.NGHTTP2_FLAG_NONE,
+            client_stream.stream_id,
+            c.NGHTTP2_CANCEL,
+        ) != 0) return error.NativeFailure;
+        client_stream.rst_submitted = true;
+    }
+    if (should_resume_data and !client_stream.rst_submitted) {
+        if (c.nghttp2_session_resume_data(impl.session, client_stream.stream_id) != 0) {
+            return error.NativeFailure;
+        }
+    }
+    if (resume_receive and !client_stream.rst_submitted) try deliverInboundMessages(client_stream);
+}
+
+fn readClientStreamData(
+    _: ?*c.nghttp2_session,
+    _: i32,
+    output: [*c]u8,
+    output_length: usize,
+    data_flags: ?*u32,
+    source: ?*c.nghttp2_data_source,
+    _: ?*anyopaque,
+) callconv(.c) c.nghttp2_ssize {
+    const client_stream: *ClientStreamState = @ptrCast(@alignCast(source.?.*.ptr.?));
+    client_stream.mutex.lockUncancelable(syncIo());
+    if (client_stream.outbound_head == client_stream.outbound.items.len) {
+        if (!client_stream.send_open) {
+            client_stream.provider_eof = true;
+            data_flags.?.* |= c.NGHTTP2_DATA_FLAG_EOF;
+            client_stream.mutex.unlock(syncIo());
+            return 0;
+        }
+        client_stream.provider_deferred = true;
+        client_stream.mutex.unlock(syncIo());
+        return c.NGHTTP2_ERR_DEFERRED;
+    }
+
+    var item = &client_stream.outbound.items[client_stream.outbound_head];
+    const remaining = item.frame_bytes[item.offset..];
+    const length = @min(remaining.len, output_length);
+    @memcpy(output[0..length], remaining[0..length]);
+    item.offset += length;
+    var notify_writable = false;
+    if (item.offset == item.frame_bytes.len) {
+        client_stream.outbound_buffered -= item.frame_bytes.len;
+        client_stream.allocator.free(item.frame_bytes);
+        client_stream.outbound_head += 1;
+        if (client_stream.outbound_head == client_stream.outbound.items.len) {
+            client_stream.outbound.clearRetainingCapacity();
+            client_stream.outbound_head = 0;
+            if (!client_stream.send_open) {
+                client_stream.provider_eof = true;
+                data_flags.?.* |= c.NGHTTP2_DATA_FLAG_EOF;
+            }
+        }
+        if (client_stream.backpressure_requested) {
+            client_stream.backpressure_requested = false;
+            notify_writable = true;
+        }
+    }
+    const callbacks_enabled = client_stream.app_owned and !client_stream.app_released and !client_stream.terminal;
+    client_stream.mutex.unlock(syncIo());
+    if (notify_writable and callbacks_enabled) {
+        invokeWritableCallback(client_stream);
+    }
+    return @intCast(length);
+}
+
+fn setForcedStreamStatus(client_stream: *ClientStreamState, value: status.Status) void {
+    if (client_stream.forced_status == null) client_stream.forced_status = value;
+}
+
+fn callbacksEnabled(client_stream: *ClientStreamState) bool {
+    client_stream.mutex.lockUncancelable(syncIo());
+    defer client_stream.mutex.unlock(syncIo());
+    return client_stream.app_owned and !client_stream.app_released and !client_stream.terminal;
+}
+
+fn beginClientCallback(client_stream: *ClientStreamState) bool {
+    client_stream.callback_mutex.lockUncancelable(syncIo());
+    if (!callbacksEnabled(client_stream)) {
+        client_stream.callback_mutex.unlock(syncIo());
+        return false;
+    }
+    std.debug.assert(active_client_callback == null);
+    active_client_callback = client_stream;
+    return true;
+}
+
+fn endClientCallback(client_stream: *ClientStreamState) void {
+    std.debug.assert(active_client_callback == client_stream);
+    active_client_callback = null;
+    client_stream.callback_mutex.unlock(syncIo());
+}
+
+fn beginTerminalCallback(client_stream: *ClientStreamState) bool {
+    client_stream.callback_mutex.lockUncancelable(syncIo());
+    client_stream.mutex.lockUncancelable(syncIo());
+    const enabled = client_stream.app_owned and !client_stream.app_released;
+    client_stream.mutex.unlock(syncIo());
+    if (!enabled) {
+        client_stream.callback_mutex.unlock(syncIo());
+        return false;
+    }
+    std.debug.assert(active_client_callback == null);
+    active_client_callback = client_stream;
+    return true;
+}
+
+fn invokeWritableCallback(client_stream: *ClientStreamState) void {
+    const callback = client_stream.callbacks.on_writable orelse return;
+    if (!beginClientCallback(client_stream)) return;
+    defer endClientCallback(client_stream);
+    callback(client_stream.callbacks.context, client_stream.handle());
+}
+
+fn invokeHeadersCallback(client_stream: *ClientStreamState) void {
+    const callback = client_stream.callbacks.on_headers orelse return;
+    if (!beginClientCallback(client_stream)) return;
+    defer endClientCallback(client_stream);
+    callback(
+        client_stream.callbacks.context,
+        client_stream.handle(),
+        &client_stream.initial_metadata,
+    );
+}
+
+fn invokeMessageCallback(
+    client_stream: *ClientStreamState,
+    payload: []const u8,
+    compression: Compression,
+) ?stream.ReceiveAction {
+    if (!beginClientCallback(client_stream)) return null;
+    defer endClientCallback(client_stream);
+    return client_stream.callbacks.on_message(
+        client_stream.callbacks.context,
+        client_stream.handle(),
+        payload,
+        compression,
+    );
+}
+
+fn terminalizeStream(client_stream: *ClientStreamState, final_status: status.Status) void {
+    client_stream.mutex.lockUncancelable(syncIo());
+    if (client_stream.terminal) {
+        client_stream.mutex.unlock(syncIo());
+        return;
+    }
+    client_stream.terminal = true;
+    const notify = client_stream.app_owned and !client_stream.app_released;
+    client_stream.mutex.unlock(syncIo());
+    if (notify) {
+        if (!beginTerminalCallback(client_stream)) return;
+        defer endClientCallback(client_stream);
+        client_stream.callbacks.on_terminal(
+            client_stream.callbacks.context,
+            client_stream.handle(),
+            final_status,
+            &client_stream.trailing_metadata,
+        );
+    }
+}
+
+fn releaseStreamLoopOwnership(client_stream: *ClientStreamState) void {
+    client_stream.mutex.lockUncancelable(syncIo());
+    std.debug.assert(client_stream.loop_owned);
+    const impl = client_stream.impl orelse unreachable;
+    impl.mutex.lockUncancelable(syncIo());
+    if (client_stream.wake_queued) removeStreamWake(impl, client_stream);
+    _ = impl.stream_states.remove(client_stream);
+    impl.mutex.unlock(syncIo());
+    client_stream.loop_owned = false;
+    client_stream.impl = null;
+    const destroy = !client_stream.app_owned;
+    client_stream.mutex.unlock(syncIo());
+    if (destroy) client_stream.destroy();
+}
+
+fn queueInboundMessage(client_stream: *ClientStreamState, decoded: frame.Decoder.DecodedMessage) !void {
+    const buffered_size = std.math.add(usize, decoded.payload.len, frame.header_size) catch
+        return error.BufferLimitExceeded;
+    if (buffered_size > client_stream.limits.max_inbound_buffer_size -| client_stream.inbound_buffered) {
+        return error.BufferLimitExceeded;
+    }
+    try client_stream.inbound.append(client_stream.allocator, .{
+        .payload = decoded.payload,
+        .compression = if (decoded.compressed) .gzip else .identity,
+        .buffered_size = buffered_size,
+    });
+    client_stream.inbound_buffered += buffered_size;
+}
+
+fn decodeAvailableMessages(client_stream: *ClientStreamState) !void {
+    while (try client_stream.decoder.nextMessage()) |decoded| {
+        var owned = true;
+        defer if (owned) client_stream.allocator.free(decoded.payload);
+        if (!callbacksEnabled(client_stream)) continue;
+        if (client_stream.receive_paused) {
+            try queueInboundMessage(client_stream, decoded);
+            owned = false;
+            continue;
+        }
+        const action = invokeMessageCallback(
+            client_stream,
+            decoded.payload,
+            if (decoded.compressed) .gzip else .identity,
+        ) orelse continue;
+        if (action == .pause) client_stream.receive_paused = true;
+    }
+}
+
+fn deliverInboundMessages(client_stream: *ClientStreamState) !void {
+    client_stream.receive_paused = false;
+    while (client_stream.inbound_head < client_stream.inbound.items.len and
+        !client_stream.receive_paused and callbacksEnabled(client_stream))
+    {
+        const item = client_stream.inbound.items[client_stream.inbound_head];
+        client_stream.inbound_head += 1;
+        client_stream.inbound_buffered -= item.buffered_size;
+        const action = invokeMessageCallback(
+            client_stream,
+            item.payload,
+            item.compression,
+        ) orelse .continue_receiving;
+        client_stream.allocator.free(item.payload);
+        if (action == .pause) client_stream.receive_paused = true;
+    }
+    if (client_stream.inbound_head == client_stream.inbound.items.len) {
+        client_stream.inbound.clearRetainingCapacity();
+        client_stream.inbound_head = 0;
+    }
+    if (!client_stream.receive_paused) try decodeAvailableMessages(client_stream);
+    if (client_stream.transport_closed and !client_stream.receive_paused and
+        client_stream.inbound_head == client_stream.inbound.items.len)
+    {
+        finalizeClientStream(client_stream);
+        releaseStreamLoopOwnership(client_stream);
+    }
+}
+
+fn notifyRemoteEnd(client_stream: *ClientStreamState) void {
+    if (!client_stream.remote_end_seen or client_stream.remote_end_called) return;
+    client_stream.remote_end_called = true;
+    const callback = client_stream.callbacks.on_remote_end orelse return;
+    if (!beginClientCallback(client_stream)) return;
+    defer endClientCallback(client_stream);
+    callback(client_stream.callbacks.context, client_stream.handle());
+}
+
+fn finalizeClientStream(client_stream: *ClientStreamState) void {
+    notifyRemoteEnd(client_stream);
+    if (client_stream.forced_status) |forced| {
+        terminalizeStream(client_stream, forced);
+        return;
+    }
+    if (client_stream.stream_error != c.NGHTTP2_NO_ERROR) {
+        terminalizeStream(client_stream, streamErrorStatus(client_stream.stream_error));
+        return;
+    }
+    if (!client_stream.saw_response_headers) {
+        terminalizeStream(client_stream, .init(.unknown, "missing response headers"));
+    } else if (client_stream.http_status == null) {
+        terminalizeStream(client_stream, .init(.unknown, "missing HTTP status"));
+    } else if (client_stream.http_status.? != 200) {
+        terminalizeStream(client_stream, .init(
+            httpStatusCode(client_stream.http_status.?),
+            "HTTP request failed",
+        ));
+    } else if (!client_stream.content_type_grpc) {
+        terminalizeStream(client_stream, .init(.unknown, "invalid gRPC content-type"));
+    } else if (client_stream.grpc_status == null) {
+        terminalizeStream(client_stream, .init(.unknown, "missing grpc-status"));
+    } else if (client_stream.response_encoding_invalid) {
+        terminalizeStream(client_stream, .init(.unimplemented, "response compression is not supported"));
+    } else if (client_stream.response_metadata_invalid) {
+        terminalizeStream(client_stream, .init(.internal, "invalid response metadata"));
+    } else if (client_stream.decoder.finish()) |_| {
+        var decoded_message: ?[]u8 = null;
+        defer if (decoded_message) |value| client_stream.allocator.free(value);
+        if (client_stream.grpc_message) |encoded| {
+            decoded_message = message.decode(client_stream.allocator, encoded) catch {
+                terminalizeStream(client_stream, .init(.unknown, "invalid grpc-message"));
+                return;
+            };
+        }
+        terminalizeStream(client_stream, .init(
+            status.Code.fromInt(client_stream.grpc_status.?),
+            if (decoded_message) |value| value else "",
+        ));
+    } else |_| {
+        terminalizeStream(client_stream, .init(.internal, "malformed streaming response"));
+    }
 }
 
 fn submitOperation(impl: *Impl, operation: *Operation) !void {
@@ -772,7 +1538,7 @@ fn onRead(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev
     defer submitCloseIfReady(impl, loop);
     const bytes_read = result catch {
         if (impl.connection_state == .closing or impl.stopping_on_loop) return .disarm;
-        if (impl.connection_state == .draining and impl.operations.count() == 0) {
+        if (impl.connection_state == .draining and impl.operations.count() == 0 and impl.streams.count() == 0) {
             beginReconnect(impl);
             return .disarm;
         }
@@ -812,17 +1578,22 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
     return .disarm;
 }
 
-fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, _: ?*anyopaque) callconv(.c) c_int {
+fn onBeginHeaders(_: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
     const native_frame = received_frame.?;
     if (native_frame.*.hd.type != c.NGHTTP2_HEADERS) return 0;
-    const operation: *Operation = @ptrCast(@alignCast(c.nghttp2_session_get_stream_user_data(session, native_frame.*.hd.stream_id) orelse return 0));
     const kind: HeaderKind = switch (native_frame.*.headers.cat) {
         c.NGHTTP2_HCAT_RESPONSE => .response,
         c.NGHTTP2_HCAT_HEADERS => .trailers,
         else => return 0,
     };
-    operation.resetHeaderBlock(kind);
-    if (kind == .response) operation.saw_response_headers = true;
+    const impl: *Impl = @ptrCast(@alignCast(user_data.?));
+    if (impl.operations.get(native_frame.*.hd.stream_id)) |operation| {
+        operation.resetHeaderBlock(kind);
+        if (kind == .response) operation.saw_response_headers = true;
+    } else if (impl.streams.get(native_frame.*.hd.stream_id)) |client_stream| {
+        client_stream.resetHeaderBlock(kind);
+        if (kind == .response) client_stream.saw_response_headers = true;
+    }
     return 0;
 }
 
@@ -834,28 +1605,50 @@ fn onHeader(
     value_pointer: [*c]const u8,
     value_length: usize,
     _: u8,
-    _: ?*anyopaque,
+    user_data: ?*anyopaque,
 ) callconv(.c) c_int {
     const stream_id = received_frame.?.*.hd.stream_id;
-    const operation: *Operation = @ptrCast(@alignCast(c.nghttp2_session_get_stream_user_data(session, stream_id) orelse return 0));
+    _ = session;
+    const impl: *Impl = @ptrCast(@alignCast(user_data.?));
     const name = name_pointer[0..name_length];
     const value = value_pointer[0..value_length];
-    if (std.mem.eql(u8, name, ":status")) {
-        operation.http_status = std.fmt.parseInt(u16, value, 10) catch null;
-    } else if (std.mem.eql(u8, name, "content-type")) {
-        operation.content_type_grpc = std.mem.startsWith(u8, value, "application/grpc");
-    } else if (std.mem.eql(u8, name, "grpc-status")) {
-        operation.block_grpc_status = std.fmt.parseInt(u32, value, 10) catch std.math.maxInt(u32);
-    } else if (std.mem.eql(u8, name, "grpc-message")) {
-        if (operation.block_grpc_message) |old| operation.impl.allocator.free(old);
-        operation.block_grpc_message = operation.impl.allocator.dupe(u8, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-    } else if (std.mem.eql(u8, name, "grpc-encoding")) {
-        operation.response_compression = Compression.parse(value) orelse {
-            operation.response_encoding_invalid = true;
-            return 0;
-        };
-    } else {
-        processResponseMetadata(operation, name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (impl.operations.get(stream_id)) |operation| {
+        if (std.mem.eql(u8, name, ":status")) {
+            operation.http_status = std.fmt.parseInt(u16, value, 10) catch null;
+        } else if (std.mem.eql(u8, name, "content-type")) {
+            operation.content_type_grpc = std.mem.startsWith(u8, value, "application/grpc");
+        } else if (std.mem.eql(u8, name, "grpc-status")) {
+            operation.block_grpc_status = std.fmt.parseInt(u32, value, 10) catch std.math.maxInt(u32);
+        } else if (std.mem.eql(u8, name, "grpc-message")) {
+            if (operation.block_grpc_message) |old| operation.impl.allocator.free(old);
+            operation.block_grpc_message = operation.impl.allocator.dupe(u8, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        } else if (std.mem.eql(u8, name, "grpc-encoding")) {
+            operation.response_compression = Compression.parse(value) orelse {
+                operation.response_encoding_invalid = true;
+                return 0;
+            };
+        } else {
+            processResponseMetadata(operation, name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+    } else if (impl.streams.get(stream_id)) |client_stream| {
+        if (std.mem.eql(u8, name, ":status")) {
+            client_stream.http_status = std.fmt.parseInt(u16, value, 10) catch null;
+        } else if (std.mem.eql(u8, name, "content-type")) {
+            client_stream.content_type_grpc = std.mem.startsWith(u8, value, "application/grpc");
+        } else if (std.mem.eql(u8, name, "grpc-status")) {
+            client_stream.block_grpc_status = std.fmt.parseInt(u32, value, 10) catch std.math.maxInt(u32);
+        } else if (std.mem.eql(u8, name, "grpc-message")) {
+            if (client_stream.block_grpc_message) |old| client_stream.allocator.free(old);
+            client_stream.block_grpc_message = client_stream.allocator.dupe(u8, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        } else if (std.mem.eql(u8, name, "grpc-encoding")) {
+            client_stream.response_compression = Compression.parse(value) orelse {
+                client_stream.response_encoding_invalid = true;
+                return 0;
+            };
+            client_stream.decoder.compression = client_stream.response_compression;
+        } else {
+            processClientResponseMetadata(client_stream, name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
     }
     return 0;
 }
@@ -866,15 +1659,35 @@ fn onDataChunk(
     stream_id: i32,
     data_pointer: [*c]const u8,
     data_length: usize,
-    _: ?*anyopaque,
+    user_data: ?*anyopaque,
 ) callconv(.c) c_int {
-    const operation: *Operation = @ptrCast(@alignCast(c.nghttp2_session_get_stream_user_data(session, stream_id) orelse return 0));
-    const limit = wireMessageLimit(operation.max_response_size);
-    if (data_length > limit -| operation.response_body.items.len) {
-        operation.response_too_large = true;
-        return 0;
+    _ = session;
+    const impl: *Impl = @ptrCast(@alignCast(user_data.?));
+    if (impl.operations.get(stream_id)) |operation| {
+        const limit = wireMessageLimit(operation.max_response_size);
+        if (data_length > limit -| operation.response_body.items.len) {
+            operation.response_too_large = true;
+            return 0;
+        }
+        operation.response_body.appendSlice(operation.impl.allocator, data_pointer[0..data_length]) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    } else if (impl.streams.get(stream_id)) |client_stream| {
+        const decoder_limit = client_stream.limits.max_inbound_buffer_size -| client_stream.inbound_buffered;
+        client_stream.decoder.feedBounded(data_pointer[0..data_length], decoder_limit) catch |err| {
+            const failure: status.Status = switch (err) {
+                error.BufferLimitExceeded => .init(.resource_exhausted, "inbound stream buffer is full"),
+                else => .init(.internal, "malformed streaming response"),
+            };
+            if (!failClientStreamOnLoop(client_stream, failure)) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            return 0;
+        };
+        decodeAvailableMessages(client_stream) catch |err| {
+            const failure: status.Status = switch (err) {
+                error.MessageTooLarge, error.BufferLimitExceeded => .init(.resource_exhausted, "response message too large"),
+                else => .init(.internal, "malformed streaming response"),
+            };
+            if (!failClientStreamOnLoop(client_stream, failure)) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        };
     }
-    operation.response_body.appendSlice(operation.impl.allocator, data_pointer[0..data_length]) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     return 0;
 }
 
@@ -884,19 +1697,44 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
         const impl: *Impl = @ptrCast(@alignCast(user_data.?));
         if (impl.connection_state == .active) {
             impl.connection_state = .draining;
+            impl.mutex.lockUncancelable(syncIo());
+            impl.accepting_streams = false;
+            impl.mutex.unlock(syncIo());
+            if (!terminalizeStreamsForGoAway(impl, native_frame.*.goaway.last_stream_id)) {
+                return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
             impl.async_handle.notify() catch {};
         }
         return 0;
     }
-    if (native_frame.*.hd.type != c.NGHTTP2_HEADERS) return 0;
-    const operation: *Operation = @ptrCast(@alignCast(c.nghttp2_session_get_stream_user_data(session, native_frame.*.hd.stream_id) orelse return 0));
-    operation.finishHeaderBlock() catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-    if (operation.response_metadata_invalid and !operation.outcome_set) {
-        operation.setOutcome(.internal, "invalid response metadata") catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-        if (native_frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM == 0 and
-            c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, native_frame.*.hd.stream_id, c.NGHTTP2_CANCEL) != 0)
-        {
-            return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    const impl: *Impl = @ptrCast(@alignCast(user_data.?));
+    if (native_frame.*.hd.type == c.NGHTTP2_HEADERS) {
+        const end_stream = native_frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
+        if (impl.operations.get(native_frame.*.hd.stream_id)) |operation| {
+            const valid_header_block = operation.finishHeaderBlock(end_stream) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            if ((!valid_header_block or operation.response_metadata_invalid) and !operation.outcome_set) {
+                operation.setOutcome(
+                    .internal,
+                    if (valid_header_block) "invalid response metadata" else "grpc-status before end of stream",
+                ) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                if (!end_stream and
+                    c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, native_frame.*.hd.stream_id, c.NGHTTP2_CANCEL) != 0)
+                {
+                    return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                }
+            }
+        } else if (impl.streams.get(native_frame.*.hd.stream_id)) |client_stream| {
+            const valid_header_block = finishClientHeaderBlock(client_stream, end_stream) catch
+                return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (!valid_header_block and !failClientStreamOnLoop(
+                client_stream,
+                .init(.internal, "grpc-status before end of stream"),
+            )) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+    }
+    if (native_frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) {
+        if (impl.streams.get(native_frame.*.hd.stream_id)) |client_stream| {
+            client_stream.remote_end_seen = true;
         }
     }
     return 0;
@@ -907,7 +1745,29 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_d
     if (impl.operations.fetchRemove(stream_id)) |entry| {
         entry.value.finalize(error_code);
         scheduleDeadlineTimer(impl);
-        if (impl.connection_state == .draining and impl.operations.count() == 0) {
+        if (impl.connection_state == .draining and impl.operations.count() == 0 and impl.streams.count() == 0) {
+            impl.async_handle.notify() catch {};
+        }
+    } else if (impl.streams.fetchRemove(stream_id)) |entry| {
+        const client_stream = entry.value;
+        client_stream.transport_closed = true;
+        client_stream.stream_error = error_code;
+        client_stream.mutex.lockUncancelable(syncIo());
+        client_stream.send_open = false;
+        const released = client_stream.app_released;
+        const cancel_requested = client_stream.cancel_requested;
+        client_stream.mutex.unlock(syncIo());
+        if (cancel_requested and !released) {
+            setForcedStreamStatus(client_stream, .init(.cancelled, "stream cancelled"));
+        }
+        if (client_stream.terminal or client_stream.forced_status != null or released or
+            (!client_stream.receive_paused and client_stream.inbound_head == client_stream.inbound.items.len))
+        {
+            finalizeClientStream(client_stream);
+            releaseStreamLoopOwnership(client_stream);
+        }
+        scheduleDeadlineTimer(impl);
+        if (impl.connection_state == .draining and impl.operations.count() == 0 and impl.streams.count() == 0) {
             impl.async_handle.notify() catch {};
         }
     }
@@ -968,6 +1828,12 @@ fn earliestDeadline(impl: *Impl) ?u64 {
     for (impl.pending.items) |operation| {
         if (operation.deadline_expired) continue;
         includeEarlierDeadline(&earliest, operation.deadline_ns);
+    }
+    var stream_states = impl.stream_states.keyIterator();
+    while (stream_states.next()) |client_stream_ptr| {
+        const client_stream = client_stream_ptr.*;
+        if (client_stream.deadline_expired or client_stream.terminal) continue;
+        includeEarlierDeadline(&earliest, client_stream.deadline_ns);
     }
     impl.mutex.unlock(syncIo());
     return earliest;
@@ -1047,11 +1913,51 @@ fn expireDeadlines(impl: *Impl, now: u64) !void {
             }
         }
     }
+    while (true) {
+        var expired: ?*ClientStreamState = null;
+        impl.mutex.lockUncancelable(syncIo());
+        var states = impl.stream_states.keyIterator();
+        while (states.next()) |client_stream_ptr| {
+            const client_stream = client_stream_ptr.*;
+            if (client_stream.deadline_expired or client_stream.terminal) continue;
+            if (client_stream.deadline_ns) |deadline| {
+                if (deadline <= now and (client_stream.stream_id < 0 or client_stream.transport_closed)) {
+                    expired = client_stream;
+                    break;
+                }
+            }
+        }
+        impl.mutex.unlock(syncIo());
+        const client_stream = expired orelse break;
+        client_stream.deadline_expired = true;
+        terminalizeStream(client_stream, .init(.deadline_exceeded, "deadline exceeded"));
+        releaseStreamLoopOwnership(client_stream);
+    }
+    var active_streams = impl.streams.valueIterator();
+    while (active_streams.next()) |client_stream_ptr| {
+        const client_stream = client_stream_ptr.*;
+        if (client_stream.deadline_expired or client_stream.terminal) continue;
+        if (client_stream.deadline_ns) |deadline| {
+            if (deadline <= now) {
+                client_stream.deadline_expired = true;
+                setForcedStreamStatus(client_stream, .init(.deadline_exceeded, "deadline exceeded"));
+                if (!client_stream.rst_submitted) {
+                    if (c.nghttp2_submit_rst_stream(
+                        impl.session,
+                        c.NGHTTP2_FLAG_NONE,
+                        client_stream.stream_id,
+                        c.NGHTTP2_CANCEL,
+                    ) != 0) return error.DeadlineCancellationFailed;
+                    client_stream.rst_submitted = true;
+                }
+            }
+        }
+    }
     if (impl.connected) try flush(impl);
 }
 
 fn beginReconnect(impl: *Impl) void {
-    if (impl.connection_state != .draining or impl.operations.count() != 0) return;
+    if (impl.connection_state != .draining or impl.operations.count() != 0 or impl.streams.count() != 0) return;
     impl.connection_state = .closing;
     impl.connected = false;
     if (impl.session) |session| {
@@ -1144,6 +2050,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     impl.connection_state = .closing;
     impl.connected = false;
     impl.mutex.lockUncancelable(syncIo());
+    impl.accepting_streams = false;
     if (impl.state == .starting) {
         impl.state = .stopping;
         impl.condition.broadcast(syncIo());
@@ -1171,6 +2078,31 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
         operation.complete();
     }
     impl.operations.clearRetainingCapacity();
+
+    while (impl.streams.count() != 0) {
+        var stream_iterator = impl.streams.iterator();
+        const entry = stream_iterator.next().?;
+        const stream_id = entry.key_ptr.*;
+        const client_stream = entry.value_ptr.*;
+        _ = impl.streams.remove(stream_id);
+        client_stream.transport_closed = true;
+        client_stream.stream_error = c.NGHTTP2_CANCEL;
+        terminalizeStream(client_stream, .init(.unavailable, reason));
+        releaseStreamLoopOwnership(client_stream);
+    }
+    while (true) {
+        var pending_stream: ?*ClientStreamState = null;
+        impl.mutex.lockUncancelable(syncIo());
+        var state_iterator = impl.stream_states.keyIterator();
+        while (state_iterator.next()) |client_stream_ptr| {
+            pending_stream = client_stream_ptr.*;
+            break;
+        }
+        impl.mutex.unlock(syncIo());
+        const client_stream = pending_stream orelse break;
+        terminalizeStream(client_stream, .init(.unavailable, reason));
+        releaseStreamLoopOwnership(client_stream);
+    }
 
     if (impl.connect_active and !impl.connect_cancel_submitted) {
         impl.connect_cancel_submitted = true;
@@ -1333,6 +2265,103 @@ fn processResponseMetadata(operation: *Operation, name: []const u8, value: []con
     }
 }
 
+fn processClientResponseMetadata(
+    client_stream: *ClientStreamState,
+    name: []const u8,
+    value: []const u8,
+) error{OutOfMemory}!void {
+    if (isResponseMetadata(name)) {
+        _ = client_stream.block_metadata.appendDecoded(name, value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                client_stream.response_metadata_invalid = true;
+                return;
+            },
+        };
+    } else if (isMalformedResponseMetadataName(name)) {
+        client_stream.response_metadata_invalid = true;
+    }
+}
+
+fn finishClientHeaderBlock(client_stream: *ClientStreamState, end_stream: bool) !bool {
+    const trailers_only = client_stream.block_kind == .response and
+        client_stream.block_grpc_status != null;
+    if (trailers_only and !end_stream) {
+        client_stream.block_kind = .none;
+        return false;
+    }
+    const initial = client_stream.block_kind == .response and !trailers_only;
+    const destination = if (initial)
+        &client_stream.initial_metadata
+    else
+        &client_stream.trailing_metadata;
+    try copyMetadata(destination, &client_stream.block_metadata);
+    if (client_stream.block_grpc_status) |code| client_stream.grpc_status = code;
+    if (client_stream.block_grpc_message) |value| {
+        if (client_stream.grpc_message) |old| client_stream.allocator.free(old);
+        client_stream.grpc_message = value;
+        client_stream.block_grpc_message = null;
+    }
+    client_stream.block_kind = .none;
+    if (initial and !client_stream.headers_called) {
+        client_stream.headers_called = true;
+        invokeHeadersCallback(client_stream);
+    }
+    return true;
+}
+
+fn failClientStreamOnLoop(client_stream: *ClientStreamState, failure: status.Status) bool {
+    setForcedStreamStatus(client_stream, failure);
+    if (client_stream.rst_submitted or client_stream.transport_closed) return true;
+    if (c.nghttp2_submit_rst_stream(
+        client_stream.impl.?.session,
+        c.NGHTTP2_FLAG_NONE,
+        client_stream.stream_id,
+        c.NGHTTP2_CANCEL,
+    ) != 0) return false;
+    client_stream.rst_submitted = true;
+    return true;
+}
+
+fn goAwayRejectsStream(stream_id: i32, last_stream_id: i32) bool {
+    return stream_id < 0 or stream_id > last_stream_id;
+}
+
+fn terminalizeStreamsForGoAway(impl: *Impl, last_stream_id: i32) bool {
+    var active = impl.streams.valueIterator();
+    while (active.next()) |client_stream_ptr| {
+        const client_stream = client_stream_ptr.*;
+        if (!goAwayRejectsStream(client_stream.stream_id, last_stream_id)) continue;
+        setForcedStreamStatus(client_stream, .init(.unavailable, "connection received GOAWAY"));
+        terminalizeStream(client_stream, client_stream.forced_status.?);
+        if (!client_stream.rst_submitted) {
+            if (c.nghttp2_submit_rst_stream(
+                impl.session,
+                c.NGHTTP2_FLAG_NONE,
+                client_stream.stream_id,
+                c.NGHTTP2_CANCEL,
+            ) != 0) return false;
+            client_stream.rst_submitted = true;
+        }
+    }
+    while (true) {
+        var pending: ?*ClientStreamState = null;
+        impl.mutex.lockUncancelable(syncIo());
+        var states = impl.stream_states.keyIterator();
+        while (states.next()) |client_stream_ptr| {
+            if (client_stream_ptr.*.stream_id < 0) {
+                pending = client_stream_ptr.*;
+                break;
+            }
+        }
+        impl.mutex.unlock(syncIo());
+        const client_stream = pending orelse break;
+        terminalizeStream(client_stream, .init(.unavailable, "connection received GOAWAY"));
+        releaseStreamLoopOwnership(client_stream);
+    }
+    return true;
+}
+
 fn httpStatusCode(http_status: u16) status.Code {
     return switch (http_status) {
         400 => .internal,
@@ -1344,10 +2373,301 @@ fn httpStatusCode(http_status: u16) status.Code {
     };
 }
 
+fn streamErrorStatus(error_code: u32) status.Status {
+    return switch (error_code) {
+        c.NGHTTP2_CANCEL => .init(.cancelled, "stream cancelled"),
+        c.NGHTTP2_ENHANCE_YOUR_CALM => .init(.resource_exhausted, "stream rejected by peer"),
+        else => .init(.unavailable, "stream closed"),
+    };
+}
+
 fn wireMessageLimit(max_message_size: usize) usize {
     const overhead = std.math.add(usize, max_message_size / 8, 1024) catch return std.math.maxInt(usize);
     const total_overhead = std.math.add(usize, overhead, frame.header_size) catch return std.math.maxInt(usize);
     return std.math.add(usize, max_message_size, total_overhead) catch std.math.maxInt(usize);
+}
+
+const StreamTestCallbacks = struct {
+    fn onMessage(
+        context: ?*anyopaque,
+        _: stream.ClientStream,
+        payload: []const u8,
+        _: Compression,
+    ) stream.ReceiveAction {
+        const count: *usize = @ptrCast(@alignCast(context.?));
+        count.* += payload.len;
+        return .continue_receiving;
+    }
+
+    fn onTerminal(
+        _: ?*anyopaque,
+        _: stream.ClientStream,
+        _: status.Status,
+        _: *const metadata.Metadata,
+    ) void {}
+};
+
+fn initTestImpl(impl: *Impl, serialized_allocator: *SerializedAllocator, host: [:0]u8) void {
+    serialized_allocator.* = .init(std.testing.allocator);
+    impl.* = .{
+        .backing_allocator = std.testing.allocator,
+        .serialized_allocator = serialized_allocator,
+        .allocator = undefined,
+        .host = host,
+        .port = 1,
+        .authority = &.{},
+        .user_agent = &.{},
+    };
+    impl.allocator = serialized_allocator.allocator();
+}
+
+test "client stream open validates its synchronous inputs" {
+    var channel: Channel = undefined;
+    var received: usize = 0;
+    const callbacks: stream.ClientCallbacks = .{
+        .context = &received,
+        .on_message = StreamTestCallbacks.onMessage,
+        .on_terminal = StreamTestCallbacks.onTerminal,
+    };
+    try std.testing.expectError(
+        error.InvalidMethodPath,
+        channel.openStream("invalid", .{}, callbacks),
+    );
+    try std.testing.expectError(
+        error.InvalidMaxMessageSize,
+        channel.openStream(
+            "/test.Stream/Duplex",
+            .{ .limits = .{ .max_message_size = 0 } },
+            callbacks,
+        ),
+    );
+}
+
+test "client stream handle outlives channel teardown" {
+    const server = @import("server.zig");
+    const TerminalState = struct {
+        terminals: usize = 0,
+
+        fn onMessage(
+            _: ?*anyopaque,
+            _: stream.ClientStream,
+            _: []const u8,
+            _: Compression,
+        ) stream.ReceiveAction {
+            return .continue_receiving;
+        }
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            _: stream.ClientStream,
+            _: status.Status,
+            _: *const metadata.Metadata,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.terminals += 1;
+        }
+    };
+
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    var terminal_state = TerminalState{};
+    var client_stream = try channel.openStream(
+        "/test.Stream/OutlivesChannel",
+        .{},
+        .{
+            .context = &terminal_state,
+            .on_message = TerminalState.onMessage,
+            .on_terminal = TerminalState.onTerminal,
+        },
+    );
+
+    channel.deinit();
+    const client_state: *ClientStreamState = @ptrCast(@alignCast(client_stream.context));
+    try std.testing.expect(client_state.impl == null);
+    try std.testing.expectEqual(@as(usize, 1), terminal_state.terminals);
+    try std.testing.expectError(error.StreamClosed, client_stream.send("late", .{}));
+    try std.testing.expectError(error.StreamClosed, client_stream.closeSend());
+    try std.testing.expectError(error.StreamClosed, client_stream.resumeReceive());
+    client_stream.cancel();
+    client_stream.deinit();
+}
+
+test "GOAWAY rejects only unaccepted client stream IDs" {
+    try std.testing.expect(goAwayRejectsStream(-1, 3));
+    try std.testing.expect(!goAwayRejectsStream(1, 3));
+    try std.testing.expect(!goAwayRejectsStream(3, 3));
+    try std.testing.expect(goAwayRejectsStream(5, 3));
+}
+
+test "initial grpc-status requires trailers-only END_STREAM" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Stream/Duplex",
+        .{},
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    client_stream.loop_owned = false;
+    var handle = client_stream.handle();
+    defer handle.deinit();
+
+    client_stream.resetHeaderBlock(.response);
+    try client_stream.block_metadata.append("x-invalid", "present");
+    client_stream.block_grpc_status = @intFromEnum(status.Code.ok);
+    try std.testing.expect(!try finishClientHeaderBlock(client_stream, false));
+    try std.testing.expectEqual(@as(usize, 0), client_stream.initial_metadata.items().len);
+    try std.testing.expectEqual(@as(usize, 0), client_stream.trailing_metadata.items().len);
+
+    client_stream.resetHeaderBlock(.response);
+    try client_stream.block_metadata.append("x-trailers-only", "present");
+    client_stream.block_grpc_status = @intFromEnum(status.Code.ok);
+    try std.testing.expect(try finishClientHeaderBlock(client_stream, true));
+    try std.testing.expectEqualStrings(
+        "present",
+        client_stream.trailing_metadata.getFirst("x-trailers-only").?,
+    );
+}
+
+test "RST error codes map to gRPC status" {
+    try std.testing.expectEqual(status.Code.cancelled, streamErrorStatus(c.NGHTTP2_CANCEL).code);
+    try std.testing.expectEqual(
+        status.Code.resource_exhausted,
+        streamErrorStatus(c.NGHTTP2_ENHANCE_YOUR_CALM).code,
+    );
+    try std.testing.expectEqual(
+        status.Code.unavailable,
+        streamErrorStatus(c.NGHTTP2_REFUSED_STREAM).code,
+    );
+    try std.testing.expectEqual(
+        status.Code.unavailable,
+        streamErrorStatus(c.NGHTTP2_INTERNAL_ERROR).code,
+    );
+}
+
+test "client stream command state owns bounded outbound frames" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Stream/Duplex",
+        .{ .limits = .{
+            .max_message_size = 16,
+            .max_inbound_buffer_size = 21,
+            .max_outbound_buffer_size = 21,
+        } },
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    client_stream.loop_owned = false;
+    var handle = client_stream.handle();
+    defer handle.deinit();
+
+    try handle.send("payload", .{});
+    try std.testing.expectEqual(@as(usize, frame.header_size + 7), client_stream.outbound_buffered);
+    try std.testing.expectError(error.WouldBlock, handle.send("12345678", .{}));
+    try std.testing.expect(client_stream.backpressure_requested);
+    try handle.closeSend();
+    try std.testing.expectError(error.SendClosed, handle.send("later", .{}));
+}
+
+test "client stream provider defers and emits EOF only after drain" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Stream/Duplex",
+        .{},
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    defer client_stream.destroyUnqueued();
+
+    var source: c.nghttp2_data_source = .{ .ptr = client_stream };
+    var output: [64]u8 = undefined;
+    var data_flags: u32 = 0;
+    try std.testing.expectEqual(
+        @as(c.nghttp2_ssize, c.NGHTTP2_ERR_DEFERRED),
+        readClientStreamData(null, 1, &output, output.len, &data_flags, &source, null),
+    );
+    try std.testing.expectEqual(@as(u32, 0), data_flags);
+
+    const encoded = try frame.encode(impl.allocator, "request");
+    try client_stream.outbound.append(impl.allocator, .{ .frame_bytes = encoded });
+    client_stream.outbound_buffered = encoded.len;
+    client_stream.send_open = false;
+    data_flags = 0;
+    try std.testing.expectEqual(
+        @as(c.nghttp2_ssize, @intCast(encoded.len)),
+        readClientStreamData(null, 1, &output, output.len, &data_flags, &source, null),
+    );
+    try std.testing.expect(data_flags & c.NGHTTP2_DATA_FLAG_EOF != 0);
+    try std.testing.expectEqual(@as(usize, 0), client_stream.outbound_buffered);
+}
+
+test "paused client stream queues decoded messages within its bound" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Stream/Duplex",
+        .{ .limits = .{
+            .max_message_size = 16,
+            .max_inbound_buffer_size = 42,
+            .max_outbound_buffer_size = 21,
+        } },
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    client_stream.loop_owned = false;
+    var handle = client_stream.handle();
+    defer handle.deinit();
+
+    const first = try frame.encode(impl.allocator, "one");
+    defer impl.allocator.free(first);
+    const second = try frame.encode(impl.allocator, "two");
+    defer impl.allocator.free(second);
+    try client_stream.decoder.feed(first);
+    try client_stream.decoder.feed(second);
+    client_stream.receive_paused = true;
+    try decodeAvailableMessages(client_stream);
+    try std.testing.expectEqual(@as(usize, 2), client_stream.inbound.items.len);
+    try std.testing.expectEqual(@as(usize, 0), received);
+
+    try deliverInboundMessages(client_stream);
+    try std.testing.expectEqual(@as(usize, 6), received);
+    try std.testing.expectEqual(@as(usize, 0), client_stream.inbound.items.len);
+    try client_stream.decoder.finish();
 }
 
 test "earliest deadline selection is order independent" {
@@ -1502,16 +2822,9 @@ test "target parsing" {
 
 test "outbound metadata rejects invalid application values before queuing" {
     var host = [_:0]u8{'x'};
-    var impl: Impl = .{
-        .backing_allocator = std.testing.allocator,
-        .serialized_allocator = .init(std.testing.allocator),
-        .allocator = undefined,
-        .host = host[0..1 :0],
-        .port = 1,
-        .authority = &.{},
-        .user_agent = &.{},
-    };
-    impl.allocator = impl.serialized_allocator.allocator();
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
 
     try std.testing.expectError(error.InvalidMetadataValue, Operation.init(
         &impl,
@@ -1537,16 +2850,9 @@ test "outbound metadata rejects invalid application values before queuing" {
 
 test "malformed binary response metadata marks only the operation invalid" {
     var host = [_:0]u8{'x'};
-    var impl: Impl = .{
-        .backing_allocator = std.testing.allocator,
-        .serialized_allocator = .init(std.testing.allocator),
-        .allocator = undefined,
-        .host = host[0..1 :0],
-        .port = 1,
-        .authority = &.{},
-        .user_agent = &.{},
-    };
-    impl.allocator = impl.serialized_allocator.allocator();
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
 
     const operation = try Operation.init(&impl, "/test.Echo/Unary", "request", .{});
     defer operation.deinit();
@@ -1561,23 +2867,16 @@ test "malformed binary response metadata marks only the operation invalid" {
 
 test "response headers with grpc-status are trailers-only metadata" {
     var host = [_:0]u8{'x'};
-    var impl: Impl = .{
-        .backing_allocator = std.testing.allocator,
-        .serialized_allocator = .init(std.testing.allocator),
-        .allocator = undefined,
-        .host = host[0..1 :0],
-        .port = 1,
-        .authority = &.{},
-        .user_agent = &.{},
-    };
-    impl.allocator = impl.serialized_allocator.allocator();
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
     const operation = try Operation.init(&impl, "/test.Echo/Unary", "", .{});
     defer operation.deinit();
 
     operation.resetHeaderBlock(.response);
     try operation.block_metadata.append("x-trailers-only", "present");
     operation.block_grpc_status = @intFromEnum(status.Code.not_found);
-    try operation.finishHeaderBlock();
+    try std.testing.expect(try operation.finishHeaderBlock(true));
 
     try std.testing.expectEqual(@as(usize, 0), operation.initial_metadata.items().len);
     try std.testing.expectEqualStrings("present", operation.trailing_metadata.getFirst("x-trailers-only").?);

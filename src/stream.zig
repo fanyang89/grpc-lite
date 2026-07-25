@@ -170,6 +170,7 @@ pub const ServerHandler = struct {
         Compression,
     ) anyerror!ReceiveAction,
     on_remote_end: *const fn (?*anyopaque, ServerStream, *service.ServerContext) anyerror!void,
+    on_writable: ?*const fn (?*anyopaque, ServerStream, *service.ServerContext) void = null,
     on_cancel: ?*const fn (?*anyopaque, ServerStream, *service.ServerContext) void = null,
 };
 
