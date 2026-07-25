@@ -15,6 +15,9 @@ pub const Options = struct {
     port: u16 = 0,
     max_request_size: usize = 4 * 1024 * 1024,
     stream_limits: raw_stream.BufferLimits = .{},
+    initial_stream_window_size: u32 = 64 * 1024,
+    write_high_watermark_bytes: usize = 1024 * 1024,
+    write_low_watermark_bytes: usize = 512 * 1024,
 };
 
 pub const LocalAddress = struct {
@@ -27,6 +30,14 @@ pub const Server = struct {
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !Server {
         try options.stream_limits.validate();
+        try validateTransportOptions(
+            options.initial_stream_window_size,
+            options.write_high_watermark_bytes,
+            options.write_low_watermark_bytes,
+        );
+        if (options.stream_limits.max_inbound_buffer_size < options.initial_stream_window_size) {
+            return error.InvalidInboundBufferSize;
+        }
         const impl = try allocator.create(Impl);
         errdefer allocator.destroy(impl);
         const host = try allocator.dupeZ(u8, options.host);
@@ -39,6 +50,9 @@ pub const Server = struct {
             .configured_port = options.port,
             .max_request_size = options.max_request_size,
             .stream_limits = options.stream_limits,
+            .initial_stream_window_size = options.initial_stream_window_size,
+            .write_high_watermark_bytes = options.write_high_watermark_bytes,
+            .write_low_watermark_bytes = options.write_low_watermark_bytes,
             .io_threaded = io_threaded,
         };
         impl.clock = .{ .context = impl, .now_fn = ioNow };
@@ -192,6 +206,9 @@ const Impl = struct {
     configured_port: u16,
     max_request_size: usize,
     stream_limits: raw_stream.BufferLimits,
+    initial_stream_window_size: u32,
+    write_high_watermark_bytes: usize,
+    write_low_watermark_bytes: usize,
     handlers: std.StringHashMapUnmanaged(service.UnaryHandler) = .empty,
     stream_handlers: std.StringHashMapUnmanaged(raw_stream.ServerHandler) = .empty,
     stream_commands: std.ArrayList(StreamCommand) = .empty,
@@ -343,6 +360,7 @@ const Stream = struct {
     finish_queued: bool = false,
     receive_paused: bool = false,
     resume_queued: bool = false,
+    deferred_stream_credit: usize = 0,
     response_gzip_requested: bool = false,
     response_headers_submitted: bool = false,
     outbound_reserved_bytes: usize = 0,
@@ -490,6 +508,7 @@ const Connection = struct {
     highest_accepted_stream_id: i32 = 0,
     local_goaway_submitted: bool = false,
     pending_writes: usize = 0,
+    queued_write_bytes: usize = 0,
     draining: bool = false,
     close_after_writes: bool = false,
     closing: bool = false,
@@ -509,6 +528,10 @@ const Connection = struct {
         var callbacks: ?*c.nghttp2_session_callbacks = null;
         if (c.nghttp2_session_callbacks_new(&callbacks) != 0) return error.OutOfMemory;
         defer c.nghttp2_session_callbacks_del(callbacks);
+        var options: ?*c.nghttp2_option = null;
+        if (c.nghttp2_option_new(&options) != 0) return error.OutOfMemory;
+        defer c.nghttp2_option_del(options);
+        c.nghttp2_option_set_no_auto_window_update(options, 1);
 
         c.nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, onBeginHeaders);
         c.nghttp2_session_callbacks_set_on_header_callback(callbacks, onHeader);
@@ -516,23 +539,35 @@ const Connection = struct {
         c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, onFrameReceived);
         c.nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, onFrameSent);
         c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, onStreamClose);
-        if (c.nghttp2_session_server_new(&self.session, callbacks, self) != 0) return error.OutOfMemory;
-        if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, null, 0) != 0) return error.NativeFailure;
+        if (c.nghttp2_session_server_new2(&self.session, callbacks, self, options) != 0) return error.OutOfMemory;
+        const settings = [_]c.nghttp2_settings_entry{.{
+            .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+            .value = self.server.initial_stream_window_size,
+        }};
+        if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, &settings, settings.len) != 0) {
+            return error.NativeFailure;
+        }
     }
 
     fn flush(self: *Connection) !void {
         while (!self.closing) {
+            if (!canFlushWrites(self.queued_write_bytes, self.server.write_high_watermark_bytes)) return;
             var data: [*c]const u8 = null;
             const length = c.nghttp2_session_mem_send2(self.session, &data);
             if (length < 0) return error.NativeFailure;
             if (length == 0) return;
+            const byte_length: usize = @intCast(length);
 
             const write = try self.server.allocator.create(WriteRequest);
             errdefer self.server.allocator.destroy(write);
-            const bytes = try self.server.allocator.dupe(u8, data[0..@intCast(length)]);
+            const bytes = try self.server.allocator.dupe(u8, data[0..byte_length]);
             errdefer self.server.allocator.free(bytes);
             write.* = .{ .connection = self, .bytes = bytes };
-            self.pending_writes += 1;
+            self.pending_writes = std.math.add(usize, self.pending_writes, 1) catch {
+                return error.WriteQueueSizeOverflow;
+            };
+            errdefer self.pending_writes -= 1;
+            self.queued_write_bytes = try addQueuedWriteBytes(self.queued_write_bytes, bytes.len);
             self.tcp.queueWrite(
                 &self.server.loop,
                 &self.write_queue,
@@ -626,6 +661,7 @@ const Connection = struct {
         while (self.write_queue.pop()) |request| {
             const write: *WriteRequest = @fieldParentPtr("request", request);
             self.pending_writes -= 1;
+            self.queued_write_bytes = completeQueuedWrite(self.queued_write_bytes, write.bytes.len);
             self.server.allocator.free(write.bytes);
             self.server.allocator.destroy(write);
         }
@@ -791,6 +827,10 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
     const request = write orelse return .disarm;
     const connection = request.connection;
     connection.pending_writes -= 1;
+    connection.queued_write_bytes = completeQueuedWrite(connection.queued_write_bytes, request.bytes.len);
+    // WriteQueue retries partial writes and calls back with the full buffer length.
+    const completed: ?usize = result catch null;
+    const write_succeeded = completed != null and completed.? == request.bytes.len;
     connection.server.allocator.free(request.bytes);
     connection.server.allocator.destroy(request);
     if (connection.closing) {
@@ -799,11 +839,21 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
         connection.finishCloseIfReady();
         return .disarm;
     }
-    _ = result catch {
+    if (!write_succeeded) {
         connection.closeOnLoop(loop);
         connection.finishCloseIfReady();
         return .disarm;
-    };
+    }
+    if (connection.queued_write_bytes < connection.server.write_low_watermark_bytes) {
+        // WriteQueue adds its next completion after this callback returns.
+        // Wake the async callback so queueWrite cannot reenter that ordering.
+        connection.server.stream_async.notify() catch {
+            connection.closeOnLoop(loop);
+            connection.finishCloseIfReady();
+            return .disarm;
+        };
+        return .disarm;
+    }
     if (connection.close_after_writes and connection.pending_writes == 0) {
         connection.closeOnLoop(loop);
         connection.finishCloseIfReady();
@@ -874,7 +924,12 @@ fn processStreamCommands(server: *Impl) void {
 
     for (server.connections.items) |connection| {
         if (connection.closing or connection.session == null) continue;
-        connection.flush() catch connection.closeOnLoop(&server.loop);
+        connection.flush() catch {
+            connection.closeOnLoop(&server.loop);
+            continue;
+        };
+        connection.closeTerminatedSession(&server.loop);
+        if (!connection.closing) maybeCloseDrainedConnection(connection);
     }
 }
 
@@ -923,7 +978,26 @@ fn processStreamCommand(server: *Impl, command: StreamCommand) void {
             target.resume_queued = false;
             if (active) target.receive_paused = false;
             server.unlock();
-            if (active) deliverStreamingMessages(target);
+            if (active) {
+                deliverStreamingMessages(target);
+                server.lock();
+                const return_credit = canReturnDeferredStreamCredit(
+                    target.receive_paused,
+                    target.transport_closed,
+                ) and target.streaming_active;
+                server.unlock();
+                if (return_credit and target.deferred_stream_credit != 0) {
+                    if (c.nghttp2_session_consume_stream(
+                        target.connection.session,
+                        target.id,
+                        target.deferred_stream_credit,
+                    ) != 0) {
+                        target.connection.close();
+                        return;
+                    }
+                    target.deferred_stream_credit = 0;
+                }
+            }
         },
     }
 }
@@ -1228,7 +1302,7 @@ fn onHeader(
 }
 
 fn onDataChunk(
-    _: ?*c.nghttp2_session,
+    session: ?*c.nghttp2_session,
     _: u8,
     stream_id: i32,
     data_pointer: [*c]const u8,
@@ -1238,16 +1312,36 @@ fn onDataChunk(
     const connection: *Connection = @ptrCast(@alignCast(user_data.?));
     const stream = connection.streams.get(stream_id) orelse return 0;
     if (stream.streaming != null) {
-        receiveStreamingData(stream, data_pointer[0..data_length]);
+        const copied = receiveStreamingData(stream, data_pointer[0..data_length]);
+        if (c.nghttp2_session_consume_connection(session, data_length) != 0) {
+            return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+        if (copied and stream.streaming_active) {
+            if (stream.receive_paused) {
+                stream.deferred_stream_credit = std.math.add(
+                    usize,
+                    stream.deferred_stream_credit,
+                    data_length,
+                ) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            } else if (c.nghttp2_session_consume_stream(session, stream_id, data_length) != 0) {
+                return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
+        }
         return 0;
     }
-    if (stream.responded) return 0;
-    const body_limit = wireMessageLimit(connection.server.max_request_size);
-    if (data_length > body_limit -| stream.request_body.items.len) {
-        stream.request_too_large = true;
-        return 0;
+    if (!stream.responded) {
+        const body_limit = wireMessageLimit(connection.server.max_request_size);
+        if (data_length > body_limit -| stream.request_body.items.len) {
+            stream.request_too_large = true;
+        } else {
+            stream.request_body.appendSlice(stream.allocator, data_pointer[0..data_length]) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
     }
-    stream.request_body.appendSlice(stream.allocator, data_pointer[0..data_length]) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (c.nghttp2_session_consume_connection(session, data_length) != 0 or
+        c.nghttp2_session_consume_stream(session, stream_id, data_length) != 0)
+    {
+        return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     return 0;
 }
 
@@ -1348,21 +1442,22 @@ fn startStreaming(session: *c.nghttp2_session, target: *Stream, handler: raw_str
     submitStreamingResponse(session, target, streaming.context.initial_metadata.items()) catch target.connection.close();
 }
 
-fn receiveStreamingData(target: *Stream, bytes: []const u8) void {
-    const streaming = &(target.streaming orelse return);
+fn receiveStreamingData(target: *Stream, bytes: []const u8) bool {
+    const streaming = &(target.streaming orelse return false);
     const server = target.connection.server;
     server.lock();
     const active = target.streaming_active;
     server.unlock();
-    if (!active) return;
+    if (!active) return false;
     streaming.decoder.feedBounded(bytes, server.stream_limits.max_inbound_buffer_size) catch |err| {
         switch (err) {
             error.BufferLimitExceeded => failStreaming(target, .resource_exhausted, "request message too large"),
             else => failStreaming(target, .invalid_argument, "malformed streaming request"),
         }
-        return;
+        return false;
     };
     deliverStreamingMessages(target);
+    return true;
 }
 
 fn deliverStreamingMessages(target: *Stream) void {
@@ -1849,6 +1944,30 @@ fn wireMessageLimit(max_message_size: usize) usize {
     return std.math.add(usize, max_message_size, total_overhead) catch std.math.maxInt(usize);
 }
 
+fn validateTransportOptions(initial_stream_window_size: u32, high: usize, low: usize) !void {
+    if (initial_stream_window_size == 0 or initial_stream_window_size > std.math.maxInt(i32)) {
+        return error.InvalidInitialStreamWindowSize;
+    }
+    if (low == 0 or low >= high) return error.InvalidWriteWatermarks;
+}
+
+fn canFlushWrites(queued: usize, high: usize) bool {
+    return queued < high;
+}
+
+fn addQueuedWriteBytes(queued: usize, length: usize) !usize {
+    return std.math.add(usize, queued, length) catch error.WriteQueueSizeOverflow;
+}
+
+fn completeQueuedWrite(queued: usize, length: usize) usize {
+    std.debug.assert(length <= queued);
+    return queued - length;
+}
+
+fn canReturnDeferredStreamCredit(receive_paused: bool, transport_closed: bool) bool {
+    return !receive_paused and !transport_closed;
+}
+
 fn isReservedTrailer(name: []const u8) bool {
     return std.mem.eql(u8, name, "grpc-status") or std.mem.eql(u8, name, "grpc-message");
 }
@@ -2310,6 +2429,96 @@ test "server validates registration and has deterministic lifecycle" {
     server.wait();
 }
 
+test "manual receive credit isolates a paused stream and resumes on loop" {
+    const Handler = struct {
+        messages: usize = 0,
+
+        fn onStart(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onMessage(
+            context: ?*anyopaque,
+            _: raw_stream.ServerStream,
+            _: *service.ServerContext,
+            _: []const u8,
+            _: Compression,
+        ) !raw_stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.messages += 1;
+            return if (self.messages <= 2) .pause else .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+    };
+
+    var handler = Handler{};
+    var server = try Server.init(std.testing.allocator, .{ .stream_limits = .{
+        .max_message_size = 48 * 1024,
+        .max_inbound_buffer_size = 64 * 1024,
+        .max_outbound_buffer_size = 64 * 1024,
+    } });
+    defer server.deinit();
+    try server.registerStream("/test.Flow/Pause", .{
+        .context = &handler,
+        .on_start = Handler.onStart,
+        .on_message = Handler.onMessage,
+        .on_remote_end = Handler.onRemoteEnd,
+    });
+
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer deinitTestConnection(&connection);
+
+    const first = try frame.encode(std.testing.allocator, "pause");
+    defer std.testing.allocator.free(first);
+    const payload = try std.testing.allocator.alloc(u8, 40 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+    const second = try frame.encode(std.testing.allocator, payload);
+    defer std.testing.allocator.free(second);
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try wire.appendSlice(std.testing.allocator, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try wire.appendSlice(std.testing.allocator, &.{ 0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0 });
+    try appendRawTestHeaders(&wire, 1, "/test.Flow/Pause", false);
+    try appendRawTestData(&wire, 1, first, false);
+    var offset: usize = 0;
+    while (offset < second.len) {
+        const end = @min(offset + 255, second.len);
+        try appendRawTestData(&wire, 1, second[offset..end], false);
+        offset = end;
+    }
+
+    const consumed = c.nghttp2_session_mem_recv2(connection.session, wire.items.ptr, wire.items.len);
+    try std.testing.expectEqual(@as(c.nghttp2_ssize, @intCast(wire.items.len)), consumed);
+    const target = connection.streams.get(1).?;
+    try std.testing.expect(target.receive_paused);
+    try std.testing.expectEqual(@as(usize, 1), handler.messages);
+    try std.testing.expectEqual(first.len + second.len, target.deferred_stream_credit);
+    try std.testing.expect(
+        c.nghttp2_session_get_local_window_size(connection.session) >
+            c.nghttp2_session_get_stream_local_window_size(connection.session, 1),
+    );
+
+    processStreamCommand(server.impl, .{ .target = target, .action = .resume_receive });
+    try std.testing.expect(target.receive_paused);
+    try std.testing.expectEqual(first.len + second.len, target.deferred_stream_credit);
+    try std.testing.expectEqual(@as(usize, 2), handler.messages);
+    try std.testing.expect(
+        c.nghttp2_session_get_stream_local_window_size(connection.session, 1) <
+            c.NGHTTP2_INITIAL_WINDOW_SIZE,
+    );
+
+    processStreamCommand(server.impl, .{ .target = target, .action = .resume_receive });
+    try std.testing.expect(!target.receive_paused);
+    try std.testing.expectEqual(@as(usize, 0), target.deferred_stream_credit);
+    try std.testing.expectEqual(@as(usize, 2), handler.messages);
+    try std.testing.expectEqual(
+        @as(i32, c.NGHTTP2_INITIAL_WINDOW_SIZE),
+        c.nghttp2_session_get_stream_local_window_size(connection.session, 1),
+    );
+}
+
 test "server occupied port startup cleans up deterministically" {
     const listen_address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var listener = try listen_address.listen(std.testing.io, .{});
@@ -2571,7 +2780,7 @@ test "raw HTTP/2 bidi stream incrementally exchanges messages" {
         .max_message_size = 64,
         .max_inbound_buffer_size = 256,
         .max_outbound_buffer_size = 69,
-    } });
+    }, .initial_stream_window_size = 256 });
     defer server.deinit();
     try server.registerStream("/test.Echo/Bidi", .{
         .context = &handler,

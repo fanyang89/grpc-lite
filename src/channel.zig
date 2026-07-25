@@ -14,6 +14,9 @@ const version = @import("version.zig");
 
 const ChannelOptions = struct {
     user_agent: []const u8 = version.user_agent,
+    initial_stream_window_size: u32 = 64 * 1024,
+    write_high_watermark_bytes: usize = 1024 * 1024,
+    write_low_watermark_bytes: usize = 512 * 1024,
 };
 
 pub const Options = ChannelOptions;
@@ -114,6 +117,11 @@ pub const Channel = struct {
     impl: *Impl,
 
     pub fn init(allocator: std.mem.Allocator, target: []const u8, options: ChannelOptions) !Channel {
+        try validateTransportOptions(
+            options.initial_stream_window_size,
+            options.write_high_watermark_bytes,
+            options.write_low_watermark_bytes,
+        );
         const parsed = try parseTarget(target);
         const impl = try allocator.create(Impl);
         errdefer allocator.destroy(impl);
@@ -129,6 +137,9 @@ pub const Channel = struct {
             .port = parsed.port,
             .authority = undefined,
             .user_agent = undefined,
+            .initial_stream_window_size = options.initial_stream_window_size,
+            .write_high_watermark_bytes = options.write_high_watermark_bytes,
+            .write_low_watermark_bytes = options.write_low_watermark_bytes,
             .async_handle = undefined,
             .deadline_timer = undefined,
         };
@@ -207,6 +218,9 @@ pub const Channel = struct {
     ) !stream.ClientStream {
         if (!isValidMethodPath(full_method_path)) return error.InvalidMethodPath;
         try options.limits.validate();
+        if (options.limits.max_inbound_buffer_size < self.impl.initial_stream_window_size) {
+            return error.InvalidInboundBufferSize;
+        }
 
         const client_stream = try ClientStreamState.init(
             self.impl,
@@ -303,6 +317,9 @@ const Impl = struct {
     port: u16,
     authority: []u8,
     user_agent: []u8,
+    initial_stream_window_size: u32,
+    write_high_watermark_bytes: usize,
+    write_low_watermark_bytes: usize,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
     state: State = .starting,
@@ -347,6 +364,7 @@ const Impl = struct {
     read_buffer: [16 * 1024]u8 = undefined,
     write_queue: xev.WriteQueue = .{},
     writes: std.AutoHashMapUnmanaged(*WriteRequest, void) = .empty,
+    queued_write_bytes: usize = 0,
     test_observer: TestObserver = .{},
 
     fn enqueue(self: *Impl, operation: *Operation) !bool {
@@ -421,6 +439,7 @@ const ClientStreamState = struct {
     rst_submitted: bool = false,
     deadline_expired: bool = false,
     receive_paused: bool = false,
+    deferred_stream_credit: usize = 0,
     inbound: std.ArrayList(InboundMessage) = .empty,
     inbound_head: usize = 0,
     inbound_buffered: usize = 0,
@@ -906,13 +925,23 @@ fn initializeSession(impl: *Impl) !void {
     var callbacks: ?*c.nghttp2_session_callbacks = null;
     if (c.nghttp2_session_callbacks_new(&callbacks) != 0) return error.OutOfMemory;
     defer c.nghttp2_session_callbacks_del(callbacks);
+    var options: ?*c.nghttp2_option = null;
+    if (c.nghttp2_option_new(&options) != 0) return error.OutOfMemory;
+    defer c.nghttp2_option_del(options);
+    c.nghttp2_option_set_no_auto_window_update(options, 1);
     c.nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, onBeginHeaders);
     c.nghttp2_session_callbacks_set_on_header_callback(callbacks, onHeader);
     c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, onDataChunk);
     c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, onFrameReceived);
     c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, onStreamClose);
-    if (c.nghttp2_session_client_new(&impl.session, callbacks, impl) != 0) return error.OutOfMemory;
-    if (c.nghttp2_submit_settings(impl.session, c.NGHTTP2_FLAG_NONE, null, 0) != 0) return error.NativeFailure;
+    if (c.nghttp2_session_client_new2(&impl.session, callbacks, impl, options) != 0) return error.OutOfMemory;
+    const settings = [_]c.nghttp2_settings_entry{.{
+        .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+        .value = impl.initial_stream_window_size,
+    }};
+    if (c.nghttp2_submit_settings(impl.session, c.NGHTTP2_FLAG_NONE, &settings, settings.len) != 0) {
+        return error.NativeFailure;
+    }
 }
 
 fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, result: xev.ConnectError!void) xev.CallbackAction {
@@ -1155,7 +1184,20 @@ fn processClientStreamCommands(client_stream: *ClientStreamState) !void {
             return error.NativeFailure;
         }
     }
-    if (resume_receive and !client_stream.rst_submitted) try deliverInboundMessages(client_stream);
+    if (resume_receive and !client_stream.rst_submitted) {
+        try deliverInboundMessages(client_stream);
+        if (canReturnDeferredStreamCredit(
+            client_stream.receive_paused,
+            client_stream.transport_closed,
+        ) and client_stream.deferred_stream_credit != 0) {
+            if (c.nghttp2_session_consume_stream(
+                impl.session,
+                client_stream.stream_id,
+                client_stream.deferred_stream_credit,
+            ) != 0) return error.NativeFailure;
+            client_stream.deferred_stream_credit = 0;
+        }
+    }
 }
 
 fn readClientStreamData(
@@ -1505,14 +1547,16 @@ fn readRequestData(
 
 fn flush(impl: *Impl) !void {
     while (!impl.stopping_on_loop) {
+        if (!canFlushWrites(impl.queued_write_bytes, impl.write_high_watermark_bytes)) return;
         var data: [*c]const u8 = null;
         const length = c.nghttp2_session_mem_send2(impl.session, &data);
         if (length < 0) return error.NativeFailure;
         if (length == 0) return;
+        const byte_length: usize = @intCast(length);
 
         const write = try impl.allocator.create(WriteRequest);
         errdefer impl.allocator.destroy(write);
-        const bytes = try impl.allocator.dupe(u8, data[0..@intCast(length)]);
+        const bytes = try impl.allocator.dupe(u8, data[0..byte_length]);
         errdefer impl.allocator.free(bytes);
         write.* = .{
             .impl = impl,
@@ -1520,6 +1564,8 @@ fn flush(impl: *Impl) !void {
             .generation = impl.connection_generation,
         };
         try impl.writes.put(impl.allocator, write, {});
+        errdefer _ = impl.writes.remove(write);
+        impl.queued_write_bytes = try addQueuedWriteBytes(impl.queued_write_bytes, bytes.len);
         impl.tcp.queueWrite(
             &impl.loop,
             &impl.write_queue,
@@ -1568,10 +1614,23 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
     const impl = write.impl;
     const generation = write.generation;
     _ = impl.writes.remove(write);
+    impl.queued_write_bytes = completeQueuedWrite(impl.queued_write_bytes, write.bytes.len);
+    // WriteQueue retries partial writes and calls back with the full buffer length.
+    const completed: ?usize = result catch null;
+    const write_succeeded = completed != null and completed.? == write.bytes.len;
     impl.allocator.free(write.bytes);
     impl.allocator.destroy(write);
-    if (result) |_| {} else |_| if (generation == impl.connection_generation and impl.connection_state != .closing) {
+    if (!write_succeeded and generation == impl.connection_generation and impl.connection_state != .closing) {
         beginStop(impl, "connection write failed");
+    }
+    if (write_succeeded and
+        generation == impl.connection_generation and
+        impl.connected and
+        impl.queued_write_bytes < impl.write_low_watermark_bytes)
+    {
+        // WriteQueue schedules its next head after this callback returns.
+        // Wake the async callback so queueWrite cannot reenter that ordering.
+        impl.async_handle.notify() catch beginStop(impl, "connection write failed");
     }
     if (impl.stopping_on_loop) discardQueuedWrites(impl);
     submitCloseIfReady(impl, loop);
@@ -1661,15 +1720,19 @@ fn onDataChunk(
     data_length: usize,
     user_data: ?*anyopaque,
 ) callconv(.c) c_int {
-    _ = session;
     const impl: *Impl = @ptrCast(@alignCast(user_data.?));
     if (impl.operations.get(stream_id)) |operation| {
         const limit = wireMessageLimit(operation.max_response_size);
         if (data_length > limit -| operation.response_body.items.len) {
             operation.response_too_large = true;
-            return 0;
+        } else {
+            operation.response_body.appendSlice(operation.impl.allocator, data_pointer[0..data_length]) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
         }
-        operation.response_body.appendSlice(operation.impl.allocator, data_pointer[0..data_length]) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (c.nghttp2_session_consume_connection(session, data_length) != 0 or
+            c.nghttp2_session_consume_stream(session, stream_id, data_length) != 0)
+        {
+            return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
     } else if (impl.streams.get(stream_id)) |client_stream| {
         const decoder_limit = client_stream.limits.max_inbound_buffer_size -| client_stream.inbound_buffered;
         client_stream.decoder.feedBounded(data_pointer[0..data_length], decoder_limit) catch |err| {
@@ -1678,15 +1741,31 @@ fn onDataChunk(
                 else => .init(.internal, "malformed streaming response"),
             };
             if (!failClientStreamOnLoop(client_stream, failure)) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (c.nghttp2_session_consume_connection(session, data_length) != 0) {
+                return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
             return 0;
         };
+        if (c.nghttp2_session_consume_connection(session, data_length) != 0) {
+            return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
         decodeAvailableMessages(client_stream) catch |err| {
             const failure: status.Status = switch (err) {
                 error.MessageTooLarge, error.BufferLimitExceeded => .init(.resource_exhausted, "response message too large"),
                 else => .init(.internal, "malformed streaming response"),
             };
             if (!failClientStreamOnLoop(client_stream, failure)) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            return 0;
         };
+        if (client_stream.receive_paused) {
+            client_stream.deferred_stream_credit = std.math.add(
+                usize,
+                client_stream.deferred_stream_credit,
+                data_length,
+            ) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        } else if (c.nghttp2_session_consume_stream(session, stream_id, data_length) != 0) {
+            return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
     }
     return 0;
 }
@@ -2147,6 +2226,7 @@ fn discardQueuedWrites(impl: *Impl) void {
     while (impl.write_queue.pop()) |request| {
         const write: *WriteRequest = @fieldParentPtr("request", request);
         _ = impl.writes.remove(write);
+        impl.queued_write_bytes = completeQueuedWrite(impl.queued_write_bytes, write.bytes.len);
         impl.allocator.free(write.bytes);
         impl.allocator.destroy(write);
     }
@@ -2219,6 +2299,30 @@ fn parseTarget(target: []const u8) !struct { host: []const u8, port: u16 } {
     const port = std.fmt.parseInt(u16, target[separator + 1 ..], 10) catch return error.InvalidTarget;
     if (port == 0) return error.InvalidTarget;
     return .{ .host = host, .port = port };
+}
+
+fn validateTransportOptions(initial_stream_window_size: u32, high: usize, low: usize) !void {
+    if (initial_stream_window_size == 0 or initial_stream_window_size > std.math.maxInt(i32)) {
+        return error.InvalidInitialStreamWindowSize;
+    }
+    if (low == 0 or low >= high) return error.InvalidWriteWatermarks;
+}
+
+fn canFlushWrites(queued: usize, high: usize) bool {
+    return queued < high;
+}
+
+fn addQueuedWriteBytes(queued: usize, length: usize) !usize {
+    return std.math.add(usize, queued, length) catch error.WriteQueueSizeOverflow;
+}
+
+fn completeQueuedWrite(queued: usize, length: usize) usize {
+    std.debug.assert(length <= queued);
+    return queued - length;
+}
+
+fn canReturnDeferredStreamCredit(receive_paused: bool, transport_closed: bool) bool {
+    return !receive_paused and !transport_closed;
 }
 
 fn isValidMethodPath(path: []const u8) bool {
@@ -2417,6 +2521,9 @@ fn initTestImpl(impl: *Impl, serialized_allocator: *SerializedAllocator, host: [
         .port = 1,
         .authority = &.{},
         .user_agent = &.{},
+        .initial_stream_window_size = 64 * 1024,
+        .write_high_watermark_bytes = 1024 * 1024,
+        .write_low_watermark_bytes = 512 * 1024,
     };
     impl.allocator = serialized_allocator.allocator();
 }
@@ -2440,6 +2547,39 @@ test "client stream open validates its synchronous inputs" {
             .{ .limits = .{ .max_message_size = 0 } },
             callbacks,
         ),
+    );
+}
+
+test "flush watermarks permit one chunk of overshoot and resume below low" {
+    const high = 10;
+    const low = 4;
+    var queued: usize = 9;
+    try std.testing.expect(canFlushWrites(queued, high));
+
+    const chunk = 5;
+    queued = try addQueuedWriteBytes(queued, chunk);
+    try std.testing.expectEqual(@as(usize, 14), queued);
+    try std.testing.expect(queued - high <= chunk);
+    try std.testing.expect(!canFlushWrites(queued, high));
+
+    queued = completeQueuedWrite(queued, chunk);
+    try std.testing.expect(!(queued < low));
+    queued = completeQueuedWrite(queued, 6);
+    try std.testing.expect(queued < low);
+    try std.testing.expectError(error.WriteQueueSizeOverflow, addQueuedWriteBytes(std.math.maxInt(usize), 1));
+}
+
+test "channel transport options reject unsafe windows and watermarks" {
+    try std.testing.expectError(
+        error.InvalidInitialStreamWindowSize,
+        Channel.init(std.testing.allocator, "127.0.0.1:1", .{ .initial_stream_window_size = 0 }),
+    );
+    try std.testing.expectError(
+        error.InvalidWriteWatermarks,
+        Channel.init(std.testing.allocator, "127.0.0.1:1", .{
+            .write_high_watermark_bytes = 8,
+            .write_low_watermark_bytes = 8,
+        }),
     );
 }
 
@@ -2629,12 +2769,27 @@ test "client stream provider defers and emits EOF only after drain" {
     try std.testing.expectEqual(@as(usize, 0), client_stream.outbound_buffered);
 }
 
-test "paused client stream queues decoded messages within its bound" {
+test "client receive resume retains credit when delivery pauses again" {
+    const ReceiveState = struct {
+        messages: usize = 0,
+
+        fn onMessage(
+            context: ?*anyopaque,
+            _: stream.ClientStream,
+            payload: []const u8,
+            _: Compression,
+        ) stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.messages += payload.len;
+            return if (self.messages == payload.len) .pause else .continue_receiving;
+        }
+    };
+
     var host = [_:0]u8{'x'};
     var serialized_allocator: SerializedAllocator = undefined;
     var impl: Impl = undefined;
     initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
-    var received: usize = 0;
+    var receive_state = ReceiveState{};
     const client_stream = try ClientStreamState.init(
         &impl,
         "/test.Stream/Duplex",
@@ -2644,8 +2799,8 @@ test "paused client stream queues decoded messages within its bound" {
             .max_outbound_buffer_size = 21,
         } },
         .{
-            .context = &received,
-            .on_message = StreamTestCallbacks.onMessage,
+            .context = &receive_state,
+            .on_message = ReceiveState.onMessage,
             .on_terminal = StreamTestCallbacks.onTerminal,
         },
     );
@@ -2660,13 +2815,29 @@ test "paused client stream queues decoded messages within its bound" {
     try client_stream.decoder.feed(first);
     try client_stream.decoder.feed(second);
     client_stream.receive_paused = true;
+    client_stream.deferred_stream_credit = first.len + second.len;
     try decodeAvailableMessages(client_stream);
     try std.testing.expectEqual(@as(usize, 2), client_stream.inbound.items.len);
-    try std.testing.expectEqual(@as(usize, 0), received);
+    try std.testing.expectEqual(@as(usize, 0), receive_state.messages);
 
     try deliverInboundMessages(client_stream);
-    try std.testing.expectEqual(@as(usize, 6), received);
+    try std.testing.expect(client_stream.receive_paused);
+    try std.testing.expectEqual(@as(usize, 3), receive_state.messages);
+    try std.testing.expectEqual(first.len + second.len, client_stream.deferred_stream_credit);
+    try std.testing.expect(!canReturnDeferredStreamCredit(
+        client_stream.receive_paused,
+        client_stream.transport_closed,
+    ));
+
+    try deliverInboundMessages(client_stream);
+    try std.testing.expect(!client_stream.receive_paused);
+    try std.testing.expectEqual(@as(usize, 6), receive_state.messages);
     try std.testing.expectEqual(@as(usize, 0), client_stream.inbound.items.len);
+    try std.testing.expect(canReturnDeferredStreamCredit(
+        client_stream.receive_paused,
+        client_stream.transport_closed,
+    ));
+    try std.testing.expect(!canReturnDeferredStreamCredit(false, true));
     try client_stream.decoder.finish();
 }
 
@@ -3133,6 +3304,48 @@ test "channel and server exchange gzip-compressed unary messages" {
     );
     defer limited.deinit();
     try std.testing.expectEqual(status.Code.resource_exhausted, limited.status.code);
+}
+
+test "manual receive flow control preserves unary messages larger than the initial window" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const Handler = struct {
+        fn handle(
+            _: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Flow/LargeUnary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+    const payload = try std.testing.allocator.alloc(u8, 128 * 1024);
+    defer std.testing.allocator.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index);
+
+    var result = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Flow/LargeUnary",
+        payload,
+        .{ .max_response_size = payload.len },
+    );
+    defer result.deinit();
+    try std.testing.expect(result.status.isOk());
+    try std.testing.expectEqualSlices(u8, payload, result.payload);
 }
 
 test "channel replaces a connection after GOAWAY without replaying calls" {
