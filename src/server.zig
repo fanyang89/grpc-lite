@@ -1,4 +1,5 @@
 const std = @import("std");
+const xev = @import("xev");
 const c = @import("c.zig").api;
 const Compression = @import("compression.zig").Compression;
 const deadline = @import("deadline.zig");
@@ -28,15 +29,15 @@ pub const Server = struct {
         const host = try allocator.dupeZ(u8, options.host);
         errdefer allocator.free(host);
 
+        const io_threaded = std.Io.Threaded.init(allocator, .{});
         impl.* = .{
             .allocator = allocator,
             .host = host,
             .configured_port = options.port,
             .max_request_size = options.max_request_size,
+            .io_threaded = io_threaded,
         };
-        if (c.uv_mutex_init(&impl.mutex) < 0) return error.SynchronizationInitializationFailed;
-        errdefer c.uv_mutex_destroy(&impl.mutex);
-        if (c.uv_cond_init(&impl.condition) < 0) return error.SynchronizationInitializationFailed;
+        impl.clock = .{ .context = impl, .now_fn = ioNow };
         return .{ .impl = impl };
     }
 
@@ -93,12 +94,12 @@ pub const Server = struct {
             .running => {
                 impl.shutdown_request = .immediate;
                 impl.state = .stopping;
-                _ = c.uv_async_send(&impl.shutdown_async);
+                impl.notifyShutdown();
             },
             .draining => {
                 impl.shutdown_request = .immediate;
                 impl.state = .stopping;
-                _ = c.uv_async_send(&impl.shutdown_async);
+                impl.notifyShutdown();
             },
             .stopping, .stopped => {},
         }
@@ -118,7 +119,7 @@ pub const Server = struct {
                 impl.shutdown_request = .graceful;
                 impl.drain_timeout_ns = timeout_ns;
                 impl.state = .draining;
-                _ = c.uv_async_send(&impl.shutdown_async);
+                impl.notifyShutdown();
             },
             .draining, .stopping, .stopped => {},
         }
@@ -143,8 +144,7 @@ pub const Server = struct {
         impl.handlers.deinit(impl.allocator);
         impl.connections.deinit(impl.allocator);
         impl.allocator.free(impl.host);
-        c.uv_cond_destroy(&impl.condition);
-        c.uv_mutex_destroy(&impl.mutex);
+        impl.io_threaded.deinit();
         const allocator = impl.allocator;
         allocator.destroy(impl);
         self.* = undefined;
@@ -171,35 +171,48 @@ const Impl = struct {
     max_request_size: usize,
     handlers: std.StringHashMapUnmanaged(service.UnaryHandler) = .empty,
     connections: std.ArrayList(*Connection) = .empty,
-    mutex: c.uv_mutex_t = undefined,
-    condition: c.uv_cond_t = undefined,
+    io_threaded: std.Io.Threaded,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     state: State = .initialized,
     shutdown_request: ShutdownRequest = .none,
     drain_timeout_ns: u64 = 0,
     startup_error: ?StartupError = null,
     thread: ?std.Thread = null,
-    loop: c.uv_loop_t = undefined,
-    listener: c.uv_tcp_t = undefined,
-    shutdown_async: c.uv_async_t = undefined,
-    drain_timer: c.uv_timer_t = undefined,
-    deadline_timer: c.uv_timer_t = undefined,
+    loop: xev.Loop = undefined,
+    loop_initialized: bool = false,
+    listener: xev.TCP = undefined,
+    listener_initialized: bool = false,
+    listener_accept_completion: xev.Completion = .{},
+    listener_close_completion: xev.Completion = .{},
+    listener_close_submitted: bool = false,
+    listener_closed: bool = false,
+    shutdown_async: xev.Async = undefined,
+    shutdown_async_initialized: bool = false,
+    shutdown_completion: xev.Completion = .{},
+    drain_timer: xev.Timer = undefined,
+    drain_timer_initialized: bool = false,
+    drain_timer_completion: xev.Completion = .{},
+    deadline_timer: xev.Timer = undefined,
     deadline_timer_initialized: bool = false,
+    deadline_timer_completion: xev.Completion = .{},
+    deadline_timer_cancel_completion: xev.Completion = .{},
     drain_started: bool = false,
-    clock: deadline.Clock = .{ .now_fn = uvNow },
+    clock: deadline.Clock = undefined,
     local_host: [15]u8 = undefined,
     local_host_len: usize = 0,
     local_port: u16 = 0,
 
     fn lock(self: *Impl) void {
-        c.uv_mutex_lock(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
     }
 
     fn unlock(self: *Impl) void {
-        c.uv_mutex_unlock(&self.mutex);
+        self.mutex.unlock(self.io());
     }
 
     fn waitForSignal(self: *Impl) void {
-        c.uv_cond_wait(&self.condition, &self.mutex);
+        self.condition.waitUncancelable(self.io(), &self.mutex);
     }
 
     fn signalStarted(self: *Impl, result: ?StartupError) void {
@@ -212,10 +225,18 @@ const Impl = struct {
             .graceful => .draining,
             .immediate => .stopping,
         };
-        c.uv_cond_broadcast(&self.condition);
+        self.condition.broadcast(self.io());
         const should_shutdown = result == null and self.shutdown_request != .none;
         self.unlock();
-        if (should_shutdown) _ = c.uv_async_send(&self.shutdown_async);
+        if (should_shutdown) self.notifyShutdown();
+    }
+
+    fn io(self: *Impl) std.Io {
+        return self.io_threaded.io();
+    }
+
+    fn notifyShutdown(self: *Impl) void {
+        if (self.shutdown_async_initialized) self.shutdown_async.notify() catch {};
     }
 };
 
@@ -279,13 +300,19 @@ const Stream = struct {
 
 const Connection = struct {
     server: *Impl,
-    tcp: c.uv_tcp_t = undefined,
+    tcp: xev.TCP = undefined,
     session: ?*c.nghttp2_session = null,
     streams: std.AutoHashMapUnmanaged(i32, *Stream) = .empty,
     highest_accepted_stream_id: i32 = 0,
     pending_writes: usize = 0,
     draining: bool = false,
     closing: bool = false,
+    read_active: bool = false,
+    close_completed: bool = false,
+    read_completion: xev.Completion = .{},
+    close_completion: xev.Completion = .{},
+    write_queue: xev.WriteQueue = .{},
+    read_buffer: []u8 = &.{},
 
     fn initializeSession(self: *Connection) !void {
         var callbacks: ?*c.nghttp2_session_callbacks = null;
@@ -313,28 +340,64 @@ const Connection = struct {
             const bytes = try self.server.allocator.dupe(u8, data[0..@intCast(length)]);
             errdefer self.server.allocator.free(bytes);
             write.* = .{ .connection = self, .bytes = bytes };
-            write.req.data = write;
-            var buffer = c.uv_buf_init(@ptrCast(bytes.ptr), @intCast(bytes.len));
             self.pending_writes += 1;
-            if (c.uv_write(&write.req, @ptrCast(&self.tcp), &buffer, 1, onWrite) < 0) {
-                self.pending_writes -= 1;
-                self.server.allocator.free(bytes);
-                self.server.allocator.destroy(write);
-                return error.WriteFailed;
-            }
+            self.tcp.queueWrite(
+                &self.server.loop,
+                &self.write_queue,
+                &write.request,
+                .{ .slice = bytes },
+                WriteRequest,
+                write,
+                onWrite,
+            );
         }
     }
 
+    fn startRead(self: *Connection, loop: *xev.Loop) !void {
+        if (self.closing or self.read_active) return;
+        if (self.read_buffer.len == 0) self.read_buffer = try self.server.allocator.alloc(u8, 16 * 1024);
+        self.read_active = true;
+        self.tcp.read(loop, &self.read_completion, .{ .slice = self.read_buffer }, Connection, self, onRead);
+    }
+
     fn close(self: *Connection) void {
+        if (!self.server.loop_initialized) {
+            self.closing = true;
+            return;
+        }
+        self.closeOnLoop(&self.server.loop);
+    }
+
+    fn closeOnLoop(self: *Connection, loop: *xev.Loop) void {
         if (self.closing) return;
         self.closing = true;
-        _ = c.uv_read_stop(@ptrCast(&self.tcp));
-        if (c.uv_is_closing(@ptrCast(&self.tcp)) == 0) c.uv_close(@ptrCast(&self.tcp), onConnectionClosed);
+        self.tcp.close(loop, &self.close_completion, Connection, self, onConnectionClosed);
+    }
+
+    fn finishCloseIfReady(self: *Connection) void {
+        if (!self.close_completed or self.read_active or self.pending_writes != 0) return;
+        const server = self.server;
+        if (self.session) |session| c.nghttp2_session_del(session);
+        var iterator = self.streams.iterator();
+        while (iterator.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            server.allocator.destroy(entry.value_ptr.*);
+        }
+        self.streams.deinit(server.allocator);
+        if (self.read_buffer.len != 0) server.allocator.free(self.read_buffer);
+        for (server.connections.items, 0..) |item, index| {
+            if (item == self) {
+                _ = server.connections.swapRemove(index);
+                break;
+            }
+        }
+        server.allocator.destroy(self);
+        finishDrainIfIdle(server);
     }
 };
 
 const WriteRequest = struct {
-    req: c.uv_write_t = undefined,
+    request: xev.WriteRequest = undefined,
     connection: *Connection,
     bytes: []u8,
 };
@@ -343,11 +406,13 @@ fn runLoop(server: *Impl) void {
     const setup_result = setupLoop(server);
     if (setup_result) |_| {
         server.signalStarted(null);
-        _ = c.uv_run(&server.loop, c.UV_RUN_DEFAULT);
-        _ = c.uv_loop_close(&server.loop);
+        server.loop.run(.until_done) catch {};
+        server.shutdown_async.deinit();
+        server.loop.deinit();
+        server.loop_initialized = false;
         server.lock();
         server.state = .stopped;
-        c.uv_cond_broadcast(&server.condition);
+        server.condition.broadcast(server.io());
         server.unlock();
     } else |err| {
         server.signalStarted(err);
@@ -355,175 +420,147 @@ fn runLoop(server: *Impl) void {
 }
 
 fn setupLoop(server: *Impl) StartupError!void {
-    if (c.uv_loop_init(&server.loop) < 0) return error.LoopInitializationFailed;
-    errdefer _ = c.uv_loop_close(&server.loop);
-
-    var listener_initialized = false;
-    var async_initialized = false;
-    var drain_timer_initialized = false;
-    var deadline_timer_initialized = false;
+    server.loop = xev.Loop.init(.{}) catch return error.LoopInitializationFailed;
+    server.loop_initialized = true;
     errdefer {
-        if (deadline_timer_initialized) c.uv_close(@ptrCast(&server.deadline_timer), null);
-        if (drain_timer_initialized) c.uv_close(@ptrCast(&server.drain_timer), null);
-        if (async_initialized) c.uv_close(@ptrCast(&server.shutdown_async), null);
-        if (listener_initialized) c.uv_close(@ptrCast(&server.listener), null);
-        _ = c.uv_run(&server.loop, c.UV_RUN_DEFAULT);
+        server.loop.deinit();
+        server.loop_initialized = false;
     }
 
-    if (c.uv_tcp_init(&server.loop, &server.listener) < 0) return error.ListenerInitializationFailed;
-    listener_initialized = true;
-    server.listener.data = server;
+    errdefer {
+        if (server.shutdown_async_initialized) server.shutdown_async.deinit();
+        if (server.listener_initialized) closeFd(server.listener.fd);
+    }
 
-    var bind_address: c.struct_sockaddr_in = undefined;
-    if (c.uv_ip4_addr(server.host.ptr, server.configured_port, &bind_address) < 0) return error.InvalidAddress;
-    if (c.uv_tcp_bind(&server.listener, @ptrCast(&bind_address), 0) < 0) return error.BindFailed;
-    if (c.uv_listen(@ptrCast(&server.listener), 128, onConnection) < 0) return error.ListenFailed;
+    const address = std.Io.net.IpAddress.parseIp4(server.host, server.configured_port) catch return error.InvalidAddress;
+    server.listener = xev.TCP.init(address) catch return error.ListenerInitializationFailed;
+    server.listener_initialized = true;
+    server.listener.bind(address) catch return error.BindFailed;
+    server.listener.listen(128) catch return error.ListenFailed;
 
-    var local_address: c.struct_sockaddr_in = undefined;
-    var address_length: c_int = @sizeOf(c.struct_sockaddr_in);
-    if (c.uv_tcp_getsockname(&server.listener, @ptrCast(&local_address), &address_length) < 0) return error.AddressQueryFailed;
-    var host_buffer: [16]u8 = undefined;
-    if (c.uv_ip4_name(&local_address, &host_buffer, host_buffer.len) < 0) return error.AddressQueryFailed;
-    const host = std.mem.sliceTo(&host_buffer, 0);
-    @memcpy(server.local_host[0..host.len], host);
-    server.local_host_len = host.len;
-    server.local_port = std.mem.bigToNative(u16, local_address.sin_port);
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(server.listener.fd, @ptrCast(&local_address), &address_length)) != .SUCCESS) return error.AddressQueryFailed;
+    @memcpy(server.local_host[0..server.host.len], server.host);
+    server.local_host_len = server.host.len;
+    server.local_port = std.mem.bigToNative(u16, local_address.port);
 
-    if (c.uv_async_init(&server.loop, &server.shutdown_async, onShutdown) < 0) return error.AsyncInitializationFailed;
-    async_initialized = true;
-    server.shutdown_async.data = server;
-
-    if (c.uv_timer_init(&server.loop, &server.drain_timer) < 0) return error.TimerInitializationFailed;
-    drain_timer_initialized = true;
-    server.drain_timer.data = server;
-
-    if (c.uv_timer_init(&server.loop, &server.deadline_timer) < 0) return error.TimerInitializationFailed;
-    deadline_timer_initialized = true;
+    server.shutdown_async = xev.Async.init() catch return error.AsyncInitializationFailed;
+    server.shutdown_async_initialized = true;
+    server.shutdown_async.wait(&server.loop, &server.shutdown_completion, Impl, server, onShutdown);
+    server.drain_timer = xev.Timer.init() catch return error.TimerInitializationFailed;
+    server.drain_timer_initialized = true;
+    server.deadline_timer = xev.Timer.init() catch return error.TimerInitializationFailed;
     server.deadline_timer_initialized = true;
-    server.deadline_timer.data = server;
+    server.listener.accept(&server.loop, &server.listener_accept_completion, Impl, server, onConnection);
 }
 
-fn onConnection(listener: ?*c.uv_stream_t, connection_status: c_int) callconv(.c) void {
-    if (connection_status < 0) return;
-    const server: *Impl = @ptrCast(@alignCast(listener.?.*.data.?));
-    server.lock();
-    const accepting = server.state == .running;
-    server.unlock();
-    if (!accepting) return;
-
-    const connection = server.allocator.create(Connection) catch return;
-    connection.* = .{ .server = server };
-
-    if (c.uv_tcp_init(&server.loop, &connection.tcp) < 0) {
-        server.allocator.destroy(connection);
-        return;
+fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev.AcceptError!xev.TCP) xev.CallbackAction {
+    const impl = server orelse return .disarm;
+    const tcp = result catch return if (isAccepting(impl)) .rearm else .disarm;
+    const server_ptr = impl;
+    if (!isAccepting(server_ptr)) {
+        closeFd(tcp.fd);
+        return .disarm;
     }
-    connection.tcp.data = connection;
-    if (c.uv_accept(listener, @ptrCast(&connection.tcp)) < 0) {
-        connection.close();
-        return;
-    }
+
+    const connection = server_ptr.allocator.create(Connection) catch {
+        closeFd(tcp.fd);
+        return .rearm;
+    };
+    connection.* = .{ .server = server_ptr, .tcp = tcp };
     connection.initializeSession() catch {
-        connection.close();
-        return;
+        connection.closeOnLoop(loop);
+        return .rearm;
     };
-    server.connections.append(server.allocator, connection) catch {
-        connection.close();
-        return;
+    server_ptr.connections.append(server_ptr.allocator, connection) catch {
+        connection.closeOnLoop(loop);
+        return .rearm;
     };
-    if (c.uv_read_start(@ptrCast(&connection.tcp), allocateReadBuffer, onRead) < 0) {
-        connection.close();
-        return;
-    }
-    connection.flush() catch connection.close();
+    connection.startRead(loop) catch connection.closeOnLoop(loop);
+    connection.flush() catch connection.closeOnLoop(loop);
+    return .rearm;
 }
 
-fn allocateReadBuffer(handle: ?*c.uv_handle_t, suggested_size: usize, buffer: ?*c.uv_buf_t) callconv(.c) void {
-    const connection: *Connection = @ptrCast(@alignCast(handle.?.*.data.?));
-    const size = @max(suggested_size, 1);
-    const bytes = connection.server.allocator.alloc(u8, size) catch {
-        buffer.?.* = c.uv_buf_init(null, 0);
-        return;
-    };
-    buffer.?.* = c.uv_buf_init(@ptrCast(bytes.ptr), @intCast(bytes.len));
-}
-
-fn onRead(stream_handle: ?*c.uv_stream_t, bytes_read: isize, buffer: ?*const c.uv_buf_t) callconv(.c) void {
-    const connection: *Connection = @ptrCast(@alignCast(stream_handle.?.*.data.?));
-    defer if (buffer.?.*.base != null) {
-        const bytes: [*]u8 = @ptrCast(buffer.?.*.base);
-        connection.server.allocator.free(bytes[0..buffer.?.*.len]);
-    };
-    if (bytes_read < 0) {
-        connection.close();
-        return;
-    }
-    if (bytes_read == 0) return;
-
-    const input: [*]const u8 = @ptrCast(buffer.?.*.base);
-    const consumed = c.nghttp2_session_mem_recv2(connection.session, input, @intCast(bytes_read));
-    if (consumed < 0 or consumed != bytes_read) {
-        connection.close();
-        return;
-    }
-    connection.flush() catch connection.close();
-}
-
-fn onWrite(request: ?*c.uv_write_t, write_status: c_int) callconv(.c) void {
-    const write: *WriteRequest = @ptrCast(@alignCast(request.?.*.data.?));
-    const connection = write.connection;
-    connection.pending_writes -= 1;
-    connection.server.allocator.free(write.bytes);
-    connection.server.allocator.destroy(write);
-    if (write_status < 0) {
-        connection.close();
-    } else {
-        maybeCloseDrainedConnection(connection);
-    }
-}
-
-fn onConnectionClosed(handle: ?*c.uv_handle_t) callconv(.c) void {
-    const connection: *Connection = @ptrCast(@alignCast(handle.?.*.data.?));
-    const server = connection.server;
-    if (connection.session) |session| c.nghttp2_session_del(session);
-    var iterator = connection.streams.iterator();
-    while (iterator.next()) |entry| {
-        entry.value_ptr.*.deinit();
-        server.allocator.destroy(entry.value_ptr.*);
-    }
-    connection.streams.deinit(server.allocator);
-    for (server.connections.items, 0..) |item, index| {
-        if (item == connection) {
-            _ = server.connections.swapRemove(index);
-            break;
-        }
-    }
-    server.allocator.destroy(connection);
-    finishDrainIfIdle(server);
-}
-
-fn onShutdown(async_handle: ?*c.uv_async_t) callconv(.c) void {
-    const server: *Impl = @ptrCast(@alignCast(async_handle.?.*.data.?));
+fn isAccepting(server: *Impl) bool {
     server.lock();
-    const state = server.state;
-    server.unlock();
+    defer server.unlock();
+    return server.state == .running;
+}
+
+fn closeFd(fd: std.posix.fd_t) void {
+    _ = std.posix.system.close(fd);
+}
+
+fn onRead(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, buffer: xev.ReadBuffer, result: xev.ReadError!usize) xev.CallbackAction {
+    const conn = connection orelse return .disarm;
+    conn.read_active = false;
+    const length = result catch {
+        conn.closeOnLoop(loop);
+        conn.finishCloseIfReady();
+        return .disarm;
+    };
+    const bytes = switch (buffer) {
+        .slice => |slice| slice[0..length],
+        .array => unreachable,
+    };
+    const consumed = c.nghttp2_session_mem_recv2(conn.session, bytes.ptr, bytes.len);
+    if (consumed < 0 or consumed != bytes.len) {
+        conn.closeOnLoop(loop);
+    } else {
+        conn.flush() catch conn.closeOnLoop(loop);
+        conn.startRead(loop) catch conn.closeOnLoop(loop);
+    }
+    conn.finishCloseIfReady();
+    return .disarm;
+}
+
+fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.WriteBuffer, result: xev.WriteError!usize) xev.CallbackAction {
+    const request = write orelse return .disarm;
+    const connection = request.connection;
+    connection.pending_writes -= 1;
+    connection.server.allocator.free(request.bytes);
+    connection.server.allocator.destroy(request);
+    _ = result catch {
+        connection.closeOnLoop(loop);
+        connection.finishCloseIfReady();
+        return .disarm;
+    };
+    maybeCloseDrainedConnection(connection);
+    connection.finishCloseIfReady();
+    return .disarm;
+}
+
+fn onConnectionClosed(connection: ?*Connection, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.CloseError!void) xev.CallbackAction {
+    const conn = connection orelse return .disarm;
+    conn.close_completed = true;
+    conn.finishCloseIfReady();
+    return .disarm;
+}
+
+fn onShutdown(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.Async.WaitError!void) xev.CallbackAction {
+    const impl = server orelse return .disarm;
+    impl.lock();
+    const state = impl.state;
+    impl.unlock();
     switch (state) {
-        .draining => beginDrain(server),
-        .stopping => stopImmediately(server),
+        .draining => beginDrain(impl),
+        .stopping => stopImmediately(impl),
         else => {},
     }
+    return .rearm;
 }
 
 fn beginDrain(server: *Impl) void {
     if (!server.drain_started) {
         server.drain_started = true;
-        if (c.uv_is_closing(@ptrCast(&server.listener)) == 0) c.uv_close(@ptrCast(&server.listener), null);
+        closeListener(server);
 
         const timeout_ms = if (server.drain_timeout_ns == 0)
             0
         else
             std.math.divCeil(u64, server.drain_timeout_ns, std.time.ns_per_ms) catch std.math.maxInt(u64);
-        _ = c.uv_timer_start(&server.drain_timer, onDrainTimeout, timeout_ms, 0);
+        server.drain_timer.run(&server.loop, &server.drain_timer_completion, timeout_ms, Impl, server, onDrainTimeout);
 
         for (server.connections.items) |connection| {
             if (connection.closing or connection.session == null) continue;
@@ -536,10 +573,10 @@ fn beginDrain(server: *Impl) void {
                 null,
                 0,
             ) != 0) {
-                connection.close();
+                connection.closeOnLoop(&server.loop);
                 continue;
             }
-            connection.flush() catch connection.close();
+            connection.flush() catch connection.closeOnLoop(&server.loop);
         }
     }
 
@@ -558,32 +595,46 @@ fn finishDrainIfIdle(server: *Impl) void {
     const draining = server.state == .draining;
     server.unlock();
     if (!draining or server.connections.items.len != 0) return;
-    closeControlHandles(server);
+    server.lock();
+    server.state = .stopping;
+    server.unlock();
+    maybeStopLoop(server);
 }
 
-fn onDrainTimeout(handle: ?*c.uv_timer_t) callconv(.c) void {
-    const server: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
-    server.lock();
-    if (server.state == .draining) server.state = .stopping;
-    server.unlock();
-    stopImmediately(server);
+fn onDrainTimeout(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+    const impl = server orelse return .disarm;
+    result catch return .disarm;
+    impl.lock();
+    if (impl.state == .draining) impl.state = .stopping;
+    impl.unlock();
+    stopImmediately(impl);
+    return .disarm;
 }
 
 fn stopImmediately(server: *Impl) void {
-    if (c.uv_is_closing(@ptrCast(&server.listener)) == 0) c.uv_close(@ptrCast(&server.listener), null);
-    for (server.connections.items) |connection| connection.close();
-    closeControlHandles(server);
+    closeListener(server);
+    for (server.connections.items) |connection| connection.closeOnLoop(&server.loop);
+    maybeStopLoop(server);
 }
 
-fn closeControlHandles(server: *Impl) void {
-    if (server.deadline_timer_initialized) {
-        server.deadline_timer_initialized = false;
-        _ = c.uv_timer_stop(&server.deadline_timer);
-        if (c.uv_is_closing(@ptrCast(&server.deadline_timer)) == 0) c.uv_close(@ptrCast(&server.deadline_timer), null);
-    }
-    _ = c.uv_timer_stop(&server.drain_timer);
-    if (c.uv_is_closing(@ptrCast(&server.drain_timer)) == 0) c.uv_close(@ptrCast(&server.drain_timer), null);
-    if (c.uv_is_closing(@ptrCast(&server.shutdown_async)) == 0) c.uv_close(@ptrCast(&server.shutdown_async), null);
+fn closeListener(server: *Impl) void {
+    if (!server.listener_initialized or server.listener_close_submitted) return;
+    server.listener_close_submitted = true;
+    server.listener.close(&server.loop, &server.listener_close_completion, Impl, server, onListenerClosed);
+}
+
+fn onListenerClosed(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.CloseError!void) xev.CallbackAction {
+    const impl = server orelse return .disarm;
+    impl.listener_closed = true;
+    maybeStopLoop(impl);
+    return .disarm;
+}
+
+fn maybeStopLoop(server: *Impl) void {
+    server.lock();
+    const stopping = server.state == .stopping;
+    server.unlock();
+    if (stopping and server.listener_closed and server.connections.items.len == 0) server.loop.stop();
 }
 
 fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
@@ -906,16 +957,18 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, _: u32, user_data: ?*an
         connection.server.allocator.destroy(entry.value);
     }
     scheduleDeadlineTimer(connection.server);
-    if (connection.draining) _ = c.uv_async_send(&connection.server.shutdown_async);
+    if (connection.draining) finishDrainIfIdle(connection.server);
     return 0;
 }
 
-fn uvNow(_: ?*anyopaque) u64 {
-    return c.uv_hrtime();
+fn ioNow(context: ?*anyopaque) u64 {
+    const server: *Impl = @ptrCast(@alignCast(context.?));
+    const nanoseconds = std.Io.Clock.awake.now(server.io()).nanoseconds;
+    return std.math.cast(u64, @max(nanoseconds, @as(i96, 0))) orelse std.math.maxInt(u64);
 }
 
 fn scheduleDeadlineTimer(server: *Impl) void {
-    if (!server.deadline_timer_initialized or c.uv_is_closing(@ptrCast(&server.deadline_timer)) != 0) return;
+    if (!server.loop_initialized or !server.deadline_timer_initialized) return;
     var earliest: ?u64 = null;
     for (server.connections.items) |connection| {
         var iterator = connection.streams.valueIterator();
@@ -927,24 +980,31 @@ fn scheduleDeadlineTimer(server: *Impl) void {
             }
         }
     }
-    if (earliest == null) {
-        _ = c.uv_timer_stop(&server.deadline_timer);
-        return;
-    }
+    if (earliest == null) return;
     const remaining = earliest.? -| server.clock.now();
     const timeout_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining, std.time.ns_per_ms) catch 1);
-    _ = c.uv_timer_start(&server.deadline_timer, onDeadlineTimer, timeout_ms, 0);
+    server.deadline_timer.reset(
+        &server.loop,
+        &server.deadline_timer_completion,
+        &server.deadline_timer_cancel_completion,
+        timeout_ms,
+        Impl,
+        server,
+        onDeadlineTimer,
+    );
 }
 
-fn onDeadlineTimer(handle: ?*c.uv_timer_t) callconv(.c) void {
-    const server: *Impl = @ptrCast(@alignCast(handle.?.*.data.?));
-    const now = server.clock.now();
-    expireDeadlines(server, now);
-    for (server.connections.items) |connection| {
+fn onDeadlineTimer(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+    const impl = server orelse return .disarm;
+    result catch return .disarm;
+    const now = impl.clock.now();
+    expireDeadlines(impl, now);
+    for (impl.connections.items) |connection| {
         if (connection.closing or connection.session == null) continue;
         connection.flush() catch connection.close();
     }
-    scheduleDeadlineTimer(server);
+    scheduleDeadlineTimer(impl);
+    return .disarm;
 }
 
 fn expireDeadlines(server: *Impl, now: u64) void {
