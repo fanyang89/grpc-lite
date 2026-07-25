@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const grpc = @import("grpc_lite");
 const testing = @import("grpc_testing");
 
@@ -11,6 +12,9 @@ const Config = struct {
     server_port: u16 = 10000,
     test_case: []const u8 = "large_unary",
     use_tls: bool = false,
+    soak_iterations: usize = 10,
+    soak_max_failures: usize = 0,
+    soak_overall_timeout_seconds: u64 = 10,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -29,6 +33,18 @@ pub fn main(init: std.process.Init) !void {
         config.server_port,
     });
     defer init.gpa.free(target);
+
+    if (std.mem.eql(u8, config.test_case, "rpc_soak")) {
+        try rpcSoak(init, target, config);
+        std.debug.print("interop case passed: {s}\n", .{config.test_case});
+        return;
+    }
+    if (std.mem.eql(u8, config.test_case, "channel_soak")) {
+        try channelSoak(init, target, config);
+        std.debug.print("interop case passed: {s}\n", .{config.test_case});
+        return;
+    }
+
     var channel = try grpc.Channel.init(init.gpa, target, .{});
     defer channel.deinit();
 
@@ -65,6 +81,65 @@ pub fn main(init: std.process.Init) !void {
         return error.UnsupportedTestCase;
     }
     std.debug.print("interop case passed: {s}\n", .{config.test_case});
+}
+
+fn rpcSoak(init: std.process.Init, target: []const u8, config: Config) !void {
+    const deadline = soakDeadline(init.io, config.soak_overall_timeout_seconds);
+    var channel = try grpc.Channel.init(init.gpa, target, .{});
+    defer channel.deinit();
+
+    var failures: usize = 0;
+    for (0..config.soak_iterations) |iteration| {
+        try checkSoakDeadline(init.io, deadline);
+        largeUnary(init.gpa, &channel) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            try recordSoakFailure(&failures, config.soak_max_failures, iteration, err);
+        };
+        try checkSoakDeadline(init.io, deadline);
+    }
+}
+
+fn channelSoak(init: std.process.Init, target: []const u8, config: Config) !void {
+    const deadline = soakDeadline(init.io, config.soak_overall_timeout_seconds);
+    var failures: usize = 0;
+    for (0..config.soak_iterations) |iteration| {
+        try checkSoakDeadline(init.io, deadline);
+        const iteration_error: ?anyerror = block: {
+            var channel = try grpc.Channel.init(init.gpa, target, .{});
+            defer channel.deinit();
+            largeUnary(init.gpa, &channel) catch |err| break :block err;
+            break :block null;
+        };
+        if (iteration_error) |err| {
+            if (err == error.OutOfMemory) return err;
+            try recordSoakFailure(&failures, config.soak_max_failures, iteration, err);
+        }
+        try checkSoakDeadline(init.io, deadline);
+    }
+}
+
+fn soakDeadline(io: std.Io, timeout_seconds: u64) i96 {
+    return std.Io.Clock.awake.now(io).nanoseconds +|
+        @as(i96, timeout_seconds) * std.time.ns_per_s;
+}
+
+fn checkSoakDeadline(io: std.Io, deadline: i96) !void {
+    if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) {
+        return error.SoakOverallTimeout;
+    }
+}
+
+fn recordSoakFailure(
+    failures: *usize,
+    max_failures: usize,
+    iteration: usize,
+    err: anyerror,
+) !void {
+    failures.* += 1;
+    if (!builtin.is_test) {
+        std.debug.print("soak iteration {d} failed: {s}\n", .{ iteration + 1, @errorName(err) });
+    }
+    if (failures.* > max_failures) return error.SoakFailureBudgetExceeded;
 }
 
 fn emptyUnary(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
@@ -311,10 +386,44 @@ fn parseArgs(args: []const []const u8) !Config {
             config.use_tls = try parseBool(arg["--use_tls=".len..]);
         } else if (std.mem.eql(u8, arg, "--use_tls")) {
             config.use_tls = true;
+        } else if (std.mem.startsWith(u8, arg, "--soak_iterations=")) {
+            config.soak_iterations = std.fmt.parseInt(
+                usize,
+                arg["--soak_iterations=".len..],
+                10,
+            ) catch return error.InvalidSoakIterations;
+        } else if (std.mem.eql(u8, arg, "--soak_iterations")) {
+            index += 1;
+            if (index >= args.len) return error.MissingSoakIterations;
+            config.soak_iterations = std.fmt.parseInt(usize, args[index], 10) catch
+                return error.InvalidSoakIterations;
+        } else if (std.mem.startsWith(u8, arg, "--soak_max_failures=")) {
+            config.soak_max_failures = std.fmt.parseInt(
+                usize,
+                arg["--soak_max_failures=".len..],
+                10,
+            ) catch return error.InvalidSoakMaxFailures;
+        } else if (std.mem.eql(u8, arg, "--soak_max_failures")) {
+            index += 1;
+            if (index >= args.len) return error.MissingSoakMaxFailures;
+            config.soak_max_failures = std.fmt.parseInt(usize, args[index], 10) catch
+                return error.InvalidSoakMaxFailures;
+        } else if (std.mem.startsWith(u8, arg, "--soak_overall_timeout_seconds=")) {
+            config.soak_overall_timeout_seconds = std.fmt.parseInt(
+                u64,
+                arg["--soak_overall_timeout_seconds=".len..],
+                10,
+            ) catch return error.InvalidSoakOverallTimeout;
+        } else if (std.mem.eql(u8, arg, "--soak_overall_timeout_seconds")) {
+            index += 1;
+            if (index >= args.len) return error.MissingSoakOverallTimeout;
+            config.soak_overall_timeout_seconds = std.fmt.parseInt(u64, args[index], 10) catch
+                return error.InvalidSoakOverallTimeout;
         } else {
             return error.UnknownArgument;
         }
     }
+    if (config.soak_iterations == 0) return error.ZeroSoakIterations;
     return config;
 }
 
@@ -322,4 +431,89 @@ fn parseBool(value: []const u8) !bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
     return error.InvalidBoolean;
+}
+
+test "parse soak arguments in equals form" {
+    const config = try parseArgs(&.{
+        "interop-client",
+        "--soak_iterations=23",
+        "--soak_max_failures=4",
+        "--soak_overall_timeout_seconds=90",
+    });
+    try std.testing.expectEqual(@as(usize, 23), config.soak_iterations);
+    try std.testing.expectEqual(@as(usize, 4), config.soak_max_failures);
+    try std.testing.expectEqual(@as(u64, 90), config.soak_overall_timeout_seconds);
+}
+
+test "parse soak arguments in split form" {
+    const config = try parseArgs(&.{
+        "interop-client",
+        "--soak_iterations",
+        "23",
+        "--soak_max_failures",
+        "4",
+        "--soak_overall_timeout_seconds",
+        "90",
+    });
+    try std.testing.expectEqual(@as(usize, 23), config.soak_iterations);
+    try std.testing.expectEqual(@as(usize, 4), config.soak_max_failures);
+    try std.testing.expectEqual(@as(u64, 90), config.soak_overall_timeout_seconds);
+}
+
+test "reject zero soak iterations" {
+    try std.testing.expectError(
+        error.ZeroSoakIterations,
+        parseArgs(&.{ "interop-client", "--soak_iterations=0" }),
+    );
+}
+
+test "reject invalid soak numbers" {
+    try std.testing.expectError(
+        error.InvalidSoakIterations,
+        parseArgs(&.{ "interop-client", "--soak_iterations=invalid" }),
+    );
+    try std.testing.expectError(
+        error.InvalidSoakMaxFailures,
+        parseArgs(&.{ "interop-client", "--soak_max_failures=invalid" }),
+    );
+    try std.testing.expectError(
+        error.InvalidSoakOverallTimeout,
+        parseArgs(&.{ "interop-client", "--soak_overall_timeout_seconds=invalid" }),
+    );
+}
+
+test "reject missing soak values" {
+    try std.testing.expectError(
+        error.MissingSoakIterations,
+        parseArgs(&.{ "interop-client", "--soak_iterations" }),
+    );
+    try std.testing.expectError(
+        error.MissingSoakMaxFailures,
+        parseArgs(&.{ "interop-client", "--soak_max_failures" }),
+    );
+    try std.testing.expectError(
+        error.MissingSoakOverallTimeout,
+        parseArgs(&.{ "interop-client", "--soak_overall_timeout_seconds" }),
+    );
+}
+
+test "reject unknown interop client argument" {
+    try std.testing.expectError(
+        error.UnknownArgument,
+        parseArgs(&.{ "interop-client", "--unknown=value" }),
+    );
+}
+
+test "soak controls fail on exceeded budget and elapsed deadline" {
+    var failures: usize = 0;
+    try recordSoakFailure(&failures, 1, 0, error.RpcFailed);
+    try std.testing.expectError(
+        error.SoakFailureBudgetExceeded,
+        recordSoakFailure(&failures, 1, 1, error.RpcFailed),
+    );
+    try std.testing.expectEqual(@as(usize, 2), failures);
+    try std.testing.expectError(
+        error.SoakOverallTimeout,
+        checkSoakDeadline(std.testing.io, std.math.minInt(i96)),
+    );
 }

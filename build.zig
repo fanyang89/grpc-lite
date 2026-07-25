@@ -227,9 +227,27 @@ fn addProtobufSupport(
     official_proto_tests.step.dependOn(&generate_interop_proto.step);
     const run_official_proto_tests = b.addRunArtifact(official_proto_tests);
 
+    const interop_client_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/official/interop_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "grpc_lite", .module = grpc_lite },
+            .{ .name = "grpc_testing", .module = interop_proto },
+        },
+    });
+    applySanitizers(interop_client_test_module, sanitizers);
+    const interop_client_tests = b.addTest(.{
+        .name = "interop-client-parser",
+        .root_module = interop_client_test_module,
+    });
+    interop_client_tests.step.dependOn(&generate_interop_proto.step);
+    const run_interop_client_tests = b.addRunArtifact(interop_client_tests);
+
     test_step.dependOn(&run_protobuf_tests.step);
     test_step.dependOn(&run_protobuf_adapter_tests.step);
     test_step.dependOn(&run_official_proto_tests.step);
+    test_step.dependOn(&run_interop_client_tests.step);
 
     const echo_server = addExample(b, "grpc-lite-echo-server", "examples/echo_server.zig", grpc_lite);
     echo_server.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);

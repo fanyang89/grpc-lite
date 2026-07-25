@@ -129,9 +129,21 @@ for test_case in "${official_cases[@]}"; do
     --test_case="$test_case" \
     --use_tls=false
 done
+for test_case in "${soak_cases[@]}"; do
+  run_case 'grpc-lite client -> grpc-go server' "$test_case" \
+    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$go_server_port" \
+    --test_case="$test_case" \
+    --soak_iterations="$soak_iterations" \
+    --soak_max_failures="$soak_max_failures" \
+    --soak_overall_timeout_seconds="$soak_overall_timeout_seconds" \
+    --use_tls=false
+done
 stop_peer
 
-printf '%s\n' "All 10 bidirectional unary and 2 grpc-go soak runs passed ($soak_iterations iteration(s) each)."
+printf '%s\n' "All 10 bidirectional unary runs passed."
+printf '%s\n' "All 4 bidirectional soak runs passed: rpc_soak and channel_soak in each direction ($soak_iterations iteration(s) each)."
 
 printf '%s\n' 'grpc-go v1.82.1 does not expose the official compression cases; running grpc-lite compression integration separately.'
 peer_log="$work_dir/grpc-lite-compression-server.log"

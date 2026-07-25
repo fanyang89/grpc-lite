@@ -21,6 +21,7 @@ mise run interop-http2-edge
 | gRPC HTTP/2 TLS framing | TLS application protocol, version, and cipher suite cases | Skipped; TLS is out of scope |
 | gRPC HTTP/2 edge-case server | reset, GOAWAY, ping, max-stream, and DATA padding cases | Pass |
 | grpc-go client to grpc-lite server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
+| grpc-lite client to grpc-go server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
 
 The HTTP/2 framing tool deliberately treats every `TestSoon*` failure as non-fatal.
 `run_http2.sh` therefore validates five required non-TLS passes, three expected TLS
@@ -32,8 +33,9 @@ framing suite is not reported as fully passing while the pinned parser limitatio
 remains.
 
 The unary harness defaults to 10 iterations for each soak case. Set `SOAK_ITERATIONS`,
-`SOAK_MAX_FAILURES`, and `SOAK_OVERALL_TIMEOUT_SECONDS` to override the official grpc-go
-soak settings for scheduled runs.
+`SOAK_MAX_FAILURES`, and `SOAK_OVERALL_TIMEOUT_SECONDS` to override both directions'
+soak settings for scheduled runs. The scheduled soak covers grpc-lite Server reuse and
+grpc-lite Channel reuse and recreation.
 
 The edge-case server sources and container image are pinned to the same grpc commit.
 The upstream server still contains Python 2 idioms, so the harness applies
