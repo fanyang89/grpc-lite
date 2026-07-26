@@ -1482,7 +1482,6 @@ fn processStreamCommand(server: *Impl, command: StreamCommand) void {
             const active = target.streaming_active and !target.transport_closed;
             if (active) target.response_finished = true;
             server.unlock();
-            if (active) removeStreamDeadline(target);
             if (!active or target.streaming == null) {
                 if (value.message.len != 0) server.allocator.free(value.message);
                 return;
@@ -2967,6 +2966,68 @@ test "server deadline heap removes destroyed targets" {
 
     try setConnectionDeadline(&connection, server.impl.clock.now() +| std.time.ns_per_s);
     connection.close();
+    try std.testing.expectEqual(@as(usize, 0), server.impl.deadline_heap.items.len);
+}
+
+test "streaming finish keeps deadline until transport retirement" {
+    const Handler = struct {
+        fn onStart(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onMessage(
+            _: ?*anyopaque,
+            _: raw_stream.ServerStream,
+            _: *service.ServerContext,
+            _: []const u8,
+            _: Compression,
+        ) !raw_stream.ReceiveAction {
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+    };
+
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    const target = try std.testing.allocator.create(Stream);
+    target.* = Stream.init(std.testing.allocator, &connection, 1);
+    var target_alive = true;
+    defer if (target_alive) {
+        discardStreamCommands(target);
+        target.deinit();
+        std.testing.allocator.destroy(target);
+    };
+    target.streaming = .{
+        .handler = .{
+            .on_start = Handler.onStart,
+            .on_message = Handler.onMessage,
+            .on_remote_end = Handler.onRemoteEnd,
+        },
+        .decoder = frame.Decoder.init(std.testing.allocator, 1024),
+        .context = service.ServerContext.init(std.testing.allocator),
+    };
+    target.streaming_active = true;
+    try setStreamDeadline(target, deadline.Deadline.initAfter(server.impl.clock, std.time.ns_per_s));
+    const heap_index = target.deadline_heap_index.?;
+
+    try server.impl.stream_commands.append(server.impl.allocator, .{
+        .target = target,
+        .action = .{ .finish = .{ .code = .ok, .message = &.{} } },
+    });
+    target.command_refs += 1;
+    processStreamCommands(server.impl);
+
+    try std.testing.expect(target.response_finished);
+    try std.testing.expect(target.streaming_active);
+    try std.testing.expectEqual(@as(?usize, heap_index), target.deadline_heap_index);
+    try std.testing.expect(deadlineTargetsEqual(
+        server.impl.deadline_heap.items[heap_index].target,
+        .{ .stream = target },
+    ));
+
+    const destroyed = retireStream(target);
+    target_alive = !destroyed;
+    try std.testing.expect(destroyed);
     try std.testing.expectEqual(@as(usize, 0), server.impl.deadline_heap.items.len);
 }
 
