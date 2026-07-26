@@ -3649,6 +3649,164 @@ test "server write callback and discard each release once" {
     try std.testing.expectEqual(@as(usize, 0), connection.queued_write_bytes);
 }
 
+test "reactor local small allocations avoid serialized backing operations" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    const local_allocator = server.impl.localAllocator();
+    var connection = Connection{ .server = server.impl };
+
+    const warm_bytes = try local_allocator.alloc(u8, 64);
+    defer local_allocator.free(warm_bytes);
+    const warm_stream = try local_allocator.create(Stream);
+    warm_stream.* = Stream.init(local_allocator, &connection, 1);
+    defer destroyStream(warm_stream);
+
+    const serialized = server.coordinator.serialized_allocator;
+    const warmed_count = serialized.operation_count.load(.monotonic);
+    for (0..1000) |_| {
+        const bytes = try local_allocator.alloc(u8, 64);
+        local_allocator.free(bytes);
+    }
+    try std.testing.expectEqual(warmed_count, serialized.operation_count.load(.monotonic));
+
+    const reused_stream = try local_allocator.create(Stream);
+    reused_stream.* = Stream.init(local_allocator, &connection, 3);
+    destroyStream(reused_stream);
+    try std.testing.expectEqual(warmed_count, serialized.operation_count.load(.monotonic));
+
+    var streams: [1000]*Stream = undefined;
+    var created: usize = 0;
+    defer for (streams[0..created]) |stream| destroyStream(stream);
+    while (created < streams.len) : (created += 1) {
+        streams[created] = try local_allocator.create(Stream);
+        streams[created].* = Stream.init(local_allocator, &connection, @intCast(created * 2 + 5));
+    }
+    for (streams[0..created]) |stream| destroyStream(stream);
+    created = 0;
+    const refill_operations = serialized.operation_count.load(.monotonic) - warmed_count;
+    try std.testing.expect(refill_operations > 0);
+    try std.testing.expect(refill_operations < streams.len / 10);
+}
+
+test "cross-thread server stream commands retain shared ownership" {
+    const Handler = struct {
+        fn onStart(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onMessage(
+            _: ?*anyopaque,
+            _: raw_stream.ServerStream,
+            _: *service.ServerContext,
+            _: []const u8,
+            _: Compression,
+        ) !raw_stream.ReceiveAction {
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+    };
+    const Worker = struct {
+        stream: raw_stream.ServerStream,
+        send_error: ?anyerror = null,
+        finish_error: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.stream.send("from-worker", .{}) catch |err| {
+                self.send_error = err;
+            };
+            self.stream.finish(.init(.ok, "worker-finished")) catch |err| {
+                self.finish_error = err;
+            };
+        }
+    };
+
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    server.impl.local_allocator_state.enterLoop();
+    defer server.impl.local_allocator_state.leaveLoop();
+
+    var connection = Connection{ .server = server.impl };
+    const target = try std.testing.allocator.create(Stream);
+    target.* = Stream.init(std.testing.allocator, &connection, 1);
+    defer {
+        target.deinit();
+        std.testing.allocator.destroy(target);
+    }
+    target.streaming = .{
+        .handler = .{
+            .on_start = Handler.onStart,
+            .on_message = Handler.onMessage,
+            .on_remote_end = Handler.onRemoteEnd,
+        },
+        .decoder = frame.Decoder.init(std.testing.allocator, 1024),
+        .context = service.ServerContext.init(std.testing.allocator),
+    };
+    target.streaming_active = true;
+    target.receive_paused = true;
+    target.resume_queued = true;
+    try server.impl.stream_commands.append(server.impl.shared_allocator, .{
+        .target = target,
+        .action = .resume_receive,
+    });
+    target.command_refs = 1;
+
+    var worker = Worker{ .stream = target.serverHandle() };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    thread.join();
+    try std.testing.expect(worker.send_error == null);
+    try std.testing.expect(worker.finish_error == null);
+
+    processStreamCommands(server.impl);
+    try std.testing.expectEqual(@as(usize, 0), target.command_refs);
+    try std.testing.expect(target.response_finished);
+    try std.testing.expectEqualStrings("worker-finished", target.response_message);
+    try std.testing.expect(target.response_message_allocator.?.ptr == server.impl.shared_allocator.ptr);
+    const outbound = target.streaming.?.nextOutbound().?;
+    try std.testing.expect(outbound.allocator.ptr == server.impl.shared_allocator.ptr);
+}
+
+test "shared stream command allocation failure does not use local storage" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    server.impl.local_allocator_state.enterLoop();
+    defer server.impl.local_allocator_state.leaveLoop();
+    var connection = Connection{ .server = server.impl };
+    var target = Stream.init(std.testing.allocator, &connection, 1);
+    defer target.deinit();
+    target.streaming_active = true;
+
+    const original_backing = server.coordinator.serialized_allocator.backing;
+    defer server.coordinator.serialized_allocator.backing = original_backing;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    server.coordinator.serialized_allocator.backing = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, streamSend(&target, "command", .{}));
+    server.coordinator.serialized_allocator.backing = original_backing;
+    try std.testing.expectEqual(@as(usize, 0), server.impl.stream_commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), target.command_refs);
+}
+
+fn testServerInitAndLocalRefill(allocator: std.mem.Allocator) !void {
+    const Handler = struct {
+        fn handle(_: *@This(), response_allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            return service.UnaryResponse.ok(response_allocator, request);
+        }
+    };
+    var handler: Handler = .{};
+    var server = try Server.init(allocator, .{ .reactor_count = 4 });
+    defer server.deinit();
+    try server.registerUnary(
+        "/test.Allocator/Refill",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+}
+
+test "server partial init and local refill handle every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testServerInitAndLocalRefill,
+        .{},
+    );
+}
+
 fn expectDeadlineHeapConsistent(server: *const Impl) !void {
     for (server.deadline_heap.items, 0..) |entry, index| {
         try std.testing.expectEqual(@as(?usize, index), deadlineTargetIndex(entry.target).*);
