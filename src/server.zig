@@ -4034,9 +4034,52 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
             return service.UnaryResponse.ok(allocator, request);
         }
     };
+    const StreamHandler = struct {
+        fn onStart(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onMessage(
+            _: ?*anyopaque,
+            stream: raw_stream.ServerStream,
+            _: *service.ServerContext,
+            payload: []const u8,
+            _: Compression,
+        ) !raw_stream.ReceiveAction {
+            try stream.send(payload, .{});
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, stream: raw_stream.ServerStream, _: *service.ServerContext) !void {
+            try stream.finish(.ok);
+        }
+    };
     const Worker = struct {
         channel: *Channel,
         succeeded: bool = false,
+        done: std.Io.Semaphore = .{},
+        message_ok: bool = false,
+        terminal_ok: bool = false,
+
+        fn onMessage(
+            context: ?*anyopaque,
+            _: raw_stream.ClientStream,
+            payload: []const u8,
+            _: Compression,
+        ) raw_stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.message_ok = std.mem.eql(u8, payload, "stream-ping");
+            return .continue_receiving;
+        }
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            _: raw_stream.ClientStream,
+            final_status: status.Status,
+            _: *const metadata.Metadata,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.terminal_ok = final_status.isOk();
+            self.done.post(syncIo());
+        }
 
         fn run(self: *@This()) void {
             var result_allocator: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
@@ -4048,7 +4091,22 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
                 .{},
             ) catch return;
             defer result.deinit();
-            self.succeeded = result.status.isOk() and std.mem.eql(u8, result.payload, "ping");
+            if (!result.status.isOk() or !std.mem.eql(u8, result.payload, "ping")) return;
+
+            var stream = self.channel.openStream(
+                "/test.Reactors/Bidi",
+                .{},
+                .{
+                    .context = self,
+                    .on_message = onMessage,
+                    .on_terminal = onTerminal,
+                },
+            ) catch return;
+            defer stream.deinit();
+            stream.send("stream-ping", .{}) catch return;
+            stream.closeSend() catch return;
+            self.done.waitUncancelable(syncIo());
+            self.succeeded = self.message_ok and self.terminal_ok;
         }
     };
 
@@ -4063,8 +4121,17 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
         "/test.Reactors/Unary",
         service.UnaryHandler.bind(Handler, &handler, Handler.handle),
     );
+    try server.registerStream(
+        "/test.Reactors/Bidi",
+        .{
+            .on_start = StreamHandler.onStart,
+            .on_message = StreamHandler.onMessage,
+            .on_remote_end = StreamHandler.onRemoteEnd,
+        },
+    );
     for (server.coordinator.reactors) |reactor| {
         try std.testing.expect(reactor.handlers.contains("/test.Reactors/Unary"));
+        try std.testing.expect(reactor.stream_handlers.contains("/test.Reactors/Bidi"));
     }
     try server.start();
 
