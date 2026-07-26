@@ -123,6 +123,33 @@ result allocator passed to `callUnary`. Callers must ensure thread safety when s
 one result allocator across threads. A non-thread-safe result allocator must not alias
 the channel backing allocator while the channel is active.
 
+Raw unary calls also have an event-driven API:
+
+```zig
+try channel.callUnaryAsync(
+    "/demo.EchoService/Echo",
+    protobuf_wire_bytes,
+    .{ .timeout_ns = 5 * std.time.ns_per_s },
+    .{
+        .context = &state,
+        .on_complete = State.onComplete,
+    },
+);
+```
+
+`callUnaryAsync` copies the method path, request, and request metadata before returning.
+A successful return means the call was accepted and its completion callback will run
+exactly once. Synchronous validation, allocation, unavailable-channel, and notification
+failures return an error without invoking the callback. There is no unary cancellation
+API; explicit cancellation remains streaming-only.
+
+The completion callback runs on the Channel transport loop thread and must not block or
+call `Channel.deinit`. Its payload, status message, and initial and trailing metadata are
+borrowed only until the callback returns and must not be retained. The Channel releases
+the operation immediately after callback return. `Channel.deinit` shuts down the loop
+and waits for every accepted async unary callback to finish before releasing Channel
+storage.
+
 ## TLS
 
 TLS is an optional mbedTLS 3.6.6 dependency. Prepare it once, then enable it on the package

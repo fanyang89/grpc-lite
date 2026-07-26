@@ -244,7 +244,7 @@ pub const Channel = struct {
 
         const queued = try self.impl.enqueue(operation);
         if (!queued) operation.setOutcome(.unavailable, "channel is unavailable") catch {};
-        if (!queued) operation.complete();
+        if (!queued) operation.finish();
         operation.wait();
 
         var result = try call.Result.initWithCompression(
@@ -257,6 +257,32 @@ pub const Channel = struct {
         try copyMetadata(&result.initial_metadata, &operation.initial_metadata);
         try copyMetadata(&result.trailing_metadata, &operation.trailing_metadata);
         return result;
+    }
+
+    /// Starts an event-driven raw unary call and copies all inputs before return.
+    ///
+    /// A successful return means the call was accepted and `on_complete` will run
+    /// exactly once on the transport loop thread. Result data is borrowed only for
+    /// the callback. The callback must not block or call `Channel.deinit`.
+    pub fn callUnaryAsync(
+        self: *Channel,
+        full_method_path: []const u8,
+        request: []const u8,
+        options: call.Options,
+        callbacks: call.Callbacks,
+    ) !void {
+        if (!isValidMethodPath(full_method_path)) return error.InvalidMethodPath;
+        if (options.max_response_size > std.math.maxInt(u32)) return error.InvalidMaxResponseSize;
+
+        const operation = try Operation.initAsync(
+            self.impl,
+            full_method_path,
+            request,
+            options,
+            callbacks,
+        );
+        errdefer operation.deinit();
+        if (!try self.impl.enqueue(operation)) return error.ChannelUnavailable;
     }
 
     /// Opens an event-driven raw duplex stream. Input slices are copied before return.
@@ -769,6 +795,11 @@ fn clientStreamRelease(context: *anyopaque) void {
 
 const HeaderKind = enum { none, response, trailers };
 
+const OperationOwner = union(enum) {
+    blocking,
+    callback: call.Callbacks,
+};
+
 const Operation = struct {
     impl: *Impl,
     path: []u8,
@@ -788,6 +819,8 @@ const Operation = struct {
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
     done: bool = false,
+    finished: bool = false,
+    owner: OperationOwner = .blocking,
     outcome_set: bool = false,
     deadline_expired: bool = false,
     response_code: status.Code = .unknown,
@@ -847,6 +880,18 @@ const Operation = struct {
         return operation;
     }
 
+    fn initAsync(
+        impl: *Impl,
+        path: []const u8,
+        payload: []const u8,
+        options: call.Options,
+        callbacks: call.Callbacks,
+    ) !*Operation {
+        const operation = try init(impl, path, payload, options);
+        operation.owner = .{ .callback = callbacks };
+        return operation;
+    }
+
     fn deinit(self: *Operation) void {
         std.debug.assert(self.deadline_heap_index == null);
         std.debug.assert(!self.waiting_queued);
@@ -877,11 +922,27 @@ const Operation = struct {
         self.outcome_set = true;
     }
 
-    fn complete(self: *Operation) void {
-        self.mutex.lockUncancelable(syncIo());
-        self.done = true;
-        self.condition.broadcast(syncIo());
-        self.mutex.unlock(syncIo());
+    fn finish(self: *Operation) void {
+        std.debug.assert(!self.finished);
+        self.finished = true;
+        switch (self.owner) {
+            .blocking => {
+                self.mutex.lockUncancelable(syncIo());
+                self.done = true;
+                self.condition.broadcast(syncIo());
+                self.mutex.unlock(syncIo());
+            },
+            .callback => |callbacks| {
+                callbacks.on_complete(callbacks.context, .{
+                    .status = .init(self.response_code, self.response_message),
+                    .payload = if (self.response_payload) |payload| payload else &.{},
+                    .response_compression = self.response_compression,
+                    .initial_metadata = &self.initial_metadata,
+                    .trailing_metadata = &self.trailing_metadata,
+                });
+                self.deinit();
+            },
+        }
     }
 
     fn wait(self: *Operation) void {
@@ -922,13 +983,13 @@ const Operation = struct {
 
     fn finalize(self: *Operation, stream_error: u32) void {
         if (self.outcome_set) {
-            self.complete();
+            self.finish();
             return;
         }
         if (stream_error != c.NGHTTP2_NO_ERROR) {
             const mapped = streamErrorStatus(stream_error);
             self.setOutcome(mapped.code, mapped.message) catch {};
-            self.complete();
+            self.finish();
             return;
         }
         if (!self.saw_response_headers) {
@@ -952,7 +1013,7 @@ const Operation = struct {
             if (self.grpc_message) |encoded| {
                 decoded_message = message.decode(self.impl.allocator, encoded) catch {
                     self.setOutcome(.unknown, "invalid grpc-message") catch {};
-                    self.complete();
+                    self.finish();
                     return;
                 };
             }
@@ -970,7 +1031,7 @@ const Operation = struct {
                         else => .init(.internal, "malformed unary response"),
                     };
                     self.setOutcome(outcome.code, outcome.message) catch {};
-                    self.complete();
+                    self.finish();
                     return;
                 };
                 self.response_payload = payload;
@@ -979,7 +1040,7 @@ const Operation = struct {
             }
         }
         if (!self.outcome_set) self.setOutcome(.unknown, "response failed") catch {};
-        self.complete();
+        self.finish();
     }
 };
 
@@ -1463,13 +1524,14 @@ fn processPending(impl: *Impl) void {
     impl.mutex.unlock(syncIo());
     defer pending.deinit(impl.allocator);
 
-    for (pending.items) |operation| {
+    for (pending.items, 0..) |operation, index| {
+        pending.items[index] = undefined;
         appendWaitingOperation(impl, operation);
         if (operation.deadline_ns) |deadline| {
             deadlineHeapInsertOrUpdate(impl, .{ .operation = operation }, deadline) catch {
                 std.debug.assert(removeWaitingOperation(impl, operation));
                 operation.setOutcome(.unavailable, "request submission failed") catch {};
-                operation.complete();
+                operation.finish();
                 continue;
             };
         }
@@ -1487,7 +1549,7 @@ fn processPending(impl: *Impl) void {
                 removeOperationDeadline(impl, operation);
                 operation.deadline_expired = true;
                 operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
-                operation.complete();
+                operation.finish();
                 continue;
             }
             operation.timeout_header_len = deadline_wire.formatTimeout(&operation.timeout_header, deadline - now).len;
@@ -1495,7 +1557,7 @@ fn processPending(impl: *Impl) void {
         submitOperation(impl, operation) catch {
             removeOperationDeadline(impl, operation);
             operation.setOutcome(.unavailable, "request submission failed") catch {};
-            operation.complete();
+            operation.finish();
             continue;
         };
     }
@@ -2625,7 +2687,7 @@ fn expireDeadlines(impl: *Impl, now: u64) !void {
                     std.debug.assert(removeWaitingOperation(impl, operation));
                     operation.deadline_expired = true;
                     operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
-                    operation.complete();
+                    operation.finish();
                     continue;
                 }
                 if (operation.stream_id < 0 or impl.operations.get(operation.stream_id) != operation) continue;
@@ -2799,30 +2861,32 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     std.mem.swap(std.ArrayList(*Operation), &pending, &impl.pending);
     impl.mutex.unlock(syncIo());
 
-    for (pending.items) |operation| {
+    while (pending.pop()) |operation| {
         operation.setOutcome(.unavailable, reason) catch {};
-        operation.complete();
+        operation.finish();
     }
     pending.deinit(impl.allocator);
 
     while (popWaitingOperation(impl)) |operation| {
         removeOperationDeadline(impl, operation);
         operation.setOutcome(.unavailable, reason) catch {};
-        operation.complete();
+        operation.finish();
     }
 
     if (impl.session) |session| {
         c.nghttp2_session_del(session);
         impl.session = null;
     }
-    var iterator = impl.operations.valueIterator();
-    while (iterator.next()) |operation_ptr| {
-        const operation = operation_ptr.*;
+    while (impl.operations.count() != 0) {
+        var iterator = impl.operations.iterator();
+        const entry = iterator.next().?;
+        const stream_id = entry.key_ptr.*;
+        const operation = entry.value_ptr.*;
+        std.debug.assert(impl.operations.remove(stream_id));
         removeOperationDeadline(impl, operation);
         operation.setOutcome(.unavailable, reason) catch {};
-        operation.complete();
+        operation.finish();
     }
-    impl.operations.clearRetainingCapacity();
 
     while (impl.streams.count() != 0) {
         var stream_iterator = impl.streams.iterator();
@@ -5603,6 +5667,268 @@ test "channel performs reusable concurrent unary calls end to end" {
     var unavailable = try channel.callUnary(std.testing.allocator, "/test.Echo/Unary", "after-close", .{});
     defer unavailable.deinit();
     try std.testing.expectEqual(status.Code.unavailable, unavailable.status.code);
+}
+
+test "event-driven unary calls complete exactly once and release operations" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    const Handler = struct {
+        blocked_entered: std.Io.Semaphore = .{},
+        blocked_release: std.Io.Semaphore = .{},
+        copied_metadata_seen: std.atomic.Value(bool) = .init(false),
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            context: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            try context.addInitialMetadata("x-initial", "present");
+            try context.addTrailingMetadata("x-trailing", "present");
+            if (context.request_metadata.getFirst("x-copy")) |value| {
+                self.copied_metadata_seen.store(std.mem.eql(u8, value, "original"), .release);
+            }
+            if (std.mem.eql(u8, request, "status")) {
+                return service.UnaryResponse.fail(allocator, .init(.invalid_argument, "bad request"));
+            }
+            if (std.mem.eql(u8, request, "slow")) {
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake);
+            } else if (std.mem.eql(u8, request, "blocked")) {
+                self.blocked_entered.post(std.testing.io);
+                self.blocked_release.waitUncancelable(std.testing.io);
+            }
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    const Completion = struct {
+        expected_code: status.Code,
+        expected_message: []const u8 = "",
+        expected_payload: []const u8 = "",
+        require_metadata: bool = false,
+        caller_thread_id: std.Thread.Id,
+        calls: std.atomic.Value(usize) = .init(0),
+        done: std.atomic.Value(bool) = .init(false),
+        valid: std.atomic.Value(bool) = .init(false),
+
+        fn onComplete(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            const first = self.calls.fetchAdd(1, .acq_rel) == 0;
+            const metadata_valid = !self.require_metadata or
+                (std.mem.eql(u8, result.initial_metadata.getFirst("x-initial") orelse "", "present") and
+                    std.mem.eql(u8, result.trailing_metadata.getFirst("x-trailing") orelse "", "present"));
+            self.valid.store(
+                first and
+                    std.Thread.getCurrentId() != self.caller_thread_id and
+                    result.status.code == self.expected_code and
+                    std.mem.eql(u8, result.status.message, self.expected_message) and
+                    std.mem.eql(u8, result.payload, self.expected_payload) and
+                    result.response_compression == .identity and
+                    metadata_valid,
+                .release,
+            );
+            self.done.store(true, .release);
+        }
+    };
+
+    const ManyState = struct {
+        remaining: std.atomic.Value(usize),
+        valid: std.atomic.Value(bool) = .init(true),
+        done: std.atomic.Value(bool) = .init(false),
+    };
+    const ManyCompletion = struct {
+        shared: *ManyState,
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn onComplete(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.calls.fetchAdd(1, .acq_rel) != 0 or
+                !result.status.isOk() or
+                !std.mem.eql(u8, result.payload, "many"))
+            {
+                self.shared.valid.store(false, .release);
+            }
+            if (self.shared.remaining.fetchSub(1, .acq_rel) == 1) {
+                self.shared.done.store(true, .release);
+            }
+        }
+    };
+
+    const Reentrant = struct {
+        channel: *Channel,
+        calls: usize = 0,
+        valid: bool = true,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn onComplete(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            self.valid = self.valid and result.status.isOk() and
+                std.mem.eql(u8, result.payload, "reentrant");
+            if (self.calls == 4) {
+                self.done.store(true, .release);
+                return;
+            }
+            self.channel.callUnaryAsync(
+                "/test.Async/Unary",
+                "reentrant",
+                .{},
+                .{ .context = self, .on_complete = onComplete },
+            ) catch {
+                self.valid = false;
+                self.done.store(true, .release);
+            };
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Async/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel_allocator: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
+    var allocator_active = true;
+    defer if (allocator_active) {
+        std.testing.expectEqual(std.heap.Check.ok, channel_allocator.deinit()) catch
+            @panic("async channel allocator leak");
+    };
+    var channel = try Channel.init(channel_allocator.allocator(), target, .{});
+    var channel_active = true;
+    defer if (channel_active) channel.deinit();
+    const caller_thread_id = std.Thread.getCurrentId();
+
+    var copied_path = "/test.Async/Unary".*;
+    var copied_request = "copied".*;
+    var copied_key = "x-copy".*;
+    var copied_value = "original".*;
+    var copied = Completion{
+        .expected_code = .ok,
+        .expected_payload = "copied",
+        .require_metadata = true,
+        .caller_thread_id = caller_thread_id,
+    };
+    try channel.callUnaryAsync(&copied_path, &copied_request, .{
+        .metadata = &.{.{ .key = &copied_key, .value = &copied_value }},
+    }, .{ .context = &copied, .on_complete = Completion.onComplete });
+    @memset(&copied_path, 'x');
+    @memset(&copied_request, 'x');
+    @memset(&copied_key, 'x');
+    @memset(&copied_value, 'x');
+    try std.testing.expect(waitForTestFlag(&copied.done, 5 * std.time.ns_per_s));
+    try std.testing.expect(copied.valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), copied.calls.load(.acquire));
+    try std.testing.expect(handler.copied_metadata_seen.load(.acquire));
+
+    var application_error = Completion{
+        .expected_code = .invalid_argument,
+        .expected_message = "bad request",
+        .caller_thread_id = caller_thread_id,
+    };
+    try channel.callUnaryAsync(
+        "/test.Async/Unary",
+        "status",
+        .{},
+        .{ .context = &application_error, .on_complete = Completion.onComplete },
+    );
+    try std.testing.expect(waitForTestFlag(&application_error.done, 5 * std.time.ns_per_s));
+    try std.testing.expect(application_error.valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), application_error.calls.load(.acquire));
+
+    var pre_submit_deadline = Completion{
+        .expected_code = .deadline_exceeded,
+        .expected_message = "deadline exceeded",
+        .caller_thread_id = caller_thread_id,
+    };
+    try channel.callUnaryAsync(
+        "/test.Async/Unary",
+        "never submitted",
+        .{ .timeout_ns = 1 },
+        .{ .context = &pre_submit_deadline, .on_complete = Completion.onComplete },
+    );
+    try std.testing.expect(waitForTestFlag(&pre_submit_deadline.done, 5 * std.time.ns_per_s));
+    try std.testing.expect(pre_submit_deadline.valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), pre_submit_deadline.calls.load(.acquire));
+
+    var active_deadline = Completion{
+        .expected_code = .deadline_exceeded,
+        .expected_message = "deadline exceeded",
+        .caller_thread_id = caller_thread_id,
+    };
+    try channel.callUnaryAsync(
+        "/test.Async/Unary",
+        "slow",
+        .{ .timeout_ns = 5 * std.time.ns_per_ms },
+        .{ .context = &active_deadline, .on_complete = Completion.onComplete },
+    );
+    try std.testing.expect(waitForTestFlag(&active_deadline.done, 5 * std.time.ns_per_s));
+    try std.testing.expect(active_deadline.valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), active_deadline.calls.load(.acquire));
+
+    const concurrent_count = 128;
+    var many_state = ManyState{ .remaining = .init(concurrent_count) };
+    var many: [concurrent_count]ManyCompletion = undefined;
+    for (&many) |*completion| {
+        completion.* = .{ .shared = &many_state };
+        try channel.callUnaryAsync(
+            "/test.Async/Unary",
+            "many",
+            .{},
+            .{ .context = completion, .on_complete = ManyCompletion.onComplete },
+        );
+    }
+    try std.testing.expect(waitForTestFlag(&many_state.done, 5 * std.time.ns_per_s));
+    try std.testing.expect(many_state.valid.load(.acquire));
+    for (&many) |*completion| {
+        try std.testing.expectEqual(@as(usize, 1), completion.calls.load(.acquire));
+    }
+
+    var reentrant = Reentrant{ .channel = &channel };
+    try channel.callUnaryAsync(
+        "/test.Async/Unary",
+        "reentrant",
+        .{},
+        .{ .context = &reentrant, .on_complete = Reentrant.onComplete },
+    );
+    try std.testing.expect(waitForTestFlag(&reentrant.done, 5 * std.time.ns_per_s));
+    try std.testing.expect(reentrant.valid);
+    try std.testing.expectEqual(@as(usize, 4), reentrant.calls);
+
+    var shutdown_completion = Completion{
+        .expected_code = .unavailable,
+        .expected_message = "channel closed",
+        .caller_thread_id = caller_thread_id,
+    };
+    try channel.callUnaryAsync(
+        "/test.Async/Unary",
+        "blocked",
+        .{},
+        .{ .context = &shutdown_completion, .on_complete = Completion.onComplete },
+    );
+    handler.blocked_entered.waitUncancelable(std.testing.io);
+    channel.shutdown();
+    try std.testing.expectError(error.ChannelUnavailable, channel.callUnaryAsync(
+        "/test.Async/Unary",
+        "rejected",
+        .{},
+        .{ .context = &shutdown_completion, .on_complete = Completion.onComplete },
+    ));
+    channel.wait();
+    try std.testing.expect(shutdown_completion.done.load(.acquire));
+    try std.testing.expect(shutdown_completion.valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), shutdown_completion.calls.load(.acquire));
+    handler.blocked_release.post(std.testing.io);
+
+    channel.deinit();
+    channel_active = false;
+    try std.testing.expectEqual(std.heap.Check.ok, channel_allocator.deinit());
+    allocator_active = false;
 }
 
 test "channel and server exchange a unary call over TLS" {

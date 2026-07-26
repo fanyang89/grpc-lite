@@ -25,6 +25,8 @@ pub const xev = @import("xev");
 
 pub const CallOptions = call.Options;
 pub const CallResult = call.Result;
+pub const AsyncCallResult = call.AsyncResult;
+pub const UnaryCallCallbacks = call.Callbacks;
 pub const Compression = compression.Compression;
 pub const Channel = channel.Channel;
 pub const ChannelOptions = channel.Options;

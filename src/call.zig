@@ -12,6 +12,27 @@ pub const Options = struct {
     request_compression: Compression = .identity,
 };
 
+/// Borrowed unary result passed to `Callbacks.on_complete`.
+///
+/// Every slice, including `status.message` and metadata entries, is valid only
+/// until the callback returns.
+pub const AsyncResult = struct {
+    status: status.Status,
+    payload: []const u8,
+    response_compression: Compression,
+    initial_metadata: *const metadata.Metadata,
+    trailing_metadata: *const metadata.Metadata,
+};
+
+/// Completion callback for an event-driven raw unary call.
+///
+/// The callback runs on the Channel transport loop thread. It must not block,
+/// retain borrowed result data, or call `Channel.deinit`.
+pub const Callbacks = struct {
+    context: ?*anyopaque = null,
+    on_complete: *const fn (?*anyopaque, AsyncResult) void,
+};
+
 pub const Result = struct {
     allocator: std.mem.Allocator,
     status: status.Status,
@@ -109,4 +130,26 @@ test "call result handles every allocation failure" {
         testResultAllocations,
         .{},
     );
+}
+
+test "async call result exposes borrowed response views" {
+    var initial = metadata.Metadata.init(std.testing.allocator);
+    defer initial.deinit();
+    var trailing = metadata.Metadata.init(std.testing.allocator);
+    defer trailing.deinit();
+    try initial.append("x-initial", "value");
+    try trailing.append("x-trailing", "value");
+
+    const result: AsyncResult = .{
+        .status = .init(.ok, "borrowed"),
+        .payload = "payload",
+        .response_compression = .gzip,
+        .initial_metadata = &initial,
+        .trailing_metadata = &trailing,
+    };
+    try std.testing.expect(result.status.isOk());
+    try std.testing.expectEqualStrings("borrowed", result.status.message);
+    try std.testing.expectEqualStrings("payload", result.payload);
+    try std.testing.expectEqualStrings("value", result.initial_metadata.getFirst("x-initial").?);
+    try std.testing.expectEqualStrings("value", result.trailing_metadata.getFirst("x-trailing").?);
 }
