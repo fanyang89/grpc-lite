@@ -8,7 +8,7 @@ const AppError = error{ Rejected, OutOfMemory };
 const AppState = struct {
     response_allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
-    context_hook_called: bool = false,
+    context_hook_called: std.atomic.Value(bool) = .init(false),
 
     fn echo(self: *AppState, request: demo.EchoRequest) AppError!demo.EchoReply {
         if (std.mem.eql(u8, request.message, "reject")) return error.Rejected;
@@ -29,7 +29,7 @@ fn mapError(err: AppError) grpc.Status {
 }
 
 fn configureContext(state: *AppState, context: *grpc.ServerContext) !void {
-    state.context_hook_called = true;
+    state.context_hook_called.store(true, .release);
     try context.addInitialMetadata("x-protobuf", "enabled");
     try context.addTrailingMetadata("x-service", "demo.EchoService");
 }
@@ -85,7 +85,7 @@ test "generated service isolates transport registration handler and client alloc
     try std.testing.expectEqualStrings("hello protobuf", success.response.?.message);
     try std.testing.expectEqualStrings("enabled", success.raw.initial_metadata.getFirst("x-protobuf").?);
     try std.testing.expectEqualStrings("demo.EchoService", success.raw.trailing_metadata.getFirst("x-service").?);
-    try std.testing.expect(state.context_hook_called);
+    try std.testing.expect(state.context_hook_called.load(.acquire));
 
     var rejected = try client.callUnary(
         client_allocator,

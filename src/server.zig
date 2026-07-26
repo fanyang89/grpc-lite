@@ -3784,7 +3784,7 @@ test "shared stream command allocation failure does not use local storage" {
     try std.testing.expectEqual(@as(usize, 0), target.command_refs);
 }
 
-fn testServerInitAndLocalRefill(allocator: std.mem.Allocator) !void {
+fn testServerInitAndRegistrationAllocations(allocator: std.mem.Allocator) !void {
     const Handler = struct {
         fn handle(_: *@This(), response_allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
             return service.UnaryResponse.ok(response_allocator, request);
@@ -3799,10 +3799,10 @@ fn testServerInitAndLocalRefill(allocator: std.mem.Allocator) !void {
     );
 }
 
-test "server partial init and local refill handle every allocation failure" {
+test "server partial init and registration handle every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
-        testServerInitAndLocalRefill,
+        testServerInitAndRegistrationAllocations,
         .{},
     );
 }
@@ -5046,8 +5046,8 @@ test "raw HTTP/2 bidi stream incrementally exchanges messages" {
 
 test "malformed streaming input resets only its stream and connection remains reusable" {
     const StreamingHandler = struct {
-        messages: usize = 0,
-        cancels: usize = 0,
+        messages: std.atomic.Value(usize) = .init(0),
+        cancels: std.atomic.Value(usize) = .init(0),
 
         fn onStart(_: ?*anyopaque, _: raw_stream.ServerStream, context: *service.ServerContext) !void {
             try context.addTrailingMetadata("x-stream-trailer", "yes");
@@ -5062,7 +5062,7 @@ test "malformed streaming input resets only its stream and connection remains re
         ) !raw_stream.ReceiveAction {
             const self: *@This() = @ptrCast(@alignCast(context_ptr.?));
             try std.testing.expectEqualStrings("valid", payload);
-            self.messages += 1;
+            _ = self.messages.fetchAdd(1, .monotonic);
             return .continue_receiving;
         }
 
@@ -5072,7 +5072,7 @@ test "malformed streaming input resets only its stream and connection remains re
 
         fn onCancel(context_ptr: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) void {
             const self: *@This() = @ptrCast(@alignCast(context_ptr.?));
-            self.cancels += 1;
+            _ = self.cancels.fetchAdd(1, .monotonic);
         }
     };
     const UnaryHandler = struct {
@@ -5174,8 +5174,8 @@ test "malformed streaming input resets only its stream and connection remains re
     const unary_response = try frame.decodeUnary(std.testing.allocator, capture.stream3_data.items, 64);
     defer std.testing.allocator.free(unary_response);
     try std.testing.expectEqualStrings("reused", unary_response);
-    try std.testing.expectEqual(@as(usize, 1), streaming_handler.messages);
-    try std.testing.expectEqual(@as(usize, 1), streaming_handler.cancels);
+    try std.testing.expectEqual(@as(usize, 1), streaming_handler.messages.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), streaming_handler.cancels.load(.acquire));
 }
 
 test "response encoding list parsing" {

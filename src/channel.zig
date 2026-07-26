@@ -4535,7 +4535,7 @@ test "binary request initial and trailing metadata round trip as raw duplicate v
     const second_value = [_]u8{0xab};
 
     const Handler = struct {
-        request_matches: bool = false,
+        request_matches: std.atomic.Value(bool) = .init(false),
 
         fn handle(
             self: *@This(),
@@ -4544,13 +4544,13 @@ test "binary request initial and trailing metadata round trip as raw duplicate v
             request: []const u8,
         ) !service.UnaryResponse {
             const entries = context.request_metadata.items();
-            self.request_matches = entries.len == 3 and
+            self.request_matches.store(entries.len == 3 and
                 std.mem.eql(u8, entries[0].key, "x-request") and
                 std.mem.eql(u8, entries[0].value, "plain") and
                 std.mem.eql(u8, entries[1].key, "x-request-bin") and
                 std.mem.eql(u8, entries[1].value, &binary_value) and
                 std.mem.eql(u8, entries[2].key, "x-request-bin") and
-                std.mem.eql(u8, entries[2].value, &second_value);
+                std.mem.eql(u8, entries[2].value, &second_value), .release);
 
             try context.addInitialMetadata("x-initial", "plain");
             try context.addInitialMetadata("x-initial-bin", &binary_value);
@@ -4589,7 +4589,7 @@ test "binary request initial and trailing metadata round trip as raw duplicate v
     defer result.deinit();
 
     try std.testing.expect(result.status.isOk());
-    try std.testing.expect(handler.request_matches);
+    try std.testing.expect(handler.request_matches.load(.acquire));
     const initial = result.initial_metadata.items();
     try std.testing.expectEqual(@as(usize, 3), initial.len);
     try std.testing.expectEqualStrings("plain", initial[0].value);
@@ -4610,7 +4610,7 @@ test "malformed response metadata fails one call and preserves the channel" {
     const service = @import("service.zig");
 
     const Handler = struct {
-        calls: usize = 0,
+        calls: std.atomic.Value(usize) = .init(0),
 
         fn appendUnchecked(target: *metadata.Metadata, key: []const u8, value: []const u8) !void {
             const owned_key = try target.allocator.dupe(u8, key);
@@ -4626,7 +4626,7 @@ test "malformed response metadata fails one call and preserves the channel" {
             context: *service.ServerContext,
             request: []const u8,
         ) !service.UnaryResponse {
-            self.calls += 1;
+            _ = self.calls.fetchAdd(1, .monotonic);
             if (std.mem.eql(u8, request, "bad-key")) {
                 try appendUnchecked(&context.initial_metadata, "x!invalid", "value");
             } else if (std.mem.eql(u8, request, "bad-trailer")) {
@@ -4693,7 +4693,7 @@ test "malformed response metadata fails one call and preserves the channel" {
     defer reused.deinit();
     try std.testing.expect(reused.status.isOk());
     try std.testing.expectEqualStrings("reused", reused.payload);
-    try std.testing.expectEqual(@as(usize, 5), handler.calls);
+    try std.testing.expectEqual(@as(usize, 5), handler.calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
 }
 
@@ -4837,7 +4837,7 @@ test "channel replaces a connection after GOAWAY without replaying calls" {
 
     const Handler = struct {
         server: *server.Server,
-        calls: usize = 0,
+        calls: std.atomic.Value(usize) = .init(0),
 
         fn handle(
             self: *@This(),
@@ -4845,8 +4845,8 @@ test "channel replaces a connection after GOAWAY without replaying calls" {
             _: *service.ServerContext,
             request: []const u8,
         ) !service.UnaryResponse {
-            self.calls += 1;
-            if (self.calls == 1) {
+            const calls = self.calls.fetchAdd(1, .acq_rel) + 1;
+            if (calls == 1) {
                 const connection = self.server.impl.connections.items[0];
                 try connection.submitGoAway(1, c.NGHTTP2_NO_ERROR);
             }
@@ -4888,7 +4888,7 @@ test "channel replaces a connection after GOAWAY without replaying calls" {
     try std.testing.expect(second.status.isOk());
     try std.testing.expectEqualStrings("second", second.payload);
     try std.testing.expectEqual(@as(usize, 2), channel.impl.connect_count.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 2), handler.calls);
+    try std.testing.expectEqual(@as(usize, 2), handler.calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
 }
 
@@ -5330,9 +5330,9 @@ test "server context observes a wire deadline and overrides a late handler respo
     };
     const Handler = struct {
         clock: *FakeClock,
-        saw_deadline: bool = false,
-        saw_no_deadline: bool = false,
-        calls: usize = 0,
+        saw_deadline: std.atomic.Value(bool) = .init(false),
+        saw_no_deadline: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(usize) = .init(0),
 
         fn handle(
             self: *@This(),
@@ -5340,12 +5340,12 @@ test "server context observes a wire deadline and overrides a late handler respo
             context: *service.ServerContext,
             request: []const u8,
         ) !service.UnaryResponse {
-            self.calls += 1;
+            _ = self.calls.fetchAdd(1, .monotonic);
             if (context.hasDeadline()) {
-                self.saw_deadline = context.remainingTimeNs().? > 0 and !context.isDeadlineExceeded();
+                self.saw_deadline.store(context.remainingTimeNs().? > 0 and !context.isDeadlineExceeded(), .release);
                 self.clock.now_ns +|= 20 * std.time.ns_per_s;
             } else {
-                self.saw_no_deadline = true;
+                self.saw_no_deadline.store(true, .release);
             }
             return service.UnaryResponse.ok(allocator, request);
         }
@@ -5375,14 +5375,14 @@ test "server context observes a wire deadline and overrides a late handler respo
     );
     defer expired.deinit();
     try std.testing.expectEqual(status.Code.deadline_exceeded, expired.status.code);
-    try std.testing.expect(handler.saw_deadline);
+    try std.testing.expect(handler.saw_deadline.load(.acquire));
 
     var reused = try channel.callUnary(std.testing.allocator, "/test.Deadline/Unary", "reused", .{});
     defer reused.deinit();
     try std.testing.expect(reused.status.isOk());
     try std.testing.expectEqualStrings("reused", reused.payload);
-    try std.testing.expect(handler.saw_no_deadline);
-    try std.testing.expectEqual(@as(usize, 2), handler.calls);
+    try std.testing.expect(handler.saw_no_deadline.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), handler.calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
 }
 
@@ -5852,8 +5852,8 @@ test "channel performs reusable concurrent unary calls end to end" {
     const service = @import("service.zig");
 
     const Handler = struct {
-        calls: usize = 0,
-        saw_request_metadata: bool = false,
+        calls: std.atomic.Value(usize) = .init(0),
+        saw_request_metadata: std.atomic.Value(bool) = .init(false),
 
         fn handle(
             self: *@This(),
@@ -5861,9 +5861,9 @@ test "channel performs reusable concurrent unary calls end to end" {
             context: *service.ServerContext,
             request: []const u8,
         ) !service.UnaryResponse {
-            self.calls += 1;
+            _ = self.calls.fetchAdd(1, .monotonic);
             if (context.request_metadata.getFirst("x-request-id")) |value| {
-                self.saw_request_metadata = std.mem.eql(u8, value, "request-1");
+                self.saw_request_metadata.store(std.mem.eql(u8, value, "request-1"), .release);
             }
             try context.addInitialMetadata("x-initial", "present");
             try context.addTrailingMetadata("x-trailing", "present");
@@ -5903,7 +5903,7 @@ test "channel performs reusable concurrent unary calls end to end" {
     try std.testing.expectEqualStrings("hello", success.payload);
     try std.testing.expectEqualStrings("present", success.initial_metadata.getFirst("x-initial").?);
     try std.testing.expectEqualStrings("present", success.trailing_metadata.getFirst("x-trailing").?);
-    try std.testing.expect(handler.saw_request_metadata);
+    try std.testing.expect(handler.saw_request_metadata.load(.acquire));
 
     const binary_payload = [_]u8{ 0, 1, 0xff, 0, 42 };
     var binary = try channel.callUnary(std.testing.allocator, "/test.Echo/Unary", &binary_payload, .{});
