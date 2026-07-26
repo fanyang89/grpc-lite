@@ -7,6 +7,7 @@ const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
 const service = @import("service.zig");
+const socket_options = @import("socket_options.zig");
 const status = @import("status.zig");
 const raw_stream = @import("stream.zig");
 
@@ -226,6 +227,9 @@ const Impl = struct {
     listener: xev.TCP = undefined,
     listener_initialized: bool = false,
     listener_accept_completion: xev.Completion = .{},
+    listener_accept_cancel_completion: xev.Completion = .{},
+    listener_accept_active: bool = false,
+    listener_accept_cancel_submitted: bool = false,
     listener_close_completion: xev.Completion = .{},
     listener_close_submitted: bool = false,
     listener_closed: bool = false,
@@ -757,33 +761,49 @@ fn setupLoop(server: *Impl) StartupError!void {
     server.drain_timer_initialized = true;
     server.deadline_timer = xev.Timer.init() catch return error.TimerInitializationFailed;
     server.deadline_timer_initialized = true;
+    server.listener_accept_active = true;
     server.listener.accept(&server.loop, &server.listener_accept_completion, Impl, server, onConnection);
 }
 
 fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev.AcceptError!xev.TCP) xev.CallbackAction {
     const impl = server orelse return .disarm;
-    const tcp = result catch return if (isAccepting(impl)) .rearm else .disarm;
+    impl.listener_accept_active = false;
+    const tcp = result catch {
+        if (isAccepting(impl)) return rearmListener(impl);
+        closeListener(impl);
+        return .disarm;
+    };
     const server_ptr = impl;
     if (!isAccepting(server_ptr)) {
         closeFd(tcp.fd);
+        closeListener(server_ptr);
         return .disarm;
     }
+    socket_options.enableTcpNoDelay(tcp.fd) catch {
+        closeFd(tcp.fd);
+        return rearmListener(server_ptr);
+    };
 
     const connection = server_ptr.allocator.create(Connection) catch {
         closeFd(tcp.fd);
-        return .rearm;
+        return rearmListener(server_ptr);
     };
     connection.* = .{ .server = server_ptr, .tcp = tcp };
     connection.initializeSession() catch {
         connection.closeOnLoop(loop);
-        return .rearm;
+        return rearmListener(server_ptr);
     };
     server_ptr.connections.append(server_ptr.allocator, connection) catch {
         connection.closeOnLoop(loop);
-        return .rearm;
+        return rearmListener(server_ptr);
     };
     connection.startRead(loop) catch connection.closeOnLoop(loop);
     connection.flush() catch connection.closeOnLoop(loop);
+    return rearmListener(server_ptr);
+}
+
+fn rearmListener(server: *Impl) xev.CallbackAction {
+    server.listener_accept_active = true;
     return .rearm;
 }
 
@@ -1143,19 +1163,23 @@ fn beginDrain(server: *Impl) void {
         else
             std.math.divCeil(u64, server.drain_timeout_ns, std.time.ns_per_ms) catch std.math.maxInt(u64);
         server.drain_timer.run(&server.loop, &server.drain_timer_completion, timeout_ms, Impl, server, onDrainTimeout);
+    }
 
-        for (server.connections.items) |connection| {
-            if (connection.closing or connection.session == null) continue;
-            connection.draining = true;
-            connection.submitGoAway(
-                connection.highest_accepted_stream_id,
-                c.NGHTTP2_NO_ERROR,
-            ) catch {
-                connection.closeOnLoop(&server.loop);
-                continue;
-            };
-            connection.flush() catch connection.closeOnLoop(&server.loop);
-        }
+    // Do not advertise GOAWAY until replacement connections can no longer enter
+    // the listener backlog and appear connected without ever being accepted.
+    if (!server.listener_closed) return;
+
+    for (server.connections.items) |connection| {
+        if (connection.draining or connection.closing or connection.session == null) continue;
+        connection.draining = true;
+        connection.submitGoAway(
+            connection.highest_accepted_stream_id,
+            c.NGHTTP2_NO_ERROR,
+        ) catch {
+            connection.closeOnLoop(&server.loop);
+            continue;
+        };
+        connection.flush() catch connection.closeOnLoop(&server.loop);
     }
 
     for (server.connections.items) |connection| maybeCloseDrainedConnection(connection);
@@ -1197,14 +1221,42 @@ fn stopImmediately(server: *Impl) void {
 
 fn closeListener(server: *Impl) void {
     if (!server.listener_initialized or server.listener_close_submitted) return;
+    if (server.listener_accept_active) {
+        if (server.listener_accept_cancel_submitted) return;
+        server.listener_accept_cancel_submitted = true;
+        server.loop.cancel(
+            &server.listener_accept_completion,
+            &server.listener_accept_cancel_completion,
+            Impl,
+            server,
+            onListenerAcceptCanceled,
+        );
+        return;
+    }
     server.listener_close_submitted = true;
     server.listener.close(&server.loop, &server.listener_close_completion, Impl, server, onListenerClosed);
+}
+
+fn onListenerAcceptCanceled(
+    server: ?*Impl,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.CancelError!void,
+) xev.CallbackAction {
+    const impl = server orelse return .disarm;
+    impl.listener_accept_active = false;
+    impl.listener_accept_cancel_submitted = false;
+    closeListener(impl);
+    return .disarm;
 }
 
 fn onListenerClosed(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.CloseError!void) xev.CallbackAction {
     const impl = server orelse return .disarm;
     impl.listener_closed = true;
-    maybeStopLoop(impl);
+    impl.lock();
+    const draining = impl.state == .draining;
+    impl.unlock();
+    if (draining) beginDrain(impl) else maybeStopLoop(impl);
     return .disarm;
 }
 

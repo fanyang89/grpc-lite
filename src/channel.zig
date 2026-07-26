@@ -8,6 +8,7 @@ const deadline_wire = @import("deadline.zig");
 const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
+const socket_options = @import("socket_options.zig");
 const status = @import("status.zig");
 const stream = @import("stream.zig");
 const version = @import("version.zig");
@@ -358,9 +359,9 @@ const Impl = struct {
     deadline_timer_deadline_ns: ?u64 = null,
     connected: bool = false,
     connection_state: ConnectionState = .connecting,
-    connection_generation: usize = 0,
+    connection_generation: std.atomic.Value(usize) = .init(0),
     stopping_on_loop: bool = false,
-    connect_count: usize = 0,
+    connect_count: std.atomic.Value(usize) = .init(0),
     read_buffer: [16 * 1024]u8 = undefined,
     write_queue: xev.WriteQueue = .{},
     writes: std.AutoHashMapUnmanaged(*WriteRequest, void) = .empty,
@@ -923,7 +924,7 @@ fn startConnection(impl: *Impl) !void {
     impl.close_completed = false;
     impl.connected = false;
     impl.connection_state = .connecting;
-    impl.connection_generation += 1;
+    _ = impl.connection_generation.fetchAdd(1, .monotonic);
 
     try initializeSession(impl);
     impl.connect_active = true;
@@ -963,6 +964,11 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
         beginStop(impl, "connection failed");
         return .disarm;
     };
+    socket_options.enableTcpNoDelay(impl.tcp.fd) catch {
+        impl.signalStartup(false);
+        beginStop(impl, "connection failed");
+        return .disarm;
+    };
     impl.mutex.lockUncancelable(syncIo());
     const stopping = impl.state == .stopping or impl.state == .stopped;
     impl.mutex.unlock(syncIo());
@@ -971,7 +977,7 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
         return .disarm;
     }
     impl.connected = true;
-    impl.connect_count += 1;
+    _ = impl.connect_count.fetchAdd(1, .monotonic);
     impl.read_active = true;
     impl.tcp.read(&impl.loop, &impl.read_completion, .{ .slice = &impl.read_buffer }, Impl, impl, onRead);
     flush(impl) catch {
@@ -1577,7 +1583,7 @@ fn flush(impl: *Impl) !void {
         write.* = .{
             .impl = impl,
             .bytes = bytes,
-            .generation = impl.connection_generation,
+            .generation = impl.connection_generation.load(.monotonic),
         };
         try impl.writes.put(impl.allocator, write, {});
         errdefer _ = impl.writes.remove(write);
@@ -1636,11 +1642,11 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
     const write_succeeded = completed != null and completed.? == write.bytes.len;
     impl.allocator.free(write.bytes);
     impl.allocator.destroy(write);
-    if (!write_succeeded and generation == impl.connection_generation and impl.connection_state != .closing) {
+    if (!write_succeeded and generation == impl.connection_generation.load(.monotonic) and impl.connection_state != .closing) {
         beginStop(impl, "connection write failed");
     }
     if (write_succeeded and
-        generation == impl.connection_generation and
+        generation == impl.connection_generation.load(.monotonic) and
         impl.connected and
         impl.queued_write_bytes < impl.write_low_watermark_bytes)
     {
@@ -3331,7 +3337,7 @@ test "malformed response metadata fails one call and preserves the channel" {
     try std.testing.expect(reused.status.isOk());
     try std.testing.expectEqualStrings("reused", reused.payload);
     try std.testing.expectEqual(@as(usize, 5), handler.calls);
-    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
 }
 
 test "channel and server exchange gzip-compressed unary messages" {
@@ -3477,7 +3483,7 @@ test "channel replaces a connection after GOAWAY without replaying calls" {
     defer second.deinit();
     try std.testing.expect(second.status.isOk());
     try std.testing.expectEqualStrings("second", second.payload);
-    try std.testing.expectEqual(@as(usize, 2), channel.impl.connect_count);
+    try std.testing.expectEqual(@as(usize, 2), channel.impl.connect_count.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 2), handler.calls);
 }
 
@@ -3525,7 +3531,7 @@ test "server drain finishes an accepted RPC and rejects a replacement connection
     var rejected = try channel.callUnary(std.testing.allocator, "/test.Drain/Unary", "later", .{});
     defer rejected.deinit();
     try std.testing.expectEqual(status.Code.unavailable, rejected.status.code);
-    try std.testing.expectEqual(@as(usize, 2), channel.impl.connection_generation);
+    try std.testing.expectEqual(@as(usize, 2), channel.impl.connection_generation.load(.monotonic));
     test_server.wait();
 }
 
@@ -3965,7 +3971,7 @@ test "server context observes a wire deadline and overrides a late handler respo
     try std.testing.expectEqualStrings("reused", reused.payload);
     try std.testing.expect(handler.saw_no_deadline);
     try std.testing.expectEqual(@as(usize, 2), handler.calls);
-    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
 }
 
 test "channel deadline timer does not poll before a distant deadline" {
@@ -4235,7 +4241,7 @@ test "completed deadline leaves at most one stale timer callback" {
     try std.testing.expectEqual(after_stale, after_observation);
     try std.testing.expect(reused.status.isOk());
     try std.testing.expectEqualStrings("reused", reused.payload);
-    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
 }
 
 test "channel serializes a non-thread-safe backing allocator" {
@@ -4514,7 +4520,7 @@ test "channel performs reusable concurrent unary calls end to end" {
     var reused = try channel.callUnary(std.testing.allocator, "/test.Echo/Unary", "again", .{});
     defer reused.deinit();
     try std.testing.expectEqualStrings("again", reused.payload);
-    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
 
     const Worker = struct {
         channel: *Channel,
@@ -4537,7 +4543,7 @@ test "channel performs reusable concurrent unary calls end to end" {
     }
     for (&threads) |*thread| thread.join();
     for (&workers) |worker| try std.testing.expect(worker.succeeded);
-    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count);
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
 
     var deadline = try channel.callUnary(
         std.testing.allocator,
