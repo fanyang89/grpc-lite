@@ -60,6 +60,8 @@ fn StackFirstBuilder(comptime T: type, comptime stack_capacity: usize) type {
 const HeaderBuilder = StackFirstBuilder(c.nghttp2_nv, request_header_stack_capacity);
 const EncodedValueBuilder = StackFirstBuilder(metadata.OutboundValue, encoded_value_stack_capacity);
 
+threadlocal var receiving_http2_impl: ?*Impl = null;
+
 pub const TlsOptions = struct {
     ca_certificates_pem: []const u8,
     handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
@@ -527,6 +529,7 @@ const Impl = struct {
         defer self.mutex.unlock(syncIo());
         if (self.state != .running) return false;
         try self.pending.append(self.allocator, operation);
+        if (receiving_http2_impl == self) return true;
         if (self.async_handle.notify()) |_| {} else |_| {
             _ = self.pending.pop();
             return false;
@@ -2389,13 +2392,8 @@ fn onRead(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev
             return .rearm;
         }
     }
-    const consumed = c.nghttp2_session_mem_recv2(impl.session, impl.read_buffer[0..bytes_read].ptr, bytes_read);
-    if (consumed < 0 or consumed != @as(c.nghttp2_ssize, @intCast(bytes_read))) {
+    receiveHttp2(impl, impl.read_buffer[0..bytes_read]) catch {
         beginStop(impl, "HTTP/2 connection failed");
-        return .disarm;
-    }
-    flush(impl) catch {
-        beginStop(impl, "connection failed");
         return .disarm;
     };
     impl.read_active = true;
@@ -2416,20 +2414,27 @@ fn receiveTlsPlaintext(impl: *Impl) !void {
     while (true) {
         switch (try tls_session.read(&impl.plaintext_buffer)) {
             .bytes => |length| {
-                const consumed = c.nghttp2_session_mem_recv2(
-                    impl.session,
-                    impl.plaintext_buffer[0..length].ptr,
-                    length,
-                );
-                if (consumed < 0 or consumed != @as(c.nghttp2_ssize, @intCast(length)))
-                    return error.Http2ConnectionFailed;
+                try receiveHttp2(impl, impl.plaintext_buffer[0..length]);
             },
             .want_read => break,
             .want_write => try drainTlsCiphertext(impl),
             else => return error.TlsConnectionClosed,
         }
     }
-    try flush(impl);
+}
+
+fn receiveHttp2(impl: *Impl, input: []const u8) !void {
+    std.debug.assert(receiving_http2_impl == null);
+    const consumed = received: {
+        receiving_http2_impl = impl;
+        defer receiving_http2_impl = null;
+        break :received c.nghttp2_session_mem_recv2(impl.session, input.ptr, input.len);
+    };
+    if (consumed < 0 or consumed != @as(c.nghttp2_ssize, @intCast(input.len))) {
+        return error.Http2ConnectionFailed;
+    }
+    processPending(impl);
+    if (impl.stopping_on_loop) return error.Http2ConnectionFailed;
 }
 
 fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.WriteBuffer, result: xev.WriteError!usize) xev.CallbackAction {
@@ -2711,7 +2716,7 @@ fn scheduleDeadlineTimer(impl: *Impl) void {
                 impl,
                 onDeadlineTimer,
             );
-        } else if (impl.deadline_timer_deadline_ns != earliest) {
+        } else if (earliest < impl.deadline_timer_deadline_ns.?) {
             impl.deadline_timer_deadline_ns = earliest;
             observeDeadlineTimerScheduled(impl, earliest);
             impl.deadline_timer.reset(
