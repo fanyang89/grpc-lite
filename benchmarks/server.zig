@@ -305,6 +305,9 @@ const Service = struct {
     }
 
     fn getState(self: *Service, key: *anyopaque) ?*StreamState {
+        // The transport serializes a stream's callbacks on its connection's owner
+        // reactor, and this benchmark does not hand ServerStream to another thread.
+        // The map lock protects different reactors; transport calls stay outside it.
         self.lockStreams();
         defer self.unlockStreams();
         return self.streams.get(key);

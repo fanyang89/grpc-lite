@@ -4015,22 +4015,32 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
         thread_ids: [4]std.Thread.Id = undefined,
         thread_count: usize = 0,
 
+        fn observeThread(self: *@This()) void {
+            const thread_id = std.Thread.getCurrentId();
+            self.mutex.lockUncancelable(syncIo());
+            defer self.mutex.unlock(syncIo());
+            for (self.thread_ids[0..self.thread_count]) |existing| {
+                if (existing == thread_id) return;
+            }
+            if (self.thread_count < self.thread_ids.len) {
+                self.thread_ids[self.thread_count] = thread_id;
+                self.thread_count += 1;
+            }
+        }
+
+        fn getThreadCount(self: *@This()) usize {
+            self.mutex.lockUncancelable(syncIo());
+            defer self.mutex.unlock(syncIo());
+            return self.thread_count;
+        }
+
         fn handle(
             self: *@This(),
             allocator: std.mem.Allocator,
             _: *service.ServerContext,
             request: []const u8,
         ) !service.UnaryResponse {
-            const thread_id = std.Thread.getCurrentId();
-            self.mutex.lockUncancelable(syncIo());
-            defer self.mutex.unlock(syncIo());
-            for (self.thread_ids[0..self.thread_count]) |existing| {
-                if (existing == thread_id) return service.UnaryResponse.ok(allocator, request);
-            }
-            if (self.thread_count < self.thread_ids.len) {
-                self.thread_ids[self.thread_count] = thread_id;
-                self.thread_count += 1;
-            }
+            self.observeThread();
             return service.UnaryResponse.ok(allocator, request);
         }
     };
@@ -4056,8 +4066,15 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
         channel: *Channel,
         succeeded: bool = false,
         done: std.Io.Semaphore = .{},
+        callback_mutex: std.Io.Mutex = .init,
         message_ok: bool = false,
         terminal_ok: bool = false,
+
+        fn callbacksSucceeded(self: *@This()) bool {
+            self.callback_mutex.lockUncancelable(syncIo());
+            defer self.callback_mutex.unlock(syncIo());
+            return self.message_ok and self.terminal_ok;
+        }
 
         fn onMessage(
             context: ?*anyopaque,
@@ -4066,6 +4083,8 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
             _: Compression,
         ) raw_stream.ReceiveAction {
             const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.callback_mutex.lockUncancelable(syncIo());
+            defer self.callback_mutex.unlock(syncIo());
             self.message_ok = std.mem.eql(u8, payload, "stream-ping");
             return .continue_receiving;
         }
@@ -4077,7 +4096,9 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
             _: *const metadata.Metadata,
         ) void {
             const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.callback_mutex.lockUncancelable(syncIo());
             self.terminal_ok = final_status.isOk();
+            self.callback_mutex.unlock(syncIo());
             self.done.post(syncIo());
         }
 
@@ -4106,7 +4127,7 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
             stream.send("stream-ping", .{}) catch return;
             stream.closeSend() catch return;
             self.done.waitUncancelable(syncIo());
-            self.succeeded = self.message_ok and self.terminal_ok;
+            self.succeeded = self.callbacksSucceeded();
         }
     };
 
@@ -4163,7 +4184,7 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
             }
         }
         try std.testing.expect(distributed);
-        try std.testing.expect(handler.thread_count >= 2);
+        try std.testing.expect(handler.getThreadCount() >= 2);
 
         server.shutdown();
         server.wait();
