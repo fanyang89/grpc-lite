@@ -4,8 +4,8 @@ set -euo pipefail
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work_dir="$project_root/.zig-cache/official"
 grpc_commit=8542e01ff47eb07247ff6cfbd545f3b6f4e9b5d3
-grpc_dir="$work_dir/grpc-http2-$grpc_commit-py3-v2"
-image=us-docker.pkg.dev/grpc-testing/testing-images-public/grpc_interop_http2@sha256:9105057ebfd4902c0b85ed7fe302d877222afdb2c4994d831affc5f76aa10fcd
+image=grpc-lite-http2-edge:${grpc_commit:0:8}-py311-v1
+dockerfile="$project_root/third_party/grpc-http2-test/Dockerfile"
 base_port=${HTTP2_EDGE_BASE_PORT:-$((40000 + $$ % 10000))}
 container_name="grpc-lite-http2-edge-$$"
 server_log="$work_dir/http2-edge-server.log"
@@ -38,36 +38,19 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 mkdir -p "$work_dir"
-if [[ ! -d "$grpc_dir/.git" ]]; then
-  git init -q "$grpc_dir"
-  git -C "$grpc_dir" remote add origin https://github.com/grpc/grpc.git
-  git -C "$grpc_dir" sparse-checkout init --cone
-  git -C "$grpc_dir" sparse-checkout set test/http2_test
-  git -C "$grpc_dir" fetch -q --depth 1 origin "$grpc_commit"
-  git -C "$grpc_dir" checkout -q --detach FETCH_HEAD
-fi
-
-if [[ $(git -C "$grpc_dir" rev-parse HEAD) != "$grpc_commit" ]]; then
-  printf '%s\n' "unexpected grpc test checkout in $grpc_dir" >&2
-  exit 1
-fi
-if ! git -C "$grpc_dir" apply --reverse --check "$project_root/tests/official/http2-test-python3.patch" 2>/dev/null; then
-  git -C "$grpc_dir" apply --check "$project_root/tests/official/http2-test-python3.patch"
-  git -C "$grpc_dir" apply "$project_root/tests/official/http2-test-python3.patch"
-fi
 
 printf '%s\n' 'Building grpc-lite HTTP/2 edge-case client...'
 (cd "$project_root" && zig build)
 
-printf '%s\n' 'Starting pinned official gRPC HTTP/2 edge-case server...'
-docker pull "$image" >/dev/null
+printf '%s\n' 'Building vendored official gRPC HTTP/2 edge-case server...'
+image_id=$(docker build --quiet --file "$dockerfile" --tag "$image" "$project_root")
+
+printf '%s\n' 'Starting vendored official gRPC HTTP/2 edge-case server...'
 docker run --rm \
   --name "$container_name" \
   --network host \
-  --volume "$grpc_dir:/var/local/git/grpc:ro" \
-  --workdir /var/local/git/grpc \
-  "$image" \
-  python3 test/http2_test/http2_test_server.py \
+  "$image_id" \
+  --host=127.0.0.1 \
   --base_port="$base_port" >"$server_log" 2>&1 &
 server_pid=$!
 

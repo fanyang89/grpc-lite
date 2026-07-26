@@ -68,8 +68,8 @@ results.
 CI runs the core build and test suite on Linux x64 and arm64 in Debug and ReleaseSafe
 modes. Required x64 jobs instrument Zig, libxev, and nghttp2 with ThreadSanitizer and C
 undefined behavior detection. Runtime interoperability runs on both architectures; the
-official HTTP/2 edge-case container runs on x64 because its pinned image is amd64-only.
-A scheduled x64 workflow runs extended official unary soak tests.
+vendored official HTTP/2 edge-case container also runs on both architectures. A
+scheduled x64 workflow runs extended official unary soak tests.
 
 ## Unary Client
 

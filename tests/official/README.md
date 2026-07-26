@@ -1,7 +1,7 @@
 # Official Interoperability
 
-The official test dependencies are pinned in `go.mod` and the grpc-proto
-submodule. Run the suites from the repository root:
+The official test dependencies are pinned in `go.mod`, the grpc-proto submodule,
+and `third_party/grpc-http2-test`. Run the suites from the repository root:
 
 ```bash
 mise run interop-official
@@ -42,9 +42,9 @@ The official harness defaults to 10 iterations for each soak case. Set `SOAK_ITE
 soak settings for scheduled runs. The scheduled soak covers grpc-lite Server reuse and
 grpc-lite Channel reuse and recreation.
 
-The edge-case server sources and container image are pinned to the same grpc commit.
-The upstream server still contains Python 2 idioms, so the harness applies
-`http2-test-python3.patch`, which only updates Python compatibility without changing test
-behavior. Docker is required for this suite. The pinned image is amd64-only, so CI runs
-this suite on x64 while running the remaining interoperability suites on both x64 and
-arm64.
+The edge-case server sources are vendored from the pinned grpc commit with Python 3
+compatibility fixes applied. Its complete Python runtime closure is stored as hash-locked
+wheels for Linux x86_64 and aarch64. The harness builds a minimal local image from a
+multi-architecture Python base pinned by manifest digest; it does not depend on the
+upstream interop image registry or a live grpc checkout. Docker is required for this
+suite. See `third_party/grpc-http2-test/UPSTREAM.md` for provenance and update rules.
