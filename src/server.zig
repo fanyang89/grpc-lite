@@ -4110,66 +4110,68 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
         }
     };
 
-    var backing: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
-    var backing_active = true;
-    defer if (backing_active) std.debug.assert(backing.deinit() == .ok);
-    var handler: Handler = .{};
-    var server = try Server.init(backing.allocator(), .{ .reactor_count = 4 });
-    var server_active = true;
-    defer if (server_active) server.deinit();
-    try server.registerUnary(
-        "/test.Reactors/Unary",
-        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
-    );
-    try server.registerStream(
-        "/test.Reactors/Bidi",
-        .{
-            .on_start = StreamHandler.onStart,
-            .on_message = StreamHandler.onMessage,
-            .on_remote_end = StreamHandler.onRemoteEnd,
-        },
-    );
-    for (server.coordinator.reactors) |reactor| {
-        try std.testing.expect(reactor.handlers.contains("/test.Reactors/Unary"));
-        try std.testing.expect(reactor.stream_handlers.contains("/test.Reactors/Bidi"));
-    }
-    try server.start();
-
-    var target_buffer: [32]u8 = undefined;
-    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try server.port()});
-    var distributed = false;
-    for (0..4) |_| {
-        var channels: [16]Channel = undefined;
-        var channel_count: usize = 0;
-        defer for (channels[0..channel_count]) |*channel| channel.deinit();
-        while (channel_count < channels.len) : (channel_count += 1) {
-            channels[channel_count] = try Channel.init(std.heap.smp_allocator, target, .{});
-        }
-        var workers: [channels.len]Worker = undefined;
-        var threads: [channels.len]std.Thread = undefined;
-        for (&workers, &channels) |*worker, *channel| worker.* = .{ .channel = channel };
-        for (&threads, &workers) |*thread, *worker| thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
-        for (&threads) |thread| thread.join();
-        for (&workers) |worker| try std.testing.expect(worker.succeeded);
-
-        var accepting_reactors: usize = 0;
+    for ([_]usize{ 2, 4 }) |reactor_count| {
+        var backing: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
+        var backing_active = true;
+        defer if (backing_active) std.debug.assert(backing.deinit() == .ok);
+        var handler: Handler = .{};
+        var server = try Server.init(backing.allocator(), .{ .reactor_count = reactor_count });
+        var server_active = true;
+        defer if (server_active) server.deinit();
+        try server.registerUnary(
+            "/test.Reactors/Unary",
+            service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+        );
+        try server.registerStream(
+            "/test.Reactors/Bidi",
+            .{
+                .on_start = StreamHandler.onStart,
+                .on_message = StreamHandler.onMessage,
+                .on_remote_end = StreamHandler.onRemoteEnd,
+            },
+        );
         for (server.coordinator.reactors) |reactor| {
-            if (reactor.accepted_connections.load(.acquire) != 0) accepting_reactors += 1;
+            try std.testing.expect(reactor.handlers.contains("/test.Reactors/Unary"));
+            try std.testing.expect(reactor.stream_handlers.contains("/test.Reactors/Bidi"));
         }
-        if (accepting_reactors >= 2) {
-            distributed = true;
-            break;
-        }
-    }
-    try std.testing.expect(distributed);
-    try std.testing.expect(handler.thread_count >= 2);
+        try server.start();
 
-    server.shutdown();
-    server.wait();
-    server.deinit();
-    server_active = false;
-    try std.testing.expectEqual(std.heap.Check.ok, backing.deinit());
-    backing_active = false;
+        var target_buffer: [32]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try server.port()});
+        var distributed = false;
+        for (0..4) |_| {
+            var channels: [16]Channel = undefined;
+            var channel_count: usize = 0;
+            defer for (channels[0..channel_count]) |*channel| channel.deinit();
+            while (channel_count < channels.len) : (channel_count += 1) {
+                channels[channel_count] = try Channel.init(std.heap.smp_allocator, target, .{});
+            }
+            var workers: [channels.len]Worker = undefined;
+            var threads: [channels.len]std.Thread = undefined;
+            for (&workers, &channels) |*worker, *channel| worker.* = .{ .channel = channel };
+            for (&threads, &workers) |*thread, *worker| thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+            for (&threads) |thread| thread.join();
+            for (&workers) |worker| try std.testing.expect(worker.succeeded);
+
+            var accepting_reactors: usize = 0;
+            for (server.coordinator.reactors) |reactor| {
+                if (reactor.accepted_connections.load(.acquire) != 0) accepting_reactors += 1;
+            }
+            if (accepting_reactors >= 2) {
+                distributed = true;
+                break;
+            }
+        }
+        try std.testing.expect(distributed);
+        try std.testing.expect(handler.thread_count >= 2);
+
+        server.shutdown();
+        server.wait();
+        server.deinit();
+        server_active = false;
+        try std.testing.expectEqual(std.heap.Check.ok, backing.deinit());
+        backing_active = false;
+    }
 }
 
 test "manual receive credit isolates a paused stream and resumes on loop" {
