@@ -44,12 +44,12 @@ mise run gen-proto
 - `libxev` owns socket and event-loop integration.
 - gRPC payloads remain raw protobuf wire bytes.
 - Generated protobuf sources live under `.zig-cache` and are not committed.
-- The transport target supports raw unary and full-duplex streaming over cleartext IPv4.
+- The transport target supports raw unary and full-duplex streaming over cleartext or TLS IPv4.
 - c-ares resolves client hostnames to IPv4 candidates on the libxev loop.
 
 Keep C types private to transport modules. Keep protobuf out of `src/root.zig` so the
-raw transport remains independently usable. Do not add TLS or grpcpp compatibility
-without expanding the project scope first.
+raw transport remains independently usable. Do not add grpcpp compatibility without
+expanding the project scope first.
 
 ## Scope Decisions
 
@@ -72,7 +72,8 @@ authoritative: change it before implementing a feature with a different decision
 | Per-message compression | Selected | Only `identity` and `gzip` |
 | GOAWAY connection replacement | Selected | New calls use a new connection; no RPC retry |
 | Graceful server drain | Selected | Stop admission, send GOAWAY, wait with timeout |
-| TLS, ALPN, and mTLS | Out of scope | Interop profile is explicitly insecure |
+| TLS and ALPN | Selected | Optional mbedTLS; TLS 1.2+, mandatory `h2`, explicit PEM credentials |
+| mTLS | Out of scope | Client certificates and server-side client verification are not required |
 | DNS | Selected | c-ares on Linux io_uring; client IPv4 hostnames only |
 | IPv6 | Out of scope | No AAAA, Happy Eyeballs, or IPv6 listeners |
 | Reflection and health services | Out of scope | Not part of the lite profile |
@@ -102,10 +103,10 @@ The v2 target requires `empty_unary`, `large_unary`,
 `server_streaming`, `ping_pong`, and `empty_stream`. Also run `rpc_soak`, `channel_soak`,
 the public HTTP/2 framing suite, and the negative HTTP/2 client cases.
 
-Streaming cases must be reported as pending until implemented and verified, never
-presented as passing. Cases requiring TLS, auth, service config, ORCA, or xDS must be
-reported as skipped with the scope-table reason. grpc-core `bad_client` tests use private
-C APIs and are not part of this profile; use the public HTTP/2 interop tools instead.
+TLS cases not yet wired into the official harness are reported separately from the
+required insecure profile. Cases requiring auth, service config, ORCA, or xDS are skipped
+with the scope-table reason. grpc-core `bad_client` tests use private C APIs and are not
+part of this profile; use the public HTTP/2 interop tools instead.
 
 ## Style
 

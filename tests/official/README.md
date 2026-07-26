@@ -23,14 +23,14 @@ mise run interop-http2-edge
 | grpc-lite compression integration | `client_compressed_unary`, `server_compressed_unary` | Pass; grpc-go v1.82.1 does not expose these cases through its interop client |
 | gRPC HTTP/2 framing | `TestSoonClientShortSettings`, `TestSoonShortPreface`, `TestSoonUnknownFrameType`, `TestSoonClientPrefaceWithStreamId`, `TestSoonAllSettingsFramesAcked` | Pass |
 | gRPC HTTP/2 framing | `TestSoonSmallMaxFrameSize` | Server GOAWAY passes the repository test; pinned upstream parser cannot recognize GOAWAY frames |
-| gRPC HTTP/2 TLS framing | TLS application protocol, version, and cipher suite cases | Skipped; TLS is out of scope |
+| gRPC HTTP/2 TLS framing | TLS application protocol, version, and cipher suite cases | Pending harness integration; public TLS transport tests pass |
 | gRPC HTTP/2 edge-case server | reset, GOAWAY, ping, max-stream, and DATA padding cases | Pass |
 | grpc-go client to grpc-lite server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
 | grpc-lite client to grpc-go server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
 
 The HTTP/2 framing tool deliberately treats every `TestSoon*` failure as non-fatal.
 `run_http2.sh` therefore validates five required non-TLS passes, three expected TLS
-skips, and the single named `TestSoonSmallMaxFrameSize` upstream harness limitation.
+pending TLS cases, and the single named `TestSoonSmallMaxFrameSize` upstream harness limitation.
 The repository raw server test independently verifies that an invalid
 `SETTINGS_MAX_FRAME_SIZE` receives GOAWAY with `NGHTTP2_PROTOCOL_ERROR`. The complete
 upstream report is stored in `.zig-cache/official/http2-framing.log`; the official

@@ -86,6 +86,31 @@ jobs:
       - name: Build raw package consumer
         run: mise run test-consumer
 
+  tls-test:
+    name: TLS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install mise tools
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4
+
+      - name: Run TLS tests
+        run: mise run test-tls
+
+      - name: Run ReleaseSafe TLS tests
+        run: zig build test -Dtls=true -Doptimize=ReleaseSafe --summary all
+
+      - name: Run TLS ThreadSanitizer tests
+        run: mise run test-tls-tsan
+
+      - name: Run TLS UndefinedBehaviorSanitizer tests
+        run: UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Dtls=true -Dsanitize-thread=false -Dsanitize-c=true --summary all
+
   gperftools:
     name: Gperftools
     runs-on: ubuntu-24.04

@@ -5,11 +5,13 @@ test "stable public API compiles for downstream consumers" {
     comptime {
         _ = grpc.Channel;
         _ = grpc.ChannelOptions;
+        _ = grpc.ClientTlsOptions;
         _ = grpc.Runtime;
         _ = grpc.CallOptions;
         _ = grpc.CallResult;
         _ = grpc.Server;
         _ = grpc.ServerOptions;
+        _ = grpc.ServerTlsOptions;
         _ = grpc.ServerLocalAddress;
         _ = grpc.ServerContext;
         _ = grpc.UnaryHandler;

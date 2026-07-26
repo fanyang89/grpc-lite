@@ -31,6 +31,16 @@ run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dtarget=x86_64-l
 description = "Run all tests with C undefined behavior detection"
 run = "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Doptimize=Debug -Dsanitize-thread=false -Dsanitize-c=true --summary all"
 
+[tasks.test-tls]
+description = "Run all tests with optional TLS support"
+depends = ["prepare-tls-deps"]
+run = "zig build test -Dtls=true --summary all"
+
+[tasks.test-tls-tsan]
+description = "Run TLS tests with ThreadSanitizer"
+depends = ["prepare-tls-deps"]
+run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dtls=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
+
 [tasks.test-consumer]
 description = "Build a raw consumer from the package archive"
 run = "tests/consumer/run_raw.sh"

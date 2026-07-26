@@ -1,6 +1,7 @@
 //! Lightweight gRPC core runtime for Zig.
 
 const std = @import("std");
+const build_options = @import("grpc_lite_options");
 
 const c = @import("c.zig");
 const cares_adapter = @import("cares_adapter.zig");
@@ -24,10 +25,12 @@ pub const CallResult = call.Result;
 pub const Compression = compression.Compression;
 pub const Channel = channel.Channel;
 pub const ChannelOptions = channel.Options;
+pub const ClientTlsOptions = channel.TlsOptions;
 pub const Metadata = metadata.Metadata;
 pub const MetadataEntry = metadata.Entry;
 pub const Server = server.Server;
 pub const ServerOptions = server.Options;
+pub const ServerTlsOptions = server.TlsOptions;
 pub const ServerLocalAddress = server.LocalAddress;
 pub const ServerContext = service.ServerContext;
 pub const Status = status.Status;
@@ -66,4 +69,5 @@ test {
     _ = status;
     _ = stream;
     _ = version_info;
+    if (build_options.tls) _ = @import("tls_record.zig");
 }

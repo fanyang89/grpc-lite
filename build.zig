@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     });
     const nghttp2_dependency = b.dependency("nghttp2", .{});
     const cares_dependency = b.dependency("cares", .{});
+    const enable_tls = b.option(bool, "tls", "Enable TLS transport support through mbedTLS") orelse false;
     const enable_protobuf = b.option(
         bool,
         "protobuf",
@@ -38,6 +39,7 @@ pub fn build(b: *std.Build) void {
     }
     const grpc_lite_options = b.addOptions();
     grpc_lite_options.addOption([]const u8, "version", manifest.version);
+    grpc_lite_options.addOption(bool, "tls", enable_tls);
     const grpc_lite = b.addModule("grpc_lite", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -58,10 +60,15 @@ pub fn build(b: *std.Build) void {
         b.lazyDependency("gperftools", .{}) orelse return
     else
         null;
+    const mbedtls_dependency = if (enable_tls)
+        b.lazyDependency("mbedtls", .{}) orelse return
+    else
+        null;
     const native = addNativeDependencies(
         b,
         nghttp2_dependency.path(""),
         cares_dependency.path(""),
+        if (mbedtls_dependency) |dependency| dependency.path("") else null,
         if (gperftools_dependency) |dependency| dependency.path("") else null,
         target,
         optimize,
@@ -77,6 +84,11 @@ pub fn build(b: *std.Build) void {
     grpc_lite.addIncludePath(cares_dependency.path("include"));
     grpc_lite.addIncludePath(native.cares_include);
     grpc_lite.addObjectFile(native.cares_archive);
+    if (mbedtls_dependency) |dependency| {
+        grpc_lite.addIncludePath(dependency.path("include"));
+        grpc_lite.addIncludePath(b.path("tools"));
+        grpc_lite.addObjectFile(native.mbedtls_archive.?);
+    }
     grpc_lite.addImport("xev", xev);
     const test_step = b.step("test", "Run unit tests");
 
@@ -443,6 +455,7 @@ const NativeDependencies = struct {
     nghttp2_include: std.Build.LazyPath,
     cares_archive: std.Build.LazyPath,
     cares_include: std.Build.LazyPath,
+    mbedtls_archive: ?std.Build.LazyPath,
     gperftools_archive: ?std.Build.LazyPath,
     gperftools_force_link: ?std.Build.LazyPath,
 };
@@ -451,6 +464,7 @@ fn addNativeDependencies(
     b: *std.Build,
     nghttp2_source_dir: std.Build.LazyPath,
     cares_source_dir: std.Build.LazyPath,
+    mbedtls_source_dir: ?std.Build.LazyPath,
     gperftools_source_dir: ?std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -485,6 +499,19 @@ fn addNativeDependencies(
         target_triple,
         sanitizers,
     );
+    const build_mbedtls = if (mbedtls_source_dir) |source_dir|
+        addNativeBuild(
+            b,
+            "mbedtls",
+            source_dir,
+            cmake_build_type,
+            cc,
+            cxx,
+            target_triple,
+            sanitizers,
+        )
+    else
+        null;
 
     const build_gperftools = if (gperftools_source_dir) |source_dir|
         addNativeBuild(
@@ -505,6 +532,7 @@ fn addNativeDependencies(
         .nghttp2_include = build_nghttp2.path(b, "lib/includes"),
         .cares_archive = build_cares.path(b, "lib64/libcares.a"),
         .cares_include = build_cares.path(b, "include"),
+        .mbedtls_archive = if (build_mbedtls) |output| output.path(b, "libmbedtls_combined.a") else null,
         .gperftools_archive = if (build_gperftools) |output| output.path(b, "libtcmalloc_and_profiler.a") else null,
         .gperftools_force_link = if (build_gperftools) |output| output.path(b, "gperftools_force_link.o") else null,
     };
@@ -533,6 +561,7 @@ fn addNativeBuild(
         target_triple,
     });
     run.addFileArg(b.path("tools/gperftools_force_link.c"));
+    run.addFileArg(b.path("tools/mbedtls_user_config.h"));
     run.addArgs(&.{
         if (sanitizers.thread == true) "true" else "false",
         if (sanitizers.c == .full) "true" else "false",

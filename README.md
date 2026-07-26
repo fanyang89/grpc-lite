@@ -11,7 +11,7 @@ exports remain available for experimentation but may change before 1.0.
 
 ## Features
 
-- Standard unary gRPC over cleartext HTTP/2
+- Unary and streaming gRPC over cleartext HTTP/2 or optional TLS
 - Persistent multiplexed channels
 - Asynchronous IPv4 hostname resolution through c-ares
 - ASCII and binary initial and trailing metadata
@@ -22,13 +22,14 @@ exports remain available for experimentation but may change before 1.0.
 - Raw protobuf wire APIs with no required message runtime
 - Optional typed APIs and service registration through zig-protobuf
 
-The transport remains IPv4-only. TLS, automatic RPC retries, and server reflection remain
-out of scope.
+The transport remains IPv4-only. Automatic RPC retries, mTLS, system CA discovery, and
+server reflection remain out of scope.
 
 ## Streaming Target
 
 The compatibility target is `grpc-lite-streaming-insecure-v2`: raw unary,
-client-streaming, server-streaming, and bidirectional streaming over cleartext HTTP/2.
+client-streaming, server-streaming, and bidirectional streaming over cleartext HTTP/2,
+with TLS available as an opt-in transport extension.
 Raw streaming is implemented and verified against grpc-go. The optional zig-protobuf
 adapter provides event-driven typed clients and servers for every streaming cardinality.
 
@@ -53,8 +54,11 @@ mise run test
 mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
+mise run test-tls
+mise run test-tls-tsan
 mise run test-consumer
 mise run prepare-network-deps
+mise run prepare-tls-deps
 mise run prepare-gperftools
 mise run build-gperftools
 mise run test-gperftools
@@ -116,6 +120,53 @@ Each `CallResult` owns its payload, status message, and response metadata throug
 result allocator passed to `callUnary`. Callers must ensure thread safety when sharing
 one result allocator across threads. A non-thread-safe result allocator must not alias
 the channel backing allocator while the channel is active.
+
+## TLS
+
+TLS is an optional mbedTLS 3.6.6 dependency. Prepare it once, then enable it on the package
+dependency:
+
+```bash
+mise run prepare-tls-deps
+zig build -Dtls=true
+```
+
+```zig
+const grpc_lite = b.dependency("grpc_lite", .{
+    .target = target,
+    .optimize = optimize,
+    .tls = true,
+});
+```
+
+Client TLS trusts only the supplied PEM CA bundle. It does not search system roots.
+Hostname verification and SNI use the hostname from the channel target, TLS 1.2 or newer
+is required, and ALPN must negotiate `h2`. The default handshake timeout is 10 seconds.
+
+```zig
+var runtime = try grpc.Runtime.init();
+defer runtime.deinit();
+
+var channel = try grpc.Channel.init(allocator, "api.example.com:443", .{
+    .runtime = &runtime,
+    .tls = .{ .ca_certificates_pem = ca_pem },
+});
+defer channel.deinit();
+```
+
+Server TLS accepts a PEM certificate chain and an unencrypted PEM private key. PEM input
+is parsed during `init` and may be released after it returns.
+
+```zig
+var server = try grpc.Server.init(allocator, .{
+    .host = "127.0.0.1",
+    .port = 50051,
+    .tls = .{
+        .certificate_chain_pem = certificate_chain_pem,
+        .private_key_pem = private_key_pem,
+    },
+});
+```
 
 ## Metadata
 

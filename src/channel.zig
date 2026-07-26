@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("grpc_lite_options");
 const c = @import("c.zig").api;
 const cares_adapter = @import("cares_adapter.zig");
 const xev = @import("xev");
@@ -14,6 +15,12 @@ const status = @import("status.zig");
 const stream = @import("stream.zig");
 const version = @import("version.zig");
 const Runtime = @import("runtime.zig").Runtime;
+const tls_record = if (build_options.tls) @import("tls_record.zig") else @import("tls_disabled.zig");
+
+pub const TlsOptions = struct {
+    ca_certificates_pem: []const u8,
+    handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
+};
 
 const ChannelOptions = struct {
     user_agent: []const u8 = version.user_agent,
@@ -21,6 +28,7 @@ const ChannelOptions = struct {
     write_high_watermark_bytes: usize = 1024 * 1024,
     write_low_watermark_bytes: usize = 512 * 1024,
     runtime: ?*Runtime = null,
+    tls: ?TlsOptions = null,
 };
 
 pub const Options = ChannelOptions;
@@ -121,6 +129,10 @@ pub const Channel = struct {
     impl: *Impl,
 
     pub fn init(allocator: std.mem.Allocator, target: []const u8, options: ChannelOptions) !Channel {
+        if (options.tls != null and !build_options.tls) return error.TlsUnavailable;
+        if (options.tls) |tls_options| {
+            if (tls_options.handshake_timeout_ns == 0) return error.InvalidTlsHandshakeTimeout;
+        }
         try validateTransportOptions(
             options.initial_stream_window_size,
             options.write_high_watermark_bytes,
@@ -151,10 +163,24 @@ pub const Channel = struct {
             .initial_stream_window_size = options.initial_stream_window_size,
             .write_high_watermark_bytes = options.write_high_watermark_bytes,
             .write_low_watermark_bytes = options.write_low_watermark_bytes,
+            .tls_config = null,
+            .tls_handshake_timeout_ns = if (options.tls) |tls_options| tls_options.handshake_timeout_ns else 0,
             .async_handle = undefined,
             .deadline_timer = undefined,
         };
         impl.allocator = serialized_allocator.allocator();
+
+        if (comptime build_options.tls) {
+            if (options.tls) |tls_options| {
+                impl.tls_config = try tls_record.Config.createClient(
+                    impl.allocator,
+                    tls_options.ca_certificates_pem,
+                );
+            }
+        }
+        errdefer if (comptime build_options.tls) {
+            if (impl.tls_config) |config| config.destroy();
+        };
 
         const host = try impl.allocator.dupeZ(u8, parsed.host);
         errdefer impl.allocator.free(host);
@@ -183,6 +209,10 @@ pub const Channel = struct {
             impl.thread.?.join();
             impl.thread = null;
             impl.pending.deinit(impl.allocator);
+            impl.operations.deinit(impl.allocator);
+            impl.stream_states.deinit(impl.allocator);
+            impl.streams.deinit(impl.allocator);
+            impl.writes.deinit(impl.allocator);
             if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
             return error.ConnectionFailed;
         }
@@ -295,6 +325,9 @@ pub const Channel = struct {
         impl.stream_states.deinit(impl.allocator);
         impl.streams.deinit(impl.allocator);
         impl.writes.deinit(impl.allocator);
+        if (comptime build_options.tls) {
+            if (impl.tls_config) |config| config.destroy();
+        }
         if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
         impl.async_handle.deinit();
         impl.deadline_timer.deinit();
@@ -310,7 +343,7 @@ pub const Channel = struct {
 };
 
 const State = enum { starting, running, stopping, stopped };
-const ConnectionState = enum { resolving, connecting, active, draining, closing };
+const ConnectionState = enum { resolving, connecting, handshaking, active, draining, closing };
 const ResolveState = enum { idle, pending, ready, failed, cancelled };
 
 const TestObserver = if (builtin.is_test) struct {
@@ -340,6 +373,13 @@ const Impl = struct {
     initial_stream_window_size: u32,
     write_high_watermark_bytes: usize,
     write_low_watermark_bytes: usize,
+    tls_config: ?*tls_record.Config = null,
+    tls_handshake_timeout_ns: u64 = 0,
+    tls_handshake_deadline_ns: ?u64 = null,
+    tls_handshake_needs_write: bool = false,
+    tls_session: ?*tls_record.Session = null,
+    tls_plaintext: ?[]u8 = null,
+    tls_plaintext_offset: usize = 0,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
     state: State = .starting,
@@ -389,6 +429,7 @@ const Impl = struct {
     stopping_on_loop: bool = false,
     connect_count: std.atomic.Value(usize) = .init(0),
     read_buffer: [16 * 1024]u8 = undefined,
+    plaintext_buffer: [16 * 1024]u8 = undefined,
     write_queue: xev.WriteQueue = .{},
     writes: std.AutoHashMapUnmanaged(*WriteRequest, void) = .empty,
     queued_write_bytes: usize = 0,
@@ -950,6 +991,7 @@ fn runLoop(impl: *Impl) void {
     };
     std.debug.assert(impl.writes.count() == 0);
     std.debug.assert(impl.write_queue.head == null);
+    clearTlsConnection(impl);
     if (impl.session) |session| c.nghttp2_session_del(session);
     impl.session = null;
     impl.loop.deinit();
@@ -988,6 +1030,11 @@ fn startConnection(impl: *Impl) !void {
     _ = impl.connection_generation.fetchAdd(1, .monotonic);
 
     try initializeSession(impl);
+    if (comptime build_options.tls) {
+        if (impl.tls_config) |config| {
+            impl.tls_session = try tls_record.Session.create(impl.allocator, config, impl.host);
+        }
+    }
     impl.connect_active = true;
     impl.tcp.connect(&impl.loop, &impl.connect_completion, address, Impl, impl, onConnect);
     observeTestIo(impl);
@@ -1064,6 +1111,7 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
         } else {
             if (impl.session) |session| c.nghttp2_session_del(session);
             impl.session = null;
+            clearTlsConnection(impl);
             impl.connection_state = .closing;
         }
         return .disarm;
@@ -1081,22 +1129,35 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
         return .disarm;
     }
     impl.connected = true;
-    clearResolvedAddresses(impl);
     _ = impl.connect_count.fetchAdd(1, .monotonic);
     impl.read_active = true;
     impl.tcp.read(&impl.loop, &impl.read_completion, .{ .slice = &impl.read_buffer }, Impl, impl, onRead);
-    flush(impl) catch {
+    if (impl.tls_session != null) {
+        impl.connection_state = .handshaking;
+        impl.tls_handshake_deadline_ns = nowNs() +| impl.tls_handshake_timeout_ns;
+        driveTlsHandshake(impl) catch {
+            failConnectionCandidate(impl, "TLS handshake failed");
+        };
+        scheduleDeadlineTimer(impl);
+        return .disarm;
+    }
+    activateConnection(impl) catch {
         impl.signalStartup(false);
         beginStop(impl, "connection failed");
-        return .disarm;
     };
+    return .disarm;
+}
+
+fn activateConnection(impl: *Impl) !void {
+    impl.tls_handshake_deadline_ns = null;
+    clearResolvedAddresses(impl);
     impl.connection_state = .active;
+    try flush(impl);
     impl.mutex.lockUncancelable(syncIo());
     impl.accepting_streams = true;
     impl.mutex.unlock(syncIo());
     impl.signalStartup(true);
     processPending(impl);
-    return .disarm;
 }
 
 fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
@@ -1124,6 +1185,12 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
         .active => processPending(impl),
         .draining => {
             if (impl.operations.count() == 0 and impl.streams.count() == 0) beginReconnect(impl);
+            scheduleDeadlineTimer(impl);
+        },
+        .handshaking => {
+            if (impl.tls_handshake_needs_write) {
+                driveTlsHandshake(impl) catch failConnectionCandidate(impl, "TLS handshake failed");
+            }
             scheduleDeadlineTimer(impl);
         },
         .connecting, .closing => scheduleDeadlineTimer(impl),
@@ -1217,7 +1284,7 @@ fn processStreamWakes(impl: *Impl) void {
             return;
         };
     }
-    if (impl.connected) flush(impl) catch {
+    if (impl.connected and (impl.connection_state == .active or impl.connection_state == .draining)) flush(impl) catch {
         beginStop(impl, "connection failed");
         return;
     };
@@ -1234,7 +1301,7 @@ fn submitClientStream(impl: *Impl, client_stream: *ClientStreamState) !void {
         encoded_values.deinit(impl.allocator);
     }
     try headers.append(impl.allocator, nativeHeader(":method", "POST"));
-    try headers.append(impl.allocator, nativeHeader(":scheme", "http"));
+    try headers.append(impl.allocator, nativeHeader(":scheme", if (impl.tls_config != null) "https" else "http"));
     try headers.append(impl.allocator, nativeHeader(":path", client_stream.path));
     try headers.append(impl.allocator, nativeHeader(":authority", impl.authority));
     try headers.append(impl.allocator, nativeHeader("content-type", "application/grpc"));
@@ -1623,7 +1690,7 @@ fn submitOperation(impl: *Impl, operation: *Operation) !void {
         encoded_values.deinit(impl.allocator);
     }
     try headers.append(impl.allocator, nativeHeader(":method", "POST"));
-    try headers.append(impl.allocator, nativeHeader(":scheme", "http"));
+    try headers.append(impl.allocator, nativeHeader(":scheme", if (impl.tls_config != null) "https" else "http"));
     try headers.append(impl.allocator, nativeHeader(":path", operation.path));
     try headers.append(impl.allocator, nativeHeader(":authority", impl.authority));
     try headers.append(impl.allocator, nativeHeader("content-type", "application/grpc"));
@@ -1679,36 +1746,134 @@ fn readRequestData(
 }
 
 fn flush(impl: *Impl) !void {
+    if (comptime build_options.tls) {
+        if (impl.tls_session != null) return flushTls(impl);
+    }
     while (!impl.stopping_on_loop) {
         if (!canFlushWrites(impl.queued_write_bytes, impl.write_high_watermark_bytes)) return;
         var data: [*c]const u8 = null;
         const length = c.nghttp2_session_mem_send2(impl.session, &data);
         if (length < 0) return error.NativeFailure;
         if (length == 0) return;
-        const byte_length: usize = @intCast(length);
-
-        const write = try impl.allocator.create(WriteRequest);
-        errdefer impl.allocator.destroy(write);
-        const bytes = try impl.allocator.dupe(u8, data[0..byte_length]);
-        errdefer impl.allocator.free(bytes);
-        write.* = .{
-            .impl = impl,
-            .bytes = bytes,
-            .generation = impl.connection_generation.load(.monotonic),
-        };
-        try impl.writes.put(impl.allocator, write, {});
-        errdefer _ = impl.writes.remove(write);
-        impl.queued_write_bytes = try addQueuedWriteBytes(impl.queued_write_bytes, bytes.len);
-        impl.tcp.queueWrite(
-            &impl.loop,
-            &impl.write_queue,
-            &write.request,
-            .{ .slice = bytes },
-            WriteRequest,
-            write,
-            onWrite,
-        );
+        try queueSocketWrite(impl, data[0..@intCast(length)]);
     }
+}
+
+fn flushTls(impl: *Impl) !void {
+    const tls_session = impl.tls_session.?;
+    while (!impl.stopping_on_loop) {
+        try drainTlsCiphertext(impl);
+        if (tls_session.hasPendingWrite()) {
+            const result = try tls_session.continueWrite();
+            if (try finishTlsWrite(impl, result)) continue;
+            return;
+        }
+        if (impl.tls_plaintext) |plaintext| {
+            if (impl.tls_plaintext_offset == plaintext.len) {
+                impl.allocator.free(plaintext);
+                impl.tls_plaintext = null;
+                impl.tls_plaintext_offset = 0;
+                continue;
+            }
+            const result = try tls_session.beginWrite(plaintext[impl.tls_plaintext_offset..]);
+            if (try finishTlsWrite(impl, result)) continue;
+            return;
+        }
+        if (!canFlushWrites(impl.queued_write_bytes, impl.write_high_watermark_bytes)) return;
+        var data: [*c]const u8 = null;
+        const length = c.nghttp2_session_mem_send2(impl.session, &data);
+        if (length < 0) return error.NativeFailure;
+        if (length == 0) return;
+        impl.tls_plaintext = try impl.allocator.dupe(u8, data[0..@intCast(length)]);
+    }
+}
+
+fn finishTlsWrite(impl: *Impl, result: tls_record.Result) !bool {
+    switch (result) {
+        .bytes => |count| {
+            impl.tls_plaintext_offset += count;
+            try drainTlsCiphertext(impl);
+            return true;
+        },
+        .want_write => {
+            try drainTlsCiphertext(impl);
+            return true;
+        },
+        .want_read => {
+            try drainTlsCiphertext(impl);
+            return false;
+        },
+        else => return error.TlsWriteFailed,
+    }
+}
+
+fn queueSocketWrite(impl: *Impl, source: []const u8) !void {
+    const write = try impl.allocator.create(WriteRequest);
+    errdefer impl.allocator.destroy(write);
+    const bytes = try impl.allocator.dupe(u8, source);
+    errdefer impl.allocator.free(bytes);
+    write.* = .{
+        .impl = impl,
+        .bytes = bytes,
+        .generation = impl.connection_generation.load(.monotonic),
+    };
+    try impl.writes.put(impl.allocator, write, {});
+    errdefer _ = impl.writes.remove(write);
+    impl.queued_write_bytes = try addQueuedWriteBytes(impl.queued_write_bytes, bytes.len);
+    impl.tcp.queueWrite(
+        &impl.loop,
+        &impl.write_queue,
+        &write.request,
+        .{ .slice = bytes },
+        WriteRequest,
+        write,
+        onWrite,
+    );
+}
+
+fn drainTlsCiphertext(impl: *Impl) !void {
+    if (comptime !build_options.tls) return;
+    const tls_session = impl.tls_session orelse return;
+    const ciphertext = tls_session.ciphertext();
+    if (ciphertext.len == 0) return;
+    try queueSocketWrite(impl, ciphertext);
+    tls_session.consumeCiphertext(ciphertext.len);
+}
+
+fn driveTlsHandshake(impl: *Impl) !void {
+    if (comptime !build_options.tls) return error.TlsUnavailable;
+    const tls_session = impl.tls_session orelse return error.TlsUnavailable;
+    while (true) {
+        impl.tls_handshake_needs_write = false;
+        const result = tls_session.handshake();
+        try drainTlsCiphertext(impl);
+        switch (result) {
+            .complete => {
+                try activateConnection(impl);
+                if (impl.stopping_on_loop) return error.TlsHandshakeFailed;
+                try receiveTlsPlaintext(impl);
+                return;
+            },
+            .want_write => {
+                impl.tls_handshake_needs_write = true;
+                return;
+            },
+            .want_read => return,
+            else => return error.TlsHandshakeFailed,
+        }
+    }
+}
+
+fn clearTlsConnection(impl: *Impl) void {
+    if (comptime build_options.tls) {
+        if (impl.tls_session) |session| session.destroy();
+    }
+    impl.tls_session = null;
+    impl.tls_handshake_deadline_ns = null;
+    impl.tls_handshake_needs_write = false;
+    if (impl.tls_plaintext) |plaintext| impl.allocator.free(plaintext);
+    impl.tls_plaintext = null;
+    impl.tls_plaintext_offset = 0;
 }
 
 fn onRead(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.ReadBuffer, result: xev.ReadError!usize) xev.CallbackAction {
@@ -1717,18 +1882,51 @@ fn onRead(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev
     defer submitCloseIfReady(impl, loop);
     const bytes_read = result catch {
         if (impl.connection_state == .closing or impl.stopping_on_loop) return .disarm;
-        if (impl.connection_state == .draining and impl.operations.count() == 0 and impl.streams.count() == 0) {
-            beginReconnect(impl);
+        if (impl.connection_state == .handshaking) {
+            failConnectionCandidate(impl, "TLS handshake failed");
             return .disarm;
         }
-        beginStop(impl, "connection closed");
+        closeOrReconnectAfterReadFailure(impl, "connection closed");
         return .disarm;
     };
     if (bytes_read == 0) {
-        beginStop(impl, "connection closed");
+        if (impl.connection_state == .closing or impl.stopping_on_loop) return .disarm;
+        if (impl.connection_state == .handshaking) {
+            failConnectionCandidate(impl, "TLS handshake failed");
+            return .disarm;
+        }
+        if (comptime build_options.tls) {
+            if (impl.tls_session) |tls_session| tls_session.markTransportEof();
+        }
+        closeOrReconnectAfterReadFailure(impl, "connection closed");
         return .disarm;
     }
     if (impl.connection_state == .closing or impl.stopping_on_loop) return .disarm;
+    if (comptime build_options.tls) {
+        if (impl.tls_session) |tls_session| {
+            tls_session.feedCiphertext(impl.read_buffer[0..bytes_read]) catch {
+                if (impl.connection_state == .handshaking)
+                    failConnectionCandidate(impl, "TLS handshake failed")
+                else
+                    closeOrReconnectAfterReadFailure(impl, "TLS connection failed");
+                return .disarm;
+            };
+            if (impl.connection_state == .handshaking) {
+                driveTlsHandshake(impl) catch {
+                    failConnectionCandidate(impl, "TLS handshake failed");
+                    return .disarm;
+                };
+            } else {
+                receiveTlsPlaintext(impl) catch {
+                    closeOrReconnectAfterReadFailure(impl, "TLS connection failed");
+                    return .disarm;
+                };
+            }
+            if (impl.connection_state == .closing or impl.stopping_on_loop) return .disarm;
+            impl.read_active = true;
+            return .rearm;
+        }
+    }
     const consumed = c.nghttp2_session_mem_recv2(impl.session, impl.read_buffer[0..bytes_read].ptr, bytes_read);
     if (consumed < 0 or consumed != @as(c.nghttp2_ssize, @intCast(bytes_read))) {
         beginStop(impl, "HTTP/2 connection failed");
@@ -1740,6 +1938,36 @@ fn onRead(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev
     };
     impl.read_active = true;
     return .rearm;
+}
+
+fn closeOrReconnectAfterReadFailure(impl: *Impl, reason: []const u8) void {
+    if (impl.connection_state == .draining and impl.operations.count() == 0 and impl.streams.count() == 0) {
+        beginReconnect(impl);
+    } else {
+        beginStop(impl, reason);
+    }
+}
+
+fn receiveTlsPlaintext(impl: *Impl) !void {
+    if (comptime !build_options.tls) return error.TlsUnavailable;
+    const tls_session = impl.tls_session orelse return error.TlsUnavailable;
+    while (true) {
+        switch (try tls_session.read(&impl.plaintext_buffer)) {
+            .bytes => |length| {
+                const consumed = c.nghttp2_session_mem_recv2(
+                    impl.session,
+                    impl.plaintext_buffer[0..length].ptr,
+                    length,
+                );
+                if (consumed < 0 or consumed != @as(c.nghttp2_ssize, @intCast(length)))
+                    return error.Http2ConnectionFailed;
+            },
+            .want_read => break,
+            .want_write => try drainTlsCiphertext(impl),
+            else => return error.TlsConnectionClosed,
+        }
+    }
+    try flush(impl);
 }
 
 fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.WriteBuffer, result: xev.WriteError!usize) xev.CallbackAction {
@@ -1759,7 +1987,7 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
     if (write_succeeded and
         generation == impl.connection_generation.load(.monotonic) and
         impl.connected and
-        impl.queued_write_bytes < impl.write_low_watermark_bytes)
+        (impl.tls_handshake_needs_write or impl.queued_write_bytes < impl.write_low_watermark_bytes))
     {
         // WriteQueue schedules its next head after this callback returns.
         // Wake the async callback so queueWrite cannot reenter that ordering.
@@ -2035,7 +2263,7 @@ fn scheduleDeadlineTimer(impl: *Impl) void {
 }
 
 fn earliestDeadline(impl: *Impl) ?u64 {
-    var earliest: ?u64 = null;
+    var earliest = impl.tls_handshake_deadline_ns;
     var iterator = impl.operations.valueIterator();
     while (iterator.next()) |operation_ptr| {
         const operation = operation_ptr.*;
@@ -2102,6 +2330,12 @@ fn onDeadlineTimer(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.
 }
 
 fn expireDeadlines(impl: *Impl, now: u64) !void {
+    if (impl.tls_handshake_deadline_ns) |handshake_deadline| {
+        if (handshake_deadline <= now) {
+            failConnectionCandidate(impl, "TLS handshake timed out");
+            return;
+        }
+    }
     impl.mutex.lockUncancelable(syncIo());
     var pending_index: usize = 0;
     while (pending_index < impl.pending.items.len) {
@@ -2183,6 +2417,33 @@ fn beginReconnect(impl: *Impl) void {
         c.nghttp2_session_del(session);
         impl.session = null;
     }
+    clearTlsConnection(impl);
+    if (impl.read_active and !impl.read_cancel_submitted) {
+        impl.read_cancel_submitted = true;
+        impl.loop.cancel(
+            &impl.read_completion,
+            &impl.read_cancel_completion,
+            Impl,
+            impl,
+            onReadCanceled,
+        );
+    }
+    submitCloseIfReady(impl, &impl.loop);
+}
+
+fn failConnectionCandidate(impl: *Impl, reason: []const u8) void {
+    if (impl.literal_address != null or impl.next_address >= impl.resolved_addresses.len) {
+        impl.signalStartup(false);
+        beginStop(impl, reason);
+        return;
+    }
+    impl.connection_state = .closing;
+    impl.connected = false;
+    if (impl.session) |session| {
+        c.nghttp2_session_del(session);
+        impl.session = null;
+    }
+    clearTlsConnection(impl);
     if (impl.read_active and !impl.read_cancel_submitted) {
         impl.read_cancel_submitted = true;
         impl.loop.cancel(
@@ -2233,7 +2494,7 @@ fn onTcpClosed(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _
     if (impl.connection_state != .closing) return .disarm;
 
     impl.mutex.lockUncancelable(syncIo());
-    const running = impl.state == .running;
+    const running = impl.state == .starting or impl.state == .running;
     impl.mutex.unlock(syncIo());
     if (!running) return .disarm;
 
@@ -4722,4 +4983,184 @@ test "channel performs reusable concurrent unary calls end to end" {
     var unavailable = try channel.callUnary(std.testing.allocator, "/test.Echo/Unary", "after-close", .{});
     defer unavailable.deinit();
     try std.testing.expectEqual(status.Code.unavailable, unavailable.status.code);
+}
+
+test "channel and server exchange a unary call over TLS" {
+    if (!build_options.tls) return error.SkipZigTest;
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const certificate = @embedFile("testdata/localhost-cert.pem");
+    const private_key = @embedFile("testdata/localhost-key.pem");
+
+    const Handler = struct {
+        fn handle(
+            _: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{
+        .tls = .{
+            .certificate_chain_pem = certificate,
+            .private_key_pem = private_key,
+        },
+    });
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Tls/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var runtime = try Runtime.init();
+    defer runtime.deinit();
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .runtime = &runtime,
+        .tls = .{ .ca_certificates_pem = certificate },
+    });
+    defer channel.deinit();
+
+    var result = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "secure", .{});
+    defer result.deinit();
+    try std.testing.expect(result.status.isOk());
+    try std.testing.expectEqualStrings("secure", result.payload);
+}
+
+test "TLS channel initialization times out against a silent peer" {
+    if (!build_options.tls) return error.SkipZigTest;
+    const certificate = @embedFile("testdata/localhost-cert.pem");
+    var listen_address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try listen_address.listen(std.testing.io, .{});
+    defer listener.deinit(std.testing.io);
+
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        listener.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(
+        &target_buffer,
+        "127.0.0.1:{d}",
+        .{std.mem.bigToNative(u16, local_address.port)},
+    );
+    try std.testing.expectError(error.ConnectionFailed, Channel.init(std.testing.allocator, target, .{
+        .tls = .{
+            .ca_certificates_pem = certificate,
+            .handshake_timeout_ns = 10 * std.time.ns_per_ms,
+        },
+    }));
+}
+
+test "channel and server exchange a bidirectional stream over TLS" {
+    if (!build_options.tls) return error.SkipZigTest;
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const certificate = @embedFile("testdata/localhost-cert.pem");
+    const private_key = @embedFile("testdata/localhost-key.pem");
+
+    const ServerHandler = struct {
+        fn onStart(_: ?*anyopaque, _: stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onMessage(
+            _: ?*anyopaque,
+            server_stream: stream.ServerStream,
+            _: *service.ServerContext,
+            payload: []const u8,
+            _: Compression,
+        ) !stream.ReceiveAction {
+            try server_stream.send(payload, .{});
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(
+            _: ?*anyopaque,
+            server_stream: stream.ServerStream,
+            _: *service.ServerContext,
+        ) !void {
+            try server_stream.finish(.ok);
+        }
+    };
+    const ClientState = struct {
+        messages: std.atomic.Value(usize) = .init(0),
+        done: std.atomic.Value(bool) = .init(false),
+        succeeded: std.atomic.Value(bool) = .init(false),
+
+        fn onMessage(
+            context: ?*anyopaque,
+            _: stream.ClientStream,
+            payload: []const u8,
+            _: Compression,
+        ) stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (std.mem.eql(u8, payload, "one") or std.mem.eql(u8, payload, "two")) {
+                _ = self.messages.fetchAdd(1, .monotonic);
+            }
+            return .continue_receiving;
+        }
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            _: stream.ClientStream,
+            final_status: status.Status,
+            _: *const metadata.Metadata,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.succeeded.store(final_status.isOk(), .release);
+            self.done.store(true, .release);
+        }
+    };
+
+    var test_server = try server.Server.init(std.testing.allocator, .{
+        .tls = .{
+            .certificate_chain_pem = certificate,
+            .private_key_pem = private_key,
+        },
+    });
+    defer test_server.deinit();
+    try test_server.registerStream("/test.Tls/Bidi", .{
+        .on_start = ServerHandler.onStart,
+        .on_message = ServerHandler.onMessage,
+        .on_remote_end = ServerHandler.onRemoteEnd,
+    });
+    try test_server.start();
+
+    var runtime = try Runtime.init();
+    defer runtime.deinit();
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .runtime = &runtime,
+        .tls = .{ .ca_certificates_pem = certificate },
+    });
+    defer channel.deinit();
+
+    var state: ClientState = .{};
+    var client_stream = try channel.openStream("/test.Tls/Bidi", .{}, .{
+        .context = &state,
+        .on_message = ClientState.onMessage,
+        .on_terminal = ClientState.onTerminal,
+    });
+    defer client_stream.deinit();
+    try client_stream.send("one", .{});
+    try client_stream.send("two", .{});
+    try client_stream.closeSend();
+
+    const deadline_ns = nowNs() +| 5 * std.time.ns_per_s;
+    while (!state.done.load(.acquire)) {
+        if (nowNs() >= deadline_ns) return error.StreamTimeout;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.succeeded.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), state.messages.load(.acquire));
 }
