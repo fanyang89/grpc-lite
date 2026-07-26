@@ -33,10 +33,18 @@ var backend: std.atomic.Value(u8) = .init(@intFromEnum(Backend.uninitialized));
 var fallback_reason: std.atomic.Value(u8) = .init(@intFromEnum(FallbackReason.none));
 var validation_lock: std.atomic.Value(bool) = .init(false);
 var next_validation_cycles: std.atomic.Value(u64) = .init(0);
+var calibration_sequence: std.atomic.Value(u32) = .init(0);
 var base_cycles: u64 = 0;
 var base_monotonic_ns: u64 = 0;
 var cycles_per_second: u64 = 0;
+var validation_base_cycles: u64 = 0;
+var validation_base_monotonic_ns: u64 = 0;
 var selected_implementation: [32:0]u8 = @splat(0);
+
+const Sample = struct {
+    cycles: u64,
+    monotonic_ns: u64,
+};
 
 pub fn now(io: std.Io) u64 {
     switch (loadBackend()) {
@@ -52,8 +60,8 @@ pub fn now(io: std.Io) u64 {
         fallBack(.counter_unavailable);
         return monotonicNow(io);
     };
-    const predicted = predictNs(cycles) orelse {
-        fallBack(if (cycles < base_cycles) .counter_regression else .conversion_overflow);
+    const predicted = predictNs(cycles) catch |err| {
+        fallBack(if (err == error.CounterRegression) .counter_regression else .conversion_overflow);
         return monotonicNow(io);
     };
     validateIfDue(io, cycles, predicted);
@@ -74,6 +82,10 @@ pub fn validatedNow(io: std.Io) u64 {
 
 pub fn usesCpuCycles() bool {
     return loadBackend() == .cycles;
+}
+
+pub fn warmup(io: std.Io) void {
+    ensureInitialized(io);
 }
 
 pub fn implementation() []const u8 {
@@ -102,7 +114,7 @@ fn ensureInitialized(io: std.Io) void {
 }
 
 fn initialize(io: std.Io) void {
-    const first_cycles = readCycles() orelse return fallBack(.counter_unavailable);
+    _ = readCycles() orelse return fallBack(.counter_unavailable);
     const implementation_pointer = c.cpucycles_implementation() orelse return fallBack(.counter_unavailable);
     const implementation_name = std.mem.span(implementation_pointer);
     const copy_length = @min(implementation_name.len, selected_implementation.len - 1);
@@ -110,23 +122,17 @@ fn initialize(io: std.Io) void {
     if (!implementationCanBeStable(implementation_name)) return fallBack(.unsupported_implementation);
     if (!platformSourceIsStable(implementation_name)) return fallBack(.unstable_platform);
 
-    const frequency = c.cpucycles_persecond();
-    if (frequency <= 0) return fallBack(.invalid_frequency);
-    cycles_per_second = @intCast(frequency);
-
-    const first_ns = monotonicNow(io);
+    const first = takeSample(io) orelse return fallBack(.counter_unavailable);
     std.Io.sleep(io, .fromNanoseconds(initial_sample_ns), .awake) catch return fallBack(.unstable_initial_sample);
-    const second_cycles = readCycles() orelse return fallBack(.counter_unavailable);
-    const second_ns = monotonicNow(io);
-    if (!stableInterval(first_cycles, second_cycles, first_ns, second_ns, cycles_per_second)) {
-        return fallBack(.unstable_initial_sample);
-    }
+    const second = takeSample(io) orelse return fallBack(.counter_unavailable);
+    const frequency = estimateFrequency(first, second) orelse return fallBack(.invalid_frequency);
 
-    base_cycles = second_cycles;
-    base_monotonic_ns = second_ns;
-    const interval_cycles = scaleNsToCycles(validation_interval_ns, cycles_per_second) orelse
+    updateCalibration(second.cycles, second.monotonic_ns, frequency);
+    validation_base_cycles = second.cycles;
+    validation_base_monotonic_ns = second.monotonic_ns;
+    const interval_cycles = scaleNsToCycles(validation_interval_ns, frequency) orelse
         return fallBack(.conversion_overflow);
-    next_validation_cycles.store(second_cycles +| interval_cycles, .release);
+    next_validation_cycles.store(second.cycles +| interval_cycles, .release);
     backend.store(@intFromEnum(Backend.cycles), .release);
 }
 
@@ -141,17 +147,57 @@ fn validateIfDue(io: std.Io, cycles: u64, predicted_ns: u64) void {
         fallBack(.runtime_drift);
         return;
     }
-    const interval_cycles = scaleNsToCycles(validation_interval_ns, cycles_per_second) orelse {
+    const frequency = estimateFrequency(
+        .{ .cycles = validation_base_cycles, .monotonic_ns = validation_base_monotonic_ns },
+        .{ .cycles = cycles, .monotonic_ns = actual_ns },
+    ) orelse {
+        fallBack(.invalid_frequency);
+        return;
+    };
+    updateCalibration(cycles, predicted_ns, frequency);
+    validation_base_cycles = cycles;
+    validation_base_monotonic_ns = actual_ns;
+    const interval_cycles = scaleNsToCycles(validation_interval_ns, frequency) orelse {
         fallBack(.conversion_overflow);
         return;
     };
     next_validation_cycles.store(cycles +| interval_cycles, .release);
 }
 
-fn predictNs(cycles: u64) ?u64 {
-    if (cycles < base_cycles) return null;
-    const elapsed_ns = scaleCyclesToNs(cycles - base_cycles, cycles_per_second) orelse return null;
-    return std.math.add(u64, base_monotonic_ns, elapsed_ns) catch null;
+fn predictNs(cycles: u64) !u64 {
+    while (true) {
+        const sequence = calibration_sequence.load(.acquire);
+        if (sequence & 1 != 0) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        const calibrated_cycles = base_cycles;
+        const calibrated_ns = base_monotonic_ns;
+        const frequency = cycles_per_second;
+        if (calibration_sequence.load(.acquire) != sequence) continue;
+        if (cycles < calibrated_cycles) return error.CounterRegression;
+        const elapsed_ns = scaleCyclesToNs(cycles - calibrated_cycles, frequency) orelse
+            return error.ConversionOverflow;
+        return std.math.add(u64, calibrated_ns, elapsed_ns) catch error.ConversionOverflow;
+    }
+}
+
+fn updateCalibration(cycles: u64, monotonic_ns: u64, frequency: u64) void {
+    _ = calibration_sequence.fetchAdd(1, .acq_rel);
+    base_cycles = cycles;
+    base_monotonic_ns = monotonic_ns;
+    cycles_per_second = frequency;
+    _ = calibration_sequence.fetchAdd(1, .release);
+}
+
+fn takeSample(io: std.Io) ?Sample {
+    const before_ns = monotonicNow(io);
+    const cycles = readCycles() orelse return null;
+    const after_ns = monotonicNow(io);
+    return .{
+        .cycles = cycles,
+        .monotonic_ns = before_ns + (after_ns - before_ns) / 2,
+    };
 }
 
 fn readCycles() ?u64 {
@@ -213,11 +259,11 @@ fn hasToken(input: []const u8, token: []const u8) bool {
     return false;
 }
 
-fn stableInterval(first_cycles: u64, second_cycles: u64, first_ns: u64, second_ns: u64, frequency: u64) bool {
-    if (second_cycles <= first_cycles or second_ns <= first_ns) return false;
-    const cycle_ns = scaleCyclesToNs(second_cycles - first_cycles, frequency) orelse return false;
-    const monotonic_ns = second_ns - first_ns;
-    return withinTolerance(cycle_ns, monotonic_ns, @max(100 * std.time.ns_per_us, monotonic_ns / 100));
+fn estimateFrequency(first: Sample, second: Sample) ?u64 {
+    if (second.cycles <= first.cycles or second.monotonic_ns <= first.monotonic_ns) return null;
+    const frequency = @as(u128, second.cycles - first.cycles) * std.time.ns_per_s /
+        (second.monotonic_ns - first.monotonic_ns);
+    return std.math.cast(u64, frequency);
 }
 
 fn withinTolerance(first: u64, second: u64, tolerance: u64) bool {
@@ -248,11 +294,26 @@ test "token detection observes exact platform capability names" {
     try std.testing.expect(!hasToken("flags: tsc_reliable", "tsc"));
 }
 
-test "stability sampling rejects regressions and clock drift" {
-    const frequency = 2_000_000_000;
-    try std.testing.expect(stableInterval(10, 20_000_010, 50, 10_000_050, frequency));
-    try std.testing.expect(!stableInterval(20, 10, 50, 10_000_050, frequency));
-    try std.testing.expect(!stableInterval(10, 24_000_010, 50, 10_000_050, frequency));
+test "counter frequency is calibrated against monotonic time" {
+    try std.testing.expectEqual(
+        @as(?u64, 2_000_000_000),
+        estimateFrequency(
+            .{ .cycles = 10, .monotonic_ns = 50 },
+            .{ .cycles = 20_000_010, .monotonic_ns = 10_000_050 },
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        estimateFrequency(
+            .{ .cycles = 20, .monotonic_ns = 50 },
+            .{ .cycles = 10, .monotonic_ns = 10_000_050 },
+        ),
+    );
+}
+
+test "runtime validation bounds counter drift" {
+    try std.testing.expect(withinTolerance(1_000_000, 1_002_000, 2_000));
+    try std.testing.expect(!withinTolerance(1_000_000, 1_002_001, 2_000));
 }
 
 test "host platform accepts its kernel monotonic counter" {

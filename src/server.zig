@@ -243,6 +243,7 @@ pub const Server = struct {
             options.write_high_watermark_bytes,
             options.write_low_watermark_bytes,
         );
+        fast_clock.warmup(syncIo());
         if (options.stream_limits.max_inbound_buffer_size < options.initial_stream_window_size) {
             return error.InvalidInboundBufferSize;
         }

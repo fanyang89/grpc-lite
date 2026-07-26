@@ -184,6 +184,7 @@ pub const Channel = struct {
             options.write_high_watermark_bytes,
             options.write_low_watermark_bytes,
         );
+        fast_clock.warmup(syncIo());
         const parsed = try parseTarget(target);
         const literal_address = std.Io.net.IpAddress.parseIp4(parsed.host, parsed.port) catch null;
         if (literal_address == null) {
