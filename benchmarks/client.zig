@@ -68,6 +68,7 @@ const Config = struct {
     duration_ns: u64 = 3 * std.time.ns_per_s,
     streams: usize = 1,
     channels: usize = 1,
+    server_reactors: usize = 1,
     pipeline: usize = 32,
     payload_bytes: usize = 128,
     payload_pattern: PayloadPattern = .repeated,
@@ -522,6 +523,7 @@ const ResultJson = struct {
     throughput_scope: []const u8,
     latency_scope: []const u8,
     channel_count: usize,
+    server_reactor_count: usize,
     grpc_lite_version: []const u8,
     client_optimize_mode: []const u8,
     client_target_arch: []const u8,
@@ -936,6 +938,7 @@ fn makeResult(config: Config, measurements: *Measurements) ResultJson {
         .throughput_scope = "exchanges-started-in-measurement-window",
         .latency_scope = "full-latency-for-exchanges-started-in-measurement-window",
         .channel_count = config.channels,
+        .server_reactor_count = config.server_reactors,
         .grpc_lite_version = grpc.version,
         .client_optimize_mode = @tagName(builtin.mode),
         .client_target_arch = @tagName(builtin.cpu.arch),
@@ -1067,6 +1070,9 @@ fn parseArgs(args: []const []const u8) !Config {
         } else if (try optionValue(args, &index, arg, "--channels")) |value| {
             try markSeen(&seen.channels);
             config.channels = try parsePositiveInt(usize, value);
+        } else if (try optionValue(args, &index, arg, "--server-reactors")) |value| {
+            try markSeen(&seen.server_reactors);
+            config.server_reactors = try parsePositiveInt(usize, value);
         } else if (try optionValue(args, &index, arg, "--pipeline")) |value| {
             try markSeen(&seen.pipeline);
             config.pipeline = try parsePositiveInt(usize, value);
@@ -1102,6 +1108,7 @@ const Seen = struct {
     duration: bool = false,
     streams: bool = false,
     channels: bool = false,
+    server_reactors: bool = false,
     pipeline: bool = false,
     payload_bytes: bool = false,
     payload_pattern: bool = false,
@@ -1245,6 +1252,7 @@ test "parse benchmark client defaults and options" {
         "2s",
         "--streams=4",
         "--channels=2",
+        "--server-reactors=4",
         "--pipeline=99",
         "--payload-bytes=1024",
         "--payload-pattern=deterministic-random",
@@ -1255,6 +1263,7 @@ test "parse benchmark client defaults and options" {
     try std.testing.expectEqual(Scenario.bidi_ping_pong, config.scenario);
     try std.testing.expectEqual(Transport.typed, config.transport);
     try std.testing.expectEqual(@as(usize, 2), config.channels);
+    try std.testing.expectEqual(@as(usize, 4), config.server_reactors);
     try std.testing.expectEqual(PayloadPattern.deterministic_random, config.payload_pattern);
     try std.testing.expectEqual(@as(usize, 1), config.pipeline);
     try std.testing.expect(config.compact);
@@ -1267,6 +1276,7 @@ test "reject malformed benchmark client options" {
     try std.testing.expectError(error.ZeroValue, parseArgs(&.{ "client", "--port=0" }));
     try std.testing.expectError(error.ZeroValue, parseArgs(&.{ "client", "--streams=0" }));
     try std.testing.expectError(error.ZeroValue, parseArgs(&.{ "client", "--channels=0" }));
+    try std.testing.expectError(error.ZeroValue, parseArgs(&.{ "client", "--server-reactors=0" }));
     try std.testing.expectError(error.ChannelsExceedStreams, parseArgs(&.{
         "client",
         "--streams=2",
@@ -1390,6 +1400,7 @@ test "result JSON has stable benchmark shape" {
         .throughput_scope = "exchanges-started-in-measurement-window",
         .latency_scope = "full-latency-for-exchanges-started-in-measurement-window",
         .channel_count = 1,
+        .server_reactor_count = 1,
         .grpc_lite_version = grpc.version,
         .client_optimize_mode = "ReleaseFast",
         .client_target_arch = "x86_64",
@@ -1432,6 +1443,7 @@ test "result JSON has stable benchmark shape" {
         object.get("client_execution_model").?.string,
     );
     try std.testing.expect(object.contains("operations_per_second"));
+    try std.testing.expectEqual(@as(i64, 1), object.get("server_reactor_count").?.integer);
     try std.testing.expect(object.contains("sampled_latency_count"));
     try std.testing.expect(object.contains("latency"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, json, "\n"));

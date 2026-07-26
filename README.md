@@ -210,6 +210,7 @@ comma-joined base64 on the wire, and reject malformed input on only the affected
 var server = try grpc.Server.init(allocator, .{
     .host = "127.0.0.1",
     .port = 50051,
+    .reactor_count = 4,
 });
 defer server.deinit();
 
@@ -220,6 +221,19 @@ try server.registerUnary(
 try server.start();
 server.wait();
 ```
+
+`reactor_count` defaults to one. Values greater than one create independent Linux
+reactor threads, event loops, listeners, HTTP/2 sessions, connection state, deadline
+heaps, and write pools. The listeners share the configured IPv4 port with
+`SO_REUSEPORT`; each TCP connection and all of its streams remain on one reactor.
+Multi-core scaling therefore requires multiple client connections or channels.
+
+Server transport allocations are serialized before reaching the allocator passed to
+`Server.init`, so that allocator may be non-thread-safe. With multiple reactors,
+handler contexts, application-owned shared state, and allocators used directly by
+handlers must be thread-safe. Callbacks run concurrently across reactor threads and
+must not block. The serialized transport allocator is a correctness boundary; a future
+per-reactor slab allocator may reduce allocator lock contention.
 
 Handlers can inspect propagated deadlines with `ServerContext.hasDeadline`,
 `remainingTimeNs`, and `isDeadlineExceeded`. Handlers are not force-cancelled; a response
@@ -365,14 +379,19 @@ local send-queue admission. Results are pretty JSON by default:
 
 ```bash
 mise run bench -- --scenario bidi-ping-pong --transport typed
+mise run bench -- --reactors=4 --channels=16 --streams=512
 ```
 
 Supported scenarios are `unary`, `bidi-ping-pong`, and `bidi-throughput`. Common options
-include `--warmup`, `--duration`, `--streams`, `--channels`, `--pipeline`,
+include `--warmup`, `--duration`, `--streams`, `--channels`, `--reactors`, `--pipeline`,
 `--payload-bytes`, `--payload-pattern`, and `--compression`. Unary concurrency slots and
 persistent streams are assigned round-robin across the configured channels; the channel
 count must not exceed the stream count. Run `mise run bench --help` for the complete task
 interface.
+
+For multi-reactor server measurements, use at least as many channels as reactors, for
+example `--reactors=N --channels=N` or greater. The result JSON records
+`server_reactor_count`; this field is descriptive and does not alter client load.
 
 The default matrix writes one parseable JSON document per case and prints each path:
 

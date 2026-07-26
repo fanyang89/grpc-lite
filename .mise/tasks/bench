@@ -10,6 +10,7 @@
 #USAGE flag "--duration <duration>" help="Measurement duration" default="3s"
 #USAGE flag "--streams <count>" help="Concurrent workers or streams" default="1"
 #USAGE flag "--channels <count>" help="Client channels" default="1"
+#USAGE flag "--reactors <count>" help="Server reactor threads" default="1"
 #USAGE flag "--pipeline <count>" help="Outstanding messages per throughput stream" default="32"
 #USAGE flag "--payload-bytes <bytes>" help="Application payload size" default="128"
 #USAGE flag "--payload-pattern <pattern>" help="Payload byte pattern" default="repeated" {
@@ -42,7 +43,7 @@ trap 'exit 143' TERM
 mkdir -p "$work_dir"
 zig build -Doptimize=ReleaseFast
 "$project_root/zig-out/bin/grpc-lite-benchmark-server" \
-  --host=127.0.0.1 --port="$requested_port" >"$server_log" 2>&1 &
+  --host=127.0.0.1 --port="$requested_port" --reactors="${usage_reactors}" >"$server_log" 2>&1 &
 server_pid=$!
 
 port=$requested_port
@@ -99,6 +100,7 @@ args=(
   --duration="${usage_duration}"
   --streams="${usage_streams}"
   --channels="${usage_channels}"
+  --server-reactors="${usage_reactors}"
   --pipeline="${usage_pipeline}"
   --payload-bytes="${usage_payload_bytes}"
   --payload-pattern="${usage_payload_pattern}"

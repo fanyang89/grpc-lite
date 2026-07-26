@@ -6,6 +6,7 @@ const grpc_pb = @import("grpc_lite_protobuf");
 const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 50061,
+    reactors: usize = 1,
 };
 
 const ServiceError = error{OutOfMemory};
@@ -39,6 +40,7 @@ const StreamState = struct {
 const Service = struct {
     allocator: std.mem.Allocator,
     streams: std.AutoHashMapUnmanaged(*anyopaque, *StreamState) = .empty,
+    streams_mutex: std.Io.Mutex = .init,
 
     fn init(allocator: std.mem.Allocator) Service {
         return .{ .allocator = allocator };
@@ -92,13 +94,14 @@ const Service = struct {
         stream: grpc.ServerStream,
         context: *grpc.ServerContext,
     ) !void {
-        if (self.streams.contains(stream.context)) return error.DuplicateStream;
-
         // The transport only enables gzip when the peer advertised it.
         context.setResponseCompression(.gzip);
         const state = try self.allocator.create(StreamState);
         errdefer self.allocator.destroy(state);
         state.* = .{};
+        self.lockStreams();
+        defer self.unlockStreams();
+        if (self.streams.contains(stream.context)) return error.DuplicateStream;
         try self.streams.put(self.allocator, stream.context, state);
     }
 
@@ -122,7 +125,7 @@ const Service = struct {
         payload: []const u8,
         compression: grpc.Compression,
     ) !grpc.StreamReceiveAction {
-        const state = self.streams.get(stream.context) orelse return error.UnknownStream;
+        const state = self.getState(stream.context) orelse return error.UnknownStream;
         sendRaw(stream, payload, compression) catch |err| {
             if (err != error.WouldBlock) return err;
             state.pending = .{ .raw = .{
@@ -154,7 +157,7 @@ const Service = struct {
         message: []const u8,
         compression: grpc.Compression,
     ) !grpc.StreamReceiveAction {
-        const state = self.streams.get(stream.raw.context) orelse return error.UnknownStream;
+        const state = self.getState(stream.raw.context) orelse return error.UnknownStream;
         sendTyped(stream, message, compression) catch |err| {
             if (err != error.WouldBlock) return err;
             state.pending = .{ .typed_message = .{
@@ -191,7 +194,7 @@ const Service = struct {
     }
 
     fn handleRemoteEnd(self: *Service, stream: grpc.ServerStream) !void {
-        const state = self.streams.get(stream.context) orelse return error.UnknownStream;
+        const state = self.getState(stream.context) orelse return error.UnknownStream;
         state.remote_ended = true;
         if (state.pending == null) try self.finishState(stream);
     }
@@ -215,7 +218,7 @@ const Service = struct {
     }
 
     fn handleRawWritable(self: *Service, stream: grpc.ServerStream) !void {
-        const state = self.streams.get(stream.context) orelse return;
+        const state = self.getState(stream.context) orelse return;
         const pending = state.pending orelse return;
         const message = switch (pending) {
             .raw => |message| message,
@@ -232,7 +235,7 @@ const Service = struct {
         self: *Service,
         stream: grpc_pb.ServerStream(demo.EchoReply),
     ) !void {
-        const state = self.streams.get(stream.raw.context) orelse return;
+        const state = self.getState(stream.raw.context) orelse return;
         const pending = state.pending orelse return;
         const message = switch (pending) {
             .typed_message => |message| message,
@@ -279,7 +282,7 @@ const Service = struct {
     }
 
     fn failContinuation(self: *Service, stream: grpc.ServerStream) void {
-        if (!self.streams.contains(stream.context)) return;
+        if (self.getState(stream.context) == null) return;
         stream.finish(.init(.internal, "stream continuation failed")) catch {};
         self.removeState(stream);
     }
@@ -290,12 +293,29 @@ const Service = struct {
     }
 
     fn removeState(self: *Service, stream: grpc.ServerStream) void {
-        if (self.streams.fetchRemove(stream.context)) |entry| self.destroyState(entry.value);
+        self.lockStreams();
+        const removed = self.streams.fetchRemove(stream.context);
+        self.unlockStreams();
+        if (removed) |entry| self.destroyState(entry.value);
     }
 
     fn destroyState(self: *Service, state: *StreamState) void {
         state.deinit(self.allocator);
         self.allocator.destroy(state);
+    }
+
+    fn getState(self: *Service, key: *anyopaque) ?*StreamState {
+        self.lockStreams();
+        defer self.unlockStreams();
+        return self.streams.get(key);
+    }
+
+    fn lockStreams(self: *Service) void {
+        self.streams_mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+    }
+
+    fn unlockStreams(self: *Service) void {
+        self.streams_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
     }
 };
 
@@ -368,6 +388,7 @@ pub fn main(init: std.process.Init) !void {
     var server = try grpc.Server.init(init.gpa, .{
         .host = config.host,
         .port = config.port,
+        .reactor_count = config.reactors,
     });
     defer server.deinit();
 
@@ -400,6 +421,7 @@ fn parseArgs(args: []const []const u8) !Config {
     var config: Config = .{};
     var host_seen = false;
     var port_seen = false;
+    var reactors_seen = false;
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
@@ -423,6 +445,16 @@ fn parseArgs(args: []const []const u8) !Config {
             if (port_seen) return error.DuplicatePort;
             port_seen = true;
             config.port = try parsePort(arg["--port=".len..]);
+        } else if (std.mem.eql(u8, arg, "--reactors")) {
+            if (reactors_seen) return error.DuplicateReactors;
+            reactors_seen = true;
+            index += 1;
+            if (index >= args.len or std.mem.startsWith(u8, args[index], "--")) return error.MissingReactors;
+            config.reactors = try parseReactors(args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--reactors=")) {
+            if (reactors_seen) return error.DuplicateReactors;
+            reactors_seen = true;
+            config.reactors = try parseReactors(arg["--reactors=".len..]);
         } else {
             return error.UnknownArgument;
         }
@@ -441,16 +473,25 @@ fn parsePort(value: []const u8) !u16 {
     return std.fmt.parseInt(u16, value, 10) catch error.InvalidPort;
 }
 
+fn parseReactors(value: []const u8) !usize {
+    if (value.len == 0) return error.InvalidReactorCount;
+    const count = std.fmt.parseInt(usize, value, 10) catch return error.InvalidReactorCount;
+    if (count == 0) return error.InvalidReactorCount;
+    return count;
+}
+
 test "parse benchmark server defaults" {
     const config = try parseArgs(&.{"server"});
     try std.testing.expectEqualStrings("127.0.0.1", config.host);
     try std.testing.expectEqual(@as(u16, 50061), config.port);
+    try std.testing.expectEqual(@as(usize, 1), config.reactors);
 }
 
 test "parse benchmark server options" {
-    var config = try parseArgs(&.{ "server", "--host", "0.0.0.0", "--port=60000" });
+    var config = try parseArgs(&.{ "server", "--host", "0.0.0.0", "--port=60000", "--reactors=4" });
     try std.testing.expectEqualStrings("0.0.0.0", config.host);
     try std.testing.expectEqual(@as(u16, 60000), config.port);
+    try std.testing.expectEqual(@as(usize, 4), config.reactors);
 
     config = try parseArgs(&.{ "server", "--host=127.0.0.2", "--port", "0" });
     try std.testing.expectEqualStrings("127.0.0.2", config.host);
@@ -465,4 +506,7 @@ test "reject malformed benchmark server options" {
     try std.testing.expectError(error.InvalidPort, parseArgs(&.{ "server", "--port=65536" }));
     try std.testing.expectError(error.DuplicateHost, parseArgs(&.{ "server", "--host=127.0.0.1", "--host=127.0.0.2" }));
     try std.testing.expectError(error.DuplicatePort, parseArgs(&.{ "server", "--port=1", "--port=2" }));
+    try std.testing.expectError(error.InvalidReactorCount, parseArgs(&.{ "server", "--reactors=0" }));
+    try std.testing.expectError(error.MissingReactors, parseArgs(&.{ "server", "--reactors" }));
+    try std.testing.expectError(error.DuplicateReactors, parseArgs(&.{ "server", "--reactors=2", "--reactors=4" }));
 }
