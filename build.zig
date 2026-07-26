@@ -1,6 +1,8 @@
 const std = @import("std");
 const manifest = @import("build.zig.zon");
 
+pub const protobuf_codegen = @import("protobuf");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -18,6 +20,10 @@ pub fn build(b: *std.Build) void {
     const nghttp2_dependency = b.dependency("nghttp2", .{});
     const cares_dependency = b.dependency("cares", .{});
     const nanozlog_dependency = b.dependency("nanozlog", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const protobuf_dependency = b.dependency("protobuf", .{
         .target = target,
         .optimize = optimize,
     });
@@ -80,7 +86,14 @@ pub fn build(b: *std.Build) void {
     );
 
     const xev = libxev_dependency.module("xev");
+    const protobuf = protobuf_dependency.module("protobuf");
     applySanitizers(xev, sanitizers);
+    applySanitizers(protobuf, sanitizers);
+    b.modules.put(
+        b.graph.arena,
+        b.dupe("grpc_lite_protobuf_runtime"),
+        protobuf,
+    ) catch @panic("OOM");
     grpc_lite.addOptions("grpc_lite_options", grpc_lite_options);
     grpc_lite.addIncludePath(nghttp2_dependency.path("lib/includes"));
     grpc_lite.addIncludePath(native.nghttp2_include);
@@ -95,6 +108,7 @@ pub fn build(b: *std.Build) void {
     }
     grpc_lite.addImport("xev", xev);
     grpc_lite.addImport("nanozlog", nanozlog_dependency.module("nanozlog"));
+    grpc_lite.addImport("protobuf", protobuf);
     const test_step = b.step("test", "Run unit tests");
 
     if (gperftools_dependency) |dependency| {
@@ -175,15 +189,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_public_api_tests.step);
 
     if (!enable_protobuf) return;
-    const protobuf_build = b.lazyImport(@This(), "protobuf") orelse return;
-    const protobuf_dependency = b.lazyDependency("protobuf", .{
-        .target = target,
-        .optimize = optimize,
-    }) orelse return;
     addProtobufSupport(
         b,
-        protobuf_build,
+        protobuf_codegen,
         protobuf_dependency,
+        protobuf,
         grpc_lite,
         test_step,
         target,
@@ -211,6 +221,7 @@ fn addProtobufSupport(
     b: *std.Build,
     comptime protobuf_build: type,
     protobuf_dependency: *std.Build.Dependency,
+    protobuf: *std.Build.Module,
     grpc_lite: *std.Build.Module,
     test_step: *std.Build.Step,
     target: std.Build.ResolvedTarget,
@@ -248,8 +259,6 @@ fn addProtobufSupport(
     );
     generate_interop_proto_step.dependOn(&generate_interop_proto.step);
 
-    const protobuf = protobuf_dependency.module("protobuf");
-    applySanitizers(protobuf, sanitizers);
     const demo_proto = b.createModule(.{
         .root_source_file = b.path(".zig-cache/generated/demo.pb.zig"),
         .target = target,

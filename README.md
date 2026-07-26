@@ -202,13 +202,16 @@ See `examples/echo_server.zig` and `examples/echo_client.zig` for complete progr
 
 ## Protobuf
 
-The optional `grpc_lite_protobuf` module integrates Arwalk/zig-protobuf while keeping
-the transport core raw-byte based. `proto/echo.proto` is generated into
+The `grpc_lite` module exports the shared zig-protobuf runtime as `grpc.protobuf`.
+Its build package exports `protobuf_codegen` for downstream code generation. The
+optional `grpc_lite_protobuf` module adds typed gRPC adapters while keeping the
+transport core raw-byte based. `proto/echo.proto` is generated into
 `.zig-cache/generated/demo.pb.zig` during the build.
 
-Downstream dependencies expose only the raw `grpc_lite` module by default. Pass
-`.protobuf = true` when declaring the dependency to fetch zig-protobuf and expose
-`grpc_lite_protobuf`. Repository builds enable protobuf support by default.
+Downstream dependencies always expose `grpc_lite` and
+`grpc_lite_protobuf_runtime`. Pass `.protobuf = true` when declaring the dependency
+to additionally expose `grpc_lite_protobuf`. Repository builds enable the typed
+adapter by default.
 
 Generated service VTables can be registered without manually specifying method paths:
 
