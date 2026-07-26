@@ -3528,10 +3528,15 @@ test "server drain finishes an accepted RPC and rejects a replacement connection
     try std.testing.expectEqualStrings("accepted", accepted.payload);
     try std.testing.expect(handler.local_address_available);
 
+    const reconnect_deadline = nowNs() +| 5 * std.time.ns_per_s;
+    while (channel.impl.connection_generation.load(.monotonic) < 2 and nowNs() < reconnect_deadline) {
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 2), channel.impl.connection_generation.load(.monotonic));
+
     var rejected = try channel.callUnary(std.testing.allocator, "/test.Drain/Unary", "later", .{});
     defer rejected.deinit();
     try std.testing.expectEqual(status.Code.unavailable, rejected.status.code);
-    try std.testing.expectEqual(@as(usize, 2), channel.impl.connection_generation.load(.monotonic));
     test_server.wait();
 }
 
