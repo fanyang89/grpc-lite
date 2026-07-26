@@ -9,8 +9,12 @@
 #USAGE flag "--warmup <duration>" help="Warmup duration" default="1s"
 #USAGE flag "--duration <duration>" help="Measurement duration" default="3s"
 #USAGE flag "--streams <count>" help="Concurrent workers or streams" default="1"
+#USAGE flag "--channels <count>" help="Client channels" default="1"
 #USAGE flag "--pipeline <count>" help="Outstanding messages per throughput stream" default="32"
 #USAGE flag "--payload-bytes <bytes>" help="Application payload size" default="128"
+#USAGE flag "--payload-pattern <pattern>" help="Payload byte pattern" default="repeated" {
+#USAGE   choices "repeated" "deterministic-random"
+#USAGE }
 #USAGE flag "--compression <compression>" help="Per-message compression" default="identity" {
 #USAGE   choices "identity" "gzip"
 #USAGE }
@@ -94,8 +98,10 @@ args=(
   --warmup="${usage_warmup}"
   --duration="${usage_duration}"
   --streams="${usage_streams}"
+  --channels="${usage_channels}"
   --pipeline="${usage_pipeline}"
   --payload-bytes="${usage_payload_bytes}"
+  --payload-pattern="${usage_payload_pattern}"
   --compression="${usage_compression}"
 )
 if [[ -n "${usage_output:-}" ]]; then

@@ -341,8 +341,10 @@ mise run bench -- --scenario bidi-ping-pong --transport typed
 ```
 
 Supported scenarios are `unary`, `bidi-ping-pong`, and `bidi-throughput`. Common options
-include `--warmup`, `--duration`, `--streams`, `--pipeline`, `--payload-bytes`, and
-`--compression`. Run `mise run bench --help` for the complete task interface.
+include `--warmup`, `--duration`, `--streams`, `--channels`, `--pipeline`,
+`--payload-bytes`, `--payload-pattern`, and `--compression`. Workers and persistent
+streams are assigned round-robin across the configured channels; the channel count must
+not exceed the stream count. Run `mise run bench --help` for the complete task interface.
 
 The default matrix writes one parseable JSON document per case and prints each path:
 
@@ -357,12 +359,20 @@ Reported bytes are application request plus response payload bytes, not HTTP/2 w
 bytes. Raw and typed results are separate because typed runs include protobuf encoding,
 decoding, and per-message arena costs.
 
-The harness uses a closed-loop load model with one shared channel. Throughput counts
-completions inside the measurement window; latency includes only exchanges that both
-start and finish inside it. Unary operations are complete RPCs, while bidi operations
-are messages on persistent streams, so compare results only within the same scenario.
-The current payload is a repeated byte pattern and therefore represents a highly
-compressible gzip workload.
+The harness uses a closed-loop load model with fixed concurrency and one or more
+channels. An exchange is eligible when its request starts inside the measurement window.
+Eligible exchanges that finish during the bounded drain are included in completed/error
+counts and full latency; warmup exchanges that finish during measurement are excluded.
+Throughput still uses the configured measurement duration as its denominator. JSON
+`min_us` and `max_us` cover every eligible latency, while percentiles and mean may use
+the documented deterministic reservoir sample.
+
+Unary operations are complete RPCs, while bidi operations are messages on persistent
+streams, so compare results only within the same scenario. `repeated` fills payloads with
+`0x5a` and represents a highly compressible gzip workload. `deterministic-random` uses a
+fixed-seed byte sequence for a repeatable higher-entropy workload. This harness remains
+closed-loop: it does not provide open-loop arrival control or a cross-framework
+comparison methodology.
 
 ## Dependencies
 

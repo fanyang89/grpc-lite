@@ -47,6 +47,18 @@ const Transport = enum {
     }
 };
 
+const PayloadPattern = enum {
+    repeated,
+    deterministic_random,
+
+    fn jsonName(self: PayloadPattern) []const u8 {
+        return switch (self) {
+            .repeated => "repeated",
+            .deterministic_random => "deterministic-random",
+        };
+    }
+};
+
 const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 50061,
@@ -55,8 +67,10 @@ const Config = struct {
     warmup_ns: u64 = std.time.ns_per_s,
     duration_ns: u64 = 3 * std.time.ns_per_s,
     streams: usize = 1,
+    channels: usize = 1,
     pipeline: usize = 32,
     payload_bytes: usize = 128,
+    payload_pattern: PayloadPattern = .repeated,
     compression: grpc.Compression = .identity,
     output: ?[]const u8 = null,
     compact: bool = false,
@@ -88,11 +102,6 @@ const Timing = struct {
             now_ns >= self.measure_start_ns.load(.acquire) and
             now_ns < self.measure_end_ns.load(.acquire);
     }
-
-    fn completionIsMeasured(self: *const Timing, now_ns: u64) bool {
-        return now_ns >= self.measure_start_ns.load(.acquire) and
-            now_ns < self.measure_end_ns.load(.acquire);
-    }
 };
 
 const Measurements = struct {
@@ -105,6 +114,8 @@ const Measurements = struct {
     exchange_errors: u64 = 0,
     stream_errors: u64 = 0,
     eligible_latency_count: u64 = 0,
+    observed_min_latency_ns: u64 = std.math.maxInt(u64),
+    observed_max_latency_ns: u64 = 0,
     sampling_seed: u64 = 0,
     latency_samples: std.ArrayList(LatencySample) = .empty,
 
@@ -114,12 +125,30 @@ const Measurements = struct {
 
     fn addLatency(self: *Measurements, latency_ns: u64, capacity: usize) void {
         self.eligible_latency_count += 1;
+        self.observed_min_latency_ns = @min(self.observed_min_latency_ns, latency_ns);
+        self.observed_max_latency_ns = @max(self.observed_max_latency_ns, latency_ns);
         if (self.latency_samples.items.len < capacity) {
             self.latency_samples.appendAssumeCapacity(.{ .ns = latency_ns });
             return;
         }
         const slot = mix64(self.eligible_latency_count ^ self.sampling_seed) % self.eligible_latency_count;
         if (slot < capacity) self.latency_samples.items[@intCast(slot)] = .{ .ns = latency_ns };
+    }
+
+    fn recordExchange(
+        self: *Measurements,
+        started_in_measurement: bool,
+        valid: bool,
+        latency_ns: u64,
+        capacity: usize,
+    ) void {
+        if (!started_in_measurement) return;
+        if (!valid) {
+            self.exchange_errors += 1;
+            return;
+        }
+        self.completed += 1;
+        self.addLatency(latency_ns, capacity);
     }
 
     fn mergeShard(
@@ -131,6 +160,16 @@ const Measurements = struct {
         self.exchange_errors += shard.exchange_errors;
         self.stream_errors += shard.stream_errors;
         self.eligible_latency_count += shard.eligible_latency_count;
+        if (shard.eligible_latency_count != 0) {
+            self.observed_min_latency_ns = @min(
+                self.observed_min_latency_ns,
+                shard.observed_min_latency_ns,
+            );
+            self.observed_max_latency_ns = @max(
+                self.observed_max_latency_ns,
+                shard.observed_max_latency_ns,
+            );
+        }
         if (shard.latency_samples.items.len == 0) return;
 
         const new_len = self.latency_samples.items.len + shard.latency_samples.items.len;
@@ -163,18 +202,16 @@ const UnaryWorker = struct {
                 .raw => self.callRaw(),
                 .typed => self.callTyped(&typed_client),
             } catch {
-                const finished_ns = nowNs(self.timing.io);
-                if (self.timing.completionIsMeasured(finished_ns)) self.measurements.exchange_errors += 1;
+                if (measured) self.measurements.exchange_errors += 1;
                 continue;
             };
             const finished_ns = nowNs(self.timing.io);
-            if (!self.timing.completionIsMeasured(finished_ns)) continue;
-            if (!valid) {
-                self.measurements.exchange_errors += 1;
-                continue;
-            }
-            self.measurements.completed += 1;
-            if (measured) self.measurements.addLatency(finished_ns -| started_ns, self.latency_capacity);
+            self.measurements.recordExchange(
+                measured,
+                valid,
+                finished_ns -| started_ns,
+                self.latency_capacity,
+            );
         }
     }
 
@@ -294,7 +331,7 @@ const StreamState = struct {
             };
             self.sendReserved(timestamp) catch |err| {
                 if (self.stoppingAfterClose(err)) return;
-                self.failStream(timestamp.measured, nowNs(self.timing.io));
+                self.failStream(timestamp.measured);
                 return;
             };
             if (self.pending != null) return;
@@ -310,7 +347,7 @@ const StreamState = struct {
             self.pending = null;
             self.sendReserved(timestamp) catch |err| {
                 if (self.stoppingAfterClose(err)) return;
-                self.failStream(timestamp.measured, nowNs(self.timing.io));
+                self.failStream(timestamp.measured);
                 return;
             };
             if (self.pending != null) return;
@@ -337,9 +374,7 @@ const StreamState = struct {
 
     fn onResponse(self: *StreamState, response: []const u8) grpc.StreamReceiveAction {
         const finished_ns = nowNs(self.timing.io);
-        const completion_measured = self.timing.completionIsMeasured(finished_ns);
         if (self.inflight == 0) {
-            if (completion_measured) self.measurements.exchange_errors += 1;
             self.cancel();
             return .continue_receiving;
         }
@@ -347,25 +382,23 @@ const StreamState = struct {
         const timestamp = self.timestamps[self.head];
         self.head = (self.head + 1) % self.timestamps.len;
         self.inflight -= 1;
-        if (completion_measured) {
-            if (!validatePayload(response, self.payload)) {
-                self.measurements.exchange_errors += 1;
-                self.cancel();
-                return .continue_receiving;
-            }
-            self.measurements.completed += 1;
-            if (timestamp.measured) {
-                self.measurements.addLatency(finished_ns -| timestamp.started_ns, self.latency_capacity);
-            }
+        const valid = validatePayload(response, self.payload);
+        self.measurements.recordExchange(
+            timestamp.measured,
+            valid,
+            finished_ns -| timestamp.started_ns,
+            self.latency_capacity,
+        );
+        if (!valid) {
+            self.cancel();
+            return .continue_receiving;
         }
         self.refill();
         return .continue_receiving;
     }
 
-    fn failStream(self: *StreamState, measured: bool, finished_ns: u64) void {
-        if (measured and self.timing.completionIsMeasured(finished_ns)) {
-            self.measurements.exchange_errors += 1;
-        }
+    fn failStream(self: *StreamState, measured: bool) void {
+        if (measured) self.measurements.exchange_errors += 1;
         self.terminal_error = true;
         self.cancel();
     }
@@ -501,18 +534,24 @@ fn run(init: std.process.Init, config: Config) !void {
     defer init.gpa.free(target);
     const payload = try init.gpa.alloc(u8, config.payload_bytes);
     defer init.gpa.free(payload);
-    @memset(payload, 0x5a);
+    fillPayload(payload, config.payload_pattern);
 
-    var channel = try grpc.Channel.init(init.gpa, target, .{});
-    defer channel.deinit();
+    const channels = try init.gpa.alloc(grpc.Channel, config.channels);
+    defer init.gpa.free(channels);
+    var initialized_channels: usize = 0;
+    defer for (channels[0..initialized_channels]) |*channel| channel.deinit();
+    for (channels) |*channel| {
+        channel.* = try grpc.Channel.init(init.gpa, target, .{});
+        initialized_channels += 1;
+    }
     var timing: Timing = .{ .io = init.io };
     var measurements = switch (config.scenario) {
-        .unary => try runUnary(init, config, payload, &channel, &timing),
+        .unary => try runUnary(init, config, payload, channels, &timing),
         .bidi_ping_pong, .bidi_throughput => try runBidi(
             init,
             config,
             payload,
-            &channel,
+            channels,
             &timing,
         ),
     };
@@ -528,7 +567,7 @@ fn runUnary(
     init: std.process.Init,
     config: Config,
     payload: []const u8,
-    channel: *grpc.Channel,
+    channels: []grpc.Channel,
     timing: *Timing,
 ) !Measurements {
     const workers = try init.gpa.alloc(UnaryWorker, config.streams);
@@ -545,7 +584,7 @@ fn runUnary(
     }
     for (workers, threads, 0..) |*worker, *thread, worker_index| {
         worker.* = .{
-            .channel = channel,
+            .channel = &channels[worker_index % channels.len],
             .timing = timing,
             .transport = config.transport,
             .payload = payload,
@@ -584,7 +623,7 @@ fn runBidi(
     init: std.process.Init,
     config: Config,
     payload: []const u8,
-    channel: *grpc.Channel,
+    channels: []grpc.Channel,
     timing: *Timing,
 ) !Measurements {
     const states = try init.gpa.alloc(StreamState, config.streams);
@@ -592,9 +631,9 @@ fn runBidi(
     var initialized: usize = 0;
     defer for (states[0..initialized]) |*state| state.deinit(init.gpa);
 
-    var typed_client = grpc_pb.ServiceClient(StreamingEchoApi).init(channel);
     const latency_capacity = @max(@as(usize, 1), max_stream_latency_samples / config.streams);
     for (states, 0..) |*state, stream_index| {
+        const channel = &channels[stream_index % channels.len];
         state.* = .{
             .timing = timing,
             .transport = config.transport,
@@ -625,21 +664,24 @@ fn runBidi(
                     .on_terminal = StreamState.rawTerminal,
                 },
             ),
-            .typed => state.typed_stream = try typed_client.openStream(
-                std.heap.page_allocator,
-                "Chat",
-                .{
-                    .timeout_ns = config.warmup_ns +| config.duration_ns +|
-                        drain_timeout_ns +| rpc_timeout_ns,
-                    .send_compression = config.compression,
-                },
-                .{
-                    .context = state,
-                    .on_message = StreamState.typedMessage,
-                    .on_writable = StreamState.typedWritable,
-                    .on_terminal = StreamState.typedTerminal,
-                },
-            ),
+            .typed => {
+                var typed_client = grpc_pb.ServiceClient(StreamingEchoApi).init(channel);
+                state.typed_stream = try typed_client.openStream(
+                    std.heap.page_allocator,
+                    "Chat",
+                    .{
+                        .timeout_ns = config.warmup_ns +| config.duration_ns +|
+                            drain_timeout_ns +| rpc_timeout_ns,
+                        .send_compression = config.compression,
+                    },
+                    .{
+                        .context = state,
+                        .on_message = StreamState.typedMessage,
+                        .on_writable = StreamState.typedWritable,
+                        .on_terminal = StreamState.typedTerminal,
+                    },
+                );
+            },
         }
     }
 
@@ -730,6 +772,19 @@ fn validatePayload(response: []const u8, expected: []const u8) bool {
     return std.mem.eql(u8, response, expected);
 }
 
+fn fillPayload(payload: []u8, pattern: PayloadPattern) void {
+    switch (pattern) {
+        .repeated => @memset(payload, 0x5a),
+        .deterministic_random => {
+            var state: u32 = 0x6d2b79f5;
+            for (payload) |*byte| {
+                state = state *% 1_664_525 +% 1_013_904_223;
+                byte.* = @truncate(state >> 24);
+            }
+        },
+    }
+}
+
 fn makeResult(config: Config, measurements: *Measurements) ResultJson {
     std.mem.sortUnstable(
         Measurements.LatencySample,
@@ -758,12 +813,12 @@ fn makeResult(config: Config, measurements: *Measurements) ResultJson {
         .transport = "grpc-http2-insecure",
         .api_mode = config.transport.jsonName(),
         .compression = config.compression.name(),
-        .payload_pattern = "repeated-byte-0x5a",
+        .payload_pattern = config.payload_pattern.jsonName(),
         .load_model = "closed-loop-fixed-concurrency",
         .operation_unit = if (config.scenario == .unary) "rpc" else "message-exchange",
-        .throughput_scope = "completions-in-measurement-window",
-        .latency_scope = "requests-started-and-completed-in-measurement-window",
-        .channel_count = 1,
+        .throughput_scope = "exchanges-started-in-measurement-window",
+        .latency_scope = "full-latency-for-exchanges-started-in-measurement-window",
+        .channel_count = config.channels,
         .grpc_lite_version = grpc.version,
         .client_optimize_mode = @tagName(builtin.mode),
         .client_target_arch = @tagName(builtin.cpu.arch),
@@ -791,8 +846,14 @@ fn makeResult(config: Config, measurements: *Measurements) ResultJson {
             .p50_us = nsToUs(weightedPercentile(measurements.latency_samples.items, 50)),
             .p95_us = nsToUs(weightedPercentile(measurements.latency_samples.items, 95)),
             .p99_us = nsToUs(weightedPercentile(measurements.latency_samples.items, 99)),
-            .min_us = nsToUs(if (count == 0) 0 else measurements.latency_samples.items[0].ns),
-            .max_us = nsToUs(if (count == 0) 0 else measurements.latency_samples.items[count - 1].ns),
+            .min_us = nsToUs(if (measurements.eligible_latency_count == 0)
+                0
+            else
+                measurements.observed_min_latency_ns),
+            .max_us = nsToUs(if (measurements.eligible_latency_count == 0)
+                0
+            else
+                measurements.observed_max_latency_ns),
             .mean_us = if (total_weight == 0) 0 else weighted_sum / total_weight / 1000.0,
         },
     };
@@ -881,6 +942,9 @@ fn parseArgs(args: []const []const u8) !Config {
         } else if (try optionValue(args, &index, arg, "--streams")) |value| {
             try markSeen(&seen.streams);
             config.streams = try parsePositiveInt(usize, value);
+        } else if (try optionValue(args, &index, arg, "--channels")) |value| {
+            try markSeen(&seen.channels);
+            config.channels = try parsePositiveInt(usize, value);
         } else if (try optionValue(args, &index, arg, "--pipeline")) |value| {
             try markSeen(&seen.pipeline);
             config.pipeline = try parsePositiveInt(usize, value);
@@ -888,6 +952,9 @@ fn parseArgs(args: []const []const u8) !Config {
             try markSeen(&seen.payload_bytes);
             config.payload_bytes = try parsePositiveInt(usize, value);
             if (config.payload_bytes > max_payload_bytes) return error.PayloadTooLarge;
+        } else if (try optionValue(args, &index, arg, "--payload-pattern")) |value| {
+            try markSeen(&seen.payload_pattern);
+            config.payload_pattern = try parsePayloadPattern(value);
         } else if (try optionValue(args, &index, arg, "--compression")) |value| {
             try markSeen(&seen.compression);
             config.compression = try parseCompression(value);
@@ -899,6 +966,7 @@ fn parseArgs(args: []const []const u8) !Config {
             return error.UnknownArgument;
         }
     }
+    if (config.channels > config.streams) return error.ChannelsExceedStreams;
     if (config.scenario != .bidi_throughput) config.pipeline = 1;
     return config;
 }
@@ -911,8 +979,10 @@ const Seen = struct {
     warmup: bool = false,
     duration: bool = false,
     streams: bool = false,
+    channels: bool = false,
     pipeline: bool = false,
     payload_bytes: bool = false,
+    payload_pattern: bool = false,
     compression: bool = false,
     output: bool = false,
     compact: bool = false,
@@ -977,6 +1047,12 @@ fn parseCompression(value: []const u8) !grpc.Compression {
     return error.InvalidCompression;
 }
 
+fn parsePayloadPattern(value: []const u8) !PayloadPattern {
+    if (std.mem.eql(u8, value, "repeated")) return .repeated;
+    if (std.mem.eql(u8, value, "deterministic-random")) return .deterministic_random;
+    return error.InvalidPayloadPattern;
+}
+
 fn parseDuration(value: []const u8) !u64 {
     const suffixes = [_]struct { name: []const u8, scale: u64, decimals: usize }{
         .{ .name = "ns", .scale = 1, .decimals = 0 },
@@ -1031,6 +1107,8 @@ test "parse benchmark client defaults and options" {
     try std.testing.expectEqual(@as(u16, 50061), defaults.port);
     try std.testing.expectEqual(Scenario.unary, defaults.scenario);
     try std.testing.expectEqual(Transport.raw, defaults.transport);
+    try std.testing.expectEqual(@as(usize, 1), defaults.channels);
+    try std.testing.expectEqual(PayloadPattern.repeated, defaults.payload_pattern);
     try std.testing.expectEqual(@as(usize, 1), defaults.pipeline);
 
     const config = try parseArgs(&.{
@@ -1044,14 +1122,18 @@ test "parse benchmark client defaults and options" {
         "--duration",
         "2s",
         "--streams=4",
+        "--channels=2",
         "--pipeline=99",
         "--payload-bytes=1024",
+        "--payload-pattern=deterministic-random",
         "--compression=gzip",
         "--output=result.json",
         "--compact",
     });
     try std.testing.expectEqual(Scenario.bidi_ping_pong, config.scenario);
     try std.testing.expectEqual(Transport.typed, config.transport);
+    try std.testing.expectEqual(@as(usize, 2), config.channels);
+    try std.testing.expectEqual(PayloadPattern.deterministic_random, config.payload_pattern);
     try std.testing.expectEqual(@as(usize, 1), config.pipeline);
     try std.testing.expect(config.compact);
 }
@@ -1062,6 +1144,16 @@ test "reject malformed benchmark client options" {
     try std.testing.expectError(error.InvalidHost, parseArgs(&.{ "client", "--host=localhost" }));
     try std.testing.expectError(error.ZeroValue, parseArgs(&.{ "client", "--port=0" }));
     try std.testing.expectError(error.ZeroValue, parseArgs(&.{ "client", "--streams=0" }));
+    try std.testing.expectError(error.ZeroValue, parseArgs(&.{ "client", "--channels=0" }));
+    try std.testing.expectError(error.ChannelsExceedStreams, parseArgs(&.{
+        "client",
+        "--streams=2",
+        "--channels=3",
+    }));
+    try std.testing.expectError(error.InvalidPayloadPattern, parseArgs(&.{
+        "client",
+        "--payload-pattern=other",
+    }));
     try std.testing.expectError(error.PayloadTooLarge, parseArgs(&.{
         "client",
         "--payload-bytes=4194300",
@@ -1071,6 +1163,59 @@ test "reject malformed benchmark client options" {
         "--transport=raw",
         "--transport=typed",
     }));
+}
+
+test "payload patterns are stable and distinct" {
+    var repeated: [16]u8 = undefined;
+    fillPayload(&repeated, .repeated);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 16), &repeated);
+
+    var first: [16]u8 = undefined;
+    var second: [16]u8 = undefined;
+    fillPayload(&first, .deterministic_random);
+    fillPayload(&second, .deterministic_random);
+    try std.testing.expectEqualSlices(u8, &first, &second);
+    try std.testing.expect(!std.mem.eql(u8, &first, &repeated));
+}
+
+test "exchange accounting follows start eligibility through drain" {
+    var measurements: Measurements = .{};
+    defer measurements.deinit(std.testing.allocator);
+    try measurements.latency_samples.ensureTotalCapacityPrecise(std.testing.allocator, 3);
+
+    measurements.recordExchange(false, true, 10, 3);
+    measurements.recordExchange(true, true, 20, 3);
+    measurements.recordExchange(true, false, 30, 3);
+
+    try std.testing.expectEqual(@as(u64, 1), measurements.completed);
+    try std.testing.expectEqual(@as(u64, 1), measurements.exchange_errors);
+    try std.testing.expectEqual(@as(u64, 1), measurements.eligible_latency_count);
+    try std.testing.expectEqual(@as(u64, 20), measurements.latency_samples.items[0].ns);
+}
+
+test "measurement merge preserves observed extrema beyond reservoir" {
+    var first: Measurements = .{};
+    defer first.deinit(std.testing.allocator);
+    try first.latency_samples.ensureTotalCapacityPrecise(std.testing.allocator, 1);
+    first.addLatency(100, 1);
+    first.addLatency(10, 1);
+
+    var second: Measurements = .{};
+    defer second.deinit(std.testing.allocator);
+    try second.latency_samples.ensureTotalCapacityPrecise(std.testing.allocator, 1);
+    second.addLatency(200, 1);
+    second.addLatency(1_000, 1);
+
+    var merged: Measurements = .{};
+    defer merged.deinit(std.testing.allocator);
+    try merged.mergeShard(std.testing.allocator, &first);
+    try merged.mergeShard(std.testing.allocator, &second);
+    try std.testing.expectEqual(@as(u64, 10), merged.observed_min_latency_ns);
+    try std.testing.expectEqual(@as(u64, 1_000), merged.observed_max_latency_ns);
+    try std.testing.expectEqual(@as(u64, 4), merged.eligible_latency_count);
+    const result = makeResult(.{}, &merged);
+    try std.testing.expectEqual(@as(f64, 0.01), result.latency.min_us);
+    try std.testing.expectEqual(@as(f64, 1), result.latency.max_us);
 }
 
 test "percentile uses nearest rank" {
@@ -1101,11 +1246,11 @@ test "result JSON has stable benchmark shape" {
         .transport = "grpc-http2-insecure",
         .api_mode = "raw",
         .compression = "identity",
-        .payload_pattern = "repeated-byte-0x5a",
+        .payload_pattern = "repeated",
         .load_model = "closed-loop-fixed-concurrency",
         .operation_unit = "rpc",
-        .throughput_scope = "completions-in-measurement-window",
-        .latency_scope = "requests-started-and-completed-in-measurement-window",
+        .throughput_scope = "exchanges-started-in-measurement-window",
+        .latency_scope = "full-latency-for-exchanges-started-in-measurement-window",
         .channel_count = 1,
         .grpc_lite_version = grpc.version,
         .client_optimize_mode = "ReleaseFast",
