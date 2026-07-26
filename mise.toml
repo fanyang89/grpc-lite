@@ -44,11 +44,11 @@ run = "zig build gen-interop-proto"
 
 [tasks.fmt]
 description = "Format Zig sources"
-run = "zig fmt build.zig src examples tests"
+run = "zig fmt build.zig src examples tests benchmarks"
 
 [tasks.fmt-check]
 description = "Check Zig formatting"
-run = "zig fmt --check build.zig src examples tests"
+run = "zig fmt --check build.zig src examples tests benchmarks"
 
 [tasks.ci-lint]
 description = "Validate GitHub Actions workflows"

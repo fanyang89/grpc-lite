@@ -221,6 +221,40 @@ application and callback threads must be thread-safe. Stream registrations, hand
 contexts, and their allocators must remain at stable addresses until the server and all
 active streams have stopped.
 
+## Benchmarks
+
+The cross-process E2E harness builds dedicated client and server binaries in
+`ReleaseFast`. It measures completed request/response exchanges after warmup rather than
+local send-queue admission. Results are pretty JSON by default:
+
+```bash
+mise run bench -- --scenario bidi-ping-pong --transport typed
+```
+
+Supported scenarios are `unary`, `bidi-ping-pong`, and `bidi-throughput`. Common options
+include `--warmup`, `--duration`, `--streams`, `--pipeline`, `--payload-bytes`, and
+`--compression`. Run `mise run bench --help` for the complete task interface.
+
+The default matrix writes one parseable JSON document per case and prints each path:
+
+```bash
+mise run bench-all
+```
+
+Use `mise run bench-server` to start a separately managed server, then run
+`mise run bench-client` with `--host` and `--port` locally or from a remote machine. Add
+`--compact` only when single-line JSON is needed for automation.
+Reported bytes are application request plus response payload bytes, not HTTP/2 wire
+bytes. Raw and typed results are separate because typed runs include protobuf encoding,
+decoding, and per-message arena costs.
+
+The harness uses a closed-loop load model with one shared channel. Throughput counts
+completions inside the measurement window; latency includes only exchanges that both
+start and finish inside it. Unary operations are complete RPCs, while bidi operations
+are messages on persistent streams, so compare results only within the same scenario.
+The current payload is a repeated byte pattern and therefore represents a highly
+compressible gzip workload.
+
 ## Dependencies
 
 - Zig 0.16.0

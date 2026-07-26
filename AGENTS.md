@@ -24,6 +24,10 @@ mise run interop
 mise run interop-official
 mise run interop-http2
 mise run interop-http2-edge
+mise run bench
+mise run bench-all
+mise run bench-client
+mise run bench-server
 mise run gen-proto
 ```
 

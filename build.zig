@@ -244,10 +244,48 @@ fn addProtobufSupport(
     interop_client_tests.step.dependOn(&generate_interop_proto.step);
     const run_interop_client_tests = b.addRunArtifact(interop_client_tests);
 
+    const benchmark_server_test_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "grpc_lite", .module = grpc_lite },
+            .{ .name = "grpc_lite_protobuf", .module = grpc_lite_protobuf },
+            .{ .name = "demo_proto", .module = demo_proto },
+        },
+    });
+    applySanitizers(benchmark_server_test_module, sanitizers);
+    const benchmark_server_tests = b.addTest(.{
+        .name = "benchmark-server-parser",
+        .root_module = benchmark_server_test_module,
+    });
+    benchmark_server_tests.step.dependOn(&generate_proto.step);
+    const run_benchmark_server_tests = b.addRunArtifact(benchmark_server_tests);
+
+    const benchmark_client_test_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "grpc_lite", .module = grpc_lite },
+            .{ .name = "grpc_lite_protobuf", .module = grpc_lite_protobuf },
+            .{ .name = "demo_proto", .module = demo_proto },
+        },
+    });
+    applySanitizers(benchmark_client_test_module, sanitizers);
+    const benchmark_client_tests = b.addTest(.{
+        .name = "benchmark-client",
+        .root_module = benchmark_client_test_module,
+    });
+    benchmark_client_tests.step.dependOn(&generate_proto.step);
+    const run_benchmark_client_tests = b.addRunArtifact(benchmark_client_tests);
+
     test_step.dependOn(&run_protobuf_tests.step);
     test_step.dependOn(&run_protobuf_adapter_tests.step);
     test_step.dependOn(&run_official_proto_tests.step);
     test_step.dependOn(&run_interop_client_tests.step);
+    test_step.dependOn(&run_benchmark_server_tests.step);
+    test_step.dependOn(&run_benchmark_client_tests.step);
 
     const echo_server = addExample(b, "grpc-lite-echo-server", "examples/echo_server.zig", grpc_lite);
     echo_server.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
@@ -278,6 +316,27 @@ fn addProtobufSupport(
     interop_client.step.dependOn(&generate_interop_proto.step);
     b.installArtifact(interop_server);
     b.installArtifact(interop_client);
+
+    const benchmark_server = addExample(
+        b,
+        "grpc-lite-benchmark-server",
+        "benchmarks/server.zig",
+        grpc_lite,
+    );
+    benchmark_server.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
+    benchmark_server.root_module.addImport("demo_proto", demo_proto);
+    benchmark_server.step.dependOn(&generate_proto.step);
+    const benchmark_client = addExample(
+        b,
+        "grpc-lite-benchmark-client",
+        "benchmarks/client.zig",
+        grpc_lite,
+    );
+    benchmark_client.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
+    benchmark_client.root_module.addImport("demo_proto", demo_proto);
+    benchmark_client.step.dependOn(&generate_proto.step);
+    b.installArtifact(benchmark_server);
+    b.installArtifact(benchmark_client);
 }
 
 fn addExample(
