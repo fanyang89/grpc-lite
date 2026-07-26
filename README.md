@@ -203,9 +203,9 @@ See `examples/echo_server.zig` and `examples/echo_client.zig` for complete progr
 ## Protobuf
 
 The `grpc_lite` module exports the shared zig-protobuf runtime as `grpc.protobuf`.
-Its build package exports `protobuf_codegen` for downstream code generation. The
-optional `grpc_lite_protobuf` module adds typed gRPC adapters while keeping the
-transport core raw-byte based. `proto/echo.proto` is generated into
+Its build package exports `createProtocStep` and `protobuf_codegen` for downstream
+code generation. The optional `grpc_lite_protobuf` module adds typed gRPC adapters
+while keeping the transport core raw-byte based. `proto/echo.proto` is generated into
 `.zig-cache/generated/demo.pb.zig` during the build.
 
 Downstream dependencies always expose `grpc_lite` and

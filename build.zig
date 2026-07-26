@@ -3,6 +3,23 @@ const manifest = @import("build.zig.zon");
 
 pub const protobuf_codegen = @import("protobuf");
 
+pub fn createProtocStep(
+    dependency: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    options: protobuf_codegen.RunProtocStep.Options,
+) *protobuf_codegen.RunProtocStep {
+    const protobuf_dependency = dependency.builder.dependency("protobuf", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    return protobuf_codegen.RunProtocStep.create(
+        protobuf_dependency.builder,
+        target,
+        options,
+    );
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
