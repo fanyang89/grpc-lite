@@ -212,10 +212,15 @@ pub const Channel = struct {
             impl.thread.?.join();
             impl.thread = null;
             impl.pending.deinit(impl.allocator);
+            std.debug.assert(impl.waiting_operations.items.len == 0);
+            impl.waiting_operations.deinit(impl.allocator);
             impl.operations.deinit(impl.allocator);
             impl.stream_states.deinit(impl.allocator);
             impl.streams.deinit(impl.allocator);
             impl.writes.deinit(impl.allocator);
+            std.debug.assert(impl.deadline_heap.items.len == 0);
+            std.debug.assert(impl.deadline_heap_index == null);
+            impl.deadline_heap.deinit(impl.allocator);
             if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
             return error.ConnectionFailed;
         }
@@ -324,10 +329,15 @@ pub const Channel = struct {
         self.wait();
 
         impl.pending.deinit(impl.allocator);
+        std.debug.assert(impl.waiting_operations.items.len == 0);
+        impl.waiting_operations.deinit(impl.allocator);
         impl.operations.deinit(impl.allocator);
         impl.stream_states.deinit(impl.allocator);
         impl.streams.deinit(impl.allocator);
         impl.writes.deinit(impl.allocator);
+        std.debug.assert(impl.deadline_heap.items.len == 0);
+        std.debug.assert(impl.deadline_heap_index == null);
+        impl.deadline_heap.deinit(impl.allocator);
         if (comptime build_options.tls) {
             if (impl.tls_config) |config| config.destroy();
         }
@@ -379,6 +389,7 @@ const Impl = struct {
     tls_config: ?*tls_record.Config = null,
     tls_handshake_timeout_ns: u64 = 0,
     tls_handshake_deadline_ns: ?u64 = null,
+    deadline_heap_index: ?usize = null,
     tls_handshake_needs_write: bool = false,
     tls_session: ?*tls_record.Session = null,
     tls_plaintext: ?[]u8 = null,
@@ -388,6 +399,7 @@ const Impl = struct {
     state: State = .starting,
     thread: ?std.Thread = null,
     pending: std.ArrayList(*Operation) = .empty,
+    waiting_operations: std.ArrayList(*Operation) = .empty,
     operations: std.AutoHashMapUnmanaged(i32, *Operation) = .empty,
     stream_states: std.AutoHashMapUnmanaged(*ClientStreamState, void) = .empty,
     streams: std.AutoHashMapUnmanaged(i32, *ClientStreamState) = .empty,
@@ -421,6 +433,7 @@ const Impl = struct {
     close_completed: bool = false,
     deadline_timer_armed: bool = false,
     deadline_timer_deadline_ns: ?u64 = null,
+    deadline_heap: std.ArrayList(DeadlineEntry) = .empty,
     connected: bool = false,
     connection_state: ConnectionState = .connecting,
     resolver: cares_adapter.Adapter = undefined,
@@ -488,6 +501,7 @@ const ClientStreamState = struct {
     limits: stream.BufferLimits,
     request_compression: Compression,
     deadline_ns: ?u64,
+    deadline_heap_index: ?usize = null,
     timeout_header: [16]u8 = undefined,
     timeout_header_len: usize = 0,
     mutex: std.Io.Mutex = .init,
@@ -594,6 +608,7 @@ const ClientStreamState = struct {
     }
 
     fn destroy(self: *ClientStreamState) void {
+        std.debug.assert(self.deadline_heap_index == null);
         const allocator = self.allocator;
         const allocator_owner = self.allocator_owner;
         allocator.free(self.path);
@@ -762,6 +777,8 @@ const Operation = struct {
     request_compression: Compression,
     max_response_size: usize,
     deadline_ns: ?u64,
+    deadline_heap_index: ?usize = null,
+    waiting_index: ?usize = null,
     timeout_header: [16]u8 = undefined,
     timeout_header_len: usize = 0,
     stream_id: i32 = -1,
@@ -828,6 +845,8 @@ const Operation = struct {
     }
 
     fn deinit(self: *Operation) void {
+        std.debug.assert(self.deadline_heap_index == null);
+        std.debug.assert(self.waiting_index == null);
         const allocator = self.impl.allocator;
         allocator.free(self.path);
         allocator.free(self.request_frame);
@@ -959,6 +978,169 @@ const Operation = struct {
     }
 };
 
+const DeadlineTarget = union(enum) {
+    operation: *Operation,
+    client_stream: *ClientStreamState,
+    tls_handshake: *Impl,
+};
+
+const DeadlineEntry = struct {
+    expires_at_ns: u64,
+    target: DeadlineTarget,
+};
+
+fn deadlineTargetIndex(target: DeadlineTarget) *?usize {
+    return switch (target) {
+        .operation => |operation| &operation.deadline_heap_index,
+        .client_stream => |client_stream| &client_stream.deadline_heap_index,
+        .tls_handshake => |impl| &impl.deadline_heap_index,
+    };
+}
+
+fn deadlineTargetsEqual(a: DeadlineTarget, b: DeadlineTarget) bool {
+    return switch (a) {
+        .operation => |operation| switch (b) {
+            .operation => |other| operation == other,
+            else => false,
+        },
+        .client_stream => |client_stream| switch (b) {
+            .client_stream => |other| client_stream == other,
+            else => false,
+        },
+        .tls_handshake => |impl| switch (b) {
+            .tls_handshake => |other| impl == other,
+            else => false,
+        },
+    };
+}
+
+fn deadlineHeapSwap(impl: *Impl, a: usize, b: usize) void {
+    if (a == b) return;
+    std.mem.swap(DeadlineEntry, &impl.deadline_heap.items[a], &impl.deadline_heap.items[b]);
+    deadlineTargetIndex(impl.deadline_heap.items[a].target).* = a;
+    deadlineTargetIndex(impl.deadline_heap.items[b].target).* = b;
+}
+
+fn deadlineHeapSiftUp(impl: *Impl, start: usize) usize {
+    var index = start;
+    while (index != 0) {
+        const parent = (index - 1) / 2;
+        if (impl.deadline_heap.items[parent].expires_at_ns <= impl.deadline_heap.items[index].expires_at_ns) break;
+        deadlineHeapSwap(impl, parent, index);
+        index = parent;
+    }
+    return index;
+}
+
+fn deadlineHeapSiftDown(impl: *Impl, start: usize) usize {
+    var index = start;
+    while (true) {
+        const left = index * 2 + 1;
+        if (left >= impl.deadline_heap.items.len) break;
+        const right = left + 1;
+        const child = if (right < impl.deadline_heap.items.len and
+            impl.deadline_heap.items[right].expires_at_ns < impl.deadline_heap.items[left].expires_at_ns)
+            right
+        else
+            left;
+        if (impl.deadline_heap.items[index].expires_at_ns <= impl.deadline_heap.items[child].expires_at_ns) break;
+        deadlineHeapSwap(impl, index, child);
+        index = child;
+    }
+    return index;
+}
+
+fn deadlineHeapInsertOrUpdate(impl: *Impl, target: DeadlineTarget, expires_at_ns: u64) !void {
+    const target_index = deadlineTargetIndex(target);
+    if (target_index.*) |index| {
+        std.debug.assert(index < impl.deadline_heap.items.len);
+        std.debug.assert(deadlineTargetsEqual(impl.deadline_heap.items[index].target, target));
+        const previous = impl.deadline_heap.items[index].expires_at_ns;
+        impl.deadline_heap.items[index].expires_at_ns = expires_at_ns;
+        if (expires_at_ns < previous) {
+            _ = deadlineHeapSiftUp(impl, index);
+        } else if (expires_at_ns > previous) {
+            _ = deadlineHeapSiftDown(impl, index);
+        }
+        return;
+    }
+
+    try impl.deadline_heap.append(impl.allocator, .{
+        .expires_at_ns = expires_at_ns,
+        .target = target,
+    });
+    const index = impl.deadline_heap.items.len - 1;
+    target_index.* = index;
+    _ = deadlineHeapSiftUp(impl, index);
+}
+
+fn deadlineHeapRemove(impl: *Impl, target: DeadlineTarget) bool {
+    const target_index = deadlineTargetIndex(target);
+    const index = target_index.* orelse return false;
+    std.debug.assert(index < impl.deadline_heap.items.len);
+    std.debug.assert(deadlineTargetsEqual(impl.deadline_heap.items[index].target, target));
+
+    const removed = impl.deadline_heap.items[index];
+    const replacement = impl.deadline_heap.pop().?;
+    deadlineTargetIndex(removed.target).* = null;
+    if (index < impl.deadline_heap.items.len) {
+        impl.deadline_heap.items[index] = replacement;
+        deadlineTargetIndex(replacement.target).* = index;
+        if (index != 0 and impl.deadline_heap.items[index].expires_at_ns <
+            impl.deadline_heap.items[(index - 1) / 2].expires_at_ns)
+        {
+            _ = deadlineHeapSiftUp(impl, index);
+        } else {
+            _ = deadlineHeapSiftDown(impl, index);
+        }
+    }
+    return true;
+}
+
+fn deadlineHeapPeek(impl: *const Impl) ?DeadlineEntry {
+    if (impl.deadline_heap.items.len == 0) return null;
+    return impl.deadline_heap.items[0];
+}
+
+fn deadlineHeapPop(impl: *Impl) ?DeadlineEntry {
+    const entry = deadlineHeapPeek(impl) orelse return null;
+    std.debug.assert(deadlineHeapRemove(impl, entry.target));
+    return entry;
+}
+
+fn appendWaitingOperation(impl: *Impl, operation: *Operation) !void {
+    std.debug.assert(operation.waiting_index == null);
+    operation.waiting_index = impl.waiting_operations.items.len;
+    errdefer operation.waiting_index = null;
+    try impl.waiting_operations.append(impl.allocator, operation);
+}
+
+fn removeWaitingOperation(impl: *Impl, operation: *Operation) bool {
+    const index = operation.waiting_index orelse return false;
+    std.debug.assert(index < impl.waiting_operations.items.len);
+    std.debug.assert(impl.waiting_operations.items[index] == operation);
+    const replacement = impl.waiting_operations.pop().?;
+    operation.waiting_index = null;
+    if (index < impl.waiting_operations.items.len) {
+        impl.waiting_operations.items[index] = replacement;
+        replacement.waiting_index = index;
+    }
+    return true;
+}
+
+fn removeOperationDeadline(impl: *Impl, operation: *Operation) void {
+    _ = deadlineHeapRemove(impl, .{ .operation = operation });
+}
+
+fn removeStreamDeadline(impl: *Impl, client_stream: *ClientStreamState) void {
+    _ = deadlineHeapRemove(impl, .{ .client_stream = client_stream });
+}
+
+fn clearTlsHandshakeDeadline(impl: *Impl) void {
+    _ = deadlineHeapRemove(impl, .{ .tls_handshake = impl });
+    impl.tls_handshake_deadline_ns = null;
+}
+
 const WriteRequest = struct {
     request: xev.WriteRequest = undefined,
     impl: *Impl,
@@ -1041,6 +1223,9 @@ fn runLoop(impl: *Impl) void {
         impl.resolver.deinitAfterLoop();
         impl.resolver_initialized = false;
     }
+    std.debug.assert(impl.deadline_heap.items.len == 0);
+    std.debug.assert(impl.deadline_heap_index == null);
+    std.debug.assert(impl.waiting_operations.items.len == 0);
     impl.markStopped();
 }
 
@@ -1175,7 +1360,12 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
     impl.tcp.read(&impl.loop, &impl.read_completion, .{ .slice = &impl.read_buffer }, Impl, impl, onRead);
     if (impl.tls_session != null) {
         impl.connection_state = .handshaking;
-        impl.tls_handshake_deadline_ns = nowNs() +| impl.tls_handshake_timeout_ns;
+        const handshake_deadline = nowNs() +| impl.tls_handshake_timeout_ns;
+        deadlineHeapInsertOrUpdate(impl, .{ .tls_handshake = impl }, handshake_deadline) catch {
+            failConnectionCandidate(impl, "TLS handshake failed");
+            return .disarm;
+        };
+        impl.tls_handshake_deadline_ns = handshake_deadline;
         driveTlsHandshake(impl) catch {
             failConnectionCandidate(impl, "TLS handshake failed");
         };
@@ -1190,7 +1380,7 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
 }
 
 fn activateConnection(impl: *Impl) !void {
-    impl.tls_handshake_deadline_ns = null;
+    clearTlsHandshakeDeadline(impl);
     clearResolvedAddresses(impl);
     impl.connection_state = .active;
     try flush(impl);
@@ -1218,12 +1408,13 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
         return .disarm;
     }
     processStreamWakes(impl);
+    processPending(impl);
     switch (impl.connection_state) {
         .resolving => {
             continueResolvedConnection(impl);
             scheduleDeadlineTimer(impl);
         },
-        .active => processPending(impl),
+        .active => {},
         .draining => {
             if (impl.operations.count() == 0 and impl.streams.count() == 0) beginReconnect(impl);
             scheduleDeadlineTimer(impl);
@@ -1240,10 +1431,6 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
 }
 
 fn processPending(impl: *Impl) void {
-    if (impl.connection_state != .active) {
-        scheduleDeadlineTimer(impl);
-        return;
-    }
     var pending: std.ArrayList(*Operation) = .empty;
     impl.mutex.lockUncancelable(syncIo());
     std.mem.swap(std.ArrayList(*Operation), &pending, &impl.pending);
@@ -1251,9 +1438,33 @@ fn processPending(impl: *Impl) void {
     defer pending.deinit(impl.allocator);
 
     for (pending.items) |operation| {
+        appendWaitingOperation(impl, operation) catch {
+            operation.setOutcome(.unavailable, "request submission failed") catch {};
+            operation.complete();
+            continue;
+        };
+        if (operation.deadline_ns) |deadline| {
+            deadlineHeapInsertOrUpdate(impl, .{ .operation = operation }, deadline) catch {
+                std.debug.assert(removeWaitingOperation(impl, operation));
+                operation.setOutcome(.unavailable, "request submission failed") catch {};
+                operation.complete();
+                continue;
+            };
+        }
+    }
+
+    if (impl.connection_state != .active) {
+        scheduleDeadlineTimer(impl);
+        return;
+    }
+
+    while (impl.waiting_operations.items.len != 0) {
+        const operation = impl.waiting_operations.items[impl.waiting_operations.items.len - 1];
+        std.debug.assert(removeWaitingOperation(impl, operation));
         if (operation.deadline_ns) |deadline| {
             const now = nowNs();
             if (deadline <= now) {
+                removeOperationDeadline(impl, operation);
                 operation.deadline_expired = true;
                 operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
                 operation.complete();
@@ -1262,6 +1473,7 @@ fn processPending(impl: *Impl) void {
             operation.timeout_header_len = deadline_wire.formatTimeout(&operation.timeout_header, deadline - now).len;
         }
         submitOperation(impl, operation) catch {
+            removeOperationDeadline(impl, operation);
             operation.setOutcome(.unavailable, "request submission failed") catch {};
             operation.complete();
             continue;
@@ -1288,6 +1500,13 @@ fn popStreamWake(impl: *Impl) ?*ClientStreamState {
 fn processStreamWakes(impl: *Impl) void {
     while (popStreamWake(impl)) |client_stream| {
         if (client_stream.stream_id < 0) {
+            if (client_stream.deadline_ns) |deadline| {
+                deadlineHeapInsertOrUpdate(impl, .{ .client_stream = client_stream }, deadline) catch {
+                    terminalizeStream(client_stream, .init(.unavailable, "stream submission failed"));
+                    releaseStreamLoopOwnership(client_stream);
+                    continue;
+                };
+            }
             client_stream.mutex.lockUncancelable(syncIo());
             const canceled = client_stream.cancel_requested or client_stream.app_released;
             client_stream.mutex.unlock(syncIo());
@@ -1393,6 +1612,8 @@ fn processClientStreamCommands(client_stream: *ClientStreamState) !void {
     client_stream.resume_requested = false;
     if (should_resume_data) client_stream.provider_deferred = false;
     client_stream.mutex.unlock(syncIo());
+
+    if (cancel_requested) removeStreamDeadline(impl, client_stream);
 
     if (client_stream.transport_closed) {
         if (cancel_requested) {
@@ -1565,6 +1786,7 @@ fn invokeMessageCallback(
 }
 
 fn terminalizeStream(client_stream: *ClientStreamState, final_status: status.Status) void {
+    if (client_stream.impl) |impl| removeStreamDeadline(impl, client_stream);
     client_stream.mutex.lockUncancelable(syncIo());
     if (client_stream.terminal) {
         client_stream.mutex.unlock(syncIo());
@@ -1589,6 +1811,7 @@ fn releaseStreamLoopOwnership(client_stream: *ClientStreamState) void {
     client_stream.mutex.lockUncancelable(syncIo());
     std.debug.assert(client_stream.loop_owned);
     const impl = client_stream.impl orelse unreachable;
+    removeStreamDeadline(impl, client_stream);
     impl.mutex.lockUncancelable(syncIo());
     if (client_stream.wake_queued) removeStreamWake(impl, client_stream);
     _ = impl.stream_states.remove(client_stream);
@@ -1928,7 +2151,7 @@ fn clearTlsConnection(impl: *Impl) void {
         if (impl.tls_session) |session| session.destroy();
     }
     impl.tls_session = null;
-    impl.tls_handshake_deadline_ns = null;
+    clearTlsHandshakeDeadline(impl);
     impl.tls_handshake_needs_write = false;
     if (impl.tls_plaintext) |plaintext| impl.allocator.free(plaintext);
     impl.tls_plaintext = null;
@@ -2248,6 +2471,7 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
 fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_data: ?*anyopaque) callconv(.c) c_int {
     const impl: *Impl = @ptrCast(@alignCast(user_data.?));
     if (impl.operations.fetchRemove(stream_id)) |entry| {
+        removeOperationDeadline(impl, entry.value);
         entry.value.finalize(error_code);
         scheduleDeadlineTimer(impl);
         if (impl.connection_state == .draining and impl.operations.count() == 0 and impl.streams.count() == 0) {
@@ -2255,6 +2479,7 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_d
         }
     } else if (impl.streams.fetchRemove(stream_id)) |entry| {
         const client_stream = entry.value;
+        removeStreamDeadline(impl, client_stream);
         client_stream.transport_closed = true;
         client_stream.stream_error = error_code;
         client_stream.mutex.lockUncancelable(syncIo());
@@ -2281,7 +2506,8 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_d
 
 fn scheduleDeadlineTimer(impl: *Impl) void {
     if (impl.stopping_on_loop) return;
-    while (earliestDeadline(impl)) |earliest| {
+    while (deadlineHeapPeek(impl)) |entry| {
+        const earliest = entry.expires_at_ns;
         const delay_ms = deadlineDelayMs(earliest, nowNs()) orelse {
             expireDeadlines(impl, nowNs()) catch |err| {
                 beginStop(impl, if (err == error.DeadlineCancellationFailed)
@@ -2319,34 +2545,6 @@ fn scheduleDeadlineTimer(impl: *Impl) void {
         }
         return;
     }
-}
-
-fn earliestDeadline(impl: *Impl) ?u64 {
-    var earliest = impl.tls_handshake_deadline_ns;
-    var iterator = impl.operations.valueIterator();
-    while (iterator.next()) |operation_ptr| {
-        const operation = operation_ptr.*;
-        if (operation.deadline_expired) continue;
-        includeEarlierDeadline(&earliest, operation.deadline_ns);
-    }
-    impl.mutex.lockUncancelable(syncIo());
-    for (impl.pending.items) |operation| {
-        if (operation.deadline_expired) continue;
-        includeEarlierDeadline(&earliest, operation.deadline_ns);
-    }
-    var stream_states = impl.stream_states.keyIterator();
-    while (stream_states.next()) |client_stream_ptr| {
-        const client_stream = client_stream_ptr.*;
-        if (client_stream.deadline_expired or client_stream.terminal) continue;
-        includeEarlierDeadline(&earliest, client_stream.deadline_ns);
-    }
-    impl.mutex.unlock(syncIo());
-    return earliest;
-}
-
-fn includeEarlierDeadline(earliest: *?u64, candidate: ?u64) void {
-    const deadline = candidate orelse return;
-    if (earliest.* == null or deadline < earliest.*.?) earliest.* = deadline;
 }
 
 fn deadlineDelayMs(deadline_ns: u64, now_ns: u64) ?u64 {
@@ -2389,68 +2587,46 @@ fn onDeadlineTimer(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.
 }
 
 fn expireDeadlines(impl: *Impl, now: u64) !void {
-    if (impl.tls_handshake_deadline_ns) |handshake_deadline| {
-        if (handshake_deadline <= now) {
-            failConnectionCandidate(impl, "TLS handshake timed out");
-            return;
-        }
-    }
-    impl.mutex.lockUncancelable(syncIo());
-    var pending_index: usize = 0;
-    while (pending_index < impl.pending.items.len) {
-        const operation = impl.pending.items[pending_index];
-        if (operation.deadline_ns != null and operation.deadline_ns.? <= now) {
-            _ = impl.pending.orderedRemove(pending_index);
-            operation.deadline_expired = true;
-            operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
-            operation.complete();
-        } else {
-            pending_index += 1;
-        }
-    }
-    impl.mutex.unlock(syncIo());
-
-    var iterator = impl.operations.valueIterator();
-    while (iterator.next()) |operation_ptr| {
-        const operation = operation_ptr.*;
-        if (operation.deadline_expired) continue;
-        if (operation.deadline_ns) |deadline| {
-            if (deadline <= now) {
+    var flush_needed = false;
+    while (deadlineHeapPeek(impl)) |next| {
+        if (next.expires_at_ns > now) break;
+        const entry = deadlineHeapPop(impl).?;
+        switch (entry.target) {
+            .tls_handshake => |target_impl| {
+                std.debug.assert(target_impl == impl);
+                if (impl.tls_handshake_deadline_ns != entry.expires_at_ns) continue;
+                impl.tls_handshake_deadline_ns = null;
+                if (impl.connection_state != .handshaking or impl.tls_session == null) continue;
+                failConnectionCandidate(impl, "TLS handshake timed out");
+            },
+            .operation => |operation| {
+                if (operation.deadline_ns != entry.expires_at_ns or operation.deadline_expired) continue;
+                if (operation.waiting_index != null) {
+                    std.debug.assert(removeWaitingOperation(impl, operation));
+                    operation.deadline_expired = true;
+                    operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
+                    operation.complete();
+                    continue;
+                }
+                if (operation.stream_id < 0 or impl.operations.get(operation.stream_id) != operation) continue;
                 operation.deadline_expired = true;
                 operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
                 if (c.nghttp2_submit_rst_stream(impl.session, c.NGHTTP2_FLAG_NONE, operation.stream_id, c.NGHTTP2_CANCEL) != 0) {
                     return error.DeadlineCancellationFailed;
                 }
-            }
-        }
-    }
-    while (true) {
-        var expired: ?*ClientStreamState = null;
-        impl.mutex.lockUncancelable(syncIo());
-        var states = impl.stream_states.keyIterator();
-        while (states.next()) |client_stream_ptr| {
-            const client_stream = client_stream_ptr.*;
-            if (client_stream.deadline_expired or client_stream.terminal) continue;
-            if (client_stream.deadline_ns) |deadline| {
-                if (deadline <= now and (client_stream.stream_id < 0 or client_stream.transport_closed)) {
-                    expired = client_stream;
-                    break;
-                }
-            }
-        }
-        impl.mutex.unlock(syncIo());
-        const client_stream = expired orelse break;
-        client_stream.deadline_expired = true;
-        terminalizeStream(client_stream, .init(.deadline_exceeded, "deadline exceeded"));
-        releaseStreamLoopOwnership(client_stream);
-    }
-    var active_streams = impl.streams.valueIterator();
-    while (active_streams.next()) |client_stream_ptr| {
-        const client_stream = client_stream_ptr.*;
-        if (client_stream.deadline_expired or client_stream.terminal) continue;
-        if (client_stream.deadline_ns) |deadline| {
-            if (deadline <= now) {
+                flush_needed = true;
+            },
+            .client_stream => |client_stream| {
+                if (client_stream.deadline_ns != entry.expires_at_ns or
+                    client_stream.deadline_expired or client_stream.terminal or
+                    client_stream.impl != impl) continue;
                 client_stream.deadline_expired = true;
+                if (client_stream.stream_id < 0 or client_stream.transport_closed) {
+                    terminalizeStream(client_stream, .init(.deadline_exceeded, "deadline exceeded"));
+                    releaseStreamLoopOwnership(client_stream);
+                    continue;
+                }
+                if (impl.streams.get(client_stream.stream_id) != client_stream) continue;
                 setForcedStreamStatus(client_stream, .init(.deadline_exceeded, "deadline exceeded"));
                 if (!client_stream.rst_submitted) {
                     if (c.nghttp2_submit_rst_stream(
@@ -2460,11 +2636,12 @@ fn expireDeadlines(impl: *Impl, now: u64) !void {
                         c.NGHTTP2_CANCEL,
                     ) != 0) return error.DeadlineCancellationFailed;
                     client_stream.rst_submitted = true;
+                    flush_needed = true;
                 }
-            }
+            },
         }
     }
-    if (impl.connected) try flush(impl);
+    if (flush_needed and impl.connected) try flush(impl);
 }
 
 fn beginReconnect(impl: *Impl) void {
@@ -2588,6 +2765,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     impl.stopping_on_loop = true;
     impl.connection_state = .closing;
     impl.connected = false;
+    clearTlsHandshakeDeadline(impl);
     if (impl.resolver_initialized) impl.resolver.shutdown();
     impl.mutex.lockUncancelable(syncIo());
     impl.accepting_streams = false;
@@ -2607,6 +2785,14 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     }
     pending.deinit(impl.allocator);
 
+    while (impl.waiting_operations.items.len != 0) {
+        const operation = impl.waiting_operations.items[impl.waiting_operations.items.len - 1];
+        std.debug.assert(removeWaitingOperation(impl, operation));
+        removeOperationDeadline(impl, operation);
+        operation.setOutcome(.unavailable, reason) catch {};
+        operation.complete();
+    }
+
     if (impl.session) |session| {
         c.nghttp2_session_del(session);
         impl.session = null;
@@ -2614,6 +2800,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     var iterator = impl.operations.valueIterator();
     while (iterator.next()) |operation_ptr| {
         const operation = operation_ptr.*;
+        removeOperationDeadline(impl, operation);
         operation.setOutcome(.unavailable, reason) catch {};
         operation.complete();
     }
@@ -2643,6 +2830,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
         terminalizeStream(client_stream, .init(.unavailable, reason));
         releaseStreamLoopOwnership(client_stream);
     }
+    std.debug.assert(impl.deadline_heap.items.len == 0);
 
     if (impl.connect_active and !impl.connect_cancel_submitted) {
         impl.connect_cancel_submitted = true;
@@ -3435,21 +3623,255 @@ test "client receive resume retains credit when delivery pauses again" {
     try client_stream.decoder.finish();
 }
 
-test "earliest deadline selection is order independent" {
-    var earliest: ?u64 = null;
-    includeEarlierDeadline(&earliest, null);
-    try std.testing.expectEqual(@as(?u64, null), earliest);
+fn expectDeadlineHeapConsistent(impl: *const Impl) !void {
+    for (impl.deadline_heap.items, 0..) |entry, index| {
+        try std.testing.expectEqual(@as(?usize, index), deadlineTargetIndex(entry.target).*);
+        if (index != 0) {
+            try std.testing.expect(impl.deadline_heap.items[(index - 1) / 2].expires_at_ns <= entry.expires_at_ns);
+        }
+    }
+}
 
-    includeEarlierDeadline(&earliest, 300);
-    includeEarlierDeadline(&earliest, 100);
-    includeEarlierDeadline(&earliest, 200);
-    try std.testing.expectEqual(@as(?u64, 100), earliest);
+test "client deadline heap orders updates and mixed targets" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer impl.deadline_heap.deinit(impl.allocator);
+    const first = try Operation.init(&impl, "/test.Deadline/First", "", .{});
+    defer first.deinit();
+    const second = try Operation.init(&impl, "/test.Deadline/Second", "", .{});
+    defer second.deinit();
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Deadline/Stream",
+        .{},
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    defer client_stream.destroyUnqueued();
 
-    earliest = null;
-    includeEarlierDeadline(&earliest, 200);
-    includeEarlierDeadline(&earliest, 300);
-    includeEarlierDeadline(&earliest, 100);
-    try std.testing.expectEqual(@as(?u64, 100), earliest);
+    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = first }, 40);
+    try deadlineHeapInsertOrUpdate(&impl, .{ .tls_handshake = &impl }, 20);
+    try deadlineHeapInsertOrUpdate(&impl, .{ .client_stream = client_stream }, 30);
+    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = second }, 10);
+    try expectDeadlineHeapConsistent(&impl);
+    try std.testing.expect(deadlineTargetsEqual(deadlineHeapPeek(&impl).?.target, .{ .operation = second }));
+
+    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = first }, 5);
+    try expectDeadlineHeapConsistent(&impl);
+    try std.testing.expect(deadlineTargetsEqual(deadlineHeapPeek(&impl).?.target, .{ .operation = first }));
+
+    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = first }, 50);
+    try expectDeadlineHeapConsistent(&impl);
+    try std.testing.expect(deadlineTargetsEqual(deadlineHeapPeek(&impl).?.target, .{ .operation = second }));
+
+    const expected = [_]u64{ 10, 20, 30, 50 };
+    for (expected) |expiry| {
+        const entry = deadlineHeapPop(&impl).?;
+        try std.testing.expectEqual(expiry, entry.expires_at_ns);
+        try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(entry.target).*);
+        try expectDeadlineHeapConsistent(&impl);
+    }
+}
+
+test "client deadline heap removes root middle and last" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer impl.deadline_heap.deinit(impl.allocator);
+    var operations: [7]*Operation = undefined;
+    var initialized: usize = 0;
+    defer for (operations[0..initialized]) |operation| operation.deinit();
+    for (&operations, 0..) |*operation, index| {
+        operation.* = try Operation.init(&impl, "/test.Deadline/Remove", "", .{});
+        initialized += 1;
+        try deadlineHeapInsertOrUpdate(&impl, .{ .operation = operation.* }, @intCast((index + 1) * 10));
+    }
+
+    const root = impl.deadline_heap.items[0].target;
+    try std.testing.expect(deadlineHeapRemove(&impl, root));
+    try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(root).*);
+    try expectDeadlineHeapConsistent(&impl);
+    const middle = impl.deadline_heap.items[impl.deadline_heap.items.len / 2].target;
+    try std.testing.expect(deadlineHeapRemove(&impl, middle));
+    try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(middle).*);
+    try expectDeadlineHeapConsistent(&impl);
+    const last = impl.deadline_heap.items[impl.deadline_heap.items.len - 1].target;
+    try std.testing.expect(deadlineHeapRemove(&impl, last));
+    try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(last).*);
+    try expectDeadlineHeapConsistent(&impl);
+    while (deadlineHeapPop(&impl)) |entry| {
+        try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(entry.target).*);
+    }
+}
+
+test "waiting unary deadline removes ownership before completion" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer impl.waiting_operations.deinit(impl.allocator);
+    defer impl.deadline_heap.deinit(impl.allocator);
+    const operation = try Operation.init(&impl, "/test.Deadline/Waiting", "", .{});
+    operation.deadline_ns = 100;
+    try appendWaitingOperation(&impl, operation);
+    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = operation }, operation.deadline_ns.?);
+
+    try expireDeadlines(&impl, 100);
+    try std.testing.expect(operation.done);
+    try std.testing.expect(operation.deadline_expired);
+    try std.testing.expectEqual(status.Code.deadline_exceeded, operation.response_code);
+    try std.testing.expectEqual(@as(?usize, null), operation.waiting_index);
+    try std.testing.expectEqual(@as(?usize, null), operation.deadline_heap_index);
+    try std.testing.expectEqual(@as(usize, 0), impl.waiting_operations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+    operation.deinit();
+}
+
+test "pre-submit stream deadline removes loop ownership" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer impl.stream_states.deinit(impl.allocator);
+    defer impl.deadline_heap.deinit(impl.allocator);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Deadline/PreSubmit",
+        .{},
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    client_stream.deadline_ns = 100;
+    try impl.stream_states.put(impl.allocator, client_stream, {});
+    try deadlineHeapInsertOrUpdate(&impl, .{ .client_stream = client_stream }, client_stream.deadline_ns.?);
+
+    try expireDeadlines(&impl, 100);
+    try std.testing.expect(client_stream.deadline_expired);
+    try std.testing.expect(client_stream.terminal);
+    try std.testing.expect(!client_stream.loop_owned);
+    try std.testing.expect(client_stream.impl == null);
+    try std.testing.expectEqual(@as(usize, 0), impl.stream_states.count());
+    try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+    var handle = client_stream.handle();
+    handle.deinit();
+}
+
+test "active unary deadline pops before submitting reset" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer impl.operations.deinit(impl.allocator);
+    defer impl.deadline_heap.deinit(impl.allocator);
+    try initializeSession(&impl);
+    const operation = try Operation.init(&impl, "/test.Deadline/ActiveUnary", "", .{});
+    defer {
+        c.nghttp2_session_del(impl.session);
+        impl.session = null;
+        operation.deinit();
+    }
+    operation.deadline_ns = 100;
+    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = operation }, operation.deadline_ns.?);
+    try submitOperation(&impl, operation);
+
+    try expireDeadlines(&impl, 100);
+    try std.testing.expect(operation.deadline_expired);
+    try std.testing.expectEqual(status.Code.deadline_exceeded, operation.response_code);
+    try std.testing.expectEqual(@as(?usize, null), operation.deadline_heap_index);
+    try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+    _ = impl.operations.remove(operation.stream_id);
+}
+
+test "active stream deadline pops before submitting reset" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer impl.stream_states.deinit(impl.allocator);
+    defer impl.streams.deinit(impl.allocator);
+    defer impl.deadline_heap.deinit(impl.allocator);
+    try initializeSession(&impl);
+    defer if (impl.session) |session| c.nghttp2_session_del(session);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Deadline/ActiveStream",
+        .{},
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    client_stream.deadline_ns = 100;
+    try impl.stream_states.put(impl.allocator, client_stream, {});
+    try deadlineHeapInsertOrUpdate(&impl, .{ .client_stream = client_stream }, client_stream.deadline_ns.?);
+    try submitClientStream(&impl, client_stream);
+
+    try expireDeadlines(&impl, 100);
+    try std.testing.expect(client_stream.deadline_expired);
+    try std.testing.expect(client_stream.rst_submitted);
+    try std.testing.expectEqual(status.Code.deadline_exceeded, client_stream.forced_status.?.code);
+    try std.testing.expectEqual(@as(?usize, null), client_stream.deadline_heap_index);
+    try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+    _ = impl.streams.remove(client_stream.stream_id);
+    client_stream.transport_closed = true;
+    terminalizeStream(client_stream, client_stream.forced_status.?);
+    releaseStreamLoopOwnership(client_stream);
+    c.nghttp2_session_del(impl.session);
+    impl.session = null;
+    var handle = client_stream.handle();
+    handle.deinit();
+}
+
+test "deadline expiration pops only an expired root among many waiting calls" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer impl.waiting_operations.deinit(impl.allocator);
+    defer impl.deadline_heap.deinit(impl.allocator);
+    const expired = try Operation.init(&impl, "/test.Deadline/Expired", "", .{});
+    expired.deadline_ns = 10;
+    try appendWaitingOperation(&impl, expired);
+    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = expired }, expired.deadline_ns.?);
+    var future: [256]*Operation = undefined;
+    var initialized: usize = 0;
+    defer for (future[0..initialized]) |operation| operation.deinit();
+    for (&future) |*operation| {
+        operation.* = try Operation.init(&impl, "/test.Deadline/Future", "", .{});
+        initialized += 1;
+        operation.*.deadline_ns = 1000;
+        try appendWaitingOperation(&impl, operation.*);
+        try deadlineHeapInsertOrUpdate(&impl, .{ .operation = operation.* }, operation.*.deadline_ns.?);
+    }
+
+    try expireDeadlines(&impl, 10);
+    try std.testing.expect(expired.done);
+    try std.testing.expectEqual(future.len, impl.deadline_heap.items.len);
+    try std.testing.expectEqual(future.len, impl.waiting_operations.items.len);
+    for (&future) |operation| {
+        try std.testing.expect(operation.deadline_heap_index != null);
+        try std.testing.expect(operation.waiting_index != null);
+    }
+    expired.deinit();
+    while (impl.waiting_operations.items.len != 0) {
+        const operation = impl.waiting_operations.items[impl.waiting_operations.items.len - 1];
+        std.debug.assert(removeWaitingOperation(&impl, operation));
+        removeOperationDeadline(&impl, operation);
+    }
+    try expectDeadlineHeapConsistent(&impl);
 }
 
 test "deadline timer delay rounds up and handles boundaries" {
@@ -4016,17 +4438,28 @@ test "channel replaces a connection after GOAWAY without replaying calls" {
     var channel = try Channel.init(std.testing.allocator, target, .{});
     defer channel.deinit();
 
-    var first = try channel.callUnary(std.testing.allocator, "/test.GoAway/Unary", "first", .{});
+    var first = try channel.callUnary(
+        std.testing.allocator,
+        "/test.GoAway/Unary",
+        "first",
+        .{ .timeout_ns = std.time.ns_per_hour },
+    );
     defer first.deinit();
     try std.testing.expect(first.status.isOk());
     try std.testing.expectEqualStrings("first", first.payload);
 
-    var second = try channel.callUnary(std.testing.allocator, "/test.GoAway/Unary", "second", .{});
+    var second = try channel.callUnary(
+        std.testing.allocator,
+        "/test.GoAway/Unary",
+        "second",
+        .{ .timeout_ns = std.time.ns_per_hour },
+    );
     defer second.deinit();
     try std.testing.expect(second.status.isOk());
     try std.testing.expectEqualStrings("second", second.payload);
     try std.testing.expectEqual(@as(usize, 2), channel.impl.connect_count.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 2), handler.calls);
+    try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
 }
 
 test "server drain finishes an accepted RPC and rejects a replacement connection" {
@@ -4210,7 +4643,7 @@ test "channel shutdown safely completes an active call before exclusive deinit" 
                 std.testing.allocator,
                 "/test.Lifecycle/Unary",
                 "request",
-                .{},
+                .{ .timeout_ns = std.time.ns_per_hour },
             ) catch {
                 self.done.post(std.testing.io);
                 return;
@@ -4232,6 +4665,7 @@ test "channel shutdown safely completes an active call before exclusive deinit" 
 
     try std.testing.expect(worker.returned_result);
     try std.testing.expectEqual(status.Code.unavailable, worker.code);
+    try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
 }
 
 test "channel shutdown cancels an active blocked write" {
@@ -4413,7 +4847,7 @@ test "channel shutdown drains an active reconnect completion" {
         std.testing.allocator,
         "/test.Lifecycle/Reconnect",
         "request",
-        .{},
+        .{ .timeout_ns = std.time.ns_per_hour },
     );
     defer result.deinit();
     try std.testing.expect(result.status.isOk());
@@ -4449,6 +4883,7 @@ test "channel shutdown drains an active reconnect completion" {
     try std.testing.expect(!channel.impl.connect_active);
     try std.testing.expect(!channel.impl.connect_cancel_submitted);
     try std.testing.expect(channel.impl.close_completed);
+    try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
 }
 
 test "server context observes a wire deadline and overrides a late handler response" {
@@ -5100,6 +5535,7 @@ test "channel performs reusable concurrent unary calls end to end" {
     );
     defer deadline.deinit();
     try std.testing.expectEqual(status.Code.deadline_exceeded, deadline.status.code);
+    try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
 
     test_server.shutdown();
     test_server.wait();
