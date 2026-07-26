@@ -208,6 +208,8 @@ pub const Server = struct {
         for (impl.stream_commands.items) |*command| command.deinit(impl.allocator);
         impl.stream_commands.deinit(impl.allocator);
         impl.connections.deinit(impl.allocator);
+        std.debug.assert(impl.deadline_heap.items.len == 0);
+        impl.deadline_heap.deinit(impl.allocator);
         if (comptime build_options.tls) {
             if (impl.tls_config) |config| config.destroy();
         }
@@ -245,6 +247,7 @@ const Impl = struct {
     stream_handlers: std.StringHashMapUnmanaged(raw_stream.ServerHandler) = .empty,
     stream_commands: std.ArrayList(StreamCommand) = .empty,
     connections: std.ArrayList(*Connection) = .empty,
+    deadline_heap: std.ArrayList(DeadlineEntry) = .empty,
     io_threaded: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
@@ -279,6 +282,8 @@ const Impl = struct {
     deadline_timer_initialized: bool = false,
     deadline_timer_completion: xev.Completion = .{},
     deadline_timer_cancel_completion: xev.Completion = .{},
+    deadline_timer_armed: bool = false,
+    deadline_timer_target_ns: ?u64 = null,
     drain_started: bool = false,
     clock: deadline.Clock = undefined,
     local_host: [15]u8 = undefined,
@@ -452,6 +457,7 @@ const Stream = struct {
     timeout_seen: bool = false,
     timeout_invalid: bool = false,
     deadline: ?deadline.Deadline = null,
+    deadline_heap_index: ?usize = null,
     request_metadata_invalid: bool = false,
     header_too_large: bool = false,
     request_too_large: bool = false,
@@ -494,6 +500,7 @@ const Stream = struct {
     }
 
     fn deinit(self: *Stream) void {
+        removeStreamDeadline(self);
         if (self.streaming) |*streaming| streaming.deinit(self.allocator);
         if (self.path) |path| self.allocator.free(path);
         self.request_body.deinit(self.allocator);
@@ -641,6 +648,7 @@ const Connection = struct {
     tls_session: ?*tls_record.Session = null,
     tls_handshaking: bool = false,
     tls_handshake_deadline_ns: ?u64 = null,
+    deadline_heap_index: ?usize = null,
     tls_handshake_needs_write: bool = false,
     tls_plaintext: ?[]u8 = null,
     tls_plaintext_offset: usize = 0,
@@ -775,7 +783,7 @@ const Connection = struct {
             switch (result) {
                 .complete => {
                     self.tls_handshaking = false;
-                    self.tls_handshake_deadline_ns = null;
+                    clearConnectionDeadline(self);
                     try self.flush();
                     try self.receiveTlsPlaintext();
                     return;
@@ -818,7 +826,7 @@ const Connection = struct {
             if (self.tls_session) |session| session.destroy();
         }
         self.tls_session = null;
-        self.tls_handshake_deadline_ns = null;
+        clearConnectionDeadline(self);
         self.tls_handshake_needs_write = false;
         if (self.tls_plaintext) |plaintext| self.server.allocator.free(plaintext);
         self.tls_plaintext = null;
@@ -882,6 +890,7 @@ const Connection = struct {
 
     fn close(self: *Connection) void {
         if (!self.server.loop_initialized) {
+            clearConnectionDeadline(self);
             self.closing = true;
             return;
         }
@@ -890,6 +899,7 @@ const Connection = struct {
 
     fn closeOnLoop(self: *Connection, loop: *xev.Loop) void {
         self.server.removeDirtyConnection(self);
+        clearConnectionDeadline(self);
         if (self.closing) return;
         self.closing = true;
         var stream_iterator = self.streams.valueIterator();
@@ -944,6 +954,7 @@ const Connection = struct {
         if (!self.close_completed or self.read_active or self.pending_writes != 0 or self.read_cancel_submitted or self.write_cancel_submitted) return;
         const server = self.server;
         server.removeDirtyConnection(self);
+        clearConnectionDeadline(self);
         var cancel_iterator = self.streams.valueIterator();
         while (cancel_iterator.next()) |stream_ptr| {
             const stream = stream_ptr.*;
@@ -970,6 +981,161 @@ const Connection = struct {
         maybeStopLoop(server);
     }
 };
+
+const DeadlineTarget = union(enum) {
+    stream: *Stream,
+    connection: *Connection,
+};
+
+const DeadlineEntry = struct {
+    expires_at_ns: u64,
+    target: DeadlineTarget,
+};
+
+fn deadlineTargetIndex(target: DeadlineTarget) *?usize {
+    return switch (target) {
+        .stream => |stream| &stream.deadline_heap_index,
+        .connection => |connection| &connection.deadline_heap_index,
+    };
+}
+
+fn deadlineTargetsEqual(a: DeadlineTarget, b: DeadlineTarget) bool {
+    return switch (a) {
+        .stream => |stream| switch (b) {
+            .stream => |other| stream == other,
+            .connection => false,
+        },
+        .connection => |connection| switch (b) {
+            .stream => false,
+            .connection => |other| connection == other,
+        },
+    };
+}
+
+fn deadlineHeapSwap(server: *Impl, a: usize, b: usize) void {
+    if (a == b) return;
+    std.mem.swap(DeadlineEntry, &server.deadline_heap.items[a], &server.deadline_heap.items[b]);
+    deadlineTargetIndex(server.deadline_heap.items[a].target).* = a;
+    deadlineTargetIndex(server.deadline_heap.items[b].target).* = b;
+}
+
+fn deadlineHeapSiftUp(server: *Impl, start: usize) usize {
+    var index = start;
+    while (index != 0) {
+        const parent = (index - 1) / 2;
+        if (server.deadline_heap.items[parent].expires_at_ns <= server.deadline_heap.items[index].expires_at_ns) break;
+        deadlineHeapSwap(server, parent, index);
+        index = parent;
+    }
+    return index;
+}
+
+fn deadlineHeapSiftDown(server: *Impl, start: usize) usize {
+    var index = start;
+    while (true) {
+        const left = index * 2 + 1;
+        if (left >= server.deadline_heap.items.len) break;
+        const right = left + 1;
+        const child = if (right < server.deadline_heap.items.len and
+            server.deadline_heap.items[right].expires_at_ns < server.deadline_heap.items[left].expires_at_ns)
+            right
+        else
+            left;
+        if (server.deadline_heap.items[index].expires_at_ns <= server.deadline_heap.items[child].expires_at_ns) break;
+        deadlineHeapSwap(server, index, child);
+        index = child;
+    }
+    return index;
+}
+
+fn deadlineHeapInsertOrUpdate(server: *Impl, target: DeadlineTarget, expires_at_ns: u64) !void {
+    const target_index = deadlineTargetIndex(target);
+    if (target_index.*) |index| {
+        std.debug.assert(index < server.deadline_heap.items.len);
+        std.debug.assert(deadlineTargetsEqual(server.deadline_heap.items[index].target, target));
+        const previous = server.deadline_heap.items[index].expires_at_ns;
+        server.deadline_heap.items[index].expires_at_ns = expires_at_ns;
+        if (expires_at_ns < previous) {
+            _ = deadlineHeapSiftUp(server, index);
+        } else if (expires_at_ns > previous) {
+            _ = deadlineHeapSiftDown(server, index);
+        }
+        return;
+    }
+
+    try server.deadline_heap.append(server.allocator, .{
+        .expires_at_ns = expires_at_ns,
+        .target = target,
+    });
+    const index = server.deadline_heap.items.len - 1;
+    target_index.* = index;
+    _ = deadlineHeapSiftUp(server, index);
+}
+
+fn deadlineHeapRemove(server: *Impl, target: DeadlineTarget) bool {
+    const target_index = deadlineTargetIndex(target);
+    const index = target_index.* orelse return false;
+    std.debug.assert(index < server.deadline_heap.items.len);
+    std.debug.assert(deadlineTargetsEqual(server.deadline_heap.items[index].target, target));
+
+    const removed = server.deadline_heap.items[index];
+    const replacement = server.deadline_heap.pop().?;
+    deadlineTargetIndex(removed.target).* = null;
+    if (index < server.deadline_heap.items.len) {
+        server.deadline_heap.items[index] = replacement;
+        deadlineTargetIndex(replacement.target).* = index;
+        if (index != 0 and server.deadline_heap.items[index].expires_at_ns <
+            server.deadline_heap.items[(index - 1) / 2].expires_at_ns)
+        {
+            _ = deadlineHeapSiftUp(server, index);
+        } else {
+            _ = deadlineHeapSiftDown(server, index);
+        }
+    }
+    return true;
+}
+
+fn deadlineHeapPeek(server: *const Impl) ?DeadlineEntry {
+    if (server.deadline_heap.items.len == 0) return null;
+    return server.deadline_heap.items[0];
+}
+
+fn deadlineHeapPop(server: *Impl) ?DeadlineEntry {
+    const entry = deadlineHeapPeek(server) orelse return null;
+    std.debug.assert(deadlineHeapRemove(server, entry.target));
+    return entry;
+}
+
+fn setStreamDeadline(stream: *Stream, value: deadline.Deadline) !void {
+    try deadlineHeapInsertOrUpdate(stream.connection.server, .{ .stream = stream }, value.expires_at_ns);
+    stream.deadline = value;
+    scheduleDeadlineTimer(stream.connection.server);
+}
+
+fn clearStreamDeadline(stream: *Stream) void {
+    const server = stream.connection.server;
+    const removed = deadlineHeapRemove(server, .{ .stream = stream });
+    stream.deadline = null;
+    if (removed) scheduleDeadlineTimer(server);
+}
+
+fn removeStreamDeadline(stream: *Stream) void {
+    const server = stream.connection.server;
+    if (deadlineHeapRemove(server, .{ .stream = stream })) scheduleDeadlineTimer(server);
+}
+
+fn setConnectionDeadline(connection: *Connection, expires_at_ns: u64) !void {
+    try deadlineHeapInsertOrUpdate(connection.server, .{ .connection = connection }, expires_at_ns);
+    connection.tls_handshake_deadline_ns = expires_at_ns;
+    scheduleDeadlineTimer(connection.server);
+}
+
+fn clearConnectionDeadline(connection: *Connection) void {
+    const server = connection.server;
+    const removed = deadlineHeapRemove(server, .{ .connection = connection });
+    connection.tls_handshake_deadline_ns = null;
+    if (removed) scheduleDeadlineTimer(server);
+}
 
 const WriteRequest = struct {
     request: xev.WriteRequest = undefined,
@@ -1076,7 +1242,13 @@ fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev
                 return rearmListener(server_ptr);
             };
             connection.tls_handshaking = true;
-            connection.tls_handshake_deadline_ns = server_ptr.clock.now() +| server_ptr.tls_handshake_timeout_ns;
+            setConnectionDeadline(
+                connection,
+                server_ptr.clock.now() +| server_ptr.tls_handshake_timeout_ns,
+            ) catch {
+                connection.closeOnLoop(loop);
+                return rearmListener(server_ptr);
+            };
         }
     }
     connection.startRead(loop) catch connection.closeOnLoop(loop);
@@ -1085,7 +1257,6 @@ fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev
     } else {
         connection.flush() catch connection.closeOnLoop(loop);
     }
-    scheduleDeadlineTimer(server_ptr);
     return rearmListener(server_ptr);
 }
 
@@ -1264,6 +1435,10 @@ fn processStreamCommands(server: *Impl) void {
         releaseStreamCommand(command.target);
     }
 
+    drainDirtyConnections(server);
+}
+
+fn drainDirtyConnections(server: *Impl) void {
     while (server.popDirtyConnection()) |connection| {
         if (connection.closing or connection.session == null) continue;
         if (connection.tls_handshaking) {
@@ -1307,6 +1482,7 @@ fn processStreamCommand(server: *Impl, command: StreamCommand) void {
             const active = target.streaming_active and !target.transport_closed;
             if (active) target.response_finished = true;
             server.unlock();
+            if (active) removeStreamDeadline(target);
             if (!active or target.streaming == null) {
                 if (value.message.len != 0) server.allocator.free(value.message);
                 return;
@@ -1398,6 +1574,7 @@ fn resumeStreamingResponse(target: *Stream) void {
 
 fn failStreaming(target: *Stream, code: status.Code, text: []const u8) void {
     if (target.streaming == null) return;
+    removeStreamDeadline(target);
     const server = target.connection.server;
     server.lock();
     target.streaming_active = false;
@@ -1440,6 +1617,7 @@ fn discardStreamCommands(target: *Stream) void {
 }
 
 fn retireStream(target: *Stream) bool {
+    removeStreamDeadline(target);
     discardStreamCommands(target);
     const server = target.connection.server;
     server.lock();
@@ -1458,6 +1636,7 @@ fn destroyStream(target: *Stream) void {
 
 fn cancelStreaming(target: *Stream) void {
     const streaming = &(target.streaming orelse return);
+    removeStreamDeadline(target);
     const server = target.connection.server;
     server.lock();
     if (target.cancel_called) {
@@ -1661,16 +1840,18 @@ fn onHeader(
     } else if (std.mem.eql(u8, name, "grpc-timeout")) {
         if (stream.timeout_seen) {
             stream.timeout_invalid = true;
-            stream.deadline = null;
+            clearStreamDeadline(stream);
         } else {
             stream.timeout_seen = true;
             const timeout_ns = deadline.parseTimeout(value) catch {
                 stream.timeout_invalid = true;
                 return 0;
             };
-            stream.deadline = deadline.Deadline.initAfter(connection.server.clock, timeout_ns);
+            setStreamDeadline(
+                stream,
+                deadline.Deadline.initAfter(connection.server.clock, timeout_ns),
+            ) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
         }
-        scheduleDeadlineTimer(connection.server);
     } else if (isRequestMetadata(name)) {
         _ = stream.request_metadata.appendDecoded(name, value) catch |err| switch (err) {
             error.OutOfMemory => return c.NGHTTP2_ERR_CALLBACK_FAILURE,
@@ -1735,7 +1916,6 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
     const stream = connection.streams.get(native_frame.*.hd.stream_id) orelse return 0;
     if (native_frame.*.hd.type == c.NGHTTP2_HEADERS and stream.request_metadata_invalid and !stream.responded) {
         stream.responded = true;
-        scheduleDeadlineTimer(connection.server);
         submitFailure(session.?, stream, .invalid_argument, "invalid request metadata");
         return 0;
     }
@@ -1759,7 +1939,6 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
 
 fn startStreaming(session: *c.nghttp2_session, target: *Stream, handler: raw_stream.ServerHandler) void {
     target.responded = true;
-    scheduleDeadlineTimer(target.connection.server);
     if (target.header_too_large) {
         submitFailure(session, target, .resource_exhausted, "request too large");
         return;
@@ -1910,7 +2089,7 @@ fn completeStreamingRemoteEnd(target: *Stream) void {
 
 fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
     stream.responded = true;
-    scheduleDeadlineTimer(stream.connection.server);
+    removeStreamDeadline(stream);
     if (stream.header_too_large or stream.request_too_large) {
         submitFailure(session, stream, .resource_exhausted, "request too large");
         return;
@@ -2007,6 +2186,7 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
 }
 
 fn submitFailure(session: *c.nghttp2_session, stream: *Stream, code: status.Code, text: []const u8) void {
+    removeStreamDeadline(stream);
     stream.setStatus(status.Status.init(code, text)) catch {
         stream.connection.close();
         return;
@@ -2198,7 +2378,6 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, stream_error: u32, user
         }
         _ = retireStream(entry.value);
     }
-    scheduleDeadlineTimer(connection.server);
     if (connection.draining) finishDrainIfIdle(connection.server);
     return 0;
 }
@@ -2211,73 +2390,80 @@ fn ioNow(context: ?*anyopaque) u64 {
 
 fn scheduleDeadlineTimer(server: *Impl) void {
     if (!server.loop_initialized or !server.deadline_timer_initialized) return;
-    var earliest: ?u64 = null;
-    for (server.connections.items) |connection| {
-        if (connection.tls_handshake_deadline_ns) |value| {
-            if (earliest == null or value < earliest.?) earliest = value;
-        }
-        var iterator = connection.streams.valueIterator();
-        while (iterator.next()) |stream_ptr| {
-            const stream = stream_ptr.*;
-            if (stream.responded and stream.streaming == null) continue;
-            if (stream.streaming != null and !stream.streaming_active) continue;
-            if (stream.deadline) |value| {
-                if (earliest == null or value.expires_at_ns < earliest.?) earliest = value.expires_at_ns;
-            }
-        }
-    }
-    if (earliest == null) return;
-    const remaining = earliest.? -| server.clock.now();
+    const earliest = (deadlineHeapPeek(server) orelse return).expires_at_ns;
+    if (server.deadline_timer_armed and server.deadline_timer_target_ns == earliest) return;
+
+    const remaining = earliest -| server.clock.now();
     const timeout_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining, std.time.ns_per_ms) catch 1);
-    server.deadline_timer.reset(
-        &server.loop,
-        &server.deadline_timer_completion,
-        &server.deadline_timer_cancel_completion,
-        timeout_ms,
-        Impl,
-        server,
-        onDeadlineTimer,
-    );
+    server.deadline_timer_target_ns = earliest;
+    if (server.deadline_timer_armed) {
+        server.deadline_timer.reset(
+            &server.loop,
+            &server.deadline_timer_completion,
+            &server.deadline_timer_cancel_completion,
+            timeout_ms,
+            Impl,
+            server,
+            onDeadlineTimer,
+        );
+    } else {
+        server.deadline_timer_armed = true;
+        server.deadline_timer.run(
+            &server.loop,
+            &server.deadline_timer_completion,
+            timeout_ms,
+            Impl,
+            server,
+            onDeadlineTimer,
+        );
+    }
 }
 
 fn onDeadlineTimer(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
     const impl = server orelse return .disarm;
-    result catch return .disarm;
+    impl.deadline_timer_armed = false;
+    impl.deadline_timer_target_ns = null;
+    result catch |err| switch (err) {
+        error.Canceled => {
+            scheduleDeadlineTimer(impl);
+            return .disarm;
+        },
+        else => return .disarm,
+    };
     const now = impl.clock.now();
     expireDeadlines(impl, now);
-    for (impl.connections.items) |connection| {
-        if (connection.closing or connection.tls_handshaking or connection.session == null) continue;
-        connection.flush() catch connection.close();
-    }
+    drainDirtyConnections(impl);
     scheduleDeadlineTimer(impl);
     return .disarm;
 }
 
 fn expireDeadlines(server: *Impl, now: u64) void {
-    for (server.connections.items) |connection| {
-        if (connection.closing or connection.session == null) continue;
-        if (connection.tls_handshake_deadline_ns) |value| {
-            if (value <= now) {
+    while (deadlineHeapPeek(server)) |next| {
+        if (next.expires_at_ns > now) return;
+        const entry = deadlineHeapPop(server).?;
+        switch (entry.target) {
+            .connection => |connection| {
+                if (connection.tls_handshake_deadline_ns != entry.expires_at_ns) continue;
+                connection.tls_handshake_deadline_ns = null;
+                if (connection.closing or connection.session == null or !connection.tls_handshaking) continue;
                 connection.closeOnLoop(&server.loop);
-                continue;
-            }
-        }
-        var iterator = connection.streams.valueIterator();
-        while (iterator.next()) |stream_ptr| {
-            const stream = stream_ptr.*;
-            if (stream.responded and stream.streaming == null) continue;
-            if (stream.streaming != null and !stream.streaming_active) continue;
-            if (stream.deadline) |value| {
-                if (value.expires_at_ns <= now) {
-                    if (stream.streaming != null) {
-                        cancelStreaming(stream);
-                        failStreaming(stream, .deadline_exceeded, "deadline exceeded");
-                    } else {
-                        stream.responded = true;
-                        submitFailure(connection.session.?, stream, .deadline_exceeded, "deadline exceeded");
-                    }
+            },
+            .stream => |stream| {
+                const value = stream.deadline orelse continue;
+                if (value.expires_at_ns != entry.expires_at_ns) continue;
+                const connection = stream.connection;
+                if (connection.closing or connection.session == null) continue;
+                if (stream.streaming) |_| {
+                    if (!stream.streaming_active) continue;
+                    cancelStreaming(stream);
+                    failStreaming(stream, .deadline_exceeded, "deadline exceeded");
+                } else {
+                    if (stream.responded) continue;
+                    stream.responded = true;
+                    submitFailure(connection.session.?, stream, .deadline_exceeded, "deadline exceeded");
                 }
-            }
+                if (!connection.closing) _ = server.enqueueDirtyConnection(connection);
+            },
         }
     }
 }
@@ -2678,6 +2864,110 @@ test "dirty connection queue safely removes closing connections" {
     server.removeDirtyConnection(&last);
     try std.testing.expect(server.popDirtyConnection() == &closing);
     try std.testing.expect(server.popDirtyConnection() == null);
+}
+
+fn expectDeadlineHeapConsistent(server: *const Impl) !void {
+    for (server.deadline_heap.items, 0..) |entry, index| {
+        try std.testing.expectEqual(@as(?usize, index), deadlineTargetIndex(entry.target).*);
+        if (index != 0) {
+            try std.testing.expect(server.deadline_heap.items[(index - 1) / 2].expires_at_ns <= entry.expires_at_ns);
+        }
+    }
+}
+
+test "server deadline heap orders updates and mixed targets" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    var streams = [_]Stream{
+        Stream.init(std.testing.allocator, &connection, 1),
+        Stream.init(std.testing.allocator, &connection, 3),
+        Stream.init(std.testing.allocator, &connection, 5),
+    };
+    defer {
+        for (&streams) |*stream| stream.deinit();
+        clearConnectionDeadline(&connection);
+    }
+
+    try deadlineHeapInsertOrUpdate(server.impl, .{ .stream = &streams[0] }, 40);
+    try deadlineHeapInsertOrUpdate(server.impl, .{ .connection = &connection }, 20);
+    try deadlineHeapInsertOrUpdate(server.impl, .{ .stream = &streams[1] }, 30);
+    try deadlineHeapInsertOrUpdate(server.impl, .{ .stream = &streams[2] }, 10);
+    try expectDeadlineHeapConsistent(server.impl);
+    try std.testing.expect(deadlineTargetsEqual(deadlineHeapPeek(server.impl).?.target, .{ .stream = &streams[2] }));
+
+    try deadlineHeapInsertOrUpdate(server.impl, .{ .stream = &streams[0] }, 5);
+    try expectDeadlineHeapConsistent(server.impl);
+    try std.testing.expect(deadlineTargetsEqual(deadlineHeapPeek(server.impl).?.target, .{ .stream = &streams[0] }));
+
+    try deadlineHeapInsertOrUpdate(server.impl, .{ .stream = &streams[0] }, 50);
+    try expectDeadlineHeapConsistent(server.impl);
+    try std.testing.expect(deadlineTargetsEqual(deadlineHeapPeek(server.impl).?.target, .{ .stream = &streams[2] }));
+
+    const expected = [_]u64{ 10, 20, 30, 50 };
+    for (expected) |expiry| {
+        const entry = deadlineHeapPop(server.impl).?;
+        try std.testing.expectEqual(expiry, entry.expires_at_ns);
+        try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(entry.target).*);
+        try expectDeadlineHeapConsistent(server.impl);
+    }
+    try std.testing.expect(deadlineHeapPeek(server.impl) == null);
+}
+
+test "server deadline heap removes root middle last and equal expiries" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    var streams: [7]Stream = undefined;
+    for (&streams, 0..) |*stream, index| {
+        stream.* = Stream.init(std.testing.allocator, &connection, @intCast(index * 2 + 1));
+    }
+    defer for (&streams) |*stream| stream.deinit();
+
+    for (&streams, 0..) |*stream, index| {
+        try deadlineHeapInsertOrUpdate(server.impl, .{ .stream = stream }, @intCast((index + 1) * 10));
+    }
+    const root = server.impl.deadline_heap.items[0].target;
+    try std.testing.expect(deadlineHeapRemove(server.impl, root));
+    try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(root).*);
+    try expectDeadlineHeapConsistent(server.impl);
+
+    const middle = server.impl.deadline_heap.items[server.impl.deadline_heap.items.len / 2].target;
+    try std.testing.expect(deadlineHeapRemove(server.impl, middle));
+    try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(middle).*);
+    try expectDeadlineHeapConsistent(server.impl);
+
+    const last = server.impl.deadline_heap.items[server.impl.deadline_heap.items.len - 1].target;
+    try std.testing.expect(deadlineHeapRemove(server.impl, last));
+    try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(last).*);
+    try expectDeadlineHeapConsistent(server.impl);
+
+    while (deadlineHeapPop(server.impl)) |entry| {
+        try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(entry.target).*);
+    }
+    for (&streams) |*stream| try deadlineHeapInsertOrUpdate(server.impl, .{ .stream = stream }, 100);
+    var popped: usize = 0;
+    while (deadlineHeapPop(server.impl)) |entry| {
+        try std.testing.expectEqual(@as(u64, 100), entry.expires_at_ns);
+        try std.testing.expectEqual(@as(?usize, null), deadlineTargetIndex(entry.target).*);
+        popped += 1;
+    }
+    try std.testing.expectEqual(streams.len, popped);
+}
+
+test "server deadline heap removes destroyed targets" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    var stream = Stream.init(std.testing.allocator, &connection, 1);
+
+    try setStreamDeadline(&stream, deadline.Deadline.initAfter(server.impl.clock, std.time.ns_per_s));
+    stream.deinit();
+    try std.testing.expectEqual(@as(usize, 0), server.impl.deadline_heap.items.len);
+
+    try setConnectionDeadline(&connection, server.impl.clock.now() +| std.time.ns_per_s);
+    connection.close();
+    try std.testing.expectEqual(@as(usize, 0), server.impl.deadline_heap.items.len);
 }
 
 test "server streaming outbound queue preserves order and reuses drained storage" {
@@ -3648,22 +3938,34 @@ test "expired and malformed grpc-timeout values fail only their stream" {
     try std.testing.expectEqual(@as(usize, 0), handler.calls);
 }
 
-test "deadline expiration completes a stream before request body end" {
+test "deadline expiration pops only expired roots among many streams" {
     var server = try Server.init(std.testing.allocator, .{});
     defer server.deinit();
     var connection = Connection{ .server = server.impl };
     try connection.initializeSession();
     defer deinitTestConnection(&connection);
-    try server.impl.connections.append(std.testing.allocator, &connection);
-    defer _ = server.impl.connections.pop();
 
     try feedTestRequest(&connection, .{ .end_stream = false, .timeout_values = &.{"0n"} });
     const stream = connection.streams.get(1).?;
     try std.testing.expect(!stream.responded);
+    var future_streams: [256]Stream = undefined;
+    for (&future_streams, 0..) |*future, index| {
+        future.* = Stream.init(std.testing.allocator, &connection, @intCast(index * 2 + 3));
+    }
+    defer for (&future_streams) |*future| future.deinit();
+    for (&future_streams) |*future| {
+        try setStreamDeadline(future, deadline.Deadline.initAfter(server.impl.clock, std.time.ns_per_s));
+    }
+
     expireDeadlines(server.impl, server.impl.clock.now());
     try std.testing.expect(stream.responded);
     try std.testing.expectEqual(status.Code.deadline_exceeded, stream.response_code);
     try std.testing.expect(!connection.closing);
+    try std.testing.expectEqual(future_streams.len, server.impl.deadline_heap.items.len);
+    for (&future_streams) |*future| try std.testing.expect(future.deadline_heap_index != null);
+    try expectDeadlineHeapConsistent(server.impl);
+    try std.testing.expect(server.impl.popDirtyConnection() == &connection);
+    try std.testing.expect(server.impl.popDirtyConnection() == null);
 }
 
 test "malformed request metadata rejects one stream and preserves the connection" {
