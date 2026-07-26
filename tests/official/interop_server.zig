@@ -5,6 +5,8 @@ const testing = @import("grpc_testing");
 const Config = struct {
     port: u16 = 10000,
     use_tls: bool = false,
+    tls_cert_file: []const u8 = "",
+    tls_key_file: []const u8 = "",
 };
 
 const StreamMethod = enum {
@@ -445,16 +447,26 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("invalid arguments: {s}\n", .{@errorName(err)});
         return err;
     };
-    if (config.use_tls) {
-        std.debug.print("TLS is not supported by grpc-lite interop\n", .{});
-        return error.TlsUnsupported;
-    }
+    const certificate = if (config.use_tls)
+        try std.Io.Dir.cwd().readFileAlloc(init.io, config.tls_cert_file, init.gpa, .limited(4 * 1024 * 1024))
+    else
+        null;
+    defer if (certificate) |bytes| init.gpa.free(bytes);
+    const private_key = if (config.use_tls)
+        try std.Io.Dir.cwd().readFileAlloc(init.io, config.tls_key_file, init.gpa, .limited(4 * 1024 * 1024))
+    else
+        null;
+    defer if (private_key) |bytes| init.gpa.free(bytes);
 
     var service = Service.init(init.gpa);
     defer service.deinit();
     var server = try grpc.Server.init(init.gpa, .{
         .host = "127.0.0.1",
         .port = config.port,
+        .tls = if (certificate) |cert| .{
+            .certificate_chain_pem = cert,
+            .private_key_pem = private_key.?,
+        } else null,
     });
     defer server.deinit();
     try server.registerUnary(
@@ -529,10 +541,24 @@ fn parseArgs(args: []const []const u8) !Config {
             config.use_tls = try parseBool(arg["--use_tls=".len..]);
         } else if (std.mem.eql(u8, arg, "--use_tls")) {
             config.use_tls = true;
+        } else if (std.mem.startsWith(u8, arg, "--tls_cert_file=")) {
+            config.tls_cert_file = arg["--tls_cert_file=".len..];
+        } else if (std.mem.eql(u8, arg, "--tls_cert_file")) {
+            index += 1;
+            if (index >= args.len) return error.MissingTlsCertFile;
+            config.tls_cert_file = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--tls_key_file=")) {
+            config.tls_key_file = arg["--tls_key_file=".len..];
+        } else if (std.mem.eql(u8, arg, "--tls_key_file")) {
+            index += 1;
+            if (index >= args.len) return error.MissingTlsKeyFile;
+            config.tls_key_file = args[index];
         } else {
             return error.UnknownArgument;
         }
     }
+    if (config.use_tls and config.tls_cert_file.len == 0) return error.MissingTlsCertFile;
+    if (config.use_tls and config.tls_key_file.len == 0) return error.MissingTlsKeyFile;
     return config;
 }
 

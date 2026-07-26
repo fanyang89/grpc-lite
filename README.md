@@ -66,6 +66,7 @@ mise run fmt
 mise run ci-lint
 mise run interop
 mise run interop-official
+mise run interop-tls
 mise run interop-http2
 mise run interop-http2-edge
 mise run gen-proto

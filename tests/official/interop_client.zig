@@ -16,6 +16,7 @@ const Config = struct {
     server_port: u16 = 10000,
     test_case: []const u8 = "large_unary",
     use_tls: bool = false,
+    ca_file: []const u8 = "",
     soak_iterations: usize = 10,
     soak_max_failures: usize = 0,
     soak_overall_timeout_seconds: u64 = 10,
@@ -27,10 +28,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("invalid arguments: {s}\n", .{@errorName(err)});
         return err;
     };
-    if (config.use_tls) {
-        std.debug.print("TLS is not supported by grpc-lite interop\n", .{});
-        return error.TlsUnsupported;
-    }
+    const ca_pem = if (config.use_tls)
+        try std.Io.Dir.cwd().readFileAlloc(init.io, config.ca_file, init.gpa, .limited(4 * 1024 * 1024))
+    else
+        null;
+    defer if (ca_pem) |bytes| init.gpa.free(bytes);
+    const channel_options: grpc.ChannelOptions = .{
+        .tls = if (ca_pem) |bytes| .{ .ca_certificates_pem = bytes } else null,
+    };
 
     const target = try std.fmt.allocPrint(init.gpa, "{s}:{d}", .{
         config.server_host,
@@ -39,17 +44,17 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(target);
 
     if (std.mem.eql(u8, config.test_case, "rpc_soak")) {
-        try rpcSoak(init, target, config);
+        try rpcSoak(init, target, config, channel_options);
         std.debug.print("interop case passed: {s}\n", .{config.test_case});
         return;
     }
     if (std.mem.eql(u8, config.test_case, "channel_soak")) {
-        try channelSoak(init, target, config);
+        try channelSoak(init, target, config, channel_options);
         std.debug.print("interop case passed: {s}\n", .{config.test_case});
         return;
     }
 
-    var channel = try grpc.Channel.init(init.gpa, target, .{});
+    var channel = try grpc.Channel.init(init.gpa, target, channel_options);
     defer channel.deinit();
 
     if (std.mem.eql(u8, config.test_case, "empty_unary")) {
@@ -101,10 +106,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("interop case passed: {s}\n", .{config.test_case});
 }
 
-fn rpcSoak(init: std.process.Init, target: []const u8, config: Config) !void {
+fn rpcSoak(init: std.process.Init, target: []const u8, config: Config, channel_options: grpc.ChannelOptions) !void {
     const deadline = soakDeadline(init.io, config.soak_overall_timeout_seconds);
     try checkSoakDeadline(init.io, deadline);
-    var channel = try grpc.Channel.init(init.gpa, target, .{});
+    var channel = try grpc.Channel.init(init.gpa, target, channel_options);
     defer channel.deinit();
     try checkSoakDeadline(init.io, deadline);
 
@@ -118,11 +123,11 @@ fn rpcSoak(init: std.process.Init, target: []const u8, config: Config) !void {
     }
 }
 
-fn channelSoak(init: std.process.Init, target: []const u8, config: Config) !void {
+fn channelSoak(init: std.process.Init, target: []const u8, config: Config, channel_options: grpc.ChannelOptions) !void {
     const deadline = soakDeadline(init.io, config.soak_overall_timeout_seconds);
     var failures: usize = 0;
     for (0..config.soak_iterations) |iteration| {
-        const iteration_error = try channelSoakIteration(init.gpa, init.io, target, deadline);
+        const iteration_error = try channelSoakIteration(init.gpa, init.io, target, deadline, channel_options);
         if (iteration_error) |err| {
             try handleSoakFailure(&failures, config.soak_max_failures, iteration, err);
         }
@@ -130,9 +135,15 @@ fn channelSoak(init: std.process.Init, target: []const u8, config: Config) !void
     }
 }
 
-fn channelSoakIteration(allocator: std.mem.Allocator, io: std.Io, target: []const u8, deadline: i96) !?anyerror {
+fn channelSoakIteration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: []const u8,
+    deadline: i96,
+    channel_options: grpc.ChannelOptions,
+) !?anyerror {
     try checkSoakDeadline(io, deadline);
-    var channel = grpc.Channel.init(allocator, target, .{}) catch |err| return @as(?anyerror, err);
+    var channel = grpc.Channel.init(allocator, target, channel_options) catch |err| return @as(?anyerror, err);
     defer channel.deinit();
     const timeout_ns = try soakRpcTimeout(io, deadline);
     largeUnary(allocator, &channel, timeout_ns) catch |err| return @as(?anyerror, err);
@@ -896,6 +907,12 @@ fn parseArgs(args: []const []const u8) !Config {
             config.use_tls = try parseBool(arg["--use_tls=".len..]);
         } else if (std.mem.eql(u8, arg, "--use_tls")) {
             config.use_tls = true;
+        } else if (std.mem.startsWith(u8, arg, "--ca_file=")) {
+            config.ca_file = arg["--ca_file=".len..];
+        } else if (std.mem.eql(u8, arg, "--ca_file")) {
+            index += 1;
+            if (index >= args.len) return error.MissingCaFile;
+            config.ca_file = args[index];
         } else if (std.mem.startsWith(u8, arg, "--soak_iterations=")) {
             config.soak_iterations = std.fmt.parseInt(
                 usize,
@@ -933,6 +950,7 @@ fn parseArgs(args: []const []const u8) !Config {
             return error.UnknownArgument;
         }
     }
+    if (config.use_tls and config.ca_file.len == 0) return error.MissingCaFile;
     if (config.soak_iterations == 0) return error.ZeroSoakIterations;
     return config;
 }
@@ -968,6 +986,16 @@ test "parse soak arguments in split form" {
     try std.testing.expectEqual(@as(usize, 23), config.soak_iterations);
     try std.testing.expectEqual(@as(usize, 4), config.soak_max_failures);
     try std.testing.expectEqual(@as(u64, 90), config.soak_overall_timeout_seconds);
+}
+
+test "parse TLS CA arguments" {
+    const config = try parseArgs(&.{
+        "interop-client",
+        "--use_tls=true",
+        "--ca_file=/tmp/test-ca.pem",
+    });
+    try std.testing.expect(config.use_tls);
+    try std.testing.expectEqualStrings("/tmp/test-ca.pem", config.ca_file);
 }
 
 test "reject zero soak iterations" {
@@ -1048,6 +1076,7 @@ test "channel soak counts init failures and preserves OOM" {
         std.testing.io,
         "invalid-target",
         deadline,
+        .{},
     )).?;
     try std.testing.expectEqual(error.InvalidTarget, init_error);
 

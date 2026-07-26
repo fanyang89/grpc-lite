@@ -183,6 +183,10 @@ jobs:
       - name: Run official unary interop
         run: mise run interop-official
 
+      - name: Run official TLS interop
+        if: matrix.arch == 'x64'
+        run: mise run interop-tls
+
       - name: Run official HTTP/2 framing report
         run: mise run interop-http2
 

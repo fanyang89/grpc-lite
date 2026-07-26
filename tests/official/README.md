@@ -21,9 +21,11 @@ mise run interop-http2-edge
 | grpc-go client to grpc-lite server | `cancel_after_begin`, `cancel_after_first_response`, `timeout_on_sleeping_server` | Pass |
 | grpc-lite client to grpc-go server | `cancel_after_begin`, `cancel_after_first_response`, `timeout_on_sleeping_server` | Pass |
 | grpc-lite compression integration | `client_compressed_unary`, `server_compressed_unary` | Pass; grpc-go v1.82.1 does not expose these cases through its interop client |
+| grpc-go TLS client to grpc-lite TLS server | `empty_unary`, `large_unary`, `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
+| grpc-lite TLS client to grpc-go TLS server | `empty_unary`, `large_unary`, `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
 | gRPC HTTP/2 framing | `TestSoonClientShortSettings`, `TestSoonShortPreface`, `TestSoonUnknownFrameType`, `TestSoonClientPrefaceWithStreamId`, `TestSoonAllSettingsFramesAcked` | Pass |
 | gRPC HTTP/2 framing | `TestSoonSmallMaxFrameSize` | Server GOAWAY passes the repository test; pinned upstream parser cannot recognize GOAWAY frames |
-| gRPC HTTP/2 TLS framing | TLS application protocol, version, and cipher suite cases | Pending harness integration; public TLS transport tests pass |
+| gRPC HTTP/2 TLS framing | TLS application protocol, version, and cipher suite cases | Pending framing-harness integration; grpc-go TLS interop passes |
 | gRPC HTTP/2 edge-case server | reset, GOAWAY, ping, max-stream, and DATA padding cases | Pass |
 | grpc-go client to grpc-lite server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
 | grpc-lite client to grpc-go server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
