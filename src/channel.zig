@@ -212,8 +212,8 @@ pub const Channel = struct {
             impl.thread.?.join();
             impl.thread = null;
             impl.pending.deinit(impl.allocator);
-            std.debug.assert(impl.waiting_operations.items.len == 0);
-            impl.waiting_operations.deinit(impl.allocator);
+            std.debug.assert(impl.waiting_operation_head == null);
+            std.debug.assert(impl.waiting_operation_tail == null);
             impl.operations.deinit(impl.allocator);
             impl.stream_states.deinit(impl.allocator);
             impl.streams.deinit(impl.allocator);
@@ -329,8 +329,8 @@ pub const Channel = struct {
         self.wait();
 
         impl.pending.deinit(impl.allocator);
-        std.debug.assert(impl.waiting_operations.items.len == 0);
-        impl.waiting_operations.deinit(impl.allocator);
+        std.debug.assert(impl.waiting_operation_head == null);
+        std.debug.assert(impl.waiting_operation_tail == null);
         impl.operations.deinit(impl.allocator);
         impl.stream_states.deinit(impl.allocator);
         impl.streams.deinit(impl.allocator);
@@ -399,7 +399,8 @@ const Impl = struct {
     state: State = .starting,
     thread: ?std.Thread = null,
     pending: std.ArrayList(*Operation) = .empty,
-    waiting_operations: std.ArrayList(*Operation) = .empty,
+    waiting_operation_head: ?*Operation = null,
+    waiting_operation_tail: ?*Operation = null,
     operations: std.AutoHashMapUnmanaged(i32, *Operation) = .empty,
     stream_states: std.AutoHashMapUnmanaged(*ClientStreamState, void) = .empty,
     streams: std.AutoHashMapUnmanaged(i32, *ClientStreamState) = .empty,
@@ -778,7 +779,9 @@ const Operation = struct {
     max_response_size: usize,
     deadline_ns: ?u64,
     deadline_heap_index: ?usize = null,
-    waiting_index: ?usize = null,
+    waiting_queued: bool = false,
+    waiting_prev: ?*Operation = null,
+    waiting_next: ?*Operation = null,
     timeout_header: [16]u8 = undefined,
     timeout_header_len: usize = 0,
     stream_id: i32 = -1,
@@ -846,7 +849,9 @@ const Operation = struct {
 
     fn deinit(self: *Operation) void {
         std.debug.assert(self.deadline_heap_index == null);
-        std.debug.assert(self.waiting_index == null);
+        std.debug.assert(!self.waiting_queued);
+        std.debug.assert(self.waiting_prev == null);
+        std.debug.assert(self.waiting_next == null);
         const allocator = self.impl.allocator;
         allocator.free(self.path);
         allocator.free(self.request_frame);
@@ -1108,24 +1113,44 @@ fn deadlineHeapPop(impl: *Impl) ?DeadlineEntry {
     return entry;
 }
 
-fn appendWaitingOperation(impl: *Impl, operation: *Operation) !void {
-    std.debug.assert(operation.waiting_index == null);
-    operation.waiting_index = impl.waiting_operations.items.len;
-    errdefer operation.waiting_index = null;
-    try impl.waiting_operations.append(impl.allocator, operation);
+fn appendWaitingOperation(impl: *Impl, operation: *Operation) void {
+    std.debug.assert(!operation.waiting_queued);
+    std.debug.assert(operation.waiting_prev == null);
+    std.debug.assert(operation.waiting_next == null);
+    operation.waiting_queued = true;
+    operation.waiting_prev = impl.waiting_operation_tail;
+    if (impl.waiting_operation_tail) |tail| {
+        tail.waiting_next = operation;
+    } else {
+        impl.waiting_operation_head = operation;
+    }
+    impl.waiting_operation_tail = operation;
 }
 
 fn removeWaitingOperation(impl: *Impl, operation: *Operation) bool {
-    const index = operation.waiting_index orelse return false;
-    std.debug.assert(index < impl.waiting_operations.items.len);
-    std.debug.assert(impl.waiting_operations.items[index] == operation);
-    const replacement = impl.waiting_operations.pop().?;
-    operation.waiting_index = null;
-    if (index < impl.waiting_operations.items.len) {
-        impl.waiting_operations.items[index] = replacement;
-        replacement.waiting_index = index;
+    if (!operation.waiting_queued) return false;
+    if (operation.waiting_prev) |previous| {
+        previous.waiting_next = operation.waiting_next;
+    } else {
+        std.debug.assert(impl.waiting_operation_head == operation);
+        impl.waiting_operation_head = operation.waiting_next;
     }
+    if (operation.waiting_next) |next| {
+        next.waiting_prev = operation.waiting_prev;
+    } else {
+        std.debug.assert(impl.waiting_operation_tail == operation);
+        impl.waiting_operation_tail = operation.waiting_prev;
+    }
+    operation.waiting_queued = false;
+    operation.waiting_prev = null;
+    operation.waiting_next = null;
     return true;
+}
+
+fn popWaitingOperation(impl: *Impl) ?*Operation {
+    const operation = impl.waiting_operation_head orelse return null;
+    std.debug.assert(removeWaitingOperation(impl, operation));
+    return operation;
 }
 
 fn removeOperationDeadline(impl: *Impl, operation: *Operation) void {
@@ -1225,7 +1250,8 @@ fn runLoop(impl: *Impl) void {
     }
     std.debug.assert(impl.deadline_heap.items.len == 0);
     std.debug.assert(impl.deadline_heap_index == null);
-    std.debug.assert(impl.waiting_operations.items.len == 0);
+    std.debug.assert(impl.waiting_operation_head == null);
+    std.debug.assert(impl.waiting_operation_tail == null);
     impl.markStopped();
 }
 
@@ -1438,11 +1464,7 @@ fn processPending(impl: *Impl) void {
     defer pending.deinit(impl.allocator);
 
     for (pending.items) |operation| {
-        appendWaitingOperation(impl, operation) catch {
-            operation.setOutcome(.unavailable, "request submission failed") catch {};
-            operation.complete();
-            continue;
-        };
+        appendWaitingOperation(impl, operation);
         if (operation.deadline_ns) |deadline| {
             deadlineHeapInsertOrUpdate(impl, .{ .operation = operation }, deadline) catch {
                 std.debug.assert(removeWaitingOperation(impl, operation));
@@ -1458,9 +1480,7 @@ fn processPending(impl: *Impl) void {
         return;
     }
 
-    while (impl.waiting_operations.items.len != 0) {
-        const operation = impl.waiting_operations.items[impl.waiting_operations.items.len - 1];
-        std.debug.assert(removeWaitingOperation(impl, operation));
+    while (popWaitingOperation(impl)) |operation| {
         if (operation.deadline_ns) |deadline| {
             const now = nowNs();
             if (deadline <= now) {
@@ -2601,7 +2621,7 @@ fn expireDeadlines(impl: *Impl, now: u64) !void {
             },
             .operation => |operation| {
                 if (operation.deadline_ns != entry.expires_at_ns or operation.deadline_expired) continue;
-                if (operation.waiting_index != null) {
+                if (operation.waiting_queued) {
                     std.debug.assert(removeWaitingOperation(impl, operation));
                     operation.deadline_expired = true;
                     operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
@@ -2785,9 +2805,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     }
     pending.deinit(impl.allocator);
 
-    while (impl.waiting_operations.items.len != 0) {
-        const operation = impl.waiting_operations.items[impl.waiting_operations.items.len - 1];
-        std.debug.assert(removeWaitingOperation(impl, operation));
+    while (popWaitingOperation(impl)) |operation| {
         removeOperationDeadline(impl, operation);
         operation.setOutcome(.unavailable, reason) catch {};
         operation.complete();
@@ -3711,25 +3729,70 @@ test "client deadline heap removes root middle and last" {
     }
 }
 
+test "waiting operation queue preserves FIFO and middle unlink" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    const first = try Operation.init(&impl, "/test.Waiting/First", "", .{});
+    defer first.deinit();
+    const middle = try Operation.init(&impl, "/test.Waiting/Middle", "", .{});
+    defer middle.deinit();
+    const last = try Operation.init(&impl, "/test.Waiting/Last", "", .{});
+    defer last.deinit();
+
+    appendWaitingOperation(&impl, first);
+    appendWaitingOperation(&impl, middle);
+    appendWaitingOperation(&impl, last);
+    try std.testing.expect(impl.waiting_operation_head == first);
+    try std.testing.expect(impl.waiting_operation_tail == last);
+    try std.testing.expect(first.waiting_prev == null);
+    try std.testing.expect(first.waiting_next == middle);
+    try std.testing.expect(middle.waiting_prev == first);
+    try std.testing.expect(middle.waiting_next == last);
+    try std.testing.expect(last.waiting_prev == middle);
+    try std.testing.expect(last.waiting_next == null);
+
+    try std.testing.expect(removeWaitingOperation(&impl, middle));
+    try std.testing.expect(!middle.waiting_queued);
+    try std.testing.expect(middle.waiting_prev == null);
+    try std.testing.expect(middle.waiting_next == null);
+    try std.testing.expect(first.waiting_next == last);
+    try std.testing.expect(last.waiting_prev == first);
+    try std.testing.expect(impl.waiting_operation_head == first);
+    try std.testing.expect(impl.waiting_operation_tail == last);
+
+    try std.testing.expect(popWaitingOperation(&impl) == first);
+    try std.testing.expect(impl.waiting_operation_head == last);
+    try std.testing.expect(impl.waiting_operation_tail == last);
+    try std.testing.expect(last.waiting_prev == null);
+    try std.testing.expect(popWaitingOperation(&impl) == last);
+    try std.testing.expect(popWaitingOperation(&impl) == null);
+    try std.testing.expect(impl.waiting_operation_head == null);
+    try std.testing.expect(impl.waiting_operation_tail == null);
+}
+
 test "waiting unary deadline removes ownership before completion" {
     var host = [_:0]u8{'x'};
     var serialized_allocator: SerializedAllocator = undefined;
     var impl: Impl = undefined;
     initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
-    defer impl.waiting_operations.deinit(impl.allocator);
     defer impl.deadline_heap.deinit(impl.allocator);
     const operation = try Operation.init(&impl, "/test.Deadline/Waiting", "", .{});
     operation.deadline_ns = 100;
-    try appendWaitingOperation(&impl, operation);
+    appendWaitingOperation(&impl, operation);
     try deadlineHeapInsertOrUpdate(&impl, .{ .operation = operation }, operation.deadline_ns.?);
 
     try expireDeadlines(&impl, 100);
     try std.testing.expect(operation.done);
     try std.testing.expect(operation.deadline_expired);
     try std.testing.expectEqual(status.Code.deadline_exceeded, operation.response_code);
-    try std.testing.expectEqual(@as(?usize, null), operation.waiting_index);
+    try std.testing.expect(!operation.waiting_queued);
+    try std.testing.expect(operation.waiting_prev == null);
+    try std.testing.expect(operation.waiting_next == null);
     try std.testing.expectEqual(@as(?usize, null), operation.deadline_heap_index);
-    try std.testing.expectEqual(@as(usize, 0), impl.waiting_operations.items.len);
+    try std.testing.expect(impl.waiting_operation_head == null);
+    try std.testing.expect(impl.waiting_operation_tail == null);
     try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
     operation.deinit();
 }
@@ -3840,11 +3903,10 @@ test "deadline expiration pops only an expired root among many waiting calls" {
     var serialized_allocator: SerializedAllocator = undefined;
     var impl: Impl = undefined;
     initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
-    defer impl.waiting_operations.deinit(impl.allocator);
     defer impl.deadline_heap.deinit(impl.allocator);
     const expired = try Operation.init(&impl, "/test.Deadline/Expired", "", .{});
     expired.deadline_ns = 10;
-    try appendWaitingOperation(&impl, expired);
+    appendWaitingOperation(&impl, expired);
     try deadlineHeapInsertOrUpdate(&impl, .{ .operation = expired }, expired.deadline_ns.?);
     var future: [256]*Operation = undefined;
     var initialized: usize = 0;
@@ -3853,22 +3915,21 @@ test "deadline expiration pops only an expired root among many waiting calls" {
         operation.* = try Operation.init(&impl, "/test.Deadline/Future", "", .{});
         initialized += 1;
         operation.*.deadline_ns = 1000;
-        try appendWaitingOperation(&impl, operation.*);
+        appendWaitingOperation(&impl, operation.*);
         try deadlineHeapInsertOrUpdate(&impl, .{ .operation = operation.* }, operation.*.deadline_ns.?);
     }
 
     try expireDeadlines(&impl, 10);
     try std.testing.expect(expired.done);
     try std.testing.expectEqual(future.len, impl.deadline_heap.items.len);
-    try std.testing.expectEqual(future.len, impl.waiting_operations.items.len);
     for (&future) |operation| {
         try std.testing.expect(operation.deadline_heap_index != null);
-        try std.testing.expect(operation.waiting_index != null);
+        try std.testing.expect(operation.waiting_queued);
     }
+    try std.testing.expect(impl.waiting_operation_head == future[0]);
+    try std.testing.expect(impl.waiting_operation_tail == future[future.len - 1]);
     expired.deinit();
-    while (impl.waiting_operations.items.len != 0) {
-        const operation = impl.waiting_operations.items[impl.waiting_operations.items.len - 1];
-        std.debug.assert(removeWaitingOperation(&impl, operation));
+    while (popWaitingOperation(&impl)) |operation| {
         removeOperationDeadline(&impl, operation);
     }
     try expectDeadlineHeapConsistent(&impl);
