@@ -530,7 +530,7 @@ fn addNativeDependencies(
     return .{
         .nghttp2_archive = build_nghttp2.path(b, "lib/libnghttp2.a"),
         .nghttp2_include = build_nghttp2.path(b, "lib/includes"),
-        .cares_archive = build_cares.path(b, "lib64/libcares.a"),
+        .cares_archive = build_cares.path(b, "lib/libcares.a"),
         .cares_include = build_cares.path(b, "include"),
         .mbedtls_archive = if (build_mbedtls) |output| output.path(b, "libmbedtls_combined.a") else null,
         .gperftools_archive = if (build_gperftools) |output| output.path(b, "libtcmalloc_and_profiler.a") else null,

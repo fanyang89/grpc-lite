@@ -60,6 +60,7 @@ case "$library" in
         ;;
     cares)
         CC="$cc" CXX="$cxx" cmake "${common_options[@]}" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
             -DCARES_STATIC=ON \
             -DCARES_SHARED=OFF \
             -DCARES_INSTALL=OFF \
