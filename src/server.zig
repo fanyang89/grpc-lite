@@ -270,7 +270,8 @@ const Impl = struct {
     stream_async: xev.Async = undefined,
     stream_async_initialized: bool = false,
     stream_async_completion: xev.Completion = .{},
-    write_wake_queued: bool = false,
+    dirty_connection_head: ?*Connection = null,
+    dirty_connection_tail: ?*Connection = null,
     drain_timer: xev.Timer = undefined,
     drain_timer_initialized: bool = false,
     drain_timer_completion: xev.Completion = .{},
@@ -320,6 +321,49 @@ const Impl = struct {
 
     fn notifyShutdown(self: *Impl) void {
         if (self.shutdown_async_initialized) self.shutdown_async.notify() catch {};
+    }
+
+    fn enqueueDirtyConnection(self: *Impl, connection: *Connection) bool {
+        if (connection.dirty_queued) return false;
+        const was_empty = self.dirty_connection_head == null;
+        connection.dirty_queued = true;
+        connection.dirty_next = null;
+        if (self.dirty_connection_tail) |tail|
+            tail.dirty_next = connection
+        else
+            self.dirty_connection_head = connection;
+        self.dirty_connection_tail = connection;
+        return was_empty;
+    }
+
+    fn popDirtyConnection(self: *Impl) ?*Connection {
+        const connection = self.dirty_connection_head orelse return null;
+        self.dirty_connection_head = connection.dirty_next;
+        if (self.dirty_connection_head == null) self.dirty_connection_tail = null;
+        connection.dirty_next = null;
+        connection.dirty_queued = false;
+        return connection;
+    }
+
+    fn removeDirtyConnection(self: *Impl, connection: *Connection) void {
+        if (!connection.dirty_queued) return;
+        var previous: ?*Connection = null;
+        var current = self.dirty_connection_head;
+        while (current) |item| {
+            if (item == connection) {
+                if (previous) |before|
+                    before.dirty_next = item.dirty_next
+                else
+                    self.dirty_connection_head = item.dirty_next;
+                if (self.dirty_connection_tail == item) self.dirty_connection_tail = previous;
+                item.dirty_next = null;
+                item.dirty_queued = false;
+                return;
+            }
+            previous = item;
+            current = item.dirty_next;
+        }
+        unreachable;
     }
 };
 
@@ -600,6 +644,8 @@ const Connection = struct {
     tls_handshake_needs_write: bool = false,
     tls_plaintext: ?[]u8 = null,
     tls_plaintext_offset: usize = 0,
+    dirty_next: ?*Connection = null,
+    dirty_queued: bool = false,
 
     fn initializeSession(self: *Connection) !void {
         var callbacks: ?*c.nghttp2_session_callbacks = null;
@@ -843,6 +889,7 @@ const Connection = struct {
     }
 
     fn closeOnLoop(self: *Connection, loop: *xev.Loop) void {
+        self.server.removeDirtyConnection(self);
         if (self.closing) return;
         self.closing = true;
         var stream_iterator = self.streams.valueIterator();
@@ -896,6 +943,7 @@ const Connection = struct {
     fn finishCloseIfReady(self: *Connection) void {
         if (!self.close_completed or self.read_active or self.pending_writes != 0 or self.read_cancel_submitted or self.write_cancel_submitted) return;
         const server = self.server;
+        server.removeDirtyConnection(self);
         var cancel_iterator = self.streams.valueIterator();
         while (cancel_iterator.next()) |stream_ptr| {
             const stream = stream_ptr.*;
@@ -1141,10 +1189,9 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
     if (connection.tls_handshake_needs_write or connection.queued_write_bytes < connection.server.write_low_watermark_bytes) {
         // WriteQueue adds its next completion after this callback returns.
         // Wake the async callback so queueWrite cannot reenter that ordering.
-        if (!connection.server.write_wake_queued) {
-            connection.server.write_wake_queued = true;
+        if (connection.server.enqueueDirtyConnection(connection)) {
             connection.server.stream_async.notify() catch {
-                connection.server.write_wake_queued = false;
+                connection.server.removeDirtyConnection(connection);
                 connection.closeOnLoop(loop);
                 connection.finishCloseIfReady();
                 return .disarm;
@@ -1195,7 +1242,6 @@ fn onShutdown(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.Async.Wai
 
 fn onStreamAsync(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
     const impl = server orelse return .disarm;
-    impl.write_wake_queued = false;
     result catch {
         stopImmediately(impl);
         return .disarm;
@@ -1212,11 +1258,13 @@ fn processStreamCommands(server: *Impl) void {
     defer commands.deinit(server.allocator);
 
     for (commands.items) |command| {
+        const connection = command.target.connection;
         processStreamCommand(server, command);
+        _ = server.enqueueDirtyConnection(connection);
         releaseStreamCommand(command.target);
     }
 
-    for (server.connections.items) |connection| {
+    while (server.popDirtyConnection()) |connection| {
         if (connection.closing or connection.session == null) continue;
         if (connection.tls_handshaking) {
             if (connection.tls_handshake_needs_write) {
@@ -2585,6 +2633,51 @@ fn exchangeRawHttp2(server: *Server, input: []const u8) ![]u8 {
         if (length == 0) break;
     }
     return output.toOwnedSlice(std.testing.allocator);
+}
+
+test "dirty connection queue deduplicates and preserves FIFO" {
+    var server: Impl = undefined;
+    server.dirty_connection_head = null;
+    server.dirty_connection_tail = null;
+    var first = Connection{ .server = &server };
+    var second = Connection{ .server = &server };
+
+    try std.testing.expect(server.enqueueDirtyConnection(&first));
+    try std.testing.expect(!server.enqueueDirtyConnection(&first));
+    try std.testing.expect(!server.enqueueDirtyConnection(&second));
+    try std.testing.expect(server.popDirtyConnection() == &first);
+    try std.testing.expect(server.popDirtyConnection() == &second);
+    try std.testing.expect(server.popDirtyConnection() == null);
+
+    try std.testing.expect(server.enqueueDirtyConnection(&first));
+    try std.testing.expect(server.popDirtyConnection() == &first);
+    try std.testing.expect(!first.dirty_queued);
+}
+
+test "dirty connection queue safely removes closing connections" {
+    var server: Impl = undefined;
+    server.dirty_connection_head = null;
+    server.dirty_connection_tail = null;
+    var first = Connection{ .server = &server };
+    var closing = Connection{ .server = &server, .closing = true };
+    var last = Connection{ .server = &server };
+
+    _ = server.enqueueDirtyConnection(&first);
+    _ = server.enqueueDirtyConnection(&closing);
+    _ = server.enqueueDirtyConnection(&last);
+    server.removeDirtyConnection(&closing);
+    try std.testing.expect(!closing.dirty_queued);
+    try std.testing.expect(closing.dirty_next == null);
+    try std.testing.expect(server.popDirtyConnection() == &first);
+    try std.testing.expect(server.popDirtyConnection() == &last);
+
+    _ = server.enqueueDirtyConnection(&first);
+    _ = server.enqueueDirtyConnection(&closing);
+    _ = server.enqueueDirtyConnection(&last);
+    server.removeDirtyConnection(&first);
+    server.removeDirtyConnection(&last);
+    try std.testing.expect(server.popDirtyConnection() == &closing);
+    try std.testing.expect(server.popDirtyConnection() == null);
 }
 
 test "server streaming outbound queue preserves order and reuses drained storage" {
