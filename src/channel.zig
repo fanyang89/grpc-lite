@@ -239,10 +239,14 @@ pub const Channel = struct {
         try self.impl.stream_states.put(self.impl.allocator, client_stream, {});
         errdefer _ = self.impl.stream_states.remove(client_stream);
         appendStreamWake(self.impl, client_stream);
-        self.impl.async_handle.notify() catch {
-            removeStreamWake(self.impl, client_stream);
-            return error.ChannelUnavailable;
-        };
+        if (!self.impl.stream_wake_notify_pending) {
+            self.impl.stream_wake_notify_pending = true;
+            self.impl.async_handle.notify() catch {
+                self.impl.stream_wake_notify_pending = false;
+                removeStreamWake(self.impl, client_stream);
+                return error.ChannelUnavailable;
+            };
+        }
         return client_stream.handle();
     }
 
@@ -331,6 +335,7 @@ const Impl = struct {
     streams: std.AutoHashMapUnmanaged(i32, *ClientStreamState) = .empty,
     stream_wake_head: ?*ClientStreamState = null,
     stream_wake_tail: ?*ClientStreamState = null,
+    stream_wake_notify_pending: bool = false,
     accepting_streams: bool = false,
     loop: xev.Loop = undefined,
     tcp: xev.TCP = undefined,
@@ -342,6 +347,7 @@ const Impl = struct {
     close_completion: xev.Completion = .{},
     async_handle: xev.Async = undefined,
     async_completion: xev.Completion = .{},
+    write_wake_queued: bool = false,
     deadline_timer: xev.Timer = undefined,
     deadline_completion: xev.Completion = .{},
     deadline_reset_completion: xev.Completion = .{},
@@ -588,11 +594,16 @@ fn wakeClientStreamLocked(client_stream: *ClientStreamState) void {
     const impl = client_stream.impl orelse return;
     if (!client_stream.loop_owned) return;
     impl.mutex.lockUncancelable(syncIo());
+    defer impl.mutex.unlock(syncIo());
     if (impl.stream_states.contains(client_stream) and !client_stream.wake_queued) {
         appendStreamWake(impl, client_stream);
     }
-    impl.mutex.unlock(syncIo());
-    impl.async_handle.notify() catch {};
+    if (impl.stream_wake_head != null and !impl.stream_wake_notify_pending) {
+        impl.stream_wake_notify_pending = true;
+        impl.async_handle.notify() catch {
+            impl.stream_wake_notify_pending = false;
+        };
+    }
 }
 
 fn clientStreamSend(context: *anyopaque, payload: []const u8, options: stream.SendOptions) !void {
@@ -996,12 +1007,14 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
 
 fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
     const impl = impl_.?;
+    impl.write_wake_queued = false;
     result catch {
         beginStop(impl, "channel wakeup failed");
         return .disarm;
     };
     observeTestIo(impl);
     impl.mutex.lockUncancelable(syncIo());
+    impl.stream_wake_notify_pending = false;
     const stopping = impl.state != .running;
     impl.mutex.unlock(syncIo());
     if (stopping) {
@@ -1652,7 +1665,13 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
     {
         // WriteQueue schedules its next head after this callback returns.
         // Wake the async callback so queueWrite cannot reenter that ordering.
-        impl.async_handle.notify() catch beginStop(impl, "connection write failed");
+        if (!impl.write_wake_queued) {
+            impl.write_wake_queued = true;
+            impl.async_handle.notify() catch {
+                impl.write_wake_queued = false;
+                beginStop(impl, "connection write failed");
+            };
+        }
     }
     if (impl.stopping_on_loop) discardQueuedWrites(impl);
     submitCloseIfReady(impl, loop);

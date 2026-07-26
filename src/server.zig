@@ -239,6 +239,7 @@ const Impl = struct {
     stream_async: xev.Async = undefined,
     stream_async_initialized: bool = false,
     stream_async_completion: xev.Completion = .{},
+    write_wake_queued: bool = false,
     drain_timer: xev.Timer = undefined,
     drain_timer_initialized: bool = false,
     drain_timer_completion: xev.Completion = .{},
@@ -442,6 +443,7 @@ fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.Send
     target.outbound_reserved_bytes += encoded.len;
     errdefer target.outbound_reserved_bytes -= encoded.len;
     if (options.compression == .gzip) target.response_gzip_requested = true;
+    const notify = server.stream_commands.items.len == 0;
     try server.stream_commands.append(server.allocator, .{
         .target = target,
         .action = .{ .send = encoded },
@@ -451,7 +453,7 @@ fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.Send
         _ = server.stream_commands.pop();
         target.command_refs -= 1;
     }
-    try server.stream_async.notify();
+    if (notify) try server.stream_async.notify();
 }
 
 fn streamFinish(context: *anyopaque, final_status: status.Status) !void {
@@ -468,6 +470,7 @@ fn streamFinish(context: *anyopaque, final_status: status.Status) !void {
     if (!target.streaming_active or target.finish_queued) return error.StreamFinished;
     target.finish_queued = true;
     errdefer target.finish_queued = false;
+    const notify = server.stream_commands.items.len == 0;
     try server.stream_commands.append(server.allocator, .{
         .target = target,
         .action = .{ .finish = .{
@@ -480,7 +483,7 @@ fn streamFinish(context: *anyopaque, final_status: status.Status) !void {
         _ = server.stream_commands.pop();
         target.command_refs -= 1;
     }
-    try server.stream_async.notify();
+    if (notify) try server.stream_async.notify();
 }
 
 fn streamResumeReceive(context: *anyopaque) !void {
@@ -492,6 +495,7 @@ fn streamResumeReceive(context: *anyopaque) !void {
     if (!target.receive_paused or target.resume_queued) return error.ReceiveNotPaused;
     target.resume_queued = true;
     errdefer target.resume_queued = false;
+    const notify = server.stream_commands.items.len == 0;
     try server.stream_commands.append(server.allocator, .{
         .target = target,
         .action = .resume_receive,
@@ -501,7 +505,7 @@ fn streamResumeReceive(context: *anyopaque) !void {
         _ = server.stream_commands.pop();
         target.command_refs -= 1;
     }
-    try server.stream_async.notify();
+    if (notify) try server.stream_async.notify();
 }
 
 const Connection = struct {
@@ -867,11 +871,15 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
     if (connection.queued_write_bytes < connection.server.write_low_watermark_bytes) {
         // WriteQueue adds its next completion after this callback returns.
         // Wake the async callback so queueWrite cannot reenter that ordering.
-        connection.server.stream_async.notify() catch {
-            connection.closeOnLoop(loop);
-            connection.finishCloseIfReady();
-            return .disarm;
-        };
+        if (!connection.server.write_wake_queued) {
+            connection.server.write_wake_queued = true;
+            connection.server.stream_async.notify() catch {
+                connection.server.write_wake_queued = false;
+                connection.closeOnLoop(loop);
+                connection.finishCloseIfReady();
+                return .disarm;
+            };
+        }
         return .disarm;
     }
     if (connection.close_after_writes and connection.pending_writes == 0) {
@@ -922,6 +930,7 @@ fn onShutdown(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.Async.Wai
 
 fn onStreamAsync(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
     const impl = server orelse return .disarm;
+    impl.write_wake_queued = false;
     result catch {
         stopImmediately(impl);
         return .disarm;
