@@ -354,13 +354,42 @@ const StreamingState = struct {
     decoder: frame.Decoder,
     context: service.ServerContext,
     outbound: std.ArrayList(OutboundMessage) = .empty,
+    outbound_head: usize = 0,
     remote_end_received: bool = false,
     remote_end_called: bool = false,
+
+    fn nextOutbound(self: *StreamingState) ?*OutboundMessage {
+        std.debug.assert(self.outbound_head <= self.outbound.items.len);
+        if (self.outbound_head == self.outbound.items.len) return null;
+        return &self.outbound.items[self.outbound_head];
+    }
+
+    fn finishOutbound(self: *StreamingState, allocator: std.mem.Allocator) void {
+        const item = self.nextOutbound().?;
+        allocator.free(item.bytes);
+        self.outbound_head += 1;
+        if (self.outbound_head == self.outbound.items.len) {
+            self.outbound.clearRetainingCapacity();
+            self.outbound_head = 0;
+        }
+    }
+
+    fn clearOutbound(self: *StreamingState, allocator: std.mem.Allocator) usize {
+        std.debug.assert(self.outbound_head <= self.outbound.items.len);
+        var reserved_bytes: usize = 0;
+        for (self.outbound.items[self.outbound_head..]) |item| {
+            reserved_bytes += item.bytes.len - item.offset;
+            allocator.free(item.bytes);
+        }
+        self.outbound.clearRetainingCapacity();
+        self.outbound_head = 0;
+        return reserved_bytes;
+    }
 
     fn deinit(self: *StreamingState, allocator: std.mem.Allocator) void {
         self.decoder.deinit();
         self.context.deinit();
-        for (self.outbound.items) |item| allocator.free(item.bytes);
+        _ = self.clearOutbound(allocator);
         self.outbound.deinit(allocator);
         self.* = undefined;
     }
@@ -1394,11 +1423,8 @@ fn cancelStreaming(target: *Stream) void {
     target.resume_queued = false;
     server.unlock();
     discardStreamCommands(target);
-    for (streaming.outbound.items) |item| {
-        releaseOutboundReservation(target, item.bytes.len - item.offset, false);
-        target.allocator.free(item.bytes);
-    }
-    streaming.outbound.clearRetainingCapacity();
+    const reserved_bytes = streaming.clearOutbound(target.allocator);
+    releaseOutboundReservation(target, reserved_bytes, false);
     if (streaming.handler.on_cancel) |callback| {
         callback(streaming.handler.context, target.serverHandle(), &streaming.context);
     }
@@ -2035,18 +2061,16 @@ fn readStreamingResponseData(
 ) callconv(.c) c.nghttp2_ssize {
     const stream: *Stream = @ptrCast(@alignCast(source.?.*.ptr.?));
     const streaming = &(stream.streaming orelse return c.NGHTTP2_ERR_CALLBACK_FAILURE);
-    if (streaming.outbound.items.len != 0) {
-        const item = &streaming.outbound.items[0];
+    if (streaming.nextOutbound()) |item| {
         const remaining = item.bytes[item.offset..];
         const length = @min(remaining.len, output_length);
         @memcpy(output[0..length], remaining[0..length]);
         item.offset += length;
         releaseOutboundReservation(stream, length, true);
         if (item.offset == item.bytes.len) {
-            stream.allocator.free(item.bytes);
-            _ = streaming.outbound.orderedRemove(0);
+            streaming.finishOutbound(stream.allocator);
         }
-        if (streaming.outbound.items.len == 0 and stream.response_finished) {
+        if (streaming.nextOutbound() == null and stream.response_finished) {
             data_flags.?.* |= c.NGHTTP2_DATA_FLAG_EOF | c.NGHTTP2_DATA_FLAG_NO_END_STREAM;
             if (!stream.trailer_submitted) {
                 stream.trailer_submitted = true;
@@ -2561,6 +2585,65 @@ fn exchangeRawHttp2(server: *Server, input: []const u8) ![]u8 {
         if (length == 0) break;
     }
     return output.toOwnedSlice(std.testing.allocator);
+}
+
+test "server streaming outbound queue preserves order and reuses drained storage" {
+    var streaming: StreamingState = undefined;
+    streaming.outbound = .empty;
+    streaming.outbound_head = 0;
+    defer {
+        _ = streaming.clearOutbound(std.testing.allocator);
+        streaming.outbound.deinit(std.testing.allocator);
+    }
+
+    try streaming.outbound.append(std.testing.allocator, .{
+        .bytes = try std.testing.allocator.dupe(u8, "first"),
+    });
+    try streaming.outbound.append(std.testing.allocator, .{
+        .bytes = try std.testing.allocator.dupe(u8, "second"),
+    });
+    const capacity = streaming.outbound.capacity;
+
+    try std.testing.expectEqualStrings("first", streaming.nextOutbound().?.bytes);
+    streaming.finishOutbound(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), streaming.outbound_head);
+    try std.testing.expectEqualStrings("second", streaming.nextOutbound().?.bytes);
+
+    streaming.finishOutbound(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), streaming.outbound_head);
+    try std.testing.expectEqual(@as(usize, 0), streaming.outbound.items.len);
+    try std.testing.expectEqual(capacity, streaming.outbound.capacity);
+
+    try streaming.outbound.append(std.testing.allocator, .{
+        .bytes = try std.testing.allocator.dupe(u8, "reused"),
+    });
+    try std.testing.expectEqualStrings("reused", streaming.nextOutbound().?.bytes);
+}
+
+test "server streaming outbound cancellation frees only pending messages" {
+    var streaming: StreamingState = undefined;
+    streaming.outbound = .empty;
+    streaming.outbound_head = 0;
+    defer streaming.outbound.deinit(std.testing.allocator);
+
+    try streaming.outbound.append(std.testing.allocator, .{
+        .bytes = try std.testing.allocator.dupe(u8, "consumed"),
+    });
+    try streaming.outbound.append(std.testing.allocator, .{
+        .bytes = try std.testing.allocator.dupe(u8, "partially sent"),
+        .offset = 4,
+    });
+    try streaming.outbound.append(std.testing.allocator, .{
+        .bytes = try std.testing.allocator.dupe(u8, "pending"),
+    });
+
+    streaming.finishOutbound(std.testing.allocator);
+    const capacity = streaming.outbound.capacity;
+    try std.testing.expectEqual(@as(usize, 1), streaming.outbound_head);
+    try std.testing.expectEqual(@as(usize, 10 + 7), streaming.clearOutbound(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), streaming.outbound_head);
+    try std.testing.expectEqual(@as(usize, 0), streaming.outbound.items.len);
+    try std.testing.expectEqual(capacity, streaming.outbound.capacity);
 }
 
 test "malformed HTTP/2 settings close the connection promptly" {
