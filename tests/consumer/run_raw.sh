@@ -50,9 +50,11 @@ prefetch_zigfetch_url_package() {
     local url=$1
     local expected_hash=$2
     local archive_name=$3
+    local output
     local actual_hash
 
-    actual_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zigfetch "$url")
+    output=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zigfetch "$url" 2>&1)
+    actual_hash=${output##*$'\n'}
     if [[ "$actual_hash" != "$expected_hash" ]]; then
         printf 'package hash mismatch for %s: expected %s, got %s\n' \
             "$archive_name" "$expected_hash" "$actual_hash" >&2
@@ -74,10 +76,6 @@ prefetch_package \
     'https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz' \
     'N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp' \
     'cares.tar.gz'
-prefetch_zigfetch_url_package \
-    'https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/mbedtls-3.6.6' \
-    'N-V-__8AAI1FmQLj92go7nR7_J6kwr-7uYyuitngGqydvWkd' \
-    'mbedtls.tar.gz'
 prefetch_url_package \
     'https://codeload.github.com/fanyang89/gperftools/tar.gz/1a01cd2cf8f7000845d343fa8e0bbac70378858b' \
     'N-V-__8AAGKVkABvsDVHhSU8seHKvtJ8Q23b9Y0OMiFVWt-y' \
@@ -116,6 +114,10 @@ if [[ -e "$mbedtls_path" || -L "$mbedtls_path" ]]; then
     printf '%s\n' 'raw consumer unexpectedly resolved optional mbedTLS' >&2
     exit 1
 fi
+prefetch_zigfetch_url_package \
+    'https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/mbedtls-3.6.6' \
+    'N-V-__8AAI1FmQLj92go7nR7_J6kwr-7uYyuitngGqydvWkd' \
+    'mbedtls.tar.gz'
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
     -Dtls=true --summary all
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
