@@ -7,6 +7,7 @@ const xev = @import("xev");
 const call = @import("call.zig");
 const Compression = @import("compression.zig").Compression;
 const deadline_wire = @import("deadline.zig");
+const fast_clock = @import("fast_clock.zig");
 const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
@@ -1652,17 +1653,21 @@ fn processPending(impl: *Impl) void {
         return;
     }
 
+    var now: ?u64 = null;
     while (popWaitingOperation(impl)) |operation| {
         if (operation.deadline_ns) |deadline| {
-            const now = nowNs();
-            if (deadline <= now) {
+            const current = cachedNow(&now);
+            if (deadline <= current) {
                 removeOperationDeadline(impl, operation);
                 operation.deadline_expired = true;
                 operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
                 operation.finish();
                 continue;
             }
-            operation.timeout_header_len = deadline_wire.formatTimeout(&operation.timeout_header, deadline - now).len;
+            operation.timeout_header_len = deadline_wire.formatTimeout(
+                &operation.timeout_header,
+                deadline - current,
+            ).len;
         }
         submitOperation(impl, operation) catch {
             removeOperationDeadline(impl, operation);
@@ -1690,6 +1695,7 @@ fn popStreamWake(impl: *Impl) ?*ClientStreamState {
 }
 
 fn processStreamWakes(impl: *Impl) void {
+    var now: ?u64 = null;
     while (popStreamWake(impl)) |client_stream| {
         if (client_stream.stream_id < 0) {
             if (client_stream.deadline_ns) |deadline| {
@@ -1708,8 +1714,8 @@ fn processStreamWakes(impl: *Impl) void {
                 continue;
             }
             if (client_stream.deadline_ns) |deadline| {
-                const now = nowNs();
-                if (deadline <= now) {
+                const current = cachedNow(&now);
+                if (deadline <= current) {
                     client_stream.deadline_expired = true;
                     terminalizeStream(client_stream, .init(.deadline_exceeded, "deadline exceeded"));
                     releaseStreamLoopOwnership(client_stream);
@@ -1717,7 +1723,7 @@ fn processStreamWakes(impl: *Impl) void {
                 }
                 client_stream.timeout_header_len = deadline_wire.formatTimeout(
                     &client_stream.timeout_header,
-                    deadline - now,
+                    deadline - current,
                 ).len;
             }
             if (impl.connection_state != .active) {
@@ -2692,10 +2698,12 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_d
 
 fn scheduleDeadlineTimer(impl: *Impl) void {
     if (impl.stopping_on_loop) return;
+    var now: ?u64 = null;
     while (deadlineHeapPeek(impl)) |entry| {
         const earliest = entry.expires_at_ns;
-        const delay_ms = deadlineDelayMs(earliest, nowNs()) orelse {
-            expireDeadlines(impl, nowNs()) catch |err| {
+        const current = cachedNow(&now);
+        const delay_ms = deadlineDelayMs(earliest, current) orelse {
+            expireDeadlines(impl, current) catch |err| {
                 beginStop(impl, if (err == error.DeadlineCancellationFailed)
                     "deadline cancellation failed"
                 else
@@ -2761,7 +2769,7 @@ fn onDeadlineTimer(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.
             return .disarm;
         },
     };
-    expireDeadlines(impl, nowNs()) catch |err| {
+    expireDeadlines(impl, fast_clock.validatedNow(syncIo())) catch |err| {
         beginStop(impl, if (err == error.DeadlineCancellationFailed)
             "deadline cancellation failed"
         else
@@ -3102,7 +3110,14 @@ fn syncIo() std.Io {
 }
 
 fn nowNs() u64 {
-    return @intCast(std.Io.Clock.awake.now(syncIo()).nanoseconds);
+    return fast_clock.now(syncIo());
+}
+
+fn cachedNow(cached: *?u64) u64 {
+    if (cached.*) |value| return value;
+    const value = nowNs();
+    cached.* = value;
+    return value;
 }
 
 fn waitForTestFlag(flag: *const std.atomic.Value(bool), timeout_ns: u64) bool {

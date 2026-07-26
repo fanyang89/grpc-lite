@@ -6,6 +6,7 @@ const build_options = @import("grpc_lite_options");
 const c = @import("c.zig");
 const cares_adapter = @import("cares_adapter.zig");
 const deadline = @import("deadline.zig");
+const fast_clock = @import("fast_clock.zig");
 const version_info = @import("version.zig");
 const runtime = @import("runtime.zig");
 pub const message = @import("message.zig");
@@ -54,6 +55,13 @@ pub const Runtime = runtime.Runtime;
 
 pub const version = version_info.string;
 
+pub const internal = struct {
+    pub const fastNowNs = fast_clock.now;
+    pub const fastClockImplementation = fast_clock.implementation;
+    pub const fastClockFallbackReason = fast_clock.fallbackReason;
+    pub const fastClockUsesCpuCycles = fast_clock.usesCpuCycles;
+};
+
 test "version is available" {
     _ = try std.SemanticVersion.parse(version);
 }
@@ -66,6 +74,7 @@ test {
     _ = compression;
     _ = deadline;
     _ = frame;
+    _ = fast_clock;
     _ = log;
     _ = metadata;
     _ = runtime;

@@ -424,7 +424,9 @@ Eligible exchanges that finish during the bounded drain are included in complete
 counts and full latency; warmup exchanges that finish during measurement are excluded.
 Throughput still uses the configured measurement duration as its denominator. JSON
 `min_us` and `max_us` cover every eligible latency, while percentiles and mean may use
-the documented deterministic reservoir sample.
+the documented deterministic reservoir sample. `clock_source`, `clock_uses_cpucycles`,
+and `clock_fallback_reason` report whether the selected cycle counter passed monotonic
+stability checks or fell back to `CLOCK_MONOTONIC`.
 
 Unary operations are complete RPCs, while bidi operations are messages on persistent
 streams, so compare results only within the same scenario. `repeated` fills payloads with
@@ -437,6 +439,7 @@ comparison methodology.
 
 - Zig 0.16.0
 - nghttp2 1.69.0
+- libcpucycles 20260625
 - libxev b0650f0
 - zig-protobuf 5.0.0
 - gperftools 2.18.1-based fork (optional)

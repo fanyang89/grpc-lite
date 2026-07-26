@@ -16,6 +16,10 @@
             .url = "https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz",
             .hash = "N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp",
         },
+        .cpucycles = .{
+            .url = "https://cpucycles.cr.yp.to/libcpucycles-20260625.tar.gz",
+            .hash = "N-V-__8AAHSUBAA_Vn8NXM2L9F21QFvrTIxbH9yvxs5cO-lY",
+        },
         .nanozlog = .{
             .url = "https://github.com/wyzdwdz/nanozlog/archive/e693c11976d55ba0a5b8deeaaaf9f1c5cc30eba9.tar.gz",
             .hash = "nanozlog-0.1.0-5UtdH535AADW7HUBpfLboKJkdB1IVYaqz7YFQ2dHIcqL",

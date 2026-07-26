@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
     });
     const nghttp2_dependency = b.dependency("nghttp2", .{});
     const cares_dependency = b.dependency("cares", .{});
+    const cpucycles_dependency = b.dependency("cpucycles", .{});
     const nanozlog_dependency = b.dependency("nanozlog", .{
         .target = target,
         .optimize = optimize,
@@ -118,6 +119,7 @@ pub fn build(b: *std.Build) void {
     grpc_lite.addIncludePath(cares_dependency.path("include"));
     grpc_lite.addIncludePath(native.cares_include);
     grpc_lite.addObjectFile(native.cares_archive);
+    addCpuCycles(b, grpc_lite, cpucycles_dependency, target);
     if (mbedtls_dependency) |dependency| {
         grpc_lite.addIncludePath(dependency.path("include"));
         grpc_lite.addIncludePath(b.path("tools"));
@@ -598,4 +600,92 @@ fn addNativeBuild(
         if (sanitizers.c == .full) "true" else "false",
     });
     return output;
+}
+
+fn addCpuCycles(
+    b: *std.Build,
+    module: *std.Build.Module,
+    dependency: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+) void {
+    const options: []const []const u8 = switch (target.result.cpu.arch) {
+        .x86_64 => &.{
+            "amd64-tsc",
+            "amd64-tscasm",
+            "default-monotonic",
+            "default-gettimeofday",
+            "default-zero",
+        },
+        .x86 => &.{
+            "x86-tsc",
+            "x86-tscasm",
+            "default-monotonic",
+            "default-gettimeofday",
+            "default-zero",
+        },
+        .aarch64 => &.{
+            "arm64-vct",
+            "default-monotonic",
+            "default-gettimeofday",
+            "default-zero",
+        },
+        else => &.{
+            "default-monotonic",
+            "default-gettimeofday",
+            "default-zero",
+        },
+    };
+
+    var declarations: []const u8 = "";
+    var entries: []const u8 = "";
+    for (options) |option| {
+        const symbol = b.dupe(option);
+        std.mem.replaceScalar(u8, symbol, '-', '_');
+        declarations = b.fmt(
+            \\{s}extern long long cpucycles_ticks_{s}_setup(void);
+            \\extern long long cpucycles_ticks_{s}(void);
+            \\extern void cpucycles_ticks_{s}_close(void);
+            \\
+        , .{ declarations, symbol, symbol, symbol });
+        entries = b.fmt(
+            \\{s}{{ "{s}", cpucycles_ticks_{s}_setup, cpucycles_ticks_{s}, cpucycles_ticks_{s}_close }},
+        , .{ entries, option, symbol, symbol, symbol });
+    }
+    const generated = b.addWriteFiles();
+    const options_include = generated.add("options.inc", b.fmt(
+        \\#define NUMOPTIONS {d}
+        \\#define DEFAULTOPTION (NUMOPTIONS-1)
+        \\
+        \\{s}
+        \\static struct {{
+        \\  const char *implementation;
+        \\  long long (*ticks_setup)(void);
+        \\  long long (*ticks)(void);
+        \\  void (*ticks_close)(void);
+        \\}} options[NUMOPTIONS] = {{
+        \\{s}}};
+        \\
+    , .{ options.len, declarations, entries }));
+
+    module.addIncludePath(options_include.dirname());
+    module.addIncludePath(dependency.path("cpucycles"));
+    module.addCSourceFile(.{
+        .file = dependency.path("cpucycles/wrapper.c"),
+        .flags = &.{ "-std=gnu99", "-D_GNU_SOURCE=1", "-fwrapv" },
+    });
+    for (options) |option| {
+        const symbol = b.dupe(option);
+        std.mem.replaceScalar(u8, symbol, '-', '_');
+        module.addCSourceFile(.{
+            .file = dependency.path(b.fmt("cpucycles/{s}.c", .{option})),
+            .flags = &.{
+                "-std=gnu99",
+                "-D_GNU_SOURCE=1",
+                "-fwrapv",
+                b.fmt("-Dticks=cpucycles_ticks_{s}", .{symbol}),
+                b.fmt("-Dticks_setup=cpucycles_ticks_{s}_setup", .{symbol}),
+                b.fmt("-Dticks_close=cpucycles_ticks_{s}_close", .{symbol}),
+            },
+        });
+    }
 }

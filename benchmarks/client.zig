@@ -528,6 +528,9 @@ const ResultJson = struct {
     client_optimize_mode: []const u8,
     client_target_arch: []const u8,
     client_target_os: []const u8,
+    clock_source: []const u8,
+    clock_uses_cpucycles: bool,
+    clock_fallback_reason: []const u8,
     warmup_ns: u64,
     duration_ns: u64,
     streams: usize,
@@ -882,8 +885,7 @@ fn sleepUntil(io: std.Io, deadline_ns: u64) !void {
 }
 
 fn nowNs(io: std.Io) u64 {
-    const value = std.Io.Clock.awake.now(io).nanoseconds;
-    return if (value <= 0) 0 else @intCast(@min(value, std.math.maxInt(u64)));
+    return grpc.internal.fastNowNs(io);
 }
 
 fn validatePayload(response: []const u8, expected: []const u8) bool {
@@ -943,6 +945,9 @@ fn makeResult(config: Config, measurements: *Measurements) ResultJson {
         .client_optimize_mode = @tagName(builtin.mode),
         .client_target_arch = @tagName(builtin.cpu.arch),
         .client_target_os = @tagName(builtin.os.tag),
+        .clock_source = grpc.internal.fastClockImplementation(),
+        .clock_uses_cpucycles = grpc.internal.fastClockUsesCpuCycles(),
+        .clock_fallback_reason = grpc.internal.fastClockFallbackReason(),
         .warmup_ns = config.warmup_ns,
         .duration_ns = config.duration_ns,
         .streams = config.streams,
@@ -1405,6 +1410,9 @@ test "result JSON has stable benchmark shape" {
         .client_optimize_mode = "ReleaseFast",
         .client_target_arch = "x86_64",
         .client_target_os = "linux",
+        .clock_source = "amd64-tsc",
+        .clock_uses_cpucycles = true,
+        .clock_fallback_reason = "none",
         .warmup_ns = 1,
         .duration_ns = 2,
         .streams = 1,

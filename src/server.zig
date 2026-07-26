@@ -5,6 +5,7 @@ const xev = @import("xev");
 const c = @import("c.zig").api;
 const Compression = @import("compression.zig").Compression;
 const deadline = @import("deadline.zig");
+const fast_clock = @import("fast_clock.zig");
 const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
@@ -2968,8 +2969,7 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, stream_error: u32, user
 
 fn ioNow(context: ?*anyopaque) u64 {
     const server: *Impl = @ptrCast(@alignCast(context.?));
-    const nanoseconds = std.Io.Clock.awake.now(server.io()).nanoseconds;
-    return std.math.cast(u64, @max(nanoseconds, @as(i96, 0))) orelse std.math.maxInt(u64);
+    return fast_clock.now(server.io());
 }
 
 fn syncIo() std.Io {
@@ -3018,7 +3018,7 @@ fn onDeadlineTimer(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev
         },
         else => return .disarm,
     };
-    const now = impl.clock.now();
+    const now = fast_clock.validatedNow(impl.io());
     expireDeadlines(impl, now);
     drainDirtyConnections(impl);
     scheduleDeadlineTimer(impl);

@@ -76,6 +76,10 @@ prefetch_package \
     'https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz' \
     'N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp' \
     'cares.tar.gz'
+prefetch_zigfetch_url_package \
+    'https://cpucycles.cr.yp.to/libcpucycles-20260625.tar.gz' \
+    'N-V-__8AAHSUBAA_Vn8NXM2L9F21QFvrTIxbH9yvxs5cO-lY' \
+    'cpucycles.tar.gz'
 prefetch_url_package \
     'https://codeload.github.com/fanyang89/gperftools/tar.gz/1a01cd2cf8f7000845d343fa8e0bbac70378858b' \
     'N-V-__8AAGKVkABvsDVHhSU8seHKvtJ8Q23b9Y0OMiFVWt-y' \
