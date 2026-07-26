@@ -46,6 +46,22 @@ prefetch_url_package() {
     tar --create --gzip --file "$global_cache/p/$expected_hash.tar.gz" --directory "$package_dir" .
 }
 
+prefetch_zigfetch_url_package() {
+    local url=$1
+    local expected_hash=$2
+    local archive_name=$3
+    local actual_hash
+
+    actual_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zigfetch "$url")
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+        printf 'package hash mismatch for %s: expected %s, got %s\n' \
+            "$archive_name" "$expected_hash" "$actual_hash" >&2
+        exit 1
+    fi
+    curl --fail --location --silent --show-error \
+        --output "$global_cache/p/$expected_hash.tar.gz" "$url"
+}
+
 prefetch_url_package \
     'https://codeload.github.com/mitchellh/libxev/tar.gz/b0650f082458226860ed7ab0fc7c9c73823c8950' \
     'libxev-0.0.0-86vtcxkOFACqPXUTAPuq5i0xpDYWU5G5RfrYQXxlUT26' \
@@ -58,7 +74,7 @@ prefetch_package \
     'https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz' \
     'N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp' \
     'cares.tar.gz'
-prefetch_package \
+prefetch_zigfetch_url_package \
     'https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/mbedtls-3.6.6' \
     'N-V-__8AAI1FmQLj92go7nR7_J6kwr-7uYyuitngGqydvWkd' \
     'mbedtls.tar.gz'
