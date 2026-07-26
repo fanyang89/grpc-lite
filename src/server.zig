@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("grpc_lite_options");
 const xev = @import("xev");
 const c = @import("c.zig").api;
@@ -65,6 +66,7 @@ pub const TlsOptions = struct {
 pub const Options = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 0,
+    reactor_count: usize = 1,
     max_request_size: usize = 4 * 1024 * 1024,
     stream_limits: raw_stream.BufferLimits = .{},
     initial_stream_window_size: u32 = 64 * 1024,
@@ -80,8 +82,10 @@ pub const LocalAddress = struct {
 
 pub const Server = struct {
     impl: *Impl,
+    coordinator: *Coordinator,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !Server {
+        if (options.reactor_count == 0) return error.InvalidReactorCount;
         if (options.tls != null and !build_options.tls) return error.TlsUnavailable;
         if (options.tls) |tls_options| {
             if (tls_options.handshake_timeout_ns == 0) return error.InvalidTlsHandshakeTimeout;
@@ -95,81 +99,104 @@ pub const Server = struct {
         if (options.stream_limits.max_inbound_buffer_size < options.initial_stream_window_size) {
             return error.InvalidInboundBufferSize;
         }
-        const impl = try allocator.create(Impl);
-        errdefer allocator.destroy(impl);
-        const host = try allocator.dupeZ(u8, options.host);
-        errdefer allocator.free(host);
+        const serialized_allocator = try allocator.create(SerializedAllocator);
+        errdefer allocator.destroy(serialized_allocator);
+        serialized_allocator.* = .init(allocator);
+        const reactors = try allocator.alloc(*Impl, options.reactor_count);
+        errdefer allocator.free(reactors);
 
-        var io_threaded = std.Io.Threaded.init(allocator, .{});
-        errdefer io_threaded.deinit();
-        impl.* = .{
-            .allocator = allocator,
-            .host = host,
-            .configured_port = options.port,
-            .max_request_size = options.max_request_size,
-            .stream_limits = options.stream_limits,
-            .initial_stream_window_size = options.initial_stream_window_size,
-            .write_high_watermark_bytes = options.write_high_watermark_bytes,
-            .write_low_watermark_bytes = options.write_low_watermark_bytes,
-            .io_threaded = io_threaded,
-            .tls_config = null,
-            .tls_handshake_timeout_ns = if (options.tls) |tls_options| tls_options.handshake_timeout_ns else 0,
-        };
-        if (comptime build_options.tls) {
-            if (options.tls) |tls_options| {
-                impl.tls_config = try tls_record.Config.createServer(
-                    allocator,
-                    tls_options.certificate_chain_pem,
-                    tls_options.private_key_pem,
-                );
-            }
+        var initialized: usize = 0;
+        errdefer for (reactors[0..initialized]) |reactor| destroyImpl(reactor);
+        while (initialized < reactors.len) : (initialized += 1) {
+            reactors[initialized] = try initImpl(serialized_allocator.allocator(), options);
         }
-        errdefer if (comptime build_options.tls) {
-            if (impl.tls_config) |config| config.destroy();
+
+        const coordinator = try allocator.create(Coordinator);
+        errdefer allocator.destroy(coordinator);
+        coordinator.* = .{
+            .backing_allocator = allocator,
+            .serialized_allocator = serialized_allocator,
+            .reactors = reactors,
         };
-        impl.clock = .{ .context = impl, .now_fn = ioNow };
-        return .{ .impl = impl };
+        return .{ .impl = reactors[0], .coordinator = coordinator };
     }
 
     pub fn registerUnary(self: *Server, full_method_path: []const u8, handler: service.UnaryHandler) !void {
-        const impl = self.impl;
-        impl.lock();
-        defer impl.unlock();
-        if (impl.state != .initialized) return error.ServerAlreadyStarted;
+        const coordinator = self.coordinator;
+        coordinator.lock();
+        defer coordinator.unlock();
+        if (coordinator.state != .initialized) return error.ServerAlreadyStarted;
         if (!isValidMethodPath(full_method_path)) return error.InvalidMethodPath;
-        if (impl.handlers.contains(full_method_path) or impl.stream_handlers.contains(full_method_path)) return error.MethodAlreadyRegistered;
+        if (self.impl.handlers.contains(full_method_path) or self.impl.stream_handlers.contains(full_method_path)) return error.MethodAlreadyRegistered;
 
-        const owned_path = try impl.allocator.dupe(u8, full_method_path);
-        errdefer impl.allocator.free(owned_path);
-        try impl.handlers.put(impl.allocator, owned_path, handler);
+        var inserted: usize = 0;
+        errdefer rollbackUnaryRegistration(coordinator.reactors[0..inserted], full_method_path);
+        while (inserted < coordinator.reactors.len) : (inserted += 1) {
+            const reactor = coordinator.reactors[inserted];
+            const owned_path = try reactor.allocator.dupe(u8, full_method_path);
+            errdefer reactor.allocator.free(owned_path);
+            try reactor.handlers.put(reactor.allocator, owned_path, handler);
+        }
     }
 
     pub fn registerStream(self: *Server, full_method_path: []const u8, handler: raw_stream.ServerHandler) !void {
-        const impl = self.impl;
-        impl.lock();
-        defer impl.unlock();
-        if (impl.state != .initialized) return error.ServerAlreadyStarted;
+        const coordinator = self.coordinator;
+        coordinator.lock();
+        defer coordinator.unlock();
+        if (coordinator.state != .initialized) return error.ServerAlreadyStarted;
         if (!isValidMethodPath(full_method_path)) return error.InvalidMethodPath;
-        if (impl.handlers.contains(full_method_path) or impl.stream_handlers.contains(full_method_path)) return error.MethodAlreadyRegistered;
+        if (self.impl.handlers.contains(full_method_path) or self.impl.stream_handlers.contains(full_method_path)) return error.MethodAlreadyRegistered;
 
-        const owned_path = try impl.allocator.dupe(u8, full_method_path);
-        errdefer impl.allocator.free(owned_path);
-        try impl.stream_handlers.put(impl.allocator, owned_path, handler);
+        var inserted: usize = 0;
+        errdefer rollbackStreamRegistration(coordinator.reactors[0..inserted], full_method_path);
+        while (inserted < coordinator.reactors.len) : (inserted += 1) {
+            const reactor = coordinator.reactors[inserted];
+            const owned_path = try reactor.allocator.dupe(u8, full_method_path);
+            errdefer reactor.allocator.free(owned_path);
+            try reactor.stream_handlers.put(reactor.allocator, owned_path, handler);
+        }
     }
 
     pub fn start(self: *Server) !void {
-        const impl = self.impl;
-        impl.lock();
-        defer impl.unlock();
-        if (impl.state != .initialized) return error.ServerAlreadyStarted;
+        const coordinator = self.coordinator;
+        coordinator.lock();
+        if (coordinator.state != .initialized) {
+            coordinator.unlock();
+            return error.ServerAlreadyStarted;
+        }
+        coordinator.state = .starting;
+        coordinator.start_in_progress = true;
+        coordinator.unlock();
 
-        impl.state = .starting;
-        impl.thread = std.Thread.spawn(.{}, runLoop, .{impl}) catch |err| {
-            impl.state = .initialized;
-            return err;
+        for (coordinator.reactors, 0..) |reactor, index| {
+            if (index != 0 and self.impl.configured_port == 0) {
+                reactor.configured_port = self.impl.local_port;
+            }
+            startReactor(coordinator, reactor, index) catch |err| {
+                rollbackStart(coordinator);
+                return err;
+            };
+            waitForReactorStartup(reactor) catch |err| {
+                rollbackStart(coordinator);
+                return err;
+            };
+            if (reactor.local_port != self.impl.local_port or
+                !std.mem.eql(u8, reactor.local_host[0..reactor.local_host_len], self.impl.local_host[0..self.impl.local_host_len]))
+            {
+                rollbackStart(coordinator);
+                return error.ReactorAddressMismatch;
+            }
+        }
+
+        coordinator.lock();
+        coordinator.start_in_progress = false;
+        coordinator.state = switch (coordinator.shutdown_request) {
+            .none => .running,
+            .graceful => .draining,
+            .immediate => .stopping,
         };
-        while (impl.state == .starting) impl.waitForSignal();
-        if (impl.startup_error) |err| return err;
+        coordinator.condition.broadcast(coordinator.io());
+        coordinator.unlock();
     }
 
     pub fn localAddress(self: *const Server) !LocalAddress {
@@ -188,79 +215,144 @@ pub const Server = struct {
     }
 
     pub fn shutdown(self: *Server) void {
-        const impl = self.impl;
-        impl.lock();
-        defer impl.unlock();
-        switch (impl.state) {
-            .initialized => impl.state = .stopped,
-            .starting => impl.shutdown_request = .immediate,
-            .running => {
-                impl.shutdown_request = .immediate;
-                impl.state = .stopping;
-                impl.notifyShutdown();
-            },
-            .draining => {
-                impl.shutdown_request = .immediate;
-                impl.state = .stopping;
-                impl.notifyShutdown();
-            },
-            .stopping, .stopped => {},
-        }
+        self.requestShutdown(.immediate, 0);
     }
 
     pub fn shutdownGracefully(self: *Server, timeout_ns: u64) void {
-        const impl = self.impl;
-        impl.lock();
-        defer impl.unlock();
-        switch (impl.state) {
-            .initialized => impl.state = .stopped,
-            .starting => if (impl.shutdown_request == .none) {
-                impl.shutdown_request = .graceful;
-                impl.drain_timeout_ns = timeout_ns;
-            },
-            .running => {
-                impl.shutdown_request = .graceful;
-                impl.drain_timeout_ns = timeout_ns;
-                impl.state = .draining;
-                impl.notifyShutdown();
-            },
-            .draining, .stopping, .stopped => {},
-        }
+        self.requestShutdown(.graceful, timeout_ns);
     }
 
     pub fn wait(self: *Server) void {
-        const impl = self.impl;
-        impl.lock();
-        const thread = impl.thread;
-        impl.thread = null;
-        impl.unlock();
-        if (thread) |running_thread| running_thread.join();
+        const coordinator = self.coordinator;
+        coordinator.lock();
+        while (coordinator.start_in_progress) coordinator.condition.waitUncancelable(coordinator.io(), &coordinator.mutex);
+        const launched_count = coordinator.launched_count;
+        coordinator.unlock();
+        for (coordinator.reactors[0..launched_count]) |reactor| waitForReactor(reactor);
+        coordinator.lock();
+        if (coordinator.state != .initialized) coordinator.state = .stopped;
+        coordinator.unlock();
     }
 
     pub fn deinit(self: *Server) void {
-        const impl = self.impl;
         self.shutdown();
         self.wait();
-
-        var iterator = impl.handlers.iterator();
-        while (iterator.next()) |entry| impl.allocator.free(entry.key_ptr.*);
-        impl.handlers.deinit(impl.allocator);
-        var stream_iterator = impl.stream_handlers.iterator();
-        while (stream_iterator.next()) |entry| impl.allocator.free(entry.key_ptr.*);
-        impl.stream_handlers.deinit(impl.allocator);
-        for (impl.stream_commands.items) |*command| command.deinit(impl.allocator);
-        impl.stream_commands.deinit(impl.allocator);
-        impl.connections.deinit(impl.allocator);
-        std.debug.assert(impl.deadline_heap.items.len == 0);
-        impl.deadline_heap.deinit(impl.allocator);
-        if (comptime build_options.tls) {
-            if (impl.tls_config) |config| config.destroy();
-        }
-        impl.allocator.free(impl.host);
-        impl.io_threaded.deinit();
-        const allocator = impl.allocator;
-        allocator.destroy(impl);
+        const coordinator = self.coordinator;
+        for (coordinator.reactors) |reactor| destroyImpl(reactor);
+        const backing_allocator = coordinator.backing_allocator;
+        const serialized_allocator = coordinator.serialized_allocator;
+        backing_allocator.free(coordinator.reactors);
+        backing_allocator.destroy(coordinator);
+        backing_allocator.destroy(serialized_allocator);
         self.* = undefined;
+    }
+
+    fn requestShutdown(self: *Server, request: ShutdownRequest, timeout_ns: u64) void {
+        const coordinator = self.coordinator;
+        coordinator.lock();
+        switch (coordinator.state) {
+            .initialized => coordinator.state = .stopped,
+            .starting, .running => coordinator.state = if (request == .graceful) .draining else .stopping,
+            .draining => {
+                if (request == .immediate) coordinator.state = .stopping;
+            },
+            .stopping, .stopped => {},
+        }
+        if (request == .immediate or coordinator.shutdown_request == .none) {
+            coordinator.shutdown_request = request;
+            coordinator.drain_timeout_ns = timeout_ns;
+        }
+        const launched_count = coordinator.launched_count;
+        const initialized = coordinator.state == .stopped and !coordinator.start_in_progress and launched_count == 0;
+        coordinator.unlock();
+
+        if (initialized) {
+            for (coordinator.reactors) |reactor| shutdownReactor(reactor, request, timeout_ns);
+        } else {
+            for (coordinator.reactors[0..launched_count]) |reactor| shutdownReactor(reactor, request, timeout_ns);
+        }
+    }
+};
+
+const SerializedAllocator = struct {
+    backing: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+
+    fn init(backing: std.mem.Allocator) SerializedAllocator {
+        return .{ .backing = backing };
+    }
+
+    fn allocator(self: *SerializedAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn lock(self: *SerializedAllocator) void {
+        self.mutex.lockUncancelable(syncIo());
+    }
+
+    fn unlock(self: *SerializedAllocator) void {
+        self.mutex.unlock(syncIo());
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+const Coordinator = struct {
+    backing_allocator: std.mem.Allocator,
+    serialized_allocator: *SerializedAllocator,
+    reactors: []*Impl,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    state: State = .initialized,
+    shutdown_request: ShutdownRequest = .none,
+    drain_timeout_ns: u64 = 0,
+    launched_count: usize = 0,
+    start_in_progress: bool = false,
+
+    fn io(_: *Coordinator) std.Io {
+        return syncIo();
+    }
+
+    fn lock(self: *Coordinator) void {
+        self.mutex.lockUncancelable(self.io());
+    }
+
+    fn unlock(self: *Coordinator) void {
+        self.mutex.unlock(self.io());
     }
 };
 
@@ -281,6 +373,7 @@ const Impl = struct {
     allocator: std.mem.Allocator,
     host: [:0]u8,
     configured_port: u16,
+    reuse_port: bool,
     max_request_size: usize,
     stream_limits: raw_stream.BufferLimits,
     initial_stream_window_size: u32,
@@ -334,6 +427,8 @@ const Impl = struct {
     local_port: u16 = 0,
     tls_config: ?*tls_record.Config = null,
     tls_handshake_timeout_ns: u64 = 0,
+    accepted_connections: if (builtin.is_test) std.atomic.Value(usize) else void = if (builtin.is_test) .init(0) else {},
+    test_fail_startup: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 
     fn lock(self: *Impl) void {
         self.mutex.lockUncancelable(self.io());
@@ -414,6 +509,151 @@ const Impl = struct {
         unreachable;
     }
 };
+
+fn initImpl(allocator: std.mem.Allocator, options: Options) !*Impl {
+    const impl = try allocator.create(Impl);
+    errdefer allocator.destroy(impl);
+    const host = try allocator.dupeZ(u8, options.host);
+    errdefer allocator.free(host);
+    var io_threaded = std.Io.Threaded.init(allocator, .{});
+    errdefer io_threaded.deinit();
+    impl.* = .{
+        .allocator = allocator,
+        .host = host,
+        .configured_port = options.port,
+        .reuse_port = options.reactor_count > 1,
+        .max_request_size = options.max_request_size,
+        .stream_limits = options.stream_limits,
+        .initial_stream_window_size = options.initial_stream_window_size,
+        .write_high_watermark_bytes = options.write_high_watermark_bytes,
+        .write_low_watermark_bytes = options.write_low_watermark_bytes,
+        .io_threaded = io_threaded,
+        .tls_config = null,
+        .tls_handshake_timeout_ns = if (options.tls) |tls_options| tls_options.handshake_timeout_ns else 0,
+    };
+    if (comptime build_options.tls) {
+        if (options.tls) |tls_options| {
+            impl.tls_config = try tls_record.Config.createServer(
+                allocator,
+                tls_options.certificate_chain_pem,
+                tls_options.private_key_pem,
+            );
+        }
+    }
+    errdefer if (comptime build_options.tls) {
+        if (impl.tls_config) |config| config.destroy();
+    };
+    impl.clock = .{ .context = impl, .now_fn = ioNow };
+    return impl;
+}
+
+fn destroyImpl(impl: *Impl) void {
+    var iterator = impl.handlers.iterator();
+    while (iterator.next()) |entry| impl.allocator.free(entry.key_ptr.*);
+    impl.handlers.deinit(impl.allocator);
+    var stream_iterator = impl.stream_handlers.iterator();
+    while (stream_iterator.next()) |entry| impl.allocator.free(entry.key_ptr.*);
+    impl.stream_handlers.deinit(impl.allocator);
+    for (impl.stream_commands.items) |*command| command.deinit(impl.allocator);
+    impl.stream_commands.deinit(impl.allocator);
+    impl.connections.deinit(impl.allocator);
+    std.debug.assert(impl.deadline_heap.items.len == 0);
+    impl.deadline_heap.deinit(impl.allocator);
+    if (comptime build_options.tls) {
+        if (impl.tls_config) |config| config.destroy();
+    }
+    impl.allocator.free(impl.host);
+    impl.io_threaded.deinit();
+    const allocator = impl.allocator;
+    allocator.destroy(impl);
+}
+
+fn rollbackUnaryRegistration(reactors: []*Impl, path: []const u8) void {
+    for (reactors) |reactor| {
+        const removed = reactor.handlers.fetchRemove(path).?;
+        reactor.allocator.free(removed.key);
+    }
+}
+
+fn rollbackStreamRegistration(reactors: []*Impl, path: []const u8) void {
+    for (reactors) |reactor| {
+        const removed = reactor.stream_handlers.fetchRemove(path).?;
+        reactor.allocator.free(removed.key);
+    }
+}
+
+fn startReactor(coordinator: *Coordinator, reactor: *Impl, index: usize) !void {
+    coordinator.lock();
+    defer coordinator.unlock();
+    reactor.lock();
+    if (reactor.state != .initialized) {
+        reactor.unlock();
+        return error.ServerAlreadyStarted;
+    }
+    reactor.state = .starting;
+    reactor.thread = std.Thread.spawn(.{}, runLoop, .{reactor}) catch |err| {
+        reactor.state = .initialized;
+        reactor.unlock();
+        return err;
+    };
+    std.debug.assert(coordinator.launched_count == index);
+    coordinator.launched_count = index + 1;
+    const request = coordinator.shutdown_request;
+    const timeout_ns = coordinator.drain_timeout_ns;
+    reactor.unlock();
+    if (request != .none) shutdownReactor(reactor, request, timeout_ns);
+}
+
+fn waitForReactorStartup(reactor: *Impl) StartupError!void {
+    reactor.lock();
+    defer reactor.unlock();
+    while (reactor.state == .starting) reactor.waitForSignal();
+    if (reactor.startup_error) |err| return err;
+}
+
+fn shutdownReactor(impl: *Impl, request: ShutdownRequest, timeout_ns: u64) void {
+    impl.lock();
+    defer impl.unlock();
+    switch (impl.state) {
+        .initialized => impl.state = .stopped,
+        .starting => if (request == .immediate or impl.shutdown_request == .none) {
+            impl.shutdown_request = request;
+            impl.drain_timeout_ns = timeout_ns;
+        },
+        .running => {
+            impl.shutdown_request = request;
+            impl.drain_timeout_ns = timeout_ns;
+            impl.state = if (request == .graceful) .draining else .stopping;
+            impl.notifyShutdown();
+        },
+        .draining => if (request == .immediate) {
+            impl.shutdown_request = .immediate;
+            impl.state = .stopping;
+            impl.notifyShutdown();
+        },
+        .stopping, .stopped => {},
+    }
+}
+
+fn waitForReactor(impl: *Impl) void {
+    impl.lock();
+    const thread = impl.thread;
+    impl.thread = null;
+    impl.unlock();
+    if (thread) |running_thread| running_thread.join();
+}
+
+fn rollbackStart(coordinator: *Coordinator) void {
+    coordinator.lock();
+    coordinator.shutdown_request = .immediate;
+    coordinator.state = .stopped;
+    coordinator.start_in_progress = false;
+    const launched_count = coordinator.launched_count;
+    coordinator.condition.broadcast(coordinator.io());
+    coordinator.unlock();
+    for (coordinator.reactors[0..launched_count]) |reactor| shutdownReactor(reactor, .immediate, 0);
+    for (coordinator.reactors[0..launched_count]) |reactor| waitForReactor(reactor);
+}
 
 const StreamCommand = struct {
     target: *Stream,
@@ -1344,6 +1584,7 @@ fn setupLoop(server: *Impl) StartupError!void {
     const address = std.Io.net.IpAddress.parseIp4(server.host, server.configured_port) catch return error.InvalidAddress;
     server.listener = xev.TCP.init(address) catch return error.ListenerInitializationFailed;
     server.listener_initialized = true;
+    if (server.reuse_port) socket_options.enableReusePort(server.listener.fd) catch return error.ListenerInitializationFailed;
     server.listener.bind(address) catch return error.BindFailed;
     server.listener.listen(128) catch return error.ListenFailed;
 
@@ -1353,6 +1594,9 @@ fn setupLoop(server: *Impl) StartupError!void {
     @memcpy(server.local_host[0..server.host.len], server.host);
     server.local_host_len = server.host.len;
     server.local_port = std.mem.bigToNative(u16, local_address.port);
+    if (comptime builtin.is_test) {
+        if (server.test_fail_startup) return error.AsyncInitializationFailed;
+    }
 
     server.shutdown_async = xev.Async.init() catch return error.AsyncInitializationFailed;
     server.shutdown_async_initialized = true;
@@ -1386,6 +1630,7 @@ fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev
         closeFd(tcp.fd);
         return rearmListener(server_ptr);
     };
+    if (comptime builtin.is_test) _ = server_ptr.accepted_connections.fetchAdd(1, .monotonic);
 
     const connection = server_ptr.allocator.create(Connection) catch {
         closeFd(tcp.fd);
@@ -2539,6 +2784,10 @@ fn ioNow(context: ?*anyopaque) u64 {
     return std.math.cast(u64, @max(nanoseconds, @as(i96, 0))) orelse std.math.maxInt(u64);
 }
 
+fn syncIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 fn scheduleDeadlineTimer(server: *Impl) void {
     if (!server.loop_initialized or !server.deadline_timer_initialized) return;
     const earliest = (deadlineHeapPeek(server) orelse return).expires_at_ns;
@@ -3656,6 +3905,204 @@ test "server validates registration and has deterministic lifecycle" {
     try std.testing.expectEqual(address.port, try server.port());
     server.shutdown();
     server.wait();
+}
+
+test "server rejects zero reactors" {
+    try std.testing.expectError(error.InvalidReactorCount, Server.init(std.testing.allocator, .{ .reactor_count = 0 }));
+}
+
+test "multi-reactor registration allocation failure rolls back every shard" {
+    const Handler = struct {
+        fn handle(_: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    var handler: Handler = .{};
+    var server = try Server.init(std.testing.allocator, .{ .reactor_count = 4 });
+    defer server.deinit();
+    const original_backing = server.coordinator.serialized_allocator.backing;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    server.coordinator.serialized_allocator.backing = failing.allocator();
+    defer server.coordinator.serialized_allocator.backing = original_backing;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        server.registerUnary(
+            "/test.Rollback/Unary",
+            service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+        ),
+    );
+    server.coordinator.serialized_allocator.backing = original_backing;
+    for (server.coordinator.reactors) |reactor| {
+        try std.testing.expect(!reactor.handlers.contains("/test.Rollback/Unary"));
+    }
+}
+
+test "multi-reactor server binds one ephemeral and fixed port" {
+    for ([_]usize{ 2, 4 }) |reactor_count| {
+        var ephemeral = try Server.init(std.testing.allocator, .{ .reactor_count = reactor_count });
+        defer ephemeral.deinit();
+        try ephemeral.start();
+        const ephemeral_address = try ephemeral.localAddress();
+        try std.testing.expect(ephemeral_address.port != 0);
+        for (ephemeral.coordinator.reactors) |reactor| {
+            try std.testing.expectEqual(ephemeral_address.port, reactor.local_port);
+            try std.testing.expectEqualStrings(ephemeral_address.host, reactor.local_host[0..reactor.local_host_len]);
+        }
+        ephemeral.shutdown();
+        ephemeral.wait();
+
+        const probe_address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var probe = try probe_address.listen(std.testing.io, .{});
+        var socket_address: std.posix.sockaddr.in = undefined;
+        var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+        if (std.posix.errno(std.posix.system.getsockname(
+            probe.socket.handle,
+            @ptrCast(&socket_address),
+            &address_length,
+        )) != .SUCCESS) return error.AddressQueryFailed;
+        const fixed_port = std.mem.bigToNative(u16, socket_address.port);
+        probe.deinit(std.testing.io);
+
+        var fixed = try Server.init(std.testing.allocator, .{
+            .port = fixed_port,
+            .reactor_count = reactor_count,
+        });
+        defer fixed.deinit();
+        try fixed.start();
+        try std.testing.expectEqual(fixed_port, try fixed.port());
+        for (fixed.coordinator.reactors) |reactor| try std.testing.expectEqual(fixed_port, reactor.local_port);
+        fixed.shutdownGracefully(std.time.ns_per_s);
+        fixed.wait();
+    }
+}
+
+test "multi-reactor startup failure rolls back launched shards" {
+    var server = try Server.init(std.testing.allocator, .{ .reactor_count = 4 });
+    defer server.deinit();
+    server.coordinator.reactors[1].test_fail_startup = true;
+
+    try std.testing.expectError(error.AsyncInitializationFailed, server.start());
+    for (server.coordinator.reactors) |reactor| {
+        try std.testing.expect(reactor.thread == null);
+        try std.testing.expect(!reactor.listener_initialized or reactor.listener_closed or reactor.state == .stopped);
+    }
+    server.shutdown();
+    server.wait();
+}
+
+test "multi-reactor shutdown modes and deinit before start" {
+    var before_start = try Server.init(std.testing.allocator, .{ .reactor_count = 4 });
+    before_start.deinit();
+
+    var immediate = try Server.init(std.testing.allocator, .{ .reactor_count = 2 });
+    defer immediate.deinit();
+    try immediate.start();
+    immediate.shutdown();
+    immediate.wait();
+    immediate.wait();
+
+    var graceful = try Server.init(std.testing.allocator, .{ .reactor_count = 4 });
+    defer graceful.deinit();
+    try graceful.start();
+    graceful.shutdownGracefully(std.time.ns_per_s);
+    graceful.wait();
+}
+
+test "multi-reactor callbacks and transport allocations are concurrent-safe" {
+    const Channel = @import("channel.zig").Channel;
+    const Handler = struct {
+        mutex: std.Io.Mutex = .init,
+        thread_ids: [4]std.Thread.Id = undefined,
+        thread_count: usize = 0,
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            const thread_id = std.Thread.getCurrentId();
+            self.mutex.lockUncancelable(syncIo());
+            defer self.mutex.unlock(syncIo());
+            for (self.thread_ids[0..self.thread_count]) |existing| {
+                if (existing == thread_id) return service.UnaryResponse.ok(allocator, request);
+            }
+            if (self.thread_count < self.thread_ids.len) {
+                self.thread_ids[self.thread_count] = thread_id;
+                self.thread_count += 1;
+            }
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Worker = struct {
+        channel: *Channel,
+        succeeded: bool = false,
+
+        fn run(self: *@This()) void {
+            var result_allocator: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
+            defer std.debug.assert(result_allocator.deinit() == .ok);
+            var result = self.channel.callUnary(
+                result_allocator.allocator(),
+                "/test.Reactors/Unary",
+                "ping",
+                .{},
+            ) catch return;
+            defer result.deinit();
+            self.succeeded = result.status.isOk() and std.mem.eql(u8, result.payload, "ping");
+        }
+    };
+
+    var backing: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
+    var backing_active = true;
+    defer if (backing_active) std.debug.assert(backing.deinit() == .ok);
+    var handler: Handler = .{};
+    var server = try Server.init(backing.allocator(), .{ .reactor_count = 4 });
+    var server_active = true;
+    defer if (server_active) server.deinit();
+    try server.registerUnary(
+        "/test.Reactors/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    for (server.coordinator.reactors) |reactor| {
+        try std.testing.expect(reactor.handlers.contains("/test.Reactors/Unary"));
+    }
+    try server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try server.port()});
+    var distributed = false;
+    for (0..4) |_| {
+        var channels: [16]Channel = undefined;
+        var channel_count: usize = 0;
+        defer for (channels[0..channel_count]) |*channel| channel.deinit();
+        while (channel_count < channels.len) : (channel_count += 1) {
+            channels[channel_count] = try Channel.init(std.heap.smp_allocator, target, .{});
+        }
+        var workers: [channels.len]Worker = undefined;
+        var threads: [channels.len]std.Thread = undefined;
+        for (&workers, &channels) |*worker, *channel| worker.* = .{ .channel = channel };
+        for (&threads, &workers) |*thread, *worker| thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        for (&threads) |thread| thread.join();
+        for (&workers) |worker| try std.testing.expect(worker.succeeded);
+
+        var accepting_reactors: usize = 0;
+        for (server.coordinator.reactors) |reactor| {
+            if (reactor.accepted_connections.load(.acquire) != 0) accepting_reactors += 1;
+        }
+        if (accepting_reactors >= 2) {
+            distributed = true;
+            break;
+        }
+    }
+    try std.testing.expect(distributed);
+    try std.testing.expect(handler.thread_count >= 2);
+
+    server.shutdown();
+    server.wait();
+    server.deinit();
+    server_active = false;
+    try std.testing.expectEqual(std.heap.Check.ok, backing.deinit());
+    backing_active = false;
 }
 
 test "manual receive credit isolates a paused stream and resumes on loop" {
