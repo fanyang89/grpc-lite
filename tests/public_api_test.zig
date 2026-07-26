@@ -29,6 +29,7 @@ test "stable public API compiles for downstream consumers" {
         _ = grpc.ClientStreamCallbacks;
         _ = grpc.ServerStream;
         _ = grpc.ServerStreamHandler;
+        _ = grpc.log;
     }
 
     _ = try std.SemanticVersion.parse(grpc.version);

@@ -17,6 +17,10 @@ pub fn build(b: *std.Build) void {
     });
     const nghttp2_dependency = b.dependency("nghttp2", .{});
     const cares_dependency = b.dependency("cares", .{});
+    const nanozlog_dependency = b.dependency("nanozlog", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const enable_tls = b.option(bool, "tls", "Enable TLS transport support through mbedTLS") orelse false;
     const enable_protobuf = b.option(
         bool,
@@ -90,6 +94,7 @@ pub fn build(b: *std.Build) void {
         grpc_lite.addObjectFile(native.mbedtls_archive.?);
     }
     grpc_lite.addImport("xev", xev);
+    grpc_lite.addImport("nanozlog", nanozlog_dependency.module("nanozlog"));
     const test_step = b.step("test", "Run unit tests");
 
     if (gperftools_dependency) |dependency| {

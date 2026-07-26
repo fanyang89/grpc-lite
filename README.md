@@ -21,6 +21,7 @@ exports remain available for experimentation but may change before 1.0.
 - Explicit allocators and deterministic `deinit`
 - Raw protobuf wire APIs with no required message runtime
 - Optional typed APIs and service registration through zig-protobuf
+- Shared asynchronous process logging for Zig applications
 
 The transport remains IPv4-only. Automatic RPC retries, mTLS, system CA discovery, and
 server reflection remain out of scope.

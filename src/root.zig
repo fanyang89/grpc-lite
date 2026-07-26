@@ -14,6 +14,7 @@ pub const call = @import("call.zig");
 pub const channel = @import("channel.zig");
 pub const compression = @import("compression.zig");
 pub const frame = @import("frame.zig");
+pub const log = @import("log.zig");
 pub const metadata = @import("metadata.zig");
 pub const server = @import("server.zig");
 pub const service = @import("service.zig");
@@ -61,6 +62,7 @@ test {
     _ = compression;
     _ = deadline;
     _ = frame;
+    _ = log;
     _ = metadata;
     _ = runtime;
     _ = message;
