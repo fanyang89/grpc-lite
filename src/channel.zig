@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").api;
+const cares_adapter = @import("cares_adapter.zig");
 const xev = @import("xev");
 const call = @import("call.zig");
 const Compression = @import("compression.zig").Compression;
@@ -12,12 +13,14 @@ const socket_options = @import("socket_options.zig");
 const status = @import("status.zig");
 const stream = @import("stream.zig");
 const version = @import("version.zig");
+const Runtime = @import("runtime.zig").Runtime;
 
 const ChannelOptions = struct {
     user_agent: []const u8 = version.user_agent,
     initial_stream_window_size: u32 = 64 * 1024,
     write_high_watermark_bytes: usize = 1024 * 1024,
     write_low_watermark_bytes: usize = 512 * 1024,
+    runtime: ?*Runtime = null,
 };
 
 pub const Options = ChannelOptions;
@@ -124,6 +127,11 @@ pub const Channel = struct {
             options.write_low_watermark_bytes,
         );
         const parsed = try parseTarget(target);
+        const literal_address = std.Io.net.IpAddress.parseIp4(parsed.host, parsed.port) catch null;
+        if (literal_address == null) {
+            const runtime = options.runtime orelse return error.RuntimeRequired;
+            if (!runtime.isInitialized()) return error.RuntimeNotInitialized;
+        }
         const impl = try allocator.create(Impl);
         errdefer allocator.destroy(impl);
         const serialized_allocator = try allocator.create(SerializedAllocator);
@@ -136,6 +144,8 @@ pub const Channel = struct {
             .allocator = undefined,
             .host = undefined,
             .port = parsed.port,
+            .runtime = options.runtime,
+            .literal_address = literal_address,
             .authority = undefined,
             .user_agent = undefined,
             .initial_stream_window_size = options.initial_stream_window_size,
@@ -173,6 +183,7 @@ pub const Channel = struct {
             impl.thread.?.join();
             impl.thread = null;
             impl.pending.deinit(impl.allocator);
+            if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
             return error.ConnectionFailed;
         }
 
@@ -284,6 +295,7 @@ pub const Channel = struct {
         impl.stream_states.deinit(impl.allocator);
         impl.streams.deinit(impl.allocator);
         impl.writes.deinit(impl.allocator);
+        if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
         impl.async_handle.deinit();
         impl.deadline_timer.deinit();
         impl.allocator.free(impl.user_agent);
@@ -298,7 +310,8 @@ pub const Channel = struct {
 };
 
 const State = enum { starting, running, stopping, stopped };
-const ConnectionState = enum { connecting, active, draining, closing };
+const ConnectionState = enum { resolving, connecting, active, draining, closing };
+const ResolveState = enum { idle, pending, ready, failed, cancelled };
 
 const TestObserver = if (builtin.is_test) struct {
     write_requested: std.atomic.Value(bool) = .init(false),
@@ -320,6 +333,8 @@ const Impl = struct {
     allocator: std.mem.Allocator,
     host: [:0]u8,
     port: u16,
+    runtime: ?*Runtime,
+    literal_address: ?std.Io.net.IpAddress,
     authority: []u8,
     user_agent: []u8,
     initial_stream_window_size: u32,
@@ -365,6 +380,11 @@ const Impl = struct {
     deadline_timer_deadline_ns: ?u64 = null,
     connected: bool = false,
     connection_state: ConnectionState = .connecting,
+    resolver: cares_adapter.Adapter = undefined,
+    resolver_initialized: bool = false,
+    resolve_state: ResolveState = .idle,
+    resolved_addresses: []std.Io.net.IpAddress = &.{},
+    next_address: usize = 0,
     connection_generation: std.atomic.Value(usize) = .init(0),
     stopping_on_loop: bool = false,
     connect_count: std.atomic.Value(usize) = .init(0),
@@ -909,6 +929,16 @@ fn runLoop(impl: *Impl) void {
         return;
     };
     impl.loop_initialized = true;
+    if (impl.literal_address == null) {
+        impl.resolver.init(impl.allocator, &impl.loop) catch {
+            impl.signalStartup(false);
+            impl.loop.deinit();
+            impl.loop_initialized = false;
+            impl.markStopped();
+            return;
+        };
+        impl.resolver_initialized = true;
+    }
     impl.async_handle.wait(&impl.loop, &impl.async_completion, Impl, impl, onAsync);
     startConnection(impl) catch {
         impl.signalStartup(false);
@@ -924,11 +954,31 @@ fn runLoop(impl: *Impl) void {
     impl.session = null;
     impl.loop.deinit();
     impl.loop_initialized = false;
+    if (impl.resolver_initialized) {
+        impl.resolver.deinitAfterLoop();
+        impl.resolver_initialized = false;
+    }
     impl.markStopped();
 }
 
 fn startConnection(impl: *Impl) !void {
-    const address = try std.Io.net.IpAddress.parseIp4(impl.host, impl.port);
+    const address = impl.literal_address orelse address: {
+        switch (impl.resolve_state) {
+            .idle => {
+                impl.resolve_state = .pending;
+                impl.connection_state = .resolving;
+                try impl.resolver.resolve(impl.host, impl.port, impl, onResolved);
+                return;
+            },
+            .pending => return,
+            .ready => {},
+            .failed, .cancelled => return error.ConnectionFailed,
+        }
+        if (impl.next_address >= impl.resolved_addresses.len) return error.ConnectionFailed;
+        const candidate = impl.resolved_addresses[impl.next_address];
+        impl.next_address += 1;
+        break :address candidate;
+    };
     impl.tcp = try xev.TCP.init(address);
     impl.tcp_initialized = true;
     impl.close_submitted = false;
@@ -941,6 +991,43 @@ fn startConnection(impl: *Impl) !void {
     impl.connect_active = true;
     impl.tcp.connect(&impl.loop, &impl.connect_completion, address, Impl, impl, onConnect);
     observeTestIo(impl);
+}
+
+fn onResolved(context: ?*anyopaque, result: cares_adapter.ResolveResult) void {
+    const impl: *Impl = @ptrCast(@alignCast(context.?));
+    switch (result) {
+        .addresses => |addresses| {
+            if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
+            impl.resolved_addresses = addresses;
+            impl.next_address = 0;
+            impl.resolve_state = .ready;
+        },
+        .failed => impl.resolve_state = .failed,
+        .cancelled => impl.resolve_state = .cancelled,
+    }
+    impl.async_handle.notify() catch @panic("resolver wakeup failed");
+}
+
+fn continueResolvedConnection(impl: *Impl) void {
+    if (impl.connection_state != .resolving) return;
+    switch (impl.resolve_state) {
+        .pending, .idle => return,
+        .ready => startConnection(impl) catch {
+            impl.signalStartup(false);
+            beginStop(impl, "name resolution failed");
+        },
+        .failed, .cancelled => {
+            impl.signalStartup(false);
+            beginStop(impl, "name resolution failed");
+        },
+    }
+}
+
+fn clearResolvedAddresses(impl: *Impl) void {
+    if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
+    impl.resolved_addresses = &.{};
+    impl.next_address = 0;
+    impl.resolve_state = .idle;
 }
 
 fn initializeSession(impl: *Impl) !void {
@@ -971,8 +1058,14 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
     impl.connect_active = false;
     defer submitCloseIfReady(impl, loop);
     result catch {
-        impl.signalStartup(false);
-        beginStop(impl, "connection failed");
+        if (impl.literal_address != null) {
+            impl.signalStartup(false);
+            beginStop(impl, "connection failed");
+        } else {
+            if (impl.session) |session| c.nghttp2_session_del(session);
+            impl.session = null;
+            impl.connection_state = .closing;
+        }
         return .disarm;
     };
     socket_options.enableTcpNoDelay(impl.tcp.fd) catch {
@@ -988,6 +1081,7 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
         return .disarm;
     }
     impl.connected = true;
+    clearResolvedAddresses(impl);
     _ = impl.connect_count.fetchAdd(1, .monotonic);
     impl.read_active = true;
     impl.tcp.read(&impl.loop, &impl.read_completion, .{ .slice = &impl.read_buffer }, Impl, impl, onRead);
@@ -1015,7 +1109,7 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
     observeTestIo(impl);
     impl.mutex.lockUncancelable(syncIo());
     impl.stream_wake_notify_pending = false;
-    const stopping = impl.state != .running;
+    const stopping = impl.state == .stopping or impl.state == .stopped;
     impl.mutex.unlock(syncIo());
     if (stopping) {
         beginStop(impl, "channel closed");
@@ -1023,6 +1117,10 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
     }
     processStreamWakes(impl);
     switch (impl.connection_state) {
+        .resolving => {
+            continueResolvedConnection(impl);
+            scheduleDeadlineTimer(impl);
+        },
         .active => processPending(impl),
         .draining => {
             if (impl.operations.count() == 0 and impl.streams.count() == 0) beginReconnect(impl);
@@ -2080,6 +2178,7 @@ fn beginReconnect(impl: *Impl) void {
     if (impl.connection_state != .draining or impl.operations.count() != 0 or impl.streams.count() != 0) return;
     impl.connection_state = .closing;
     impl.connected = false;
+    clearResolvedAddresses(impl);
     if (impl.session) |session| {
         c.nghttp2_session_del(session);
         impl.session = null;
@@ -2169,6 +2268,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     impl.stopping_on_loop = true;
     impl.connection_state = .closing;
     impl.connected = false;
+    if (impl.resolver_initialized) impl.resolver.shutdown();
     impl.mutex.lockUncancelable(syncIo());
     impl.accepting_streams = false;
     if (impl.state == .starting) {
@@ -2560,6 +2660,8 @@ fn initTestImpl(impl: *Impl, serialized_allocator: *SerializedAllocator, host: [
         .allocator = undefined,
         .host = host,
         .port = 1,
+        .runtime = null,
+        .literal_address = std.Io.net.IpAddress.parseIp4("127.0.0.1", 1) catch unreachable,
         .authority = &.{},
         .user_agent = &.{},
         .initial_stream_window_size = 64 * 1024,
@@ -3412,6 +3514,43 @@ test "channel and server exchange gzip-compressed unary messages" {
     );
     defer limited.deinit();
     try std.testing.expectEqual(status.Code.resource_exhausted, limited.status.code);
+}
+
+test "channel resolves an IPv4 hostname with c-ares" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+
+    var runtime = try Runtime.init();
+    defer runtime.deinit();
+
+    const Handler = struct {
+        fn handle(
+            _: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Dns/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{ .runtime = &runtime });
+    defer channel.deinit();
+
+    var result = try channel.callUnary(std.testing.allocator, "/test.Dns/Unary", "resolved", .{});
+    defer result.deinit();
+    try std.testing.expect(result.status.isOk());
+    try std.testing.expectEqualStrings("resolved", result.payload);
 }
 
 test "manual receive flow control preserves unary messages larger than the initial window" {

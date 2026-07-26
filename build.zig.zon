@@ -12,6 +12,10 @@
             .url = "https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99",
             .hash = "N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX",
         },
+        .cares = .{
+            .url = "https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz",
+            .hash = "N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp",
+        },
         .protobuf = .{
             .url = "https://github.com/Arwalk/zig-protobuf/archive/1f6cb06156b3ff4f52f98bc14f829c0b8393a6fc.tar.gz",
             .hash = "protobuf-5.0.0-0e82avKUKAAVwTWJzTIEZ14Fu0zC11_lElR8tE6H__y1",

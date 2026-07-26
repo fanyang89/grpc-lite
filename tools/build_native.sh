@@ -57,6 +57,16 @@ case "$library" in
             -DBUILD_TESTING=OFF \
             -DBUILD_STATIC_LIBS=ON
         ;;
+    cares)
+        CC="$cc" CXX="$cxx" cmake "${common_options[@]}" \
+            -DCARES_STATIC=ON \
+            -DCARES_SHARED=OFF \
+            -DCARES_INSTALL=OFF \
+            -DCARES_BUILD_TESTS=OFF \
+            -DCARES_BUILD_CONTAINER_TESTS=OFF \
+            -DCARES_BUILD_TOOLS=OFF \
+            -DCARES_THREADS=ON
+        ;;
     gperftools)
         CC="$cc" CXX="$cxx" cmake "${common_options[@]}" \
             -DBUILD_TESTING=OFF \

@@ -13,6 +13,7 @@ exports remain available for experimentation but may change before 1.0.
 
 - Standard unary gRPC over cleartext HTTP/2
 - Persistent multiplexed channels
+- Asynchronous IPv4 hostname resolution through c-ares
 - ASCII and binary initial and trailing metadata
 - Deadlines and deadline-driven HTTP/2 stream cancellation
 - Unary identity and gzip compression
@@ -21,8 +22,8 @@ exports remain available for experimentation but may change before 1.0.
 - Raw protobuf wire APIs with no required message runtime
 - Optional typed APIs and service registration through zig-protobuf
 
-The transport remains IPv4-only. TLS, DNS, automatic RPC retries, and server reflection
-remain out of scope.
+The transport remains IPv4-only. TLS, automatic RPC retries, and server reflection remain
+out of scope.
 
 ## Streaming Target
 
@@ -53,6 +54,7 @@ mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
 mise run test-consumer
+mise run prepare-network-deps
 mise run prepare-gperftools
 mise run build-gperftools
 mise run test-gperftools
@@ -75,6 +77,20 @@ vendored official HTTP/2 edge-case container also runs on both architectures. A
 scheduled x64 workflow runs extended official unary soak tests.
 
 ## Unary Client
+
+IPv4 literals require no global setup. Hostname targets use c-ares and require a Runtime
+initialized before the application creates any threads. The runtime must outlive every
+channel that references it.
+
+```zig
+var runtime = try grpc.Runtime.init();
+defer runtime.deinit();
+
+var channel = try grpc.Channel.init(allocator, "api.example.com:50051", .{
+    .runtime = &runtime,
+});
+defer channel.deinit();
+```
 
 `Channel.callUnary` supports concurrent callers. `Channel.shutdown` may run while calls
 are active; join those caller threads before giving `Channel.deinit` exclusive access.

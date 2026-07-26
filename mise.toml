@@ -8,8 +8,8 @@ actionlint = "1.7.12"
 "github:jiacai2050/zigcli" = "0.6.2"
 
 [tasks.bootstrap]
-description = "Initialize native dependency submodules"
-run = "git submodule update --init --depth 1 third_party/nghttp2 third_party/grpc-proto"
+description = "Initialize native dependencies"
+run = "git submodule update --init --depth 1 third_party/nghttp2 third_party/grpc-proto && mise run prepare-network-deps"
 
 [tasks.build]
 description = "Build grpc-lite"

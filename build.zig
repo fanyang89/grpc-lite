@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const nghttp2_dependency = b.dependency("nghttp2", .{});
+    const cares_dependency = b.dependency("cares", .{});
     const enable_protobuf = b.option(
         bool,
         "protobuf",
@@ -26,6 +27,9 @@ pub fn build(b: *std.Build) void {
         "gperftools",
         "Use tcmalloc and expose CPU and heap profiling APIs",
     ) orelse false;
+    if (target.result.os.tag != .linux) {
+        @panic("DNS support is currently limited to Linux");
+    }
     if (enable_gperftools and target.result.os.tag != .linux) {
         @panic("gperftools support is currently limited to Linux");
     }
@@ -57,6 +61,7 @@ pub fn build(b: *std.Build) void {
     const native = addNativeDependencies(
         b,
         nghttp2_dependency.path(""),
+        cares_dependency.path(""),
         if (gperftools_dependency) |dependency| dependency.path("") else null,
         target,
         optimize,
@@ -69,6 +74,9 @@ pub fn build(b: *std.Build) void {
     grpc_lite.addIncludePath(nghttp2_dependency.path("lib/includes"));
     grpc_lite.addIncludePath(native.nghttp2_include);
     grpc_lite.addObjectFile(native.nghttp2_archive);
+    grpc_lite.addIncludePath(cares_dependency.path("include"));
+    grpc_lite.addIncludePath(native.cares_include);
+    grpc_lite.addObjectFile(native.cares_archive);
     grpc_lite.addImport("xev", xev);
     const test_step = b.step("test", "Run unit tests");
 
@@ -433,6 +441,8 @@ fn addExample(
 const NativeDependencies = struct {
     nghttp2_archive: std.Build.LazyPath,
     nghttp2_include: std.Build.LazyPath,
+    cares_archive: std.Build.LazyPath,
+    cares_include: std.Build.LazyPath,
     gperftools_archive: ?std.Build.LazyPath,
     gperftools_force_link: ?std.Build.LazyPath,
 };
@@ -440,6 +450,7 @@ const NativeDependencies = struct {
 fn addNativeDependencies(
     b: *std.Build,
     nghttp2_source_dir: std.Build.LazyPath,
+    cares_source_dir: std.Build.LazyPath,
     gperftools_source_dir: ?std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -464,6 +475,16 @@ fn addNativeDependencies(
         target_triple,
         sanitizers,
     );
+    const build_cares = addNativeBuild(
+        b,
+        "cares",
+        cares_source_dir,
+        cmake_build_type,
+        cc,
+        cxx,
+        target_triple,
+        sanitizers,
+    );
 
     const build_gperftools = if (gperftools_source_dir) |source_dir|
         addNativeBuild(
@@ -482,6 +503,8 @@ fn addNativeDependencies(
     return .{
         .nghttp2_archive = build_nghttp2.path(b, "lib/libnghttp2.a"),
         .nghttp2_include = build_nghttp2.path(b, "lib/includes"),
+        .cares_archive = build_cares.path(b, "lib64/libcares.a"),
+        .cares_include = build_cares.path(b, "include"),
         .gperftools_archive = if (build_gperftools) |output| output.path(b, "libtcmalloc_and_profiler.a") else null,
         .gperftools_force_link = if (build_gperftools) |output| output.path(b, "gperftools_force_link.o") else null,
     };

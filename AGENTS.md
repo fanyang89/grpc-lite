@@ -17,6 +17,7 @@ mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
 mise run test-consumer
+mise run prepare-network-deps
 mise run prepare-gperftools
 mise run build-gperftools
 mise run test-gperftools
@@ -44,6 +45,7 @@ mise run gen-proto
 - gRPC payloads remain raw protobuf wire bytes.
 - Generated protobuf sources live under `.zig-cache` and are not committed.
 - The transport target supports raw unary and full-duplex streaming over cleartext IPv4.
+- c-ares resolves client hostnames to IPv4 candidates on the libxev loop.
 
 Keep C types private to transport modules. Keep protobuf out of `src/root.zig` so the
 raw transport remains independently usable. Do not add TLS or grpcpp compatibility
@@ -71,7 +73,8 @@ authoritative: change it before implementing a feature with a different decision
 | GOAWAY connection replacement | Selected | New calls use a new connection; no RPC retry |
 | Graceful server drain | Selected | Stop admission, send GOAWAY, wait with timeout |
 | TLS, ALPN, and mTLS | Out of scope | Interop profile is explicitly insecure |
-| DNS and IPv6 | Out of scope | IPv4 literals only |
+| DNS | Selected | c-ares on Linux io_uring; client IPv4 hostnames only |
+| IPv6 | Out of scope | No AAAA, Happy Eyeballs, or IPv6 listeners |
 | Reflection and health services | Out of scope | Not part of the lite profile |
 | Interceptors and middleware | Out of scope | Keep the core API small |
 | Retry policies and connection backoff | Out of scope | Applications retry explicitly |

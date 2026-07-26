@@ -3,8 +3,10 @@
 const std = @import("std");
 
 const c = @import("c.zig");
+const cares_adapter = @import("cares_adapter.zig");
 const deadline = @import("deadline.zig");
 const version_info = @import("version.zig");
+const runtime = @import("runtime.zig");
 pub const message = @import("message.zig");
 
 pub const call = @import("call.zig");
@@ -40,6 +42,7 @@ pub const ServerStream = stream.ServerStream;
 pub const ServerStreamHandler = stream.ServerHandler;
 pub const UnaryHandler = service.UnaryHandler;
 pub const UnaryResponse = service.UnaryResponse;
+pub const Runtime = runtime.Runtime;
 
 pub const version = version_info.string;
 
@@ -49,12 +52,14 @@ test "version is available" {
 
 test {
     _ = c;
+    _ = cares_adapter;
     _ = call;
     _ = channel;
     _ = compression;
     _ = deadline;
     _ = frame;
     _ = metadata;
+    _ = runtime;
     _ = message;
     _ = server;
     _ = service;
