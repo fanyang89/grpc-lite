@@ -19,6 +19,46 @@ const tls_record = if (build_options.tls) @import("tls_record.zig") else @import
 
 // Bounds socket-write aggregation only; HTTP/2 frame boundaries remain unchanged.
 const socket_write_batch_target = 64 * 1024;
+const request_header_stack_capacity = 10;
+const encoded_value_stack_capacity = 4;
+
+fn StackFirstBuilder(comptime T: type, comptime stack_capacity: usize) type {
+    return struct {
+        stack: [stack_capacity]T = undefined,
+        stack_len: usize = 0,
+        overflow: std.ArrayList(T) = .empty,
+        overflowed: bool = false,
+
+        fn append(self: *@This(), allocator: std.mem.Allocator, value: T) !void {
+            if (self.overflowed) return self.overflow.append(allocator, value);
+            if (self.stack_len < stack_capacity) {
+                self.stack[self.stack_len] = value;
+                self.stack_len += 1;
+                return;
+            }
+
+            var overflow: std.ArrayList(T) = .empty;
+            errdefer overflow.deinit(allocator);
+            try overflow.ensureTotalCapacity(allocator, stack_capacity * 2);
+            overflow.appendSliceAssumeCapacity(self.stack[0..self.stack_len]);
+            overflow.appendAssumeCapacity(value);
+            self.overflow = overflow;
+            self.overflowed = true;
+        }
+
+        fn items(self: *@This()) []T {
+            return if (self.overflowed) self.overflow.items else self.stack[0..self.stack_len];
+        }
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.overflow.deinit(allocator);
+            self.* = undefined;
+        }
+    };
+}
+
+const HeaderBuilder = StackFirstBuilder(c.nghttp2_nv, request_header_stack_capacity);
+const EncodedValueBuilder = StackFirstBuilder(metadata.OutboundValue, encoded_value_stack_capacity);
 
 pub const TlsOptions = struct {
     ca_certificates_pem: []const u8,
@@ -1635,11 +1675,11 @@ fn processStreamWakes(impl: *Impl) void {
 
 fn submitClientStream(impl: *Impl, client_stream: *ClientStreamState) !void {
     try impl.streams.ensureUnusedCapacity(impl.allocator, 1);
-    var headers: std.ArrayList(c.nghttp2_nv) = .empty;
+    var headers: HeaderBuilder = .{};
     defer headers.deinit(impl.allocator);
-    var encoded_values: std.ArrayList([]u8) = .empty;
+    var encoded_values: EncodedValueBuilder = .{};
     defer {
-        for (encoded_values.items) |value| impl.allocator.free(value);
+        for (encoded_values.items()) |value| value.deinit(impl.allocator);
         encoded_values.deinit(impl.allocator);
     }
     try headers.append(impl.allocator, nativeHeader(":method", "POST"));
@@ -1658,12 +1698,7 @@ fn submitClientStream(impl: *Impl, client_stream: *ClientStreamState) !void {
         ));
     }
     for (client_stream.request_metadata.items()) |entry| {
-        const value = try metadata.encodeValue(impl.allocator, entry.key, entry.value);
-        encoded_values.append(impl.allocator, value) catch |err| {
-            impl.allocator.free(value);
-            return err;
-        };
-        try headers.append(impl.allocator, nativeHeader(entry.key, value));
+        try appendMetadataHeader(&headers, &encoded_values, impl.allocator, entry);
     }
 
     var provider: c.nghttp2_data_provider2 = .{
@@ -1673,8 +1708,8 @@ fn submitClientStream(impl: *Impl, client_stream: *ClientStreamState) !void {
     const stream_id = c.nghttp2_submit_request2(
         impl.session,
         null,
-        headers.items.ptr,
-        headers.items.len,
+        headers.items().ptr,
+        headers.items().len,
         &provider,
         client_stream,
     );
@@ -2028,11 +2063,11 @@ fn finalizeClientStream(client_stream: *ClientStreamState) void {
 
 fn submitOperation(impl: *Impl, operation: *Operation) !void {
     try impl.operations.ensureUnusedCapacity(impl.allocator, 1);
-    var headers: std.ArrayList(c.nghttp2_nv) = .empty;
+    var headers: HeaderBuilder = .{};
     defer headers.deinit(impl.allocator);
-    var encoded_values: std.ArrayList([]u8) = .empty;
+    var encoded_values: EncodedValueBuilder = .{};
     defer {
-        for (encoded_values.items) |value| impl.allocator.free(value);
+        for (encoded_values.items()) |value| value.deinit(impl.allocator);
         encoded_values.deinit(impl.allocator);
     }
     try headers.append(impl.allocator, nativeHeader(":method", "POST"));
@@ -2048,12 +2083,7 @@ fn submitOperation(impl: *Impl, operation: *Operation) !void {
         try headers.append(impl.allocator, nativeHeader("grpc-timeout", operation.timeout_header[0..operation.timeout_header_len]));
     }
     for (operation.request_metadata.items()) |entry| {
-        const value = try metadata.encodeValue(impl.allocator, entry.key, entry.value);
-        encoded_values.append(impl.allocator, value) catch |err| {
-            impl.allocator.free(value);
-            return err;
-        };
-        try headers.append(impl.allocator, nativeHeader(entry.key, value));
+        try appendMetadataHeader(&headers, &encoded_values, impl.allocator, entry);
     }
 
     var provider: c.nghttp2_data_provider2 = .{
@@ -2063,8 +2093,8 @@ fn submitOperation(impl: *Impl, operation: *Operation) !void {
     const stream_id = c.nghttp2_submit_request2(
         impl.session,
         null,
-        headers.items.ptr,
-        headers.items.len,
+        headers.items().ptr,
+        headers.items().len,
         &provider,
         operation,
     );
@@ -3017,6 +3047,91 @@ fn nativeHeader(name: []const u8, value: []const u8) c.nghttp2_nv {
         .valuelen = value.len,
         .flags = c.NGHTTP2_NV_FLAG_NONE,
     };
+}
+
+fn appendMetadataHeader(
+    headers: *HeaderBuilder,
+    encoded_values: *EncodedValueBuilder,
+    allocator: std.mem.Allocator,
+    entry: metadata.Entry,
+) !void {
+    const encoded = try metadata.encodeOutboundValue(allocator, entry.key, entry.value);
+    encoded_values.append(allocator, encoded) catch |err| {
+        encoded.deinit(allocator);
+        return err;
+    };
+    try headers.append(allocator, nativeHeader(entry.key, encoded.bytes()));
+}
+
+fn testHeaderBuilderAllocations(allocator: std.mem.Allocator) !void {
+    var headers: HeaderBuilder = .{};
+    defer headers.deinit(allocator);
+    for (0..request_header_stack_capacity * 4) |_| {
+        try headers.append(allocator, nativeHeader("x-test", "value"));
+    }
+}
+
+fn testMixedMetadataHeaderCleanup(allocator: std.mem.Allocator) !void {
+    var headers: HeaderBuilder = .{};
+    defer headers.deinit(allocator);
+    var encoded_values: EncodedValueBuilder = .{};
+    defer {
+        for (encoded_values.items()) |value| value.deinit(allocator);
+        encoded_values.deinit(allocator);
+    }
+    for (0..request_header_stack_capacity) |_| {
+        try headers.append(allocator, nativeHeader("x-fixed", "value"));
+    }
+    const entries = [_]metadata.Entry{
+        .{ .key = "x-first", .value = "one" },
+        .{ .key = "first-bin", .value = "first" },
+        .{ .key = "x-second", .value = "two" },
+        .{ .key = "second-bin", .value = "second" },
+        .{ .key = "x-third", .value = "three" },
+    };
+    for (entries) |entry| try appendMetadataHeader(&headers, &encoded_values, allocator, entry);
+}
+
+test "client header builder stack path does not allocate" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    var headers: HeaderBuilder = .{};
+    defer headers.deinit(failing.allocator());
+
+    for (0..request_header_stack_capacity) |_| {
+        try headers.append(failing.allocator(), nativeHeader("x-test", "value"));
+    }
+    try std.testing.expect(!headers.overflowed);
+    try std.testing.expectEqual(request_header_stack_capacity, headers.items().len);
+}
+
+test "client header builder overflow preserves order" {
+    const values = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10" };
+    var headers: HeaderBuilder = .{};
+    defer headers.deinit(std.testing.allocator);
+
+    for (values) |value| try headers.append(std.testing.allocator, nativeHeader("x-test", value));
+    try std.testing.expect(headers.overflowed);
+    for (headers.items(), values) |header, value| {
+        try std.testing.expectEqualStrings(value, header.value[0..header.valuelen]);
+    }
+}
+
+test "client header builder handles every overflow allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testHeaderBuilderAllocations,
+        .{},
+    );
+}
+
+test "client mixed metadata header cleanup handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testMixedMetadataHeaderCleanup,
+        .{},
+    );
 }
 
 fn copyMetadata(destination: *metadata.Metadata, source: *const metadata.Metadata) !void {

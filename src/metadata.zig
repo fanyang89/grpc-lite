@@ -7,6 +7,24 @@ pub const Entry = struct {
 
 pub const IncomingResult = enum { appended, discarded };
 
+pub const OutboundValue = union(enum) {
+    borrowed: []const u8,
+    owned: []u8,
+
+    pub fn bytes(self: OutboundValue) []const u8 {
+        return switch (self) {
+            inline else => |value| value,
+        };
+    }
+
+    pub fn deinit(self: OutboundValue, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .borrowed => {},
+            .owned => |value| allocator.free(value),
+        }
+    }
+};
+
 pub const Metadata = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry) = .empty,
@@ -107,12 +125,12 @@ pub fn isBinaryKey(key: []const u8) bool {
     return std.mem.endsWith(u8, key, "-bin");
 }
 
-pub fn encodeValue(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
-    if (!isBinaryKey(key)) return allocator.dupe(u8, value);
+pub fn encodeOutboundValue(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !OutboundValue {
+    if (!isBinaryKey(key)) return .{ .borrowed = value };
 
     const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(value.len));
     _ = std.base64.standard.Encoder.encode(encoded, value);
-    return encoded;
+    return .{ .owned = encoded };
 }
 
 fn testMetadataAllocations(allocator: std.mem.Allocator) !void {
@@ -121,8 +139,24 @@ fn testMetadataAllocations(allocator: std.mem.Allocator) !void {
     try metadata.append("x-request-id", "value");
     _ = try metadata.appendDecoded("trace-bin", "qw==");
 
-    const encoded = try encodeValue(allocator, "trace-bin", "binary");
-    defer allocator.free(encoded);
+    const encoded = try encodeOutboundValue(allocator, "trace-bin", "binary");
+    defer encoded.deinit(allocator);
+}
+
+fn testMixedOutboundValueCleanup(allocator: std.mem.Allocator) !void {
+    const entries = [_]Entry{
+        .{ .key = "x-ascii", .value = "borrowed" },
+        .{ .key = "first-bin", .value = "first" },
+        .{ .key = "second-bin", .value = "second" },
+    };
+    var values: [entries.len]OutboundValue = undefined;
+    var initialized: usize = 0;
+    defer for (values[0..initialized]) |value| value.deinit(allocator);
+
+    for (entries) |entry| {
+        values[initialized] = try encodeOutboundValue(allocator, entry.key, entry.value);
+        initialized += 1;
+    }
 }
 
 test "metadata owns entries and preserves duplicates" {
@@ -173,11 +207,44 @@ test "metadata rejects invalid keys" {
     try std.testing.expectError(error.InvalidMetadataValue, metadata.append("x-control", "bad\nvalue"));
 }
 
-test "binary metadata codec emits padded base64 and accepts padded or unpadded input" {
+test "ASCII outbound metadata values are borrowed" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    var original = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
+    const encoded = try encodeOutboundValue(failing.allocator(), "x-ascii", &original);
+    defer encoded.deinit(failing.allocator());
+
+    switch (encoded) {
+        .borrowed => |value| {
+            try std.testing.expect(value.ptr == original[0..].ptr);
+            original[0] = 'V';
+            try std.testing.expectEqualStrings("Value", value);
+        },
+        .owned => return error.TestExpectedBorrowedValue,
+    }
+}
+
+test "binary outbound metadata values are owned padded base64" {
     const raw = [_]u8{0xab};
-    const encoded = try encodeValue(std.testing.allocator, "trace-bin", &raw);
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings("qw==", encoded);
+    const encoded = try encodeOutboundValue(std.testing.allocator, "trace-bin", &raw);
+    defer encoded.deinit(std.testing.allocator);
+    switch (encoded) {
+        .borrowed => return error.TestExpectedOwnedValue,
+        .owned => |value| try std.testing.expectEqualStrings("qw==", value),
+    }
+}
+
+test "mixed outbound metadata cleanup handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testMixedOutboundValueCleanup,
+        .{},
+    );
+}
+
+test "binary metadata codec accepts padded or unpadded input" {
+    const raw = [_]u8{0xab};
 
     var metadata = Metadata.init(std.testing.allocator);
     defer metadata.deinit();
@@ -187,10 +254,6 @@ test "binary metadata codec emits padded base64 and accepts padded or unpadded i
     try std.testing.expectEqualSlices(u8, &.{ 0xab, 0xab, 0xab }, metadata.items()[0].value);
     try std.testing.expectEqualSlices(u8, &raw, metadata.items()[1].value);
     try std.testing.expectEqualSlices(u8, &raw, metadata.items()[2].value);
-
-    const ascii = try encodeValue(std.testing.allocator, "trace-bin-extra", "unchanged");
-    defer std.testing.allocator.free(ascii);
-    try std.testing.expectEqualStrings("unchanged", ascii);
 }
 
 test "binary metadata codec rejects invalid input without appending" {
