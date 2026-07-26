@@ -257,6 +257,7 @@ pub const Channel = struct {
             impl.operations.deinit(impl.allocator);
             impl.stream_states.deinit(impl.allocator);
             impl.streams.deinit(impl.allocator);
+            drainWriteRequestPool(impl);
             impl.writes.deinit(impl.allocator);
             std.debug.assert(impl.deadline_heap.items.len == 0);
             std.debug.assert(impl.deadline_heap_index == null);
@@ -400,6 +401,7 @@ pub const Channel = struct {
         impl.operations.deinit(impl.allocator);
         impl.stream_states.deinit(impl.allocator);
         impl.streams.deinit(impl.allocator);
+        drainWriteRequestPool(impl);
         impl.writes.deinit(impl.allocator);
         std.debug.assert(impl.deadline_heap.items.len == 0);
         std.debug.assert(impl.deadline_heap_index == null);
@@ -515,6 +517,8 @@ const Impl = struct {
     plaintext_buffer: [16 * 1024]u8 = undefined,
     write_queue: xev.WriteQueue = .{},
     writes: std.AutoHashMapUnmanaged(*WriteRequest, void) = .empty,
+    write_request_pool_head: ?*WriteRequest = null,
+    write_request_pool_count: usize = 0,
     queued_write_bytes: usize = 0,
     test_observer: TestObserver = .{},
 
@@ -1272,7 +1276,70 @@ const WriteRequest = struct {
     impl: *Impl,
     bytes: []u8,
     generation: usize,
+    free_next: ?*WriteRequest = null,
+    in_pool: bool = false,
 };
+
+fn acquireWriteRequest(impl: *Impl, bytes: []u8) !*WriteRequest {
+    const write = if (impl.write_request_pool_head) |pooled| pooled else try impl.allocator.create(WriteRequest);
+    if (impl.write_request_pool_head != null) {
+        std.debug.assert(write.in_pool);
+        std.debug.assert(impl.write_request_pool_count > 0);
+        impl.write_request_pool_head = write.free_next;
+        impl.write_request_pool_count -= 1;
+    }
+    write.* = .{
+        .request = .{ .full_write_buffer = .{ .slice = &.{} } },
+        .impl = impl,
+        .bytes = bytes,
+        .generation = impl.connection_generation.load(.monotonic),
+    };
+    return write;
+}
+
+fn releaseWriteRequest(impl: *Impl, write: *WriteRequest) void {
+    std.debug.assert(write.impl == impl);
+    std.debug.assert(!write.in_pool);
+    std.debug.assert(!impl.writes.contains(write));
+    std.debug.assert(!isWriteRequestQueued(impl, write));
+    std.debug.assert(write.request.completion.state() == .dead);
+    write.bytes = &.{};
+    write.free_next = impl.write_request_pool_head;
+    write.in_pool = true;
+    impl.write_request_pool_head = write;
+    impl.write_request_pool_count += 1;
+}
+
+fn drainWriteRequestPool(impl: *Impl) void {
+    std.debug.assert(impl.writes.count() == 0);
+    std.debug.assert(impl.write_queue.head == null);
+    var count: usize = 0;
+    var current = impl.write_request_pool_head;
+    while (current) |write| {
+        std.debug.assert(write.in_pool);
+        std.debug.assert(!impl.writes.contains(write));
+        std.debug.assert(write.request.completion.state() == .dead);
+        count += 1;
+        std.debug.assert(count <= impl.write_request_pool_count);
+        current = write.free_next;
+    }
+    std.debug.assert(count == impl.write_request_pool_count);
+
+    while (impl.write_request_pool_head) |write| {
+        impl.write_request_pool_head = write.free_next;
+        impl.write_request_pool_count -= 1;
+        impl.allocator.destroy(write);
+    }
+    std.debug.assert(impl.write_request_pool_count == 0);
+}
+
+fn isWriteRequestQueued(impl: *const Impl, write: *const WriteRequest) bool {
+    var current = impl.write_queue.head;
+    while (current) |request| : (current = request.next) {
+        if (request == &write.request) return true;
+    }
+    return false;
+}
 
 const CleartextWriteBatch = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -2203,16 +2270,17 @@ fn queueSocketWrite(impl: *Impl, source: []const u8) !void {
 }
 
 fn queueOwnedSocketWrite(impl: *Impl, bytes: []u8) !void {
-    errdefer impl.allocator.free(bytes);
-    const write = try impl.allocator.create(WriteRequest);
-    errdefer impl.allocator.destroy(write);
-    write.* = .{
-        .impl = impl,
-        .bytes = bytes,
-        .generation = impl.connection_generation.load(.monotonic),
+    const write = acquireWriteRequest(impl, bytes) catch |err| {
+        impl.allocator.free(bytes);
+        return err;
     };
+    errdefer releaseWriteRequest(impl, write);
+    errdefer impl.allocator.free(bytes);
     try impl.writes.put(impl.allocator, write, {});
-    errdefer _ = impl.writes.remove(write);
+    errdefer {
+        const removed = impl.writes.remove(write);
+        std.debug.assert(removed);
+    }
     impl.queued_write_bytes = try addQueuedWriteBytes(impl.queued_write_bytes, bytes.len);
     impl.tcp.queueWrite(
         &impl.loop,
@@ -2368,13 +2436,14 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
     const write = write_.?;
     const impl = write.impl;
     const generation = write.generation;
-    _ = impl.writes.remove(write);
+    const removed = impl.writes.remove(write);
+    std.debug.assert(removed);
     impl.queued_write_bytes = completeQueuedWrite(impl.queued_write_bytes, write.bytes.len);
     // WriteQueue retries partial writes and calls back with the full buffer length.
     const completed: ?usize = result catch null;
     const write_succeeded = completed != null and completed.? == write.bytes.len;
     impl.allocator.free(write.bytes);
-    impl.allocator.destroy(write);
+    releaseWriteRequest(impl, write);
     if (!write_succeeded and generation == impl.connection_generation.load(.monotonic) and impl.connection_state != .closing) {
         beginStop(impl, "connection write failed");
     }
@@ -2986,10 +3055,11 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
 fn discardQueuedWrites(impl: *Impl) void {
     while (impl.write_queue.pop()) |request| {
         const write: *WriteRequest = @fieldParentPtr("request", request);
-        _ = impl.writes.remove(write);
+        const removed = impl.writes.remove(write);
+        std.debug.assert(removed);
         impl.queued_write_bytes = completeQueuedWrite(impl.queued_write_bytes, write.bytes.len);
         impl.allocator.free(write.bytes);
-        impl.allocator.destroy(write);
+        releaseWriteRequest(impl, write);
     }
 }
 
@@ -3419,6 +3489,126 @@ test "flush watermarks permit one chunk of overshoot and resume below low" {
     queued = completeQueuedWrite(queued, 6);
     try std.testing.expect(queued < low);
     try std.testing.expectError(error.WriteQueueSizeOverflow, addQueuedWriteBytes(std.math.maxInt(usize), 1));
+}
+
+test "client write request pool reuses descriptors without allocation" {
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    var host = [_:0]u8{'x'};
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    const owner_allocator = impl.allocator;
+    defer {
+        impl.allocator = owner_allocator;
+        drainWriteRequestPool(&impl);
+        impl.writes.deinit(impl.allocator);
+    }
+
+    const first = try acquireWriteRequest(&impl, &.{});
+    releaseWriteRequest(&impl, first);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    impl.allocator = failing.allocator();
+    const reused = try acquireWriteRequest(&impl, &.{});
+    try std.testing.expect(reused == first);
+    try std.testing.expectEqual(@as(usize, 0), impl.write_request_pool_count);
+    releaseWriteRequest(&impl, reused);
+    try std.testing.expectEqual(@as(usize, 1), impl.write_request_pool_count);
+}
+
+test "client write request pool is LIFO without duplicates" {
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    var host = [_:0]u8{'x'};
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer {
+        drainWriteRequestPool(&impl);
+        impl.writes.deinit(impl.allocator);
+    }
+
+    const first = try acquireWriteRequest(&impl, &.{});
+    const second = try acquireWriteRequest(&impl, &.{});
+    const third = try acquireWriteRequest(&impl, &.{});
+    releaseWriteRequest(&impl, first);
+    releaseWriteRequest(&impl, second);
+    releaseWriteRequest(&impl, third);
+
+    const reused_third = try acquireWriteRequest(&impl, &.{});
+    const reused_second = try acquireWriteRequest(&impl, &.{});
+    const reused_first = try acquireWriteRequest(&impl, &.{});
+    try std.testing.expect(reused_third == third);
+    try std.testing.expect(reused_second == second);
+    try std.testing.expect(reused_first == first);
+    try std.testing.expect(reused_third != reused_second);
+    try std.testing.expect(reused_second != reused_first);
+    releaseWriteRequest(&impl, reused_third);
+    releaseWriteRequest(&impl, reused_second);
+    releaseWriteRequest(&impl, reused_first);
+
+    drainWriteRequestPool(&impl);
+    try std.testing.expect(impl.write_request_pool_head == null);
+    try std.testing.expectEqual(@as(usize, 0), impl.write_request_pool_count);
+}
+
+test "client write queue setup failure returns descriptor to owner pool" {
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    var host = [_:0]u8{'x'};
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    const owner_allocator = impl.allocator;
+    defer {
+        impl.allocator = owner_allocator;
+        drainWriteRequestPool(&impl);
+        impl.writes.deinit(impl.allocator);
+    }
+
+    const pooled = try acquireWriteRequest(&impl, &.{});
+    releaseWriteRequest(&impl, pooled);
+    const bytes = try std.testing.allocator.dupe(u8, "owned");
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    impl.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, queueOwnedSocketWrite(&impl, bytes));
+    try std.testing.expectEqual(@as(usize, 1), impl.write_request_pool_count);
+    try std.testing.expect(impl.write_request_pool_head == pooled);
+    try std.testing.expectEqual(@as(usize, 0), impl.writes.count());
+    try std.testing.expectEqual(@as(usize, 0), impl.queued_write_bytes);
+    try std.testing.expectEqual(@as(usize, 1), failing.deallocations);
+}
+
+test "client write callback and discard each release once" {
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    var host = [_:0]u8{'x'};
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer {
+        drainWriteRequestPool(&impl);
+        impl.writes.deinit(impl.allocator);
+    }
+
+    const callback_bytes = try impl.allocator.dupe(u8, "callback");
+    const callback_write = try acquireWriteRequest(&impl, callback_bytes);
+    try impl.writes.put(impl.allocator, callback_write, {});
+    impl.queued_write_bytes = callback_bytes.len;
+    var loop: xev.Loop = undefined;
+    _ = onWrite(
+        callback_write,
+        &loop,
+        &callback_write.request.completion,
+        undefined,
+        .{ .slice = callback_bytes },
+        callback_bytes.len,
+    );
+    try std.testing.expectEqual(@as(usize, 1), impl.write_request_pool_count);
+
+    const discarded_bytes = try impl.allocator.dupe(u8, "discarded");
+    const discarded_write = try acquireWriteRequest(&impl, discarded_bytes);
+    try impl.writes.put(impl.allocator, discarded_write, {});
+    impl.queued_write_bytes = discarded_bytes.len;
+    impl.write_queue.push(&discarded_write.request);
+    discardQueuedWrites(&impl);
+    try std.testing.expectEqual(@as(usize, 1), impl.write_request_pool_count);
+    try std.testing.expect(impl.write_request_pool_head == discarded_write);
+    try std.testing.expectEqual(@as(usize, 0), impl.writes.count());
+    try std.testing.expectEqual(@as(usize, 0), impl.queued_write_bytes);
 }
 
 test "cleartext write batch coalesces chunks below target" {

@@ -686,6 +686,8 @@ const Connection = struct {
     write_cancel_completion: xev.Completion = .{},
     close_completion: xev.Completion = .{},
     write_queue: xev.WriteQueue = .{},
+    write_request_pool_head: ?*WriteRequest = null,
+    write_request_pool_count: usize = 0,
     read_buffer: []u8 = &.{},
     plaintext_buffer: [16 * 1024]u8 = undefined,
     tls_session: ?*tls_record.Session = null,
@@ -805,10 +807,12 @@ const Connection = struct {
     }
 
     fn queueOwnedSocketWrite(self: *Connection, bytes: []u8) !void {
+        const write = acquireWriteRequest(self, bytes) catch |err| {
+            self.server.allocator.free(bytes);
+            return err;
+        };
+        errdefer releaseWriteRequest(self, write);
         errdefer self.server.allocator.free(bytes);
-        const write = try self.server.allocator.create(WriteRequest);
-        errdefer self.server.allocator.destroy(write);
-        write.* = .{ .connection = self, .bytes = bytes };
         self.pending_writes = std.math.add(usize, self.pending_writes, 1) catch {
             return error.WriteQueueSizeOverflow;
         };
@@ -1007,7 +1011,7 @@ const Connection = struct {
             self.pending_writes -= 1;
             self.queued_write_bytes = completeQueuedWrite(self.queued_write_bytes, write.bytes.len);
             self.server.allocator.free(write.bytes);
-            self.server.allocator.destroy(write);
+            releaseWriteRequest(self, write);
         }
     }
 
@@ -1031,6 +1035,9 @@ const Connection = struct {
         }
         self.streams.deinit(server.allocator);
         if (self.read_buffer.len != 0) server.allocator.free(self.read_buffer);
+        std.debug.assert(self.pending_writes == 0);
+        std.debug.assert(self.write_queue.head == null);
+        drainWriteRequestPool(self);
         for (server.connections.items, 0..) |item, index| {
             if (item == self) {
                 _ = server.connections.swapRemove(index);
@@ -1202,7 +1209,67 @@ const WriteRequest = struct {
     request: xev.WriteRequest = undefined,
     connection: *Connection,
     bytes: []u8,
+    free_next: ?*WriteRequest = null,
+    in_pool: bool = false,
 };
+
+fn acquireWriteRequest(connection: *Connection, bytes: []u8) !*WriteRequest {
+    const write = if (connection.write_request_pool_head) |pooled| pooled else try connection.server.allocator.create(WriteRequest);
+    if (connection.write_request_pool_head != null) {
+        std.debug.assert(write.in_pool);
+        std.debug.assert(connection.write_request_pool_count > 0);
+        connection.write_request_pool_head = write.free_next;
+        connection.write_request_pool_count -= 1;
+    }
+    write.* = .{
+        .request = .{ .full_write_buffer = .{ .slice = &.{} } },
+        .connection = connection,
+        .bytes = bytes,
+    };
+    return write;
+}
+
+fn releaseWriteRequest(connection: *Connection, write: *WriteRequest) void {
+    std.debug.assert(write.connection == connection);
+    std.debug.assert(!write.in_pool);
+    std.debug.assert(!isWriteRequestQueued(connection, write));
+    std.debug.assert(write.request.completion.state() == .dead);
+    write.bytes = &.{};
+    write.free_next = connection.write_request_pool_head;
+    write.in_pool = true;
+    connection.write_request_pool_head = write;
+    connection.write_request_pool_count += 1;
+}
+
+fn drainWriteRequestPool(connection: *Connection) void {
+    std.debug.assert(connection.pending_writes == 0);
+    std.debug.assert(connection.write_queue.head == null);
+    var count: usize = 0;
+    var current = connection.write_request_pool_head;
+    while (current) |write| {
+        std.debug.assert(write.in_pool);
+        std.debug.assert(write.request.completion.state() == .dead);
+        count += 1;
+        std.debug.assert(count <= connection.write_request_pool_count);
+        current = write.free_next;
+    }
+    std.debug.assert(count == connection.write_request_pool_count);
+
+    while (connection.write_request_pool_head) |write| {
+        connection.write_request_pool_head = write.free_next;
+        connection.write_request_pool_count -= 1;
+        connection.server.allocator.destroy(write);
+    }
+    std.debug.assert(connection.write_request_pool_count == 0);
+}
+
+fn isWriteRequestQueued(connection: *const Connection, write: *const WriteRequest) bool {
+    var current = connection.write_queue.head;
+    while (current) |request| : (current = request.next) {
+        if (request == &write.request) return true;
+    }
+    return false;
+}
 
 const CleartextWriteBatch = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -1327,6 +1394,7 @@ fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev
     connection.* = .{ .server = server_ptr, .tcp = tcp };
     server_ptr.connections.append(server_ptr.allocator, connection) catch {
         closeFd(tcp.fd);
+        drainWriteRequestPool(connection);
         server_ptr.allocator.destroy(connection);
         return rearmListener(server_ptr);
     };
@@ -1439,7 +1507,7 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
     const completed: ?usize = result catch null;
     const write_succeeded = completed != null and completed.? == request.bytes.len;
     connection.server.allocator.free(request.bytes);
-    connection.server.allocator.destroy(request);
+    releaseWriteRequest(connection, request);
     if (connection.closing) {
         connection.discardQueuedWrites();
         connection.submitCloseIfReady(loop);
@@ -2956,6 +3024,7 @@ fn deinitTestConnection(connection: *Connection) void {
         std.testing.allocator.destroy(entry.value_ptr.*);
     }
     connection.streams.deinit(std.testing.allocator);
+    drainWriteRequestPool(connection);
 }
 
 fn exchangeRawHttp2(server: *Server, input: []const u8) ![]u8 {
@@ -3036,6 +3105,114 @@ test "dirty connection queue safely removes closing connections" {
     server.removeDirtyConnection(&last);
     try std.testing.expect(server.popDirtyConnection() == &closing);
     try std.testing.expect(server.popDirtyConnection() == null);
+}
+
+test "server write request pool reuses descriptors without allocation" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    const owner_allocator = server.impl.allocator;
+    defer server.impl.allocator = owner_allocator;
+    var connection = Connection{ .server = server.impl };
+    defer {
+        server.impl.allocator = owner_allocator;
+        drainWriteRequestPool(&connection);
+    }
+
+    const first = try acquireWriteRequest(&connection, &.{});
+    releaseWriteRequest(&connection, first);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    server.impl.allocator = failing.allocator();
+    const reused = try acquireWriteRequest(&connection, &.{});
+    try std.testing.expect(reused == first);
+    try std.testing.expectEqual(@as(usize, 0), connection.write_request_pool_count);
+    releaseWriteRequest(&connection, reused);
+    try std.testing.expectEqual(@as(usize, 1), connection.write_request_pool_count);
+}
+
+test "server write request pool is LIFO and drains with connection" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    defer if (connection.write_request_pool_head != null) drainWriteRequestPool(&connection);
+
+    const first = try acquireWriteRequest(&connection, &.{});
+    const second = try acquireWriteRequest(&connection, &.{});
+    const third = try acquireWriteRequest(&connection, &.{});
+    releaseWriteRequest(&connection, first);
+    releaseWriteRequest(&connection, second);
+    releaseWriteRequest(&connection, third);
+
+    const reused_third = try acquireWriteRequest(&connection, &.{});
+    const reused_second = try acquireWriteRequest(&connection, &.{});
+    const reused_first = try acquireWriteRequest(&connection, &.{});
+    try std.testing.expect(reused_third == third);
+    try std.testing.expect(reused_second == second);
+    try std.testing.expect(reused_first == first);
+    try std.testing.expect(reused_third != reused_second);
+    try std.testing.expect(reused_second != reused_first);
+    releaseWriteRequest(&connection, reused_third);
+    releaseWriteRequest(&connection, reused_second);
+    releaseWriteRequest(&connection, reused_first);
+
+    drainWriteRequestPool(&connection);
+    try std.testing.expect(connection.write_request_pool_head == null);
+    try std.testing.expectEqual(@as(usize, 0), connection.write_request_pool_count);
+}
+
+test "server write queue bookkeeping failure returns descriptor to pool" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    defer {
+        connection.pending_writes = 0;
+        drainWriteRequestPool(&connection);
+    }
+
+    const pooled = try acquireWriteRequest(&connection, &.{});
+    releaseWriteRequest(&connection, pooled);
+    connection.pending_writes = std.math.maxInt(usize);
+    const bytes = try server.impl.allocator.dupe(u8, "owned");
+    try std.testing.expectError(error.WriteQueueSizeOverflow, connection.queueOwnedSocketWrite(bytes));
+    try std.testing.expectEqual(std.math.maxInt(usize), connection.pending_writes);
+    try std.testing.expectEqual(@as(usize, 1), connection.write_request_pool_count);
+    try std.testing.expect(connection.write_request_pool_head == pooled);
+    try std.testing.expectEqual(@as(usize, 0), connection.queued_write_bytes);
+    connection.pending_writes = 0;
+}
+
+test "server write callback and discard each release once" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    server.impl.write_low_watermark_bytes = 0;
+    var connection = Connection{ .server = server.impl };
+    defer drainWriteRequestPool(&connection);
+
+    const callback_bytes = try server.impl.allocator.dupe(u8, "callback");
+    const callback_write = try acquireWriteRequest(&connection, callback_bytes);
+    connection.pending_writes = 1;
+    connection.queued_write_bytes = callback_bytes.len;
+    var loop: xev.Loop = undefined;
+    _ = onWrite(
+        callback_write,
+        &loop,
+        &callback_write.request.completion,
+        undefined,
+        .{ .slice = callback_bytes },
+        callback_bytes.len,
+    );
+    try std.testing.expectEqual(@as(usize, 1), connection.write_request_pool_count);
+
+    const discarded_bytes = try server.impl.allocator.dupe(u8, "discarded");
+    const discarded_write = try acquireWriteRequest(&connection, discarded_bytes);
+    connection.pending_writes = 1;
+    connection.queued_write_bytes = discarded_bytes.len;
+    connection.write_queue.push(&discarded_write.request);
+    connection.discardQueuedWrites();
+    try std.testing.expectEqual(@as(usize, 1), connection.write_request_pool_count);
+    try std.testing.expect(connection.write_request_pool_head == discarded_write);
+    try std.testing.expectEqual(@as(usize, 0), connection.pending_writes);
+    try std.testing.expectEqual(@as(usize, 0), connection.queued_write_bytes);
 }
 
 fn expectDeadlineHeapConsistent(server: *const Impl) !void {
