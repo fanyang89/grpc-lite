@@ -17,6 +17,9 @@ const version = @import("version.zig");
 const Runtime = @import("runtime.zig").Runtime;
 const tls_record = if (build_options.tls) @import("tls_record.zig") else @import("tls_disabled.zig");
 
+// Bounds socket-write aggregation only; HTTP/2 frame boundaries remain unchanged.
+const socket_write_batch_target = 64 * 1024;
+
 pub const TlsOptions = struct {
     ca_certificates_pem: []const u8,
     handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
@@ -963,6 +966,44 @@ const WriteRequest = struct {
     generation: usize,
 };
 
+const CleartextWriteBatch = struct {
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *CleartextWriteBatch, allocator: std.mem.Allocator) void {
+        self.bytes.deinit(allocator);
+    }
+
+    fn pendingBytes(self: *const CleartextWriteBatch) usize {
+        return self.bytes.items.len;
+    }
+
+    fn append(
+        self: *CleartextWriteBatch,
+        allocator: std.mem.Allocator,
+        chunk: []const u8,
+        target: usize,
+    ) !?[]u8 {
+        var completed: ?[]u8 = null;
+        if (self.bytes.items.len != 0 and
+            (self.bytes.items.len >= target or chunk.len > target - self.bytes.items.len))
+        {
+            completed = (try self.take(allocator)).?;
+        }
+        errdefer if (completed) |owned| allocator.free(owned);
+        try self.bytes.appendSlice(allocator, chunk);
+        return completed;
+    }
+
+    fn ready(self: *const CleartextWriteBatch, target: usize) bool {
+        return self.bytes.items.len >= target;
+    }
+
+    fn take(self: *CleartextWriteBatch, allocator: std.mem.Allocator) !?[]u8 {
+        if (self.bytes.items.len == 0) return null;
+        return try self.bytes.toOwnedSlice(allocator);
+    }
+};
+
 fn runLoop(impl: *Impl) void {
     impl.loop = xev.Loop.init(.{}) catch {
         impl.signalStartup(false);
@@ -1749,14 +1790,28 @@ fn flush(impl: *Impl) !void {
     if (comptime build_options.tls) {
         if (impl.tls_session != null) return flushTls(impl);
     }
+    var batch: CleartextWriteBatch = .{};
+    defer batch.deinit(impl.allocator);
     while (!impl.stopping_on_loop) {
-        if (!canFlushWrites(impl.queued_write_bytes, impl.write_high_watermark_bytes)) return;
+        if (!canFlushWritesWithPending(
+            impl.queued_write_bytes,
+            batch.pendingBytes(),
+            impl.write_high_watermark_bytes,
+        )) break;
         var data: [*c]const u8 = null;
         const length = c.nghttp2_session_mem_send2(impl.session, &data);
         if (length < 0) return error.NativeFailure;
-        if (length == 0) return;
-        try queueSocketWrite(impl, data[0..@intCast(length)]);
+        if (length == 0) break;
+        if (try batch.append(
+            impl.allocator,
+            data[0..@intCast(length)],
+            socket_write_batch_target,
+        )) |bytes| try queueOwnedSocketWrite(impl, bytes);
+        if (batch.ready(socket_write_batch_target)) {
+            try queueOwnedSocketWrite(impl, (try batch.take(impl.allocator)).?);
+        }
     }
+    if (try batch.take(impl.allocator)) |bytes| try queueOwnedSocketWrite(impl, bytes);
 }
 
 fn flushTls(impl: *Impl) !void {
@@ -1808,10 +1863,14 @@ fn finishTlsWrite(impl: *Impl, result: tls_record.Result) !bool {
 }
 
 fn queueSocketWrite(impl: *Impl, source: []const u8) !void {
+    const bytes = try impl.allocator.dupe(u8, source);
+    try queueOwnedSocketWrite(impl, bytes);
+}
+
+fn queueOwnedSocketWrite(impl: *Impl, bytes: []u8) !void {
+    errdefer impl.allocator.free(bytes);
     const write = try impl.allocator.create(WriteRequest);
     errdefer impl.allocator.destroy(write);
-    const bytes = try impl.allocator.dupe(u8, source);
-    errdefer impl.allocator.free(bytes);
     write.* = .{
         .impl = impl,
         .bytes = bytes,
@@ -2714,6 +2773,10 @@ fn canFlushWrites(queued: usize, high: usize) bool {
     return queued < high;
 }
 
+fn canFlushWritesWithPending(queued: usize, pending: usize, high: usize) bool {
+    return queued < high and pending < high - queued;
+}
+
 fn addQueuedWriteBytes(queued: usize, length: usize) !usize {
     return std.math.add(usize, queued, length) catch error.WriteQueueSizeOverflow;
 }
@@ -2971,6 +3034,66 @@ test "flush watermarks permit one chunk of overshoot and resume below low" {
     queued = completeQueuedWrite(queued, 6);
     try std.testing.expect(queued < low);
     try std.testing.expectError(error.WriteQueueSizeOverflow, addQueuedWriteBytes(std.math.maxInt(usize), 1));
+}
+
+test "cleartext write batch coalesces chunks below target" {
+    var batch: CleartextWriteBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(null, try batch.append(std.testing.allocator, "abc", 8));
+    try std.testing.expectEqual(null, try batch.append(std.testing.allocator, "def", 8));
+    const owned = (try batch.take(std.testing.allocator)).?;
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings("abcdef", owned);
+}
+
+test "cleartext write batch splits before crossing target" {
+    var batch: CleartextWriteBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(null, try batch.append(std.testing.allocator, "12345", 8));
+    const completed = (try batch.append(std.testing.allocator, "6789", 8)).?;
+    defer std.testing.allocator.free(completed);
+    try std.testing.expectEqualStrings("12345", completed);
+    try std.testing.expectEqualStrings("6789", batch.bytes.items);
+}
+
+test "cleartext write batch keeps an oversized chunk intact" {
+    var batch: CleartextWriteBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(null, try batch.append(std.testing.allocator, "123456789", 8));
+    try std.testing.expect(batch.ready(8));
+    const owned = (try batch.take(std.testing.allocator)).?;
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings("123456789", owned);
+}
+
+test "empty cleartext write batch has nothing to submit" {
+    var batch: CleartextWriteBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try std.testing.expectEqual(null, try batch.take(std.testing.allocator));
+}
+
+test "cleartext write batch transfers ownership only once" {
+    var batch: CleartextWriteBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(null, try batch.append(std.testing.allocator, "owned", 8));
+    const owned = (try batch.take(std.testing.allocator)).?;
+    try std.testing.expectEqual(null, try batch.take(std.testing.allocator));
+    std.testing.allocator.free(owned);
+}
+
+test "flush watermark includes pending cleartext batch bytes" {
+    const high = 10;
+    var batch: CleartextWriteBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+
+    try std.testing.expect(canFlushWritesWithPending(8, batch.pendingBytes(), high));
+    try std.testing.expectEqual(null, try batch.append(std.testing.allocator, "abc", 8));
+    try std.testing.expect(!canFlushWritesWithPending(8, batch.pendingBytes(), high));
+    try std.testing.expectEqual(@as(usize, 1), 8 + batch.pendingBytes() - high);
 }
 
 test "channel transport options reject unsafe windows and watermarks" {

@@ -13,6 +13,9 @@ const status = @import("status.zig");
 const raw_stream = @import("stream.zig");
 const tls_record = if (build_options.tls) @import("tls_record.zig") else @import("tls_disabled.zig");
 
+// Bounds socket-write aggregation only; HTTP/2 frame boundaries remain unchanged.
+const socket_write_batch_target = 64 * 1024;
+
 pub const TlsOptions = struct {
     certificate_chain_pem: []const u8,
     private_key_pem: []const u8,
@@ -684,14 +687,28 @@ const Connection = struct {
         if (comptime build_options.tls) {
             if (self.tls_session != null) return self.flushTls();
         }
+        var batch: CleartextWriteBatch = .{};
+        defer batch.deinit(self.server.allocator);
         while (!self.closing) {
-            if (!canFlushWrites(self.queued_write_bytes, self.server.write_high_watermark_bytes)) return;
+            if (!canFlushWritesWithPending(
+                self.queued_write_bytes,
+                batch.pendingBytes(),
+                self.server.write_high_watermark_bytes,
+            )) break;
             var data: [*c]const u8 = null;
             const length = c.nghttp2_session_mem_send2(self.session, &data);
             if (length < 0) return error.NativeFailure;
-            if (length == 0) return;
-            try self.queueSocketWrite(data[0..@intCast(length)]);
+            if (length == 0) break;
+            if (try batch.append(
+                self.server.allocator,
+                data[0..@intCast(length)],
+                socket_write_batch_target,
+            )) |bytes| try self.queueOwnedSocketWrite(bytes);
+            if (batch.ready(socket_write_batch_target)) {
+                try self.queueOwnedSocketWrite((try batch.take(self.server.allocator)).?);
+            }
         }
+        if (try batch.take(self.server.allocator)) |bytes| try self.queueOwnedSocketWrite(bytes);
     }
 
     fn flushTls(self: *Connection) !void {
@@ -743,10 +760,14 @@ const Connection = struct {
     }
 
     fn queueSocketWrite(self: *Connection, source: []const u8) !void {
+        const bytes = try self.server.allocator.dupe(u8, source);
+        try self.queueOwnedSocketWrite(bytes);
+    }
+
+    fn queueOwnedSocketWrite(self: *Connection, bytes: []u8) !void {
+        errdefer self.server.allocator.free(bytes);
         const write = try self.server.allocator.create(WriteRequest);
         errdefer self.server.allocator.destroy(write);
-        const bytes = try self.server.allocator.dupe(u8, source);
-        errdefer self.server.allocator.free(bytes);
         write.* = .{ .connection = self, .bytes = bytes };
         self.pending_writes = std.math.add(usize, self.pending_writes, 1) catch {
             return error.WriteQueueSizeOverflow;
@@ -1141,6 +1162,44 @@ const WriteRequest = struct {
     request: xev.WriteRequest = undefined,
     connection: *Connection,
     bytes: []u8,
+};
+
+const CleartextWriteBatch = struct {
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *CleartextWriteBatch, allocator: std.mem.Allocator) void {
+        self.bytes.deinit(allocator);
+    }
+
+    fn pendingBytes(self: *const CleartextWriteBatch) usize {
+        return self.bytes.items.len;
+    }
+
+    fn append(
+        self: *CleartextWriteBatch,
+        allocator: std.mem.Allocator,
+        chunk: []const u8,
+        target: usize,
+    ) !?[]u8 {
+        var completed: ?[]u8 = null;
+        if (self.bytes.items.len != 0 and
+            (self.bytes.items.len >= target or chunk.len > target - self.bytes.items.len))
+        {
+            completed = (try self.take(allocator)).?;
+        }
+        errdefer if (completed) |owned| allocator.free(owned);
+        try self.bytes.appendSlice(allocator, chunk);
+        return completed;
+    }
+
+    fn ready(self: *const CleartextWriteBatch, target: usize) bool {
+        return self.bytes.items.len >= target;
+    }
+
+    fn take(self: *CleartextWriteBatch, allocator: std.mem.Allocator) !?[]u8 {
+        if (self.bytes.items.len == 0) return null;
+        return try self.bytes.toOwnedSlice(allocator);
+    }
 };
 
 fn runLoop(server: *Impl) void {
@@ -2529,6 +2588,10 @@ fn validateTransportOptions(initial_stream_window_size: u32, high: usize, low: u
 
 fn canFlushWrites(queued: usize, high: usize) bool {
     return queued < high;
+}
+
+fn canFlushWritesWithPending(queued: usize, pending: usize, high: usize) bool {
+    return queued < high and pending < high - queued;
 }
 
 fn addQueuedWriteBytes(queued: usize, length: usize) !usize {
