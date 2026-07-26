@@ -6,8 +6,12 @@ source_dir=$2
 build_dir=$3
 build_type=$4
 cc=$5
-sanitize_thread=$6
-sanitize_c=$7
+cxx=$6
+zig_exe=$7
+target_triple=$8
+force_link_source=$9
+sanitize_thread=${10}
+sanitize_c=${11}
 
 c_flags=()
 
@@ -38,12 +42,13 @@ common_options=(
     -G Ninja
     "-DCMAKE_BUILD_TYPE=$build_type"
     "-DCMAKE_C_FLAGS=${c_flags[*]}"
+    "-DCMAKE_CXX_FLAGS=${c_flags[*]}"
     -DBUILD_SHARED_LIBS=OFF
 )
 
 case "$library" in
     nghttp2)
-        CC="$cc" cmake "${common_options[@]}" \
+        CC="$cc" CXX="$cxx" cmake "${common_options[@]}" \
             -DENABLE_LIB_ONLY=ON \
             -DENABLE_APP=OFF \
             -DENABLE_EXAMPLES=OFF \
@@ -51,6 +56,32 @@ case "$library" in
             -DENABLE_DOC=OFF \
             -DBUILD_TESTING=OFF \
             -DBUILD_STATIC_LIBS=ON
+        ;;
+    gperftools)
+        CC="$cc" CXX="$cxx" cmake "${common_options[@]}" \
+            -DBUILD_TESTING=OFF \
+            -DGPERFTOOLS_BUILD_CPU_PROFILER=ON \
+            -DGPERFTOOLS_BUILD_HEAP_PROFILER=ON \
+            -DGPERFTOOLS_BUILD_DEBUGALLOC=OFF \
+            -Dgperftools_build_minimal=OFF \
+            -Dgperftools_build_benchmark=OFF \
+            -Dgperftools_enable_libunwind=OFF \
+            -Dgperftools_enable_frame_pointers=ON
+        cmake --build "$build_dir" --target tcmalloc profiler
+        archive="$build_dir/libtcmalloc_and_profiler.a"
+        rm -f "$archive"
+        {
+            printf 'CREATE %s\n' "$archive"
+            printf 'ADDLIB %s/libtcmalloc.a\n' "$build_dir"
+            printf 'ADDLIB %s/libprofiler.a\n' "$build_dir"
+            printf 'ADDLIB %s/libstacktrace.a\n' "$build_dir"
+            printf 'ADDLIB %s/liblow_level_alloc.a\n' "$build_dir"
+            printf 'ADDLIB %s/libcommon.a\n' "$build_dir"
+            printf 'SAVE\nEND\n'
+        } | "$zig_exe" ar -M
+        "$zig_exe" cc -target "$target_triple" -c "$force_link_source" \
+            -o "$build_dir/gperftools_force_link.o"
+        exit 0
         ;;
     *)
         printf 'unsupported native library: %s\n' "$library" >&2

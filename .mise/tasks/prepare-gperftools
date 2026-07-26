@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+#MISE description="Prepare the pinned gperftools fork for Zig builds"
+set -euo pipefail
+
+url=https://codeload.github.com/fanyang89/gperftools/tar.gz/1a01cd2cf8f7000845d343fa8e0bbac70378858b
+expected_hash=N-V-__8AAGKVkABvsDVHhSU8seHKvtJ8Q23b9Y0OMiFVWt-y
+
+fetch_output=$(zigfetch "$url" 2>&1)
+printf '%s\n' "$fetch_output"
+actual_hash=${fetch_output##*$'\n'}
+if [[ "$actual_hash" != "$expected_hash" ]]; then
+  printf 'gperftools hash mismatch: expected %s, got %s\n' \
+    "$expected_hash" "$actual_hash" >&2
+  exit 1
+fi
+
+cache_root=${ZIG_GLOBAL_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig}
+package_cache="$cache_root/p"
+archive="$package_cache/$expected_hash.tar.gz"
+if [[ ! -f "$archive" ]]; then
+  mkdir -p "$package_cache"
+  temporary="$archive.tmp.$$"
+  trap 'rm -f "$temporary"' EXIT
+  curl -fsSL -o "$temporary" "$url"
+  mv "$temporary" "$archive"
+  trap - EXIT
+fi
+
+printf 'Prepared gperftools %s\n' "$expected_hash"

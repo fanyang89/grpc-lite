@@ -17,6 +17,9 @@ mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
 mise run test-consumer
+mise run prepare-gperftools
+mise run build-gperftools
+mise run test-gperftools
 mise run fmt
 mise run ci-lint
 mise run check

@@ -54,12 +54,17 @@ prefetch_package \
     'https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99' \
     'N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX' \
     'nghttp2.tar.gz'
+prefetch_url_package \
+    'https://codeload.github.com/fanyang89/gperftools/tar.gz/1a01cd2cf8f7000845d343fa8e0bbac70378858b' \
+    'N-V-__8AAGKVkABvsDVHhSU8seHKvtJ8Q23b9Y0OMiFVWt-y' \
+    'gperftools.tar.gz'
 
 git -C "$project_root" archive --format=tar.gz --output="$archive" HEAD
 package_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zig fetch "$archive")
 
 cp "$project_root/tests/consumer/raw/build.zig" "$consumer/build.zig"
 cp "$project_root/tests/consumer/raw/src/main.zig" "$consumer/src/main.zig"
+cp "$project_root/tests/consumer/raw/src/gperftools.zig" "$consumer/src/gperftools.zig"
 cat >"$consumer/build.zig.zon" <<EOF
 .{
     .name = .grpc_lite_raw_consumer,
@@ -82,6 +87,9 @@ ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig
     -Dsanitize-thread=true -Dsanitize-c=false --summary all
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
     -Doptimize=Debug -Dsanitize-thread=false -Dsanitize-c=true --summary all
+ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
+    -Doptimize=ReleaseFast -Dgperftools=true --summary all
+"$consumer/zig-out/bin/grpc-lite-raw-consumer"
 
 protobuf_path="$consumer/zig-pkg/protobuf-5.0.0-0e82avKUKAAVwTWJzTIEZ14Fu0zC11_lElR8tE6H__y1"
 if [[ -e "$protobuf_path" || -L "$protobuf_path" ]]; then

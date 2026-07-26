@@ -21,16 +21,19 @@ pub fn build(b: *std.Build) void {
         "protobuf",
         "Enable the typed protobuf adapter, examples, and tests",
     ) orelse (b.pkg_hash.len == 0);
+    const enable_gperftools = b.option(
+        bool,
+        "gperftools",
+        "Use tcmalloc and expose CPU and heap profiling APIs",
+    ) orelse false;
+    if (enable_gperftools and target.result.os.tag != .linux) {
+        @panic("gperftools support is currently limited to Linux");
+    }
+    if (enable_gperftools and sanitizers.thread == true) {
+        @panic("gperftools/tcmalloc is incompatible with ThreadSanitizer");
+    }
     const grpc_lite_options = b.addOptions();
     grpc_lite_options.addOption([]const u8, "version", manifest.version);
-    const native = addNativeDependencies(
-        b,
-        nghttp2_dependency.path(""),
-        target,
-        optimize,
-        sanitizers,
-    );
-
     const grpc_lite = b.addModule("grpc_lite", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -38,6 +41,28 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     applySanitizers(grpc_lite, sanitizers);
+    const grpc_lite_gperftools = if (enable_gperftools)
+        b.addModule("grpc_lite_gperftools", .{
+            .root_source_file = b.path("src/gperftools.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
+        })
+    else
+        null;
+    const gperftools_dependency = if (enable_gperftools)
+        b.lazyDependency("gperftools", .{}) orelse return
+    else
+        null;
+    const native = addNativeDependencies(
+        b,
+        nghttp2_dependency.path(""),
+        if (gperftools_dependency) |dependency| dependency.path("") else null,
+        target,
+        optimize,
+        sanitizers,
+    );
+
     const xev = libxev_dependency.module("xev");
     applySanitizers(xev, sanitizers);
     grpc_lite.addOptions("grpc_lite_options", grpc_lite_options);
@@ -45,6 +70,51 @@ pub fn build(b: *std.Build) void {
     grpc_lite.addIncludePath(native.nghttp2_include);
     grpc_lite.addObjectFile(native.nghttp2_archive);
     grpc_lite.addImport("xev", xev);
+    const test_step = b.step("test", "Run unit tests");
+
+    if (gperftools_dependency) |dependency| {
+        grpc_lite.addObjectFile(native.gperftools_archive.?);
+        grpc_lite.addObjectFile(native.gperftools_force_link.?);
+        grpc_lite.link_libcpp = true;
+        grpc_lite.omit_frame_pointer = false;
+        xev.omit_frame_pointer = false;
+
+        grpc_lite_gperftools.?.addIncludePath(dependency.path("src"));
+        applySanitizers(grpc_lite_gperftools.?, sanitizers);
+        grpc_lite_gperftools.?.omit_frame_pointer = false;
+
+        const gperftools_test_module = b.createModule(.{
+            .root_source_file = b.path("tests/gperftools_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "grpc_lite_gperftools", .module = grpc_lite_gperftools.? }},
+        });
+        applySanitizers(gperftools_test_module, sanitizers);
+        gperftools_test_module.omit_frame_pointer = false;
+        const gperftools_tests = b.addTest(.{
+            .name = "gperftools-integration",
+            .root_module = gperftools_test_module,
+        });
+        test_step.dependOn(&b.addRunArtifact(gperftools_tests).step);
+
+        const gperftools_env_module = b.createModule(.{
+            .root_source_file = b.path("tests/gperftools_env_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
+        });
+        applySanitizers(gperftools_env_module, sanitizers);
+        gperftools_env_module.omit_frame_pointer = false;
+        const gperftools_env_test = b.addExecutable(.{
+            .name = "gperftools-env-test",
+            .root_module = gperftools_env_module,
+        });
+        const run_gperftools_env_test = b.addSystemCommand(&.{"bash"});
+        run_gperftools_env_test.addFileArg(b.path("tests/run_gperftools_env_test.sh"));
+        run_gperftools_env_test.addArtifactArg(gperftools_env_test);
+        _ = run_gperftools_env_test.addOutputDirectoryArg("profiles");
+        test_step.dependOn(&run_gperftools_env_test.step);
+    }
 
     if (target.result.os.tag == .linux) {
         grpc_lite.linkSystemLibrary("pthread", .{});
@@ -76,7 +146,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_public_api_tests = b.addRunArtifact(public_api_tests);
 
-    const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_public_api_tests.step);
 
@@ -364,17 +433,21 @@ fn addExample(
 const NativeDependencies = struct {
     nghttp2_archive: std.Build.LazyPath,
     nghttp2_include: std.Build.LazyPath,
+    gperftools_archive: ?std.Build.LazyPath,
+    gperftools_force_link: ?std.Build.LazyPath,
 };
 
 fn addNativeDependencies(
     b: *std.Build,
     nghttp2_source_dir: std.Build.LazyPath,
+    gperftools_source_dir: ?std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     sanitizers: Sanitizers,
 ) NativeDependencies {
     const target_triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
     const cc = b.fmt("{s} cc -target {s}", .{ b.graph.zig_exe, target_triple });
+    const cxx = b.fmt("{s} c++ -target {s}", .{ b.graph.zig_exe, target_triple });
     const cmake_build_type = switch (optimize) {
         .Debug => "Debug",
         .ReleaseSafe => "RelWithDebInfo",
@@ -387,12 +460,30 @@ fn addNativeDependencies(
         nghttp2_source_dir,
         cmake_build_type,
         cc,
+        cxx,
+        target_triple,
         sanitizers,
     );
+
+    const build_gperftools = if (gperftools_source_dir) |source_dir|
+        addNativeBuild(
+            b,
+            "gperftools",
+            source_dir,
+            cmake_build_type,
+            cc,
+            cxx,
+            target_triple,
+            sanitizers,
+        )
+    else
+        null;
 
     return .{
         .nghttp2_archive = build_nghttp2.path(b, "lib/libnghttp2.a"),
         .nghttp2_include = build_nghttp2.path(b, "lib/includes"),
+        .gperftools_archive = if (build_gperftools) |output| output.path(b, "libtcmalloc_and_profiler.a") else null,
+        .gperftools_force_link = if (build_gperftools) |output| output.path(b, "gperftools_force_link.o") else null,
     };
 }
 
@@ -402,6 +493,8 @@ fn addNativeBuild(
     source_dir: std.Build.LazyPath,
     cmake_build_type: []const u8,
     cc: []const u8,
+    cxx: []const u8,
+    target_triple: []const u8,
     sanitizers: Sanitizers,
 ) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{"bash"});
@@ -412,6 +505,12 @@ fn addNativeBuild(
     run.addArgs(&.{
         cmake_build_type,
         cc,
+        cxx,
+        b.graph.zig_exe,
+        target_triple,
+    });
+    run.addFileArg(b.path("tools/gperftools_force_link.c"));
+    run.addArgs(&.{
         if (sanitizers.thread == true) "true" else "false",
         if (sanitizers.c == .full) "true" else "false",
     });

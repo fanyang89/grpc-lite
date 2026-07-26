@@ -53,6 +53,9 @@ mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
 mise run test-consumer
+mise run prepare-gperftools
+mise run build-gperftools
+mise run test-gperftools
 mise run fmt
 mise run ci-lint
 mise run interop
@@ -221,6 +224,40 @@ application and callback threads must be thread-safe. Stream registrations, hand
 contexts, and their allocators must remain at stable addresses until the server and all
 active streams have stopped.
 
+## Gperftools
+
+Linux builds can optionally link the pinned gperftools fork for tcmalloc, CPU profiling,
+heap profiling, and guarded allocation sampling. Prepare its Zig package cache once,
+then enable it explicitly:
+
+```bash
+mise run prepare-gperftools
+mise run build-gperftools -- -Doptimize=ReleaseFast
+mise run test-gperftools
+```
+
+Downstream packages pass `.gperftools = true` to the `grpc_lite` dependency and import
+`grpc_lite_gperftools`. Enabling the option replaces the final process C allocator with
+tcmalloc; `perf.allocator` provides the same allocator explicitly to Zig APIs.
+
+```zig
+const grpc = @import("grpc_lite");
+const perf = @import("grpc_lite_gperftools");
+
+try perf.startCpuProfiler("/tmp/server.prof");
+defer perf.stopCpuProfiler();
+
+var server = try grpc.Server.init(perf.allocator, .{
+    .host = "127.0.0.1",
+    .port = 50051,
+});
+```
+
+CPU and heap profilers are process-global and may also be activated with `CPUPROFILE`
+and `HEAPPROFILE`. The module exposes profiler lifecycle functions, tcmalloc numeric
+properties, ownership checks, memory release, and guarded sampling controls. Gperftools
+cannot be combined with ThreadSanitizer and is not currently supported outside Linux.
+
 ## Benchmarks
 
 The cross-process E2E harness builds dedicated client and server binaries in
@@ -261,6 +298,7 @@ compressible gzip workload.
 - nghttp2 1.69.0
 - libxev b0650f0
 - zig-protobuf 5.0.0
+- gperftools 2.18.1-based fork (optional)
 - CMake and Ninja for the upstream C builds
 - mise for tool versions and project tasks
 
