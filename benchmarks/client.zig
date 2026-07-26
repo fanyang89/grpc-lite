@@ -182,26 +182,22 @@ const Measurements = struct {
     }
 };
 
-const UnaryWorker = struct {
+const TypedUnaryWorker = struct {
     channel: *grpc.Channel,
     timing: *Timing,
-    transport: Transport,
     payload: []const u8,
     compression: grpc.Compression,
     latency_capacity: usize,
     measurements: Measurements = .{},
 
-    fn run(self: *UnaryWorker) void {
+    fn run(self: *TypedUnaryWorker) void {
         while (self.timing.loadPhase() == .setup) std.atomic.spinLoopHint();
         var typed_client = grpc_pb.ServiceClient(EchoApi).init(self.channel);
 
         while (self.timing.loadPhase() != .stop) {
             const started_ns = nowNs(self.timing.io);
             const measured = self.timing.requestIsMeasured(started_ns);
-            const valid = switch (self.transport) {
-                .raw => self.callRaw(),
-                .typed => self.callTyped(&typed_client),
-            } catch {
+            const valid = self.callTyped(&typed_client) catch {
                 if (measured) self.measurements.exchange_errors += 1;
                 continue;
             };
@@ -215,22 +211,8 @@ const UnaryWorker = struct {
         }
     }
 
-    fn callRaw(self: *UnaryWorker) !bool {
-        var result = try self.channel.callUnary(
-            std.heap.c_allocator,
-            raw_unary_path,
-            self.payload,
-            .{
-                .timeout_ns = rpc_timeout_ns,
-                .request_compression = self.compression,
-            },
-        );
-        defer result.deinit();
-        return result.status.isOk() and validatePayload(result.payload, self.payload);
-    }
-
     fn callTyped(
-        self: *UnaryWorker,
+        self: *TypedUnaryWorker,
         client: *grpc_pb.ServiceClient(EchoApi),
     ) !bool {
         var result = try client.callUnary(
@@ -245,6 +227,53 @@ const UnaryWorker = struct {
         defer result.deinit();
         return result.raw.status.isOk() and result.response != null and
             validatePayload(result.response.?.message, self.payload);
+    }
+};
+
+const RawUnarySlot = struct {
+    channel: *grpc.Channel,
+    timing: *Timing,
+    payload: []const u8,
+    compression: grpc.Compression,
+    latency_capacity: usize,
+    current: Timestamp = .{ .started_ns = 0, .measured = false },
+    measurements: Measurements = .{},
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *RawUnarySlot) void {
+        const started_ns = nowNs(self.timing.io);
+        const measured = rawUnaryMeasurementEligibilityAt(self.timing, started_ns) orelse {
+            self.done.store(true, .release);
+            return;
+        };
+        self.current = .{
+            .started_ns = started_ns,
+            .measured = measured,
+        };
+        self.channel.callUnaryAsync(
+            raw_unary_path,
+            self.payload,
+            .{
+                .timeout_ns = rpc_timeout_ns,
+                .request_compression = self.compression,
+            },
+            .{ .context = self, .on_complete = onComplete },
+        ) catch {
+            self.measurements.exchange_errors += 1;
+            self.done.store(true, .release);
+        };
+    }
+
+    fn onComplete(context: ?*anyopaque, result: grpc.AsyncCallResult) void {
+        const self: *RawUnarySlot = @ptrCast(@alignCast(context.?));
+        const finished_ns = nowNs(self.timing.io);
+        self.measurements.recordExchange(
+            self.current.measured,
+            result.status.isOk() and validatePayload(result.payload, self.payload),
+            finished_ns -| self.current.started_ns,
+            self.latency_capacity,
+        );
+        self.start();
     }
 };
 
@@ -485,6 +514,7 @@ const ResultJson = struct {
     scenario: []const u8,
     transport: []const u8,
     api_mode: []const u8,
+    client_execution_model: []const u8,
     compression: []const u8,
     payload_pattern: []const u8,
     load_model: []const u8,
@@ -570,7 +600,66 @@ fn runUnary(
     channels: []grpc.Channel,
     timing: *Timing,
 ) !Measurements {
-    const workers = try init.gpa.alloc(UnaryWorker, config.streams);
+    return switch (config.transport) {
+        .raw => runRawUnary(init, config, payload, channels, timing),
+        .typed => runTypedUnary(init, config, payload, channels, timing),
+    };
+}
+
+fn runRawUnary(
+    init: std.process.Init,
+    config: Config,
+    payload: []const u8,
+    channels: []grpc.Channel,
+    timing: *Timing,
+) !Measurements {
+    const slots = try init.gpa.alloc(RawUnarySlot, config.streams);
+    defer init.gpa.free(slots);
+    var initialized: usize = 0;
+    defer for (slots[0..initialized]) |*slot| {
+        slot.measurements.deinit(std.heap.page_allocator);
+    };
+
+    const latency_capacity = @max(@as(usize, 1), max_stream_latency_samples / config.streams);
+    for (slots, 0..) |*slot, slot_index| {
+        slot.* = .{
+            .channel = &channels[slot_index % channels.len],
+            .timing = timing,
+            .payload = payload,
+            .compression = config.compression,
+            .latency_capacity = latency_capacity,
+            .measurements = .{ .sampling_seed = slot_index + 1 },
+        };
+        initialized += 1;
+        try slot.measurements.latency_samples.ensureTotalCapacityPrecise(
+            std.heap.page_allocator,
+            latency_capacity,
+        );
+    }
+
+    const warmup_start_ns = nowNs(timing.io);
+    timing.storePhase(.warmup);
+    for (slots) |*slot| slot.start();
+    try sleepUntil(timing.io, warmup_start_ns +| config.warmup_ns);
+    startMeasurement(timing, config.duration_ns);
+    try sleepUntil(timing.io, timing.measure_end_ns.load(.acquire));
+    timing.storePhase(.stop);
+    try waitForRawUnarySlots(timing.io, slots, channels);
+
+    var result: Measurements = .{};
+    errdefer result.deinit(init.gpa);
+    for (slots) |*slot| try result.mergeShard(init.gpa, &slot.measurements);
+    return result;
+}
+
+fn runTypedUnary(
+    init: std.process.Init,
+    config: Config,
+    payload: []const u8,
+    channels: []grpc.Channel,
+    timing: *Timing,
+) !Measurements {
+    const workers = try init.gpa.alloc(TypedUnaryWorker, config.streams);
     defer init.gpa.free(workers);
     const threads = try init.gpa.alloc(std.Thread, config.streams);
     defer init.gpa.free(threads);
@@ -586,7 +675,6 @@ fn runUnary(
         worker.* = .{
             .channel = &channels[worker_index % channels.len],
             .timing = timing,
-            .transport = config.transport,
             .payload = payload,
             .compression = config.compression,
             .latency_capacity = latency_capacity,
@@ -599,7 +687,7 @@ fn runUnary(
             worker.measurements.deinit(std.heap.page_allocator);
             return err;
         };
-        thread.* = std.Thread.spawn(.{}, UnaryWorker.run, .{worker}) catch |err| {
+        thread.* = std.Thread.spawn(.{}, TypedUnaryWorker.run, .{worker}) catch |err| {
             worker.measurements.deinit(std.heap.page_allocator);
             return err;
         };
@@ -617,6 +705,34 @@ fn runUnary(
         try result.mergeShard(init.gpa, &worker.measurements);
     }
     return result;
+}
+
+fn rawUnaryMeasurementEligibilityAt(timing: *const Timing, current_ns: u64) ?bool {
+    return switch (timing.loadPhase()) {
+        .warmup => false,
+        .measurement => if (current_ns >= timing.measure_start_ns.load(.acquire) and
+            current_ns < timing.measure_end_ns.load(.acquire)) true else null,
+        .setup, .stop => null,
+    };
+}
+
+fn waitForRawUnarySlots(io: std.Io, slots: []const RawUnarySlot, channels: []grpc.Channel) !void {
+    const drain_deadline = nowNs(io) +| drain_timeout_ns;
+    while (!allRawUnarySlotsDone(slots)) {
+        if (nowNs(io) >= drain_deadline) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    if (allRawUnarySlotsDone(slots)) return;
+
+    for (channels) |*channel| channel.shutdown();
+    for (channels) |*channel| channel.wait();
+    std.debug.assert(allRawUnarySlotsDone(slots));
+    return error.UnaryDrainTimeout;
+}
+
+fn allRawUnarySlotsDone(slots: []const RawUnarySlot) bool {
+    for (slots) |*slot| if (!slot.done.load(.acquire)) return false;
+    return true;
 }
 
 fn runBidi(
@@ -812,6 +928,7 @@ fn makeResult(config: Config, measurements: *Measurements) ResultJson {
         .scenario = config.scenario.jsonName(),
         .transport = "grpc-http2-insecure",
         .api_mode = config.transport.jsonName(),
+        .client_execution_model = clientExecutionModel(config),
         .compression = config.compression.name(),
         .payload_pattern = config.payload_pattern.jsonName(),
         .load_model = "closed-loop-fixed-concurrency",
@@ -857,6 +974,11 @@ fn makeResult(config: Config, measurements: *Measurements) ResultJson {
             .mean_us = if (total_weight == 0) 0 else weighted_sum / total_weight / 1000.0,
         },
     };
+}
+
+fn clientExecutionModel(config: Config) []const u8 {
+    if (config.scenario == .unary and config.transport == .typed) return "blocking-workers";
+    return "event-driven";
 }
 
 fn weightedPercentile(sorted: []const Measurements.LatencySample, percent: u8) u64 {
@@ -1178,7 +1300,7 @@ test "payload patterns are stable and distinct" {
     try std.testing.expect(!std.mem.eql(u8, &first, &repeated));
 }
 
-test "exchange accounting follows start eligibility through drain" {
+test "async unary slot accounting follows start eligibility through drain" {
     var measurements: Measurements = .{};
     defer measurements.deinit(std.testing.allocator);
     try measurements.latency_samples.ensureTotalCapacityPrecise(std.testing.allocator, 3);
@@ -1191,6 +1313,21 @@ test "exchange accounting follows start eligibility through drain" {
     try std.testing.expectEqual(@as(u64, 1), measurements.exchange_errors);
     try std.testing.expectEqual(@as(u64, 1), measurements.eligible_latency_count);
     try std.testing.expectEqual(@as(u64, 20), measurements.latency_samples.items[0].ns);
+}
+
+test "async unary slots classify start windows and stop at boundaries" {
+    var timing: Timing = .{ .io = std.testing.io };
+    try std.testing.expectEqual(@as(?bool, null), rawUnaryMeasurementEligibilityAt(&timing, 99));
+    timing.storePhase(.warmup);
+    try std.testing.expectEqual(@as(?bool, false), rawUnaryMeasurementEligibilityAt(&timing, 99));
+    timing.measure_start_ns.store(10, .release);
+    timing.measure_end_ns.store(100, .release);
+    timing.storePhase(.measurement);
+    try std.testing.expectEqual(@as(?bool, null), rawUnaryMeasurementEligibilityAt(&timing, 9));
+    try std.testing.expectEqual(@as(?bool, true), rawUnaryMeasurementEligibilityAt(&timing, 99));
+    try std.testing.expectEqual(@as(?bool, null), rawUnaryMeasurementEligibilityAt(&timing, 100));
+    timing.storePhase(.stop);
+    try std.testing.expectEqual(@as(?bool, null), rawUnaryMeasurementEligibilityAt(&timing, 99));
 }
 
 test "measurement merge preserves observed extrema beyond reservoir" {
@@ -1245,6 +1382,7 @@ test "result JSON has stable benchmark shape" {
         .scenario = "unary",
         .transport = "grpc-http2-insecure",
         .api_mode = "raw",
+        .client_execution_model = "event-driven",
         .compression = "identity",
         .payload_pattern = "repeated",
         .load_model = "closed-loop-fixed-concurrency",
@@ -1289,8 +1427,27 @@ test "result JSON has stable benchmark shape" {
     defer parsed.deinit();
     const object = parsed.value.object;
     try std.testing.expect(object.contains("scenario"));
+    try std.testing.expectEqualStrings(
+        "event-driven",
+        object.get("client_execution_model").?.string,
+    );
     try std.testing.expect(object.contains("operations_per_second"));
     try std.testing.expect(object.contains("sampled_latency_count"));
     try std.testing.expect(object.contains("latency"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, json, "\n"));
+}
+
+test "unary execution model distinguishes raw and typed clients" {
+    try std.testing.expectEqualStrings("event-driven", clientExecutionModel(.{
+        .scenario = .unary,
+        .transport = .raw,
+    }));
+    try std.testing.expectEqualStrings("blocking-workers", clientExecutionModel(.{
+        .scenario = .unary,
+        .transport = .typed,
+    }));
+    try std.testing.expectEqualStrings("event-driven", clientExecutionModel(.{
+        .scenario = .bidi_ping_pong,
+        .transport = .typed,
+    }));
 }

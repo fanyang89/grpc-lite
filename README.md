@@ -369,9 +369,10 @@ mise run bench -- --scenario bidi-ping-pong --transport typed
 
 Supported scenarios are `unary`, `bidi-ping-pong`, and `bidi-throughput`. Common options
 include `--warmup`, `--duration`, `--streams`, `--channels`, `--pipeline`,
-`--payload-bytes`, `--payload-pattern`, and `--compression`. Workers and persistent
-streams are assigned round-robin across the configured channels; the channel count must
-not exceed the stream count. Run `mise run bench --help` for the complete task interface.
+`--payload-bytes`, `--payload-pattern`, and `--compression`. Unary concurrency slots and
+persistent streams are assigned round-robin across the configured channels; the channel
+count must not exceed the stream count. Run `mise run bench --help` for the complete task
+interface.
 
 The default matrix writes one parseable JSON document per case and prints each path:
 
@@ -383,8 +384,11 @@ Use `mise run bench-server` to start a separately managed server, then run
 `mise run bench-client` with `--host` and `--port` locally or from a remote machine. Add
 `--compact` only when single-line JSON is needed for automation.
 Reported bytes are application request plus response payload bytes, not HTTP/2 wire
-bytes. Raw and typed results are separate because typed runs include protobuf encoding,
-decoding, and per-message arena costs.
+bytes. Raw unary uses event-driven callbacks with one in-flight call per preallocated
+slot, while typed unary currently uses one blocking worker thread per slot. JSON reports
+these as `client_execution_model: "event-driven"` and `"blocking-workers"`. Raw and typed
+unary results therefore cannot be interpreted as a pure transport comparison; typed
+runs also include protobuf encoding, decoding, and per-message arena costs.
 
 The harness uses a closed-loop load model with fixed concurrency and one or more
 channels. An exchange is eligible when its request starts inside the measurement window.
