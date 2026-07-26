@@ -18,6 +18,152 @@ const tls_record = if (build_options.tls) @import("tls_record.zig") else @import
 const socket_write_batch_target = 64 * 1024;
 const response_header_stack_capacity = 4;
 const encoded_value_stack_capacity = 4;
+const local_page_size = @max(std.heap.page_size_max, 128 * 1024);
+const local_page_alignment = std.mem.Alignment.fromByteUnits(local_page_size);
+
+const LocalDebugAllocator = std.heap.DebugAllocator(.{
+    .thread_safe = false,
+    .stack_trace_frames = 0,
+    .backing_allocator_zeroes = false,
+    .page_size = local_page_size,
+});
+
+const ReactorLocalAllocator = struct {
+    const FreePage = struct {
+        next: ?*FreePage,
+    };
+
+    shared_allocator: std.mem.Allocator,
+    free_page_head: ?*FreePage = null,
+    gpa: LocalDebugAllocator,
+    owner_thread_id: std.Thread.Id = undefined,
+    loop_running: std.atomic.Value(bool) = .init(false),
+
+    fn init(shared_allocator: std.mem.Allocator) ReactorLocalAllocator {
+        return .{
+            .shared_allocator = shared_allocator,
+            .gpa = .init,
+        };
+    }
+
+    fn bindBacking(self: *ReactorLocalAllocator) void {
+        self.gpa.backing_allocator = self.pageAllocator();
+    }
+
+    fn allocator(self: *ReactorLocalAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn enterLoop(self: *ReactorLocalAllocator) void {
+        self.owner_thread_id = std.Thread.getCurrentId();
+        self.loop_running.store(true, .release);
+    }
+
+    fn leaveLoop(self: *ReactorLocalAllocator) void {
+        const was_running = self.loop_running.swap(false, .acq_rel);
+        std.debug.assert(!was_running or self.owner_thread_id == std.Thread.getCurrentId());
+    }
+
+    fn assertOwner(self: *const ReactorLocalAllocator) void {
+        if (std.debug.runtime_safety or builtin.is_test) {
+            if (self.loop_running.load(.acquire)) {
+                std.debug.assert(self.owner_thread_id == std.Thread.getCurrentId());
+            }
+        }
+    }
+
+    fn deinit(self: *ReactorLocalAllocator) void {
+        std.debug.assert(!self.loop_running.load(.acquire));
+        const check = self.gpa.deinit();
+        std.debug.assert(check == .ok);
+        while (self.free_page_head) |page| {
+            self.free_page_head = page.next;
+            self.shared_allocator.rawFree(
+                @as([*]u8, @ptrCast(page))[0..local_page_size],
+                local_page_alignment,
+                @returnAddress(),
+            );
+        }
+        self.* = undefined;
+    }
+
+    fn pageAllocator(self: *ReactorLocalAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = pageAlloc,
+                .resize = pageResize,
+                .remap = pageRemap,
+                .free = pageFree,
+            },
+        };
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ReactorLocalAllocator = @ptrCast(@alignCast(context));
+        self.assertOwner();
+        return self.gpa.allocator().rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ReactorLocalAllocator = @ptrCast(@alignCast(context));
+        self.assertOwner();
+        return self.gpa.allocator().rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ReactorLocalAllocator = @ptrCast(@alignCast(context));
+        self.assertOwner();
+        return self.gpa.allocator().rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ReactorLocalAllocator = @ptrCast(@alignCast(context));
+        self.assertOwner();
+        if (memory.len == 0) return;
+        self.gpa.allocator().rawFree(memory, alignment, ret_addr);
+    }
+
+    fn pageAlloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ReactorLocalAllocator = @ptrCast(@alignCast(context));
+        if (len == local_page_size and alignment == local_page_alignment) {
+            if (self.free_page_head) |page| {
+                self.free_page_head = page.next;
+                return @ptrCast(page);
+            }
+        }
+        return self.shared_allocator.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn pageResize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ReactorLocalAllocator = @ptrCast(@alignCast(context));
+        return self.shared_allocator.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn pageRemap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ReactorLocalAllocator = @ptrCast(@alignCast(context));
+        return self.shared_allocator.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn pageFree(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ReactorLocalAllocator = @ptrCast(@alignCast(context));
+        if (memory.len == local_page_size and alignment == local_page_alignment) {
+            const page: *FreePage = @ptrCast(@alignCast(memory.ptr));
+            page.* = .{ .next = self.free_page_head };
+            self.free_page_head = page;
+            return;
+        }
+        self.shared_allocator.rawFree(memory, alignment, ret_addr);
+    }
+};
 
 fn StackFirstBuilder(comptime T: type, comptime stack_capacity: usize) type {
     return struct {
@@ -133,9 +279,10 @@ pub const Server = struct {
         errdefer rollbackUnaryRegistration(coordinator.reactors[0..inserted], full_method_path);
         while (inserted < coordinator.reactors.len) : (inserted += 1) {
             const reactor = coordinator.reactors[inserted];
-            const owned_path = try reactor.allocator.dupe(u8, full_method_path);
-            errdefer reactor.allocator.free(owned_path);
-            try reactor.handlers.put(reactor.allocator, owned_path, handler);
+            const local_allocator = reactor.localAllocator();
+            const owned_path = try local_allocator.dupe(u8, full_method_path);
+            errdefer local_allocator.free(owned_path);
+            try reactor.handlers.put(local_allocator, owned_path, handler);
         }
     }
 
@@ -151,9 +298,10 @@ pub const Server = struct {
         errdefer rollbackStreamRegistration(coordinator.reactors[0..inserted], full_method_path);
         while (inserted < coordinator.reactors.len) : (inserted += 1) {
             const reactor = coordinator.reactors[inserted];
-            const owned_path = try reactor.allocator.dupe(u8, full_method_path);
-            errdefer reactor.allocator.free(owned_path);
-            try reactor.stream_handlers.put(reactor.allocator, owned_path, handler);
+            const local_allocator = reactor.localAllocator();
+            const owned_path = try local_allocator.dupe(u8, full_method_path);
+            errdefer local_allocator.free(owned_path);
+            try reactor.stream_handlers.put(local_allocator, owned_path, handler);
         }
     }
 
@@ -277,6 +425,7 @@ pub const Server = struct {
 const SerializedAllocator = struct {
     backing: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
+    operation_count: if (builtin.is_test) std.atomic.Value(usize) else void = if (builtin.is_test) .init(0) else {},
 
     fn init(backing: std.mem.Allocator) SerializedAllocator {
         return .{ .backing = backing };
@@ -302,8 +451,13 @@ const SerializedAllocator = struct {
         self.mutex.unlock(syncIo());
     }
 
+    fn recordOperation(self: *SerializedAllocator) void {
+        if (comptime builtin.is_test) _ = self.operation_count.fetchAdd(1, .monotonic);
+    }
+
     fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.recordOperation();
         self.lock();
         defer self.unlock();
         return self.backing.rawAlloc(len, alignment, ret_addr);
@@ -311,6 +465,7 @@ const SerializedAllocator = struct {
 
     fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.recordOperation();
         self.lock();
         defer self.unlock();
         return self.backing.rawResize(memory, alignment, new_len, ret_addr);
@@ -318,6 +473,7 @@ const SerializedAllocator = struct {
 
     fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.recordOperation();
         self.lock();
         defer self.unlock();
         return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
@@ -325,6 +481,7 @@ const SerializedAllocator = struct {
 
     fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *SerializedAllocator = @ptrCast(@alignCast(context));
+        self.recordOperation();
         self.lock();
         defer self.unlock();
         self.backing.rawFree(memory, alignment, ret_addr);
@@ -370,7 +527,10 @@ const StartupError = error{
 };
 
 const Impl = struct {
-    allocator: std.mem.Allocator,
+    // Shared storage may be touched by application and reactor threads.
+    shared_allocator: std.mem.Allocator,
+    // Transport state uses this only on the owner reactor, or before start/after join.
+    local_allocator_state: ReactorLocalAllocator,
     host: [:0]u8,
     configured_port: u16,
     reuse_port: bool,
@@ -429,6 +589,10 @@ const Impl = struct {
     tls_handshake_timeout_ns: u64 = 0,
     accepted_connections: if (builtin.is_test) std.atomic.Value(usize) else void = if (builtin.is_test) .init(0) else {},
     test_fail_startup: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+
+    fn localAllocator(self: *Impl) std.mem.Allocator {
+        return self.local_allocator_state.allocator();
+    }
 
     fn lock(self: *Impl) void {
         self.mutex.lockUncancelable(self.io());
@@ -510,15 +674,16 @@ const Impl = struct {
     }
 };
 
-fn initImpl(allocator: std.mem.Allocator, options: Options) !*Impl {
-    const impl = try allocator.create(Impl);
-    errdefer allocator.destroy(impl);
-    const host = try allocator.dupeZ(u8, options.host);
-    errdefer allocator.free(host);
-    var io_threaded = std.Io.Threaded.init(allocator, .{});
+fn initImpl(shared_allocator: std.mem.Allocator, options: Options) !*Impl {
+    const impl = try shared_allocator.create(Impl);
+    errdefer shared_allocator.destroy(impl);
+    const host = try shared_allocator.dupeZ(u8, options.host);
+    errdefer shared_allocator.free(host);
+    var io_threaded = std.Io.Threaded.init(shared_allocator, .{});
     errdefer io_threaded.deinit();
     impl.* = .{
-        .allocator = allocator,
+        .shared_allocator = shared_allocator,
+        .local_allocator_state = .init(shared_allocator),
         .host = host,
         .configured_port = options.port,
         .reuse_port = options.reactor_count > 1,
@@ -531,10 +696,12 @@ fn initImpl(allocator: std.mem.Allocator, options: Options) !*Impl {
         .tls_config = null,
         .tls_handshake_timeout_ns = if (options.tls) |tls_options| tls_options.handshake_timeout_ns else 0,
     };
+    impl.local_allocator_state.bindBacking();
+    errdefer impl.local_allocator_state.deinit();
     if (comptime build_options.tls) {
         if (options.tls) |tls_options| {
             impl.tls_config = try tls_record.Config.createServer(
-                allocator,
+                shared_allocator,
                 tls_options.certificate_chain_pem,
                 tls_options.private_key_pem,
             );
@@ -548,37 +715,39 @@ fn initImpl(allocator: std.mem.Allocator, options: Options) !*Impl {
 }
 
 fn destroyImpl(impl: *Impl) void {
+    const local_allocator = impl.localAllocator();
     var iterator = impl.handlers.iterator();
-    while (iterator.next()) |entry| impl.allocator.free(entry.key_ptr.*);
-    impl.handlers.deinit(impl.allocator);
+    while (iterator.next()) |entry| local_allocator.free(entry.key_ptr.*);
+    impl.handlers.deinit(local_allocator);
     var stream_iterator = impl.stream_handlers.iterator();
-    while (stream_iterator.next()) |entry| impl.allocator.free(entry.key_ptr.*);
-    impl.stream_handlers.deinit(impl.allocator);
-    for (impl.stream_commands.items) |*command| command.deinit(impl.allocator);
-    impl.stream_commands.deinit(impl.allocator);
-    impl.connections.deinit(impl.allocator);
+    while (stream_iterator.next()) |entry| local_allocator.free(entry.key_ptr.*);
+    impl.stream_handlers.deinit(local_allocator);
+    for (impl.stream_commands.items) |*command| command.deinit(impl.shared_allocator);
+    impl.stream_commands.deinit(impl.shared_allocator);
+    impl.connections.deinit(local_allocator);
     std.debug.assert(impl.deadline_heap.items.len == 0);
-    impl.deadline_heap.deinit(impl.allocator);
+    impl.deadline_heap.deinit(local_allocator);
     if (comptime build_options.tls) {
         if (impl.tls_config) |config| config.destroy();
     }
-    impl.allocator.free(impl.host);
+    impl.shared_allocator.free(impl.host);
     impl.io_threaded.deinit();
-    const allocator = impl.allocator;
-    allocator.destroy(impl);
+    impl.local_allocator_state.deinit();
+    const shared_allocator = impl.shared_allocator;
+    shared_allocator.destroy(impl);
 }
 
 fn rollbackUnaryRegistration(reactors: []*Impl, path: []const u8) void {
     for (reactors) |reactor| {
         const removed = reactor.handlers.fetchRemove(path).?;
-        reactor.allocator.free(removed.key);
+        reactor.localAllocator().free(removed.key);
     }
 }
 
 fn rollbackStreamRegistration(reactors: []*Impl, path: []const u8) void {
     for (reactors) |reactor| {
         const removed = reactor.stream_handlers.fetchRemove(path).?;
-        reactor.allocator.free(removed.key);
+        reactor.localAllocator().free(removed.key);
     }
 }
 
@@ -678,6 +847,7 @@ const StreamCommand = struct {
 
 const OutboundMessage = struct {
     bytes: []u8,
+    allocator: std.mem.Allocator,
     offset: usize = 0,
 };
 
@@ -696,9 +866,9 @@ const StreamingState = struct {
         return &self.outbound.items[self.outbound_head];
     }
 
-    fn finishOutbound(self: *StreamingState, allocator: std.mem.Allocator) void {
+    fn finishOutbound(self: *StreamingState) void {
         const item = self.nextOutbound().?;
-        allocator.free(item.bytes);
+        item.allocator.free(item.bytes);
         self.outbound_head += 1;
         if (self.outbound_head == self.outbound.items.len) {
             self.outbound.clearRetainingCapacity();
@@ -706,12 +876,12 @@ const StreamingState = struct {
         }
     }
 
-    fn clearOutbound(self: *StreamingState, allocator: std.mem.Allocator) usize {
+    fn clearOutbound(self: *StreamingState) usize {
         std.debug.assert(self.outbound_head <= self.outbound.items.len);
         var reserved_bytes: usize = 0;
         for (self.outbound.items[self.outbound_head..]) |item| {
             reserved_bytes += item.bytes.len - item.offset;
-            allocator.free(item.bytes);
+            item.allocator.free(item.bytes);
         }
         self.outbound.clearRetainingCapacity();
         self.outbound_head = 0;
@@ -721,7 +891,7 @@ const StreamingState = struct {
     fn deinit(self: *StreamingState, allocator: std.mem.Allocator) void {
         self.decoder.deinit();
         self.context.deinit();
-        _ = self.clearOutbound(allocator);
+        _ = self.clearOutbound();
         self.outbound.deinit(allocator);
         self.* = undefined;
     }
@@ -754,6 +924,7 @@ const Stream = struct {
     trailing_metadata: metadata.Metadata,
     response_code: status.Code = .ok,
     response_message: []const u8 = &.{},
+    response_message_allocator: ?std.mem.Allocator = null,
     streaming: ?StreamingState = null,
     streaming_active: bool = false,
     response_finished: bool = false,
@@ -789,7 +960,7 @@ const Stream = struct {
         self.request_body.deinit(self.allocator);
         self.request_metadata.deinit();
         if (self.response_body.len != 0) self.allocator.free(self.response_body);
-        if (self.response_message.len != 0) self.allocator.free(self.response_message);
+        if (self.response_message_allocator) |owner| owner.free(self.response_message);
         self.trailing_metadata.deinit();
         self.* = undefined;
     }
@@ -799,15 +970,22 @@ const Stream = struct {
             &.{}
         else
             try self.allocator.dupe(u8, response_status.message);
-        if (self.response_message.len != 0) self.allocator.free(self.response_message);
+        if (self.response_message_allocator) |owner| owner.free(self.response_message);
         self.response_code = response_status.code;
         self.response_message = owned_message;
+        self.response_message_allocator = if (owned_message.len == 0) null else self.allocator;
     }
 
-    fn setOwnedStatus(self: *Stream, code: status.Code, owned_message: []const u8) void {
-        if (self.response_message.len != 0) self.allocator.free(self.response_message);
+    fn setOwnedStatus(
+        self: *Stream,
+        code: status.Code,
+        owned_message: []const u8,
+        owner: std.mem.Allocator,
+    ) void {
+        if (self.response_message_allocator) |old_owner| old_owner.free(self.response_message);
         self.response_code = code;
         self.response_message = owned_message;
+        self.response_message_allocator = if (owned_message.len == 0) null else owner;
     }
 
     fn serverHandle(self: *Stream) raw_stream.ServerStream {
@@ -821,8 +999,8 @@ fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.Send
     if (payload.len > server.stream_limits.max_message_size) return error.MessageTooLarge;
     if (options.compression == .gzip and !target.accepts_response_gzip) return error.CompressionNotAccepted;
 
-    const encoded = try frame.encodeWithCompression(target.allocator, payload, options.compression);
-    errdefer target.allocator.free(encoded);
+    const encoded = try frame.encodeWithCompression(server.shared_allocator, payload, options.compression);
+    errdefer server.shared_allocator.free(encoded);
 
     server.lock();
     defer server.unlock();
@@ -840,7 +1018,7 @@ fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.Send
     errdefer target.outbound_reserved_bytes -= encoded.len;
     if (options.compression == .gzip) target.response_gzip_requested = true;
     const notify = server.stream_commands.items.len == 0;
-    try server.stream_commands.append(server.allocator, .{
+    try server.stream_commands.append(server.shared_allocator, .{
         .target = target,
         .action = .{ .send = encoded },
     });
@@ -858,8 +1036,8 @@ fn streamFinish(context: *anyopaque, final_status: status.Status) !void {
     const owned_message = if (final_status.message.len == 0)
         &.{}
     else
-        try target.allocator.dupe(u8, final_status.message);
-    errdefer if (owned_message.len != 0) target.allocator.free(owned_message);
+        try server.shared_allocator.dupe(u8, final_status.message);
+    errdefer if (owned_message.len != 0) server.shared_allocator.free(owned_message);
 
     server.lock();
     defer server.unlock();
@@ -867,7 +1045,7 @@ fn streamFinish(context: *anyopaque, final_status: status.Status) !void {
     target.finish_queued = true;
     errdefer target.finish_queued = false;
     const notify = server.stream_commands.items.len == 0;
-    try server.stream_commands.append(server.allocator, .{
+    try server.stream_commands.append(server.shared_allocator, .{
         .target = target,
         .action = .{ .finish = .{
             .code = final_status.code,
@@ -892,7 +1070,7 @@ fn streamResumeReceive(context: *anyopaque) !void {
     target.resume_queued = true;
     errdefer target.resume_queued = false;
     const notify = server.stream_commands.items.len == 0;
-    try server.stream_commands.append(server.allocator, .{
+    try server.stream_commands.append(server.shared_allocator, .{
         .target = target,
         .action = .resume_receive,
     });
@@ -940,6 +1118,10 @@ const Connection = struct {
     dirty_next: ?*Connection = null,
     dirty_queued: bool = false,
 
+    fn allocator(self: *Connection) std.mem.Allocator {
+        return self.server.localAllocator();
+    }
+
     fn initializeSession(self: *Connection) !void {
         var callbacks: ?*c.nghttp2_session_callbacks = null;
         if (c.nghttp2_session_callbacks_new(&callbacks) != 0) return error.OutOfMemory;
@@ -970,7 +1152,7 @@ const Connection = struct {
             if (self.tls_session != null) return self.flushTls();
         }
         var batch: CleartextWriteBatch = .{};
-        defer batch.deinit(self.server.allocator);
+        defer batch.deinit(self.allocator());
         while (!self.closing) {
             if (!canFlushWritesWithPending(
                 self.queued_write_bytes,
@@ -982,15 +1164,15 @@ const Connection = struct {
             if (length < 0) return error.NativeFailure;
             if (length == 0) break;
             if (try batch.append(
-                self.server.allocator,
+                self.allocator(),
                 data[0..@intCast(length)],
                 socket_write_batch_target,
             )) |bytes| try self.queueOwnedSocketWrite(bytes);
             if (batch.ready(socket_write_batch_target)) {
-                try self.queueOwnedSocketWrite((try batch.take(self.server.allocator)).?);
+                try self.queueOwnedSocketWrite((try batch.take(self.allocator())).?);
             }
         }
-        if (try batch.take(self.server.allocator)) |bytes| try self.queueOwnedSocketWrite(bytes);
+        if (try batch.take(self.allocator())) |bytes| try self.queueOwnedSocketWrite(bytes);
     }
 
     fn flushTls(self: *Connection) !void {
@@ -1004,7 +1186,7 @@ const Connection = struct {
             }
             if (self.tls_plaintext) |plaintext| {
                 if (self.tls_plaintext_offset == plaintext.len) {
-                    self.server.allocator.free(plaintext);
+                    self.allocator().free(plaintext);
                     self.tls_plaintext = null;
                     self.tls_plaintext_offset = 0;
                     continue;
@@ -1018,7 +1200,7 @@ const Connection = struct {
             const length = c.nghttp2_session_mem_send2(self.session, &data);
             if (length < 0) return error.NativeFailure;
             if (length == 0) return;
-            self.tls_plaintext = try self.server.allocator.dupe(u8, data[0..@intCast(length)]);
+            self.tls_plaintext = try self.allocator().dupe(u8, data[0..@intCast(length)]);
         }
     }
 
@@ -1042,17 +1224,17 @@ const Connection = struct {
     }
 
     fn queueSocketWrite(self: *Connection, source: []const u8) !void {
-        const bytes = try self.server.allocator.dupe(u8, source);
+        const bytes = try self.allocator().dupe(u8, source);
         try self.queueOwnedSocketWrite(bytes);
     }
 
     fn queueOwnedSocketWrite(self: *Connection, bytes: []u8) !void {
         const write = acquireWriteRequest(self, bytes) catch |err| {
-            self.server.allocator.free(bytes);
+            self.allocator().free(bytes);
             return err;
         };
         errdefer releaseWriteRequest(self, write);
-        errdefer self.server.allocator.free(bytes);
+        errdefer self.allocator().free(bytes);
         self.pending_writes = std.math.add(usize, self.pending_writes, 1) catch {
             return error.WriteQueueSizeOverflow;
         };
@@ -1133,14 +1315,14 @@ const Connection = struct {
         self.tls_session = null;
         clearConnectionDeadline(self);
         self.tls_handshake_needs_write = false;
-        if (self.tls_plaintext) |plaintext| self.server.allocator.free(plaintext);
+        if (self.tls_plaintext) |plaintext| self.allocator().free(plaintext);
         self.tls_plaintext = null;
         self.tls_plaintext_offset = 0;
     }
 
     fn startRead(self: *Connection, loop: *xev.Loop) !void {
         if (self.close_after_writes or self.closing or self.read_active) return;
-        if (self.read_buffer.len == 0) self.read_buffer = try self.server.allocator.alloc(u8, 16 * 1024);
+        if (self.read_buffer.len == 0) self.read_buffer = try self.allocator().alloc(u8, 16 * 1024);
         self.read_active = true;
         self.tcp.read(loop, &self.read_completion, .{ .slice = self.read_buffer }, Connection, self, onRead);
     }
@@ -1250,7 +1432,7 @@ const Connection = struct {
             const write: *WriteRequest = @fieldParentPtr("request", request);
             self.pending_writes -= 1;
             self.queued_write_bytes = completeQueuedWrite(self.queued_write_bytes, write.bytes.len);
-            self.server.allocator.free(write.bytes);
+            self.allocator().free(write.bytes);
             releaseWriteRequest(self, write);
         }
     }
@@ -1273,8 +1455,8 @@ const Connection = struct {
             if (stream.streaming != null and !stream.trailer_submitted) cancelStreaming(stream);
             std.debug.assert(retireStream(stream));
         }
-        self.streams.deinit(server.allocator);
-        if (self.read_buffer.len != 0) server.allocator.free(self.read_buffer);
+        self.streams.deinit(self.allocator());
+        if (self.read_buffer.len != 0) self.allocator().free(self.read_buffer);
         std.debug.assert(self.pending_writes == 0);
         std.debug.assert(self.write_queue.head == null);
         drainWriteRequestPool(self);
@@ -1284,7 +1466,7 @@ const Connection = struct {
                 break;
             }
         }
-        server.allocator.destroy(self);
+        server.localAllocator().destroy(self);
         finishDrainIfIdle(server);
         maybeStopLoop(server);
     }
@@ -1371,7 +1553,7 @@ fn deadlineHeapInsertOrUpdate(server: *Impl, target: DeadlineTarget, expires_at_
         return;
     }
 
-    try server.deadline_heap.append(server.allocator, .{
+    try server.deadline_heap.append(server.localAllocator(), .{
         .expires_at_ns = expires_at_ns,
         .target = target,
     });
@@ -1454,7 +1636,7 @@ const WriteRequest = struct {
 };
 
 fn acquireWriteRequest(connection: *Connection, bytes: []u8) !*WriteRequest {
-    const write = if (connection.write_request_pool_head) |pooled| pooled else try connection.server.allocator.create(WriteRequest);
+    const write = if (connection.write_request_pool_head) |pooled| pooled else try connection.allocator().create(WriteRequest);
     if (connection.write_request_pool_head != null) {
         std.debug.assert(write.in_pool);
         std.debug.assert(connection.write_request_pool_count > 0);
@@ -1498,7 +1680,7 @@ fn drainWriteRequestPool(connection: *Connection) void {
     while (connection.write_request_pool_head) |write| {
         connection.write_request_pool_head = write.free_next;
         connection.write_request_pool_count -= 1;
-        connection.server.allocator.destroy(write);
+        connection.allocator().destroy(write);
     }
     std.debug.assert(connection.write_request_pool_count == 0);
 }
@@ -1550,6 +1732,8 @@ const CleartextWriteBatch = struct {
 };
 
 fn runLoop(server: *Impl) void {
+    server.local_allocator_state.enterLoop();
+    defer server.local_allocator_state.leaveLoop();
     const setup_result = setupLoop(server);
     if (setup_result) |_| {
         server.signalStarted(null);
@@ -1632,15 +1816,15 @@ fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev
     };
     if (comptime builtin.is_test) _ = server_ptr.accepted_connections.fetchAdd(1, .monotonic);
 
-    const connection = server_ptr.allocator.create(Connection) catch {
+    const connection = server_ptr.localAllocator().create(Connection) catch {
         closeFd(tcp.fd);
         return rearmListener(server_ptr);
     };
     connection.* = .{ .server = server_ptr, .tcp = tcp };
-    server_ptr.connections.append(server_ptr.allocator, connection) catch {
+    server_ptr.connections.append(server_ptr.localAllocator(), connection) catch {
         closeFd(tcp.fd);
         drainWriteRequestPool(connection);
-        server_ptr.allocator.destroy(connection);
+        server_ptr.localAllocator().destroy(connection);
         return rearmListener(server_ptr);
     };
     connection.initializeSession() catch {
@@ -1649,7 +1833,7 @@ fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev
     };
     if (comptime build_options.tls) {
         if (server_ptr.tls_config) |config| {
-            connection.tls_session = tls_record.Session.create(server_ptr.allocator, config, null) catch {
+            connection.tls_session = tls_record.Session.create(server_ptr.localAllocator(), config, null) catch {
                 connection.closeOnLoop(loop);
                 return rearmListener(server_ptr);
             };
@@ -1751,7 +1935,7 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
     // WriteQueue retries partial writes and calls back with the full buffer length.
     const completed: ?usize = result catch null;
     const write_succeeded = completed != null and completed.? == request.bytes.len;
-    connection.server.allocator.free(request.bytes);
+    connection.allocator().free(request.bytes);
     releaseWriteRequest(connection, request);
     if (connection.closing) {
         connection.discardQueuedWrites();
@@ -1838,7 +2022,7 @@ fn processStreamCommands(server: *Impl) void {
     server.lock();
     std.mem.swap(std.ArrayList(StreamCommand), &commands, &server.stream_commands);
     server.unlock();
-    defer commands.deinit(server.allocator);
+    defer commands.deinit(server.shared_allocator);
 
     for (commands.items) |command| {
         const connection = command.target.connection;
@@ -1877,13 +2061,16 @@ fn processStreamCommand(server: *Impl, command: StreamCommand) void {
             server.unlock();
             if (!active or target.streaming == null) {
                 releaseOutboundReservation(target, bytes.len, false);
-                server.allocator.free(bytes);
+                server.shared_allocator.free(bytes);
                 return;
             }
             const streaming = &target.streaming.?;
-            streaming.outbound.append(server.allocator, .{ .bytes = bytes }) catch {
+            streaming.outbound.append(target.allocator, .{
+                .bytes = bytes,
+                .allocator = server.shared_allocator,
+            }) catch {
                 releaseOutboundReservation(target, bytes.len, false);
-                server.allocator.free(bytes);
+                server.shared_allocator.free(bytes);
                 failStreaming(target, .internal, "response allocation failed");
                 return;
             };
@@ -1895,10 +2082,10 @@ fn processStreamCommand(server: *Impl, command: StreamCommand) void {
             if (active) target.response_finished = true;
             server.unlock();
             if (!active or target.streaming == null) {
-                if (value.message.len != 0) server.allocator.free(value.message);
+                if (value.message.len != 0) server.shared_allocator.free(value.message);
                 return;
             }
-            target.setOwnedStatus(value.code, value.message);
+            target.setOwnedStatus(value.code, value.message, server.shared_allocator);
             copyStreamingTrailers(target) catch {
                 target.setStatus(.init(.internal, "metadata allocation failed")) catch {
                     target.connection.close();
@@ -2023,7 +2210,7 @@ fn discardStreamCommands(target: *Stream) void {
             .send => |bytes| target.outbound_reserved_bytes -= bytes.len,
             else => {},
         }
-        command.deinit(server.allocator);
+        command.deinit(server.shared_allocator);
     }
 }
 
@@ -2061,7 +2248,7 @@ fn cancelStreaming(target: *Stream) void {
     target.resume_queued = false;
     server.unlock();
     discardStreamCommands(target);
-    const reserved_bytes = streaming.clearOutbound(target.allocator);
+    const reserved_bytes = streaming.clearOutbound();
     releaseOutboundReservation(target, reserved_bytes, false);
     if (streaming.handler.on_cancel) |callback| {
         callback(streaming.handler.context, target.serverHandle(), &streaming.context);
@@ -2197,11 +2384,12 @@ fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp
         _ = c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, native_frame.*.hd.stream_id, c.NGHTTP2_REFUSED_STREAM);
         return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     }
-    const stream = connection.server.allocator.create(Stream) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-    stream.* = Stream.init(connection.server.allocator, connection, native_frame.*.hd.stream_id);
-    connection.streams.put(connection.server.allocator, stream.id, stream) catch {
+    const local_allocator = connection.allocator();
+    const stream = local_allocator.create(Stream) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    stream.* = Stream.init(local_allocator, connection, native_frame.*.hd.stream_id);
+    connection.streams.put(local_allocator, stream.id, stream) catch {
         stream.deinit();
-        connection.server.allocator.destroy(stream);
+        local_allocator.destroy(stream);
         return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     };
     connection.highest_accepted_stream_id = @max(connection.highest_accepted_stream_id, stream.id);
@@ -2697,7 +2885,7 @@ fn readStreamingResponseData(
         item.offset += length;
         releaseOutboundReservation(stream, length, true);
         if (item.offset == item.bytes.len) {
-            streaming.finishOutbound(stream.allocator);
+            streaming.finishOutbound();
         }
         if (streaming.nextOutbound() == null and stream.response_finished) {
             data_flags.?.* |= c.NGHTTP2_DATA_FLAG_EOF | c.NGHTTP2_DATA_FLAG_NO_END_STREAM;
@@ -3269,10 +3457,9 @@ fn deinitTestConnection(connection: *Connection) void {
     if (connection.session) |session| c.nghttp2_session_del(session);
     var iterator = connection.streams.iterator();
     while (iterator.next()) |entry| {
-        entry.value_ptr.*.deinit();
-        std.testing.allocator.destroy(entry.value_ptr.*);
+        destroyStream(entry.value_ptr.*);
     }
-    connection.streams.deinit(std.testing.allocator);
+    connection.streams.deinit(connection.allocator());
     drainWriteRequestPool(connection);
 }
 
@@ -3359,20 +3546,18 @@ test "dirty connection queue safely removes closing connections" {
 test "server write request pool reuses descriptors without allocation" {
     var server = try Server.init(std.testing.allocator, .{});
     defer server.deinit();
-    const owner_allocator = server.impl.allocator;
-    defer server.impl.allocator = owner_allocator;
     var connection = Connection{ .server = server.impl };
-    defer {
-        server.impl.allocator = owner_allocator;
-        drainWriteRequestPool(&connection);
-    }
+    defer drainWriteRequestPool(&connection);
 
     const first = try acquireWriteRequest(&connection, &.{});
     releaseWriteRequest(&connection, first);
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    server.impl.allocator = failing.allocator();
+    const operation_count = server.coordinator.serialized_allocator.operation_count.load(.monotonic);
     const reused = try acquireWriteRequest(&connection, &.{});
+    try std.testing.expectEqual(
+        operation_count,
+        server.coordinator.serialized_allocator.operation_count.load(.monotonic),
+    );
     try std.testing.expect(reused == first);
     try std.testing.expectEqual(@as(usize, 0), connection.write_request_pool_count);
     releaseWriteRequest(&connection, reused);
@@ -3421,7 +3606,7 @@ test "server write queue bookkeeping failure returns descriptor to pool" {
     const pooled = try acquireWriteRequest(&connection, &.{});
     releaseWriteRequest(&connection, pooled);
     connection.pending_writes = std.math.maxInt(usize);
-    const bytes = try server.impl.allocator.dupe(u8, "owned");
+    const bytes = try server.impl.localAllocator().dupe(u8, "owned");
     try std.testing.expectError(error.WriteQueueSizeOverflow, connection.queueOwnedSocketWrite(bytes));
     try std.testing.expectEqual(std.math.maxInt(usize), connection.pending_writes);
     try std.testing.expectEqual(@as(usize, 1), connection.write_request_pool_count);
@@ -3437,7 +3622,7 @@ test "server write callback and discard each release once" {
     var connection = Connection{ .server = server.impl };
     defer drainWriteRequestPool(&connection);
 
-    const callback_bytes = try server.impl.allocator.dupe(u8, "callback");
+    const callback_bytes = try server.impl.localAllocator().dupe(u8, "callback");
     const callback_write = try acquireWriteRequest(&connection, callback_bytes);
     connection.pending_writes = 1;
     connection.queued_write_bytes = callback_bytes.len;
@@ -3452,7 +3637,7 @@ test "server write callback and discard each release once" {
     );
     try std.testing.expectEqual(@as(usize, 1), connection.write_request_pool_count);
 
-    const discarded_bytes = try server.impl.allocator.dupe(u8, "discarded");
+    const discarded_bytes = try server.impl.localAllocator().dupe(u8, "discarded");
     const discarded_write = try acquireWriteRequest(&connection, discarded_bytes);
     connection.pending_writes = 1;
     connection.queued_write_bytes = discarded_bytes.len;
@@ -3609,7 +3794,7 @@ test "streaming finish keeps deadline until transport retirement" {
     try setStreamDeadline(target, deadline.Deadline.initAfter(server.impl.clock, std.time.ns_per_s));
     const heap_index = target.deadline_heap_index.?;
 
-    try server.impl.stream_commands.append(server.impl.allocator, .{
+    try server.impl.stream_commands.append(server.impl.shared_allocator, .{
         .target = target,
         .action = .{ .finish = .{ .code = .ok, .message = &.{} } },
     });
@@ -3635,30 +3820,33 @@ test "server streaming outbound queue preserves order and reuses drained storage
     streaming.outbound = .empty;
     streaming.outbound_head = 0;
     defer {
-        _ = streaming.clearOutbound(std.testing.allocator);
+        _ = streaming.clearOutbound();
         streaming.outbound.deinit(std.testing.allocator);
     }
 
     try streaming.outbound.append(std.testing.allocator, .{
         .bytes = try std.testing.allocator.dupe(u8, "first"),
+        .allocator = std.testing.allocator,
     });
     try streaming.outbound.append(std.testing.allocator, .{
         .bytes = try std.testing.allocator.dupe(u8, "second"),
+        .allocator = std.testing.allocator,
     });
     const capacity = streaming.outbound.capacity;
 
     try std.testing.expectEqualStrings("first", streaming.nextOutbound().?.bytes);
-    streaming.finishOutbound(std.testing.allocator);
+    streaming.finishOutbound();
     try std.testing.expectEqual(@as(usize, 1), streaming.outbound_head);
     try std.testing.expectEqualStrings("second", streaming.nextOutbound().?.bytes);
 
-    streaming.finishOutbound(std.testing.allocator);
+    streaming.finishOutbound();
     try std.testing.expectEqual(@as(usize, 0), streaming.outbound_head);
     try std.testing.expectEqual(@as(usize, 0), streaming.outbound.items.len);
     try std.testing.expectEqual(capacity, streaming.outbound.capacity);
 
     try streaming.outbound.append(std.testing.allocator, .{
         .bytes = try std.testing.allocator.dupe(u8, "reused"),
+        .allocator = std.testing.allocator,
     });
     try std.testing.expectEqualStrings("reused", streaming.nextOutbound().?.bytes);
 }
@@ -3671,19 +3859,22 @@ test "server streaming outbound cancellation frees only pending messages" {
 
     try streaming.outbound.append(std.testing.allocator, .{
         .bytes = try std.testing.allocator.dupe(u8, "consumed"),
+        .allocator = std.testing.allocator,
     });
     try streaming.outbound.append(std.testing.allocator, .{
         .bytes = try std.testing.allocator.dupe(u8, "partially sent"),
+        .allocator = std.testing.allocator,
         .offset = 4,
     });
     try streaming.outbound.append(std.testing.allocator, .{
         .bytes = try std.testing.allocator.dupe(u8, "pending"),
+        .allocator = std.testing.allocator,
     });
 
-    streaming.finishOutbound(std.testing.allocator);
+    streaming.finishOutbound();
     const capacity = streaming.outbound.capacity;
     try std.testing.expectEqual(@as(usize, 1), streaming.outbound_head);
-    try std.testing.expectEqual(@as(usize, 10 + 7), streaming.clearOutbound(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 10 + 7), streaming.clearOutbound());
     try std.testing.expectEqual(@as(usize, 0), streaming.outbound_head);
     try std.testing.expectEqual(@as(usize, 0), streaming.outbound.items.len);
     try std.testing.expectEqual(capacity, streaming.outbound.capacity);
@@ -4362,10 +4553,9 @@ test "raw HTTP/2 request routes unary data and ends with trailers" {
         if (connection.session) |session| c.nghttp2_session_del(session);
         var iterator = connection.streams.iterator();
         while (iterator.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            std.testing.allocator.destroy(entry.value_ptr.*);
+            destroyStream(entry.value_ptr.*);
         }
-        connection.streams.deinit(std.testing.allocator);
+        connection.streams.deinit(connection.allocator());
     }
 
     const header_block = [_]u8{

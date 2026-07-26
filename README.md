@@ -228,12 +228,21 @@ heaps, and write pools. The listeners share the configured IPv4 port with
 `SO_REUSEPORT`; each TCP connection and all of its streams remain on one reactor.
 Multi-core scaling therefore requires multiple client connections or channels.
 
-Server transport allocations are serialized before reaching the allocator passed to
-`Server.init`, so that allocator may be non-thread-safe. With multiple reactors,
-handler contexts, application-owned shared state, and allocators used directly by
-handlers must be thread-safe. Callbacks run concurrently across reactor threads and
-must not block. The serialized transport allocator is a correctness boundary; a future
-per-reactor slab allocator may reduce allocator lock contention.
+Each reactor uses a non-thread-safe local size-class allocator for connection, stream,
+deadline, TLS session, and socket-write state. Small transport allocations therefore
+remain on the owner reactor. Page refills, large allocations, coordinator state,
+`std.Io.Threaded`, TLS configuration, and cross-thread streaming commands use a
+serialized allocator backed by the allocator passed to `Server.init`, so that backing
+allocator may be non-thread-safe.
+
+The allocator passed to unary handlers and stored in `ServerContext` is reactor-local.
+It may be used only during the callback on its owner reactor; allocations must be freed
+there and must not be retained by another thread. A returned `UnaryResponse` is consumed
+and released synchronously on that reactor. `ServerStream` handles may be used from
+application threads because `send`, `finish`, and `resumeReceive` copy command data into
+shared serialized storage. With multiple reactors, handler contexts, application-owned
+shared state, and application allocators used across callbacks must still be
+thread-safe. Callbacks run concurrently across reactor threads and must not block.
 
 Handlers can inspect propagated deadlines with `ServerContext.hasDeadline`,
 `remainingTimeNs`, and `isDeadlineExceeded`. Handlers are not force-cancelled; a response
