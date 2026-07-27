@@ -127,7 +127,7 @@ case "$library" in
             printf 'ADDLIB %s/libcommon.a\n' "$build_dir"
             printf 'SAVE\nEND\n'
         } | "$zig_exe" ar -M
-        "$zig_exe" cc -target "$target_triple" -c "$force_link_source" \
+        "$zig_exe" cc -target "$target_triple" "${c_flags[@]}" -c "$force_link_source" \
             -o "$build_dir/gperftools_force_link.o"
         exit 0
         ;;
