@@ -85,6 +85,8 @@ jobs:
 
       - name: Build raw package consumer
         run: mise run test-consumer
+      - name: Test CMake FetchContent C consumers
+        run: mise run test-consumer-cmake-c
       - name: Install protobuf C++ tools
         run: |
           sudo apt-get update

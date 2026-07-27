@@ -49,6 +49,10 @@ run = "tests/consumer/run_raw.sh"
 description = "Generate, build, and run the C++ package consumer"
 run = "tests/consumer/run_cpp.sh"
 
+[tasks.test-consumer-cmake-c]
+description = "Build and run CMake FetchContent C consumers"
+run = "tests/consumer/run_cmake_c.sh"
+
 [tasks.gen-proto]
 description = "Generate Zig protobuf sources"
 run = "zig build gen-proto"

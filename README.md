@@ -107,8 +107,26 @@ responses, cancellation observation, and graceful drain. Runtime
 initialization must happen before application threads are created and must outlive
 dependent handles. C and C++ compile/link smoke tests run as part of `zig build test`;
 the grpcpp-shaped facade builds on this ABI in later stages.
-The installed static archive remains a Zig build artifact and is not a standalone C SDK;
-the C ABI currently targets the versioned shared library.
+Direct compiler invocation should use the versioned shared library. CMake consumers can
+also build and link the static archive directly from source with FetchContent; the
+static target carries its required Linux system libraries:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(
+  grpc_lite
+  GIT_REPOSITORY https://github.com/fanyang89/grpc-lite.git
+  GIT_TAG v0.3.1)
+FetchContent_MakeAvailable(grpc_lite)
+
+target_link_libraries(shared_app PRIVATE grpc_lite::c)
+target_link_libraries(static_app PRIVATE grpc_lite::c_static)
+```
+
+This source-build integration requires Zig 0.16.0 and currently supports Linux. Set
+`GRPC_LITE_ENABLE_TLS=ON` before `FetchContent_MakeAvailable` to enable TLS, or set
+`GRPC_LITE_ZIG_OPTIMIZE` to override the optimization mode derived from the CMake build
+configuration.
 
 ## Synchronous C++ Facade
 

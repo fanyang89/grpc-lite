@@ -269,12 +269,32 @@ pub fn build(b: *std.Build) void {
         .root_module = grpc_lite,
         .version = .{ .major = 1, .minor = 0, .patch = 0 },
     });
-    b.installArtifact(library);
-    b.installArtifact(shared_library);
-    b.getInstallStep().dependOn(&b.addInstallHeaderFile(
+    const package_static_library = b.addSystemCommand(&.{"bash"});
+    package_static_library.addFileArg(b.path("tools/package_static_library.sh"));
+    package_static_library.addFileArg(library.getEmittedBin());
+    const packaged_static_library = package_static_library.addOutputFileArg("libgrpc_lite.a");
+    package_static_library.addArg(b.graph.zig_exe);
+    const install_library = b.addInstallFileWithDir(
+        packaged_static_library,
+        .lib,
+        "libgrpc_lite.a",
+    );
+    const install_shared_library = b.addInstallArtifact(shared_library, .{});
+    const install_c_header = b.addInstallHeaderFile(
         b.path("include/grpc_lite/grpc_lite.h"),
         "grpc_lite/grpc_lite.h",
-    ).step);
+    );
+    b.getInstallStep().dependOn(&install_library.step);
+    b.getInstallStep().dependOn(&install_shared_library.step);
+    b.getInstallStep().dependOn(&install_c_header.step);
+
+    const install_c_sdk = b.step(
+        "install-c-sdk",
+        "Install the C header, static library, and shared library",
+    );
+    install_c_sdk.dependOn(&install_library.step);
+    install_c_sdk.dependOn(&install_shared_library.step);
+    install_c_sdk.dependOn(&install_c_header.step);
     b.getInstallStep().dependOn(&b.addInstallDirectory(.{
         .source_dir = b.path("include/grpcpp"),
         .install_dir = .header,
