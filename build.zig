@@ -73,6 +73,7 @@ pub fn build(b: *std.Build) void {
     const grpc_lite_options = b.addOptions();
     grpc_lite_options.addOption([]const u8, "version", manifest.version);
     grpc_lite_options.addOption(bool, "tls", enable_tls);
+    grpc_lite_options.addOption(bool, "sanitize_thread", sanitizers.thread == true);
     const grpc_lite = b.addModule("grpc_lite", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,

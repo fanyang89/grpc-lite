@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const options = @import("grpc_lite_options");
 
 const c = @cImport({
     @cInclude("cpucycles.h");
@@ -114,6 +115,7 @@ fn ensureInitialized(io: std.Io) void {
 }
 
 fn initialize(io: std.Io) void {
+    if (options.sanitize_thread) return fallBack(.unsupported_implementation);
     _ = readCycles() orelse return fallBack(.counter_unavailable);
     const implementation_pointer = c.cpucycles_implementation() orelse return fallBack(.counter_unavailable);
     const implementation_name = std.mem.span(implementation_pointer);
