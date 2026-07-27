@@ -23,9 +23,17 @@ comptime {
     @export(&c_api.grpc_lite_metadata_add, .{ .name = "grpc_lite_metadata_add" });
     @export(&c_api.grpc_lite_metadata_count, .{ .name = "grpc_lite_metadata_count" });
     @export(&c_api.grpc_lite_metadata_at, .{ .name = "grpc_lite_metadata_at" });
+    @export(&c_api.grpc_lite_metadata_view_count, .{ .name = "grpc_lite_metadata_view_count" });
+    @export(&c_api.grpc_lite_metadata_view_at, .{ .name = "grpc_lite_metadata_view_at" });
     @export(&c_api.grpc_lite_channel_create, .{ .name = "grpc_lite_channel_create" });
     @export(&c_api.grpc_lite_channel_destroy, .{ .name = "grpc_lite_channel_destroy" });
     @export(&c_api.grpc_lite_channel_call_unary, .{ .name = "grpc_lite_channel_call_unary" });
+    @export(&c_api.grpc_lite_channel_open_stream, .{ .name = "grpc_lite_channel_open_stream" });
+    @export(&c_api.grpc_lite_client_stream_send, .{ .name = "grpc_lite_client_stream_send" });
+    @export(&c_api.grpc_lite_client_stream_close_send, .{ .name = "grpc_lite_client_stream_close_send" });
+    @export(&c_api.grpc_lite_client_stream_cancel, .{ .name = "grpc_lite_client_stream_cancel" });
+    @export(&c_api.grpc_lite_client_stream_resume_receive, .{ .name = "grpc_lite_client_stream_resume_receive" });
+    @export(&c_api.grpc_lite_client_stream_destroy, .{ .name = "grpc_lite_client_stream_destroy" });
     @export(&c_api.grpc_lite_unary_result_destroy, .{ .name = "grpc_lite_unary_result_destroy" });
     @export(&c_api.grpc_lite_unary_result_status_code, .{ .name = "grpc_lite_unary_result_status_code" });
     @export(&c_api.grpc_lite_unary_result_status_message, .{ .name = "grpc_lite_unary_result_status_message" });

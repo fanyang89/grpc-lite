@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define GRPC_LITE_ABI_MAJOR 1u
-#define GRPC_LITE_ABI_MINOR 0u
+#define GRPC_LITE_ABI_MINOR 1u
 #define GRPC_LITE_ABI_VERSION \
   ((GRPC_LITE_ABI_MAJOR << 16) | GRPC_LITE_ABI_MINOR)
 
@@ -24,6 +24,7 @@ enum {
   GRPC_LITE_ERROR_UNAVAILABLE = 5,
   GRPC_LITE_ERROR_OUT_OF_RANGE = 6,
   GRPC_LITE_ERROR_CLOSED = 7,
+  GRPC_LITE_ERROR_WOULD_BLOCK = 8,
   GRPC_LITE_ERROR_INTERNAL = 255,
 };
 
@@ -35,11 +36,14 @@ typedef uint64_t grpc_lite_feature_bits;
 #define GRPC_LITE_FEATURE_DNS (UINT64_C(1) << 3)
 #define GRPC_LITE_FEATURE_TLS (UINT64_C(1) << 4)
 #define GRPC_LITE_FEATURE_GRACEFUL_SERVER_DRAIN (UINT64_C(1) << 5)
+#define GRPC_LITE_FEATURE_C_STREAMING (UINT64_C(1) << 6)
 
 typedef struct grpc_lite_runtime grpc_lite_runtime;
 typedef struct grpc_lite_metadata grpc_lite_metadata;
 typedef struct grpc_lite_channel grpc_lite_channel;
 typedef struct grpc_lite_unary_result grpc_lite_unary_result;
+typedef struct grpc_lite_metadata_view grpc_lite_metadata_view;
+typedef struct grpc_lite_client_stream grpc_lite_client_stream;
 
 typedef struct grpc_lite_bytes_view {
   const uint8_t *data;
@@ -129,6 +133,84 @@ grpc_lite_error grpc_lite_unary_result_metadata_at(
     uint32_t trailing,
     size_t index,
     grpc_lite_metadata_entry_view *out_entry);
+
+/* Metadata views are borrowed and remain valid only during their callback. */
+size_t grpc_lite_metadata_view_count(const grpc_lite_metadata_view *metadata);
+grpc_lite_error grpc_lite_metadata_view_at(
+    const grpc_lite_metadata_view *metadata,
+    size_t index,
+    grpc_lite_metadata_entry_view *out_entry);
+
+enum {
+  GRPC_LITE_RECEIVE_CONTINUE = 0,
+  GRPC_LITE_RECEIVE_PAUSE = 1,
+};
+
+typedef struct grpc_lite_client_stream_options {
+  size_t struct_size;
+  const grpc_lite_metadata *metadata;
+  uint32_t has_timeout;
+  uint32_t send_compression;
+  uint64_t timeout_ns;
+  uint64_t max_message_size;
+  uint64_t max_inbound_buffer_size;
+  uint64_t max_outbound_buffer_size;
+} grpc_lite_client_stream_options;
+
+#define GRPC_LITE_CLIENT_STREAM_OPTIONS_INIT \
+  { sizeof(grpc_lite_client_stream_options), NULL, 0, \
+    GRPC_LITE_COMPRESSION_IDENTITY, 0, UINT64_C(4194304), \
+    UINT64_C(8388608), UINT64_C(8388608) }
+
+typedef struct grpc_lite_client_stream_callbacks {
+  size_t struct_size;
+  void *user_data;
+  void (*on_headers)(
+      void *user_data,
+      grpc_lite_client_stream *stream,
+      const grpc_lite_metadata_view *headers);
+  uint32_t (*on_message)(
+      void *user_data,
+      grpc_lite_client_stream *stream,
+      grpc_lite_bytes_view payload,
+      uint32_t compression);
+  void (*on_remote_end)(
+      void *user_data,
+      grpc_lite_client_stream *stream);
+  void (*on_writable)(
+      void *user_data,
+      grpc_lite_client_stream *stream);
+  void (*on_terminal)(
+      void *user_data,
+      grpc_lite_client_stream *stream,
+      int32_t status_code,
+      grpc_lite_bytes_view status_message,
+      const grpc_lite_metadata_view *trailing_metadata);
+} grpc_lite_client_stream_callbacks;
+
+/* on_message and on_terminal are required. Callback data is borrowed. */
+#define GRPC_LITE_CLIENT_STREAM_CALLBACKS_INIT \
+  { sizeof(grpc_lite_client_stream_callbacks), NULL, NULL, NULL, NULL, NULL, NULL }
+
+grpc_lite_error grpc_lite_channel_open_stream(
+    grpc_lite_channel *channel,
+    grpc_lite_bytes_view full_method_path,
+    const grpc_lite_client_stream_options *options,
+    const grpc_lite_client_stream_callbacks *callbacks,
+    grpc_lite_client_stream **out_stream);
+/* Commands are thread-safe while the owning handle remains alive. */
+/* GRPC_LITE_ERROR_WOULD_BLOCK is retryable. */
+grpc_lite_error grpc_lite_client_stream_send(
+    grpc_lite_client_stream *stream,
+    grpc_lite_bytes_view payload,
+    uint32_t compression);
+grpc_lite_error grpc_lite_client_stream_close_send(
+    grpc_lite_client_stream *stream);
+void grpc_lite_client_stream_cancel(grpc_lite_client_stream *stream);
+grpc_lite_error grpc_lite_client_stream_resume_receive(
+    grpc_lite_client_stream *stream);
+/* Destroy exactly once, outside callbacks and synchronized with all commands. */
+void grpc_lite_client_stream_destroy(grpc_lite_client_stream *stream);
 
 #ifdef __cplusplus
 }

@@ -5,10 +5,14 @@ const channel = @import("channel.zig");
 const Compression = @import("compression.zig").Compression;
 const metadata = @import("metadata.zig");
 const Runtime = @import("runtime.zig").Runtime;
+const raw_stream = @import("stream.zig");
+const Server = @import("server.zig").Server;
+const ServerContext = @import("service.zig").ServerContext;
+const Status = @import("status.zig").Status;
 const version = @import("version.zig");
 
 pub const abi_major: u16 = 1;
-pub const abi_minor: u16 = 0;
+pub const abi_minor: u16 = 1;
 
 pub const Error = enum(i32) {
     ok = 0,
@@ -19,6 +23,7 @@ pub const Error = enum(i32) {
     unavailable = 5,
     out_of_range = 6,
     closed = 7,
+    would_block = 8,
     internal = 255,
 };
 
@@ -29,6 +34,7 @@ pub const Feature = struct {
     pub const dns: u64 = 1 << 3;
     pub const tls: u64 = 1 << 4;
     pub const graceful_server_drain: u64 = 1 << 5;
+    pub const c_streaming: u64 = 1 << 6;
 };
 
 pub const BytesView = extern struct {
@@ -45,6 +51,8 @@ pub const RuntimeHandle = opaque {};
 pub const MetadataHandle = opaque {};
 pub const ChannelHandle = opaque {};
 pub const UnaryResultHandle = opaque {};
+pub const MetadataViewHandle = opaque {};
+pub const ClientStreamHandle = opaque {};
 
 pub const UnaryOptions = extern struct {
     struct_size: usize = @sizeOf(UnaryOptions),
@@ -53,6 +61,27 @@ pub const UnaryOptions = extern struct {
     request_compression: u32 = 0,
     timeout_ns: u64 = 0,
     max_response_size: u64 = call.default_max_message_size,
+};
+
+pub const ClientStreamOptions = extern struct {
+    struct_size: usize = @sizeOf(ClientStreamOptions),
+    metadata: ?*const MetadataHandle = null,
+    has_timeout: u32 = 0,
+    send_compression: u32 = 0,
+    timeout_ns: u64 = 0,
+    max_message_size: u64 = call.default_max_message_size,
+    max_inbound_buffer_size: u64 = 8 * 1024 * 1024,
+    max_outbound_buffer_size: u64 = 8 * 1024 * 1024,
+};
+
+pub const ClientStreamCallbacks = extern struct {
+    struct_size: usize = @sizeOf(ClientStreamCallbacks),
+    user_data: ?*anyopaque = null,
+    on_headers: ?*const fn (?*anyopaque, *ClientStreamHandle, *const MetadataViewHandle) callconv(.c) void = null,
+    on_message: ?*const fn (?*anyopaque, *ClientStreamHandle, BytesView, u32) callconv(.c) u32 = null,
+    on_remote_end: ?*const fn (?*anyopaque, *ClientStreamHandle) callconv(.c) void = null,
+    on_writable: ?*const fn (?*anyopaque, *ClientStreamHandle) callconv(.c) void = null,
+    on_terminal: ?*const fn (?*anyopaque, *ClientStreamHandle, i32, BytesView, *const MetadataViewHandle) callconv(.c) void = null,
 };
 
 const RuntimeStorage = struct {
@@ -65,6 +94,14 @@ const MetadataStorage = struct {
 
 const ChannelStorage = struct { value: channel.Channel };
 const UnaryResultStorage = struct { value: call.Result };
+const ClientStreamStorage = struct {
+    callbacks: ClientStreamCallbacks,
+    value: raw_stream.ClientStream,
+    ready: std.atomic.Value(bool),
+};
+
+const client_stream_options_v1_size = @offsetOf(ClientStreamOptions, "max_outbound_buffer_size") + @sizeOf(u64);
+const client_stream_callbacks_v1_size = @offsetOf(ClientStreamCallbacks, "on_terminal") + @sizeOf(?*const fn (?*anyopaque, *ClientStreamHandle, i32, BytesView, *const MetadataViewHandle) callconv(.c) void);
 
 const allocator = std.heap.c_allocator;
 
@@ -81,7 +118,8 @@ pub fn grpc_lite_features() callconv(.c) u64 {
         Feature.streaming |
         Feature.gzip |
         Feature.dns |
-        Feature.graceful_server_drain;
+        Feature.graceful_server_drain |
+        Feature.c_streaming;
     if (build_options.tls) features |= Feature.tls;
     return features;
 }
@@ -97,6 +135,7 @@ pub fn grpc_lite_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
         .unavailable => "unavailable",
         .out_of_range => "out of range",
         .closed => "closed",
+        .would_block => "would block",
         .internal => "internal error",
     };
 }
@@ -177,6 +216,25 @@ pub fn grpc_lite_metadata_at(
     return .ok;
 }
 
+pub fn grpc_lite_metadata_view_count(view_handle: ?*const MetadataViewHandle) callconv(.c) usize {
+    const handle = view_handle orelse return 0;
+    return metadataView(handle).items().len;
+}
+
+pub fn grpc_lite_metadata_view_at(
+    view_handle: ?*const MetadataViewHandle,
+    index: usize,
+    out_entry: ?*MetadataEntryView,
+) callconv(.c) Error {
+    const output = out_entry orelse return .invalid_argument;
+    output.* = .{};
+    const handle = view_handle orelse return .invalid_argument;
+    const entries = metadataView(handle).items();
+    if (index >= entries.len) return .out_of_range;
+    output.* = .{ .key = view(entries[index].key), .value = view(entries[index].value) };
+    return .ok;
+}
+
 pub fn grpc_lite_channel_create(
     runtime_handle: ?*RuntimeHandle,
     target: BytesView,
@@ -236,6 +294,75 @@ pub fn grpc_lite_channel_call_unary(
     return .ok;
 }
 
+pub fn grpc_lite_channel_open_stream(
+    channel_handle: ?*ChannelHandle,
+    full_method_path: BytesView,
+    options_pointer: ?*const ClientStreamOptions,
+    callbacks_pointer: ?*const ClientStreamCallbacks,
+    out_stream: ?*?*ClientStreamHandle,
+) callconv(.c) Error {
+    const output = out_stream orelse return .invalid_argument;
+    output.* = null;
+    const handle = channel_handle orelse return .invalid_argument;
+    const method = bytes(full_method_path) orelse return .invalid_argument;
+    const options = parseClientStreamOptions(options_pointer) orelse return .invalid_argument;
+    const callbacks = parseClientStreamCallbacks(callbacks_pointer) orelse return .invalid_argument;
+
+    const storage = allocator.create(ClientStreamStorage) catch return .out_of_memory;
+    errdefer allocator.destroy(storage);
+    storage.callbacks = callbacks;
+    storage.ready = .init(false);
+    storage.value = channelStorage(handle).value.openStream(method, options, .{
+        .context = storage,
+        .on_headers = clientStreamOnHeaders,
+        .on_message = clientStreamOnMessage,
+        .on_remote_end = clientStreamOnRemoteEnd,
+        .on_writable = clientStreamOnWritable,
+        .on_terminal = clientStreamOnTerminal,
+    }) catch |err| return mapStreamError(err);
+    storage.ready.store(true, .release);
+    output.* = clientStreamHandle(storage);
+    return .ok;
+}
+
+pub fn grpc_lite_client_stream_send(
+    stream_handle: ?*ClientStreamHandle,
+    payload: BytesView,
+    compression: u32,
+) callconv(.c) Error {
+    const handle = stream_handle orelse return .invalid_argument;
+    const payload_bytes = bytes(payload) orelse return .invalid_argument;
+    const algorithm = parseCompression(compression) orelse return .invalid_argument;
+    clientStreamStorage(handle).value.send(payload_bytes, .{ .compression = algorithm }) catch |err| {
+        return mapStreamError(err);
+    };
+    return .ok;
+}
+
+pub fn grpc_lite_client_stream_close_send(stream_handle: ?*ClientStreamHandle) callconv(.c) Error {
+    const handle = stream_handle orelse return .invalid_argument;
+    clientStreamStorage(handle).value.closeSend() catch |err| return mapStreamError(err);
+    return .ok;
+}
+
+pub fn grpc_lite_client_stream_cancel(stream_handle: ?*ClientStreamHandle) callconv(.c) void {
+    const handle = stream_handle orelse return;
+    clientStreamStorage(handle).value.cancel();
+}
+
+pub fn grpc_lite_client_stream_resume_receive(stream_handle: ?*ClientStreamHandle) callconv(.c) Error {
+    const handle = stream_handle orelse return .invalid_argument;
+    clientStreamStorage(handle).value.resumeReceive() catch |err| return mapStreamError(err);
+    return .ok;
+}
+
+pub fn grpc_lite_client_stream_destroy(stream_handle: ?*ClientStreamHandle) callconv(.c) void {
+    const handle = stream_handle orelse return;
+    const storage = clientStreamStorage(handle);
+    storage.value.deinit();
+    allocator.destroy(storage);
+}
+
 pub fn grpc_lite_unary_result_destroy(result_handle: ?*UnaryResultHandle) callconv(.c) void {
     const handle = result_handle orelse return;
     const storage = unaryResultStorage(handle);
@@ -278,6 +405,102 @@ pub fn grpc_lite_unary_result_metadata_at(result_handle: ?*const UnaryResultHand
     return .ok;
 }
 
+fn clientStreamOnHeaders(
+    context: ?*anyopaque,
+    _: raw_stream.ClientStream,
+    headers: *const metadata.Metadata,
+) void {
+    const storage = clientStreamContext(context);
+    const callback = storage.callbacks.on_headers orelse return;
+    callback(storage.callbacks.user_data, clientStreamHandle(storage), metadataViewHandle(headers));
+}
+
+fn clientStreamOnMessage(
+    context: ?*anyopaque,
+    _: raw_stream.ClientStream,
+    payload: []const u8,
+    compression: Compression,
+) raw_stream.ReceiveAction {
+    const storage = clientStreamContext(context);
+    const callback = storage.callbacks.on_message.?;
+    return if (callback(
+        storage.callbacks.user_data,
+        clientStreamHandle(storage),
+        view(payload),
+        @intFromEnum(compression),
+    ) == 0) .continue_receiving else .pause;
+}
+
+fn clientStreamOnRemoteEnd(context: ?*anyopaque, _: raw_stream.ClientStream) void {
+    const storage = clientStreamContext(context);
+    const callback = storage.callbacks.on_remote_end orelse return;
+    callback(storage.callbacks.user_data, clientStreamHandle(storage));
+}
+
+fn clientStreamOnWritable(context: ?*anyopaque, _: raw_stream.ClientStream) void {
+    const storage = clientStreamContext(context);
+    const callback = storage.callbacks.on_writable orelse return;
+    callback(storage.callbacks.user_data, clientStreamHandle(storage));
+}
+
+fn clientStreamOnTerminal(
+    context: ?*anyopaque,
+    _: raw_stream.ClientStream,
+    final_status: Status,
+    trailing_metadata: *const metadata.Metadata,
+) void {
+    const storage = clientStreamContext(context);
+    const callback = storage.callbacks.on_terminal.?;
+    callback(
+        storage.callbacks.user_data,
+        clientStreamHandle(storage),
+        @intFromEnum(final_status.code),
+        view(final_status.message),
+        metadataViewHandle(trailing_metadata),
+    );
+}
+
+fn clientStreamContext(context: ?*anyopaque) *ClientStreamStorage {
+    const storage: *ClientStreamStorage = @ptrCast(@alignCast(context.?));
+    while (!storage.ready.load(.acquire)) std.atomic.spinLoopHint();
+    return storage;
+}
+
+fn clientStreamHandle(storage: *ClientStreamStorage) *ClientStreamHandle {
+    return @ptrCast(storage);
+}
+
+fn clientStreamStorage(handle: *ClientStreamHandle) *ClientStreamStorage {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn metadataViewHandle(value: *const metadata.Metadata) *const MetadataViewHandle {
+    return @ptrCast(value);
+}
+
+fn metadataView(handle: *const MetadataViewHandle) *const metadata.Metadata {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn mapStreamError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.WouldBlock => .would_block,
+        error.StreamClosed, error.SendClosed => .closed,
+        error.ChannelUnavailable => .unavailable,
+        error.MessageTooLarge, error.OutboundBufferLimitExceeded => .out_of_range,
+        error.InvalidMethodPath,
+        error.InvalidMetadataKey,
+        error.InvalidMetadataValue,
+        error.InvalidMaxMessageSize,
+        error.InvalidInboundBufferSize,
+        error.InvalidOutboundBufferSize,
+        error.CompressionNotConfigured,
+        => .invalid_argument,
+        else => .internal,
+    };
+}
+
 fn metadataStorage(handle: *MetadataHandle) *MetadataStorage {
     return @ptrCast(@alignCast(handle));
 }
@@ -305,17 +528,47 @@ fn resultMetadata(result: *const UnaryResultStorage, trailing: u32) *const metad
 fn parseUnaryOptions(pointer: ?*const UnaryOptions) ?call.Options {
     const value = pointer orelse return .{};
     if (value.struct_size < @sizeOf(UnaryOptions) or value.has_timeout > 1) return null;
-    const compression: Compression = switch (value.request_compression) {
-        0 => .identity,
-        1 => .gzip,
-        else => return null,
-    };
+    const compression = parseCompression(value.request_compression) orelse return null;
     if (value.max_response_size > std.math.maxInt(usize)) return null;
     return .{
         .metadata = if (value.metadata) |handle| metadataStorageConst(handle).value.items() else &.{},
         .timeout_ns = if (value.has_timeout == 1) value.timeout_ns else null,
         .max_response_size = @intCast(value.max_response_size),
         .request_compression = compression,
+    };
+}
+
+fn parseClientStreamOptions(pointer: ?*const ClientStreamOptions) ?raw_stream.Options {
+    const value = pointer orelse return .{};
+    if (value.struct_size < client_stream_options_v1_size or value.has_timeout > 1) return null;
+    const compression = parseCompression(value.send_compression) orelse return null;
+    if (value.max_message_size > std.math.maxInt(usize) or
+        value.max_inbound_buffer_size > std.math.maxInt(usize) or
+        value.max_outbound_buffer_size > std.math.maxInt(usize)) return null;
+    return .{
+        .metadata = if (value.metadata) |handle| metadataStorageConst(handle).value.items() else &.{},
+        .timeout_ns = if (value.has_timeout == 1) value.timeout_ns else null,
+        .limits = .{
+            .max_message_size = @intCast(value.max_message_size),
+            .max_inbound_buffer_size = @intCast(value.max_inbound_buffer_size),
+            .max_outbound_buffer_size = @intCast(value.max_outbound_buffer_size),
+        },
+        .send_compression = compression,
+    };
+}
+
+fn parseClientStreamCallbacks(pointer: ?*const ClientStreamCallbacks) ?ClientStreamCallbacks {
+    const value = pointer orelse return null;
+    if (value.struct_size < client_stream_callbacks_v1_size or
+        value.on_message == null or value.on_terminal == null) return null;
+    return value.*;
+}
+
+fn parseCompression(value: u32) ?Compression {
+    return switch (value) {
+        0 => .identity,
+        1 => .gzip,
+        else => null,
     };
 }
 
@@ -467,4 +720,150 @@ test "C unary result exposes owned response data" {
     try std.testing.expectEqual(Error.ok, grpc_lite_unary_result_metadata_at(handle, 1, 0, &entry));
     try std.testing.expectEqualStrings("trace-bin", bytes(entry.key).?);
     try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, bytes(entry.value).?);
+}
+
+test "C stream ABI validates extensible options and callbacks" {
+    const Callbacks = struct {
+        fn onMessage(_: ?*anyopaque, _: *ClientStreamHandle, _: BytesView, _: u32) callconv(.c) u32 {
+            return 0;
+        }
+
+        fn onTerminal(_: ?*anyopaque, _: *ClientStreamHandle, _: i32, _: BytesView, _: *const MetadataViewHandle) callconv(.c) void {}
+    };
+
+    var options: ClientStreamOptions = .{};
+    try std.testing.expect(parseClientStreamOptions(&options) != null);
+    options.send_compression = 2;
+    try std.testing.expectEqual(null, parseClientStreamOptions(&options));
+    options = .{};
+    options.max_message_size = 0;
+    try std.testing.expect(parseClientStreamOptions(&options) != null);
+
+    var callbacks: ClientStreamCallbacks = .{};
+    try std.testing.expectEqual(null, parseClientStreamCallbacks(&callbacks));
+    callbacks.on_message = Callbacks.onMessage;
+    callbacks.on_terminal = Callbacks.onTerminal;
+    try std.testing.expect(parseClientStreamCallbacks(&callbacks) != null);
+    callbacks.struct_size = 0;
+    try std.testing.expectEqual(null, parseClientStreamCallbacks(&callbacks));
+
+    var stream_handle: ?*ClientStreamHandle = @ptrFromInt(1);
+    try std.testing.expectEqual(
+        Error.invalid_argument,
+        grpc_lite_channel_open_stream(null, view("/test.Echo/Stream"), null, &callbacks, &stream_handle),
+    );
+    try std.testing.expectEqual(null, stream_handle);
+    try std.testing.expectEqual(Error.invalid_argument, grpc_lite_client_stream_send(null, view("x"), 0));
+    grpc_lite_client_stream_cancel(null);
+    grpc_lite_client_stream_destroy(null);
+}
+
+test "C borrowed metadata view exposes entries" {
+    var value = metadata.Metadata.init(std.testing.allocator);
+    defer value.deinit();
+    try value.append("x-test", "value");
+    const handle = metadataViewHandle(&value);
+    try std.testing.expectEqual(@as(usize, 1), grpc_lite_metadata_view_count(handle));
+    var entry: MetadataEntryView = .{};
+    try std.testing.expectEqual(Error.ok, grpc_lite_metadata_view_at(handle, 0, &entry));
+    try std.testing.expectEqualStrings("x-test", bytes(entry.key).?);
+    try std.testing.expectEqualStrings("value", bytes(entry.value).?);
+}
+
+test "C client stream completes an event-driven round trip" {
+    const Handler = struct {
+        fn onStart(_: ?*anyopaque, _: raw_stream.ServerStream, _: *ServerContext) !void {}
+
+        fn onMessage(
+            _: ?*anyopaque,
+            stream: raw_stream.ServerStream,
+            _: *ServerContext,
+            payload: []const u8,
+            _: Compression,
+        ) !raw_stream.ReceiveAction {
+            try stream.send(payload, .{});
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, stream: raw_stream.ServerStream, _: *ServerContext) !void {
+            try stream.finish(.ok);
+        }
+    };
+    const State = struct {
+        message_seen: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        succeeded: std.atomic.Value(bool) = .init(false),
+
+        fn onMessage(
+            user_data: ?*anyopaque,
+            _: *ClientStreamHandle,
+            payload: BytesView,
+            compression: u32,
+        ) callconv(.c) u32 {
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            self.message_seen.store(
+                compression == @intFromEnum(Compression.identity) and
+                    std.mem.eql(u8, bytes(payload).?, "hello"),
+                .release,
+            );
+            return 0;
+        }
+
+        fn onTerminal(
+            user_data: ?*anyopaque,
+            _: *ClientStreamHandle,
+            status_code: i32,
+            _: BytesView,
+            trailing_metadata: *const MetadataViewHandle,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            self.succeeded.store(
+                status_code == 0 and grpc_lite_metadata_view_count(trailing_metadata) == 0,
+                .release,
+            );
+            self.done.store(true, .release);
+        }
+    };
+
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    try server.registerStream("/test.CAbi/Echo", .{
+        .on_start = Handler.onStart,
+        .on_message = Handler.onMessage,
+        .on_remote_end = Handler.onRemoteEnd,
+    });
+    try server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try server.port()});
+    var channel_handle: ?*ChannelHandle = null;
+    try std.testing.expectEqual(Error.ok, grpc_lite_channel_create(null, view(target), &channel_handle));
+    defer grpc_lite_channel_destroy(channel_handle);
+
+    var state: State = .{};
+    var callbacks: ClientStreamCallbacks = .{
+        .user_data = &state,
+        .on_message = State.onMessage,
+        .on_terminal = State.onTerminal,
+    };
+    var stream_handle: ?*ClientStreamHandle = null;
+    try std.testing.expectEqual(Error.ok, grpc_lite_channel_open_stream(
+        channel_handle,
+        view("/test.CAbi/Echo"),
+        null,
+        &callbacks,
+        &stream_handle,
+    ));
+    defer grpc_lite_client_stream_destroy(stream_handle);
+    try std.testing.expectEqual(Error.ok, grpc_lite_client_stream_send(stream_handle, view("hello"), 0));
+    try std.testing.expectEqual(Error.ok, grpc_lite_client_stream_close_send(stream_handle));
+
+    var attempts: usize = 0;
+    while (!state.done.load(.acquire)) {
+        if (attempts == 5000) return error.StreamTimeout;
+        attempts += 1;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.message_seen.load(.acquire));
+    try std.testing.expect(state.succeeded.load(.acquire));
 }

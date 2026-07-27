@@ -17,8 +17,16 @@ static_assert(sizeof(grpc_lite_metadata_entry_view) ==
 
 int main() {
   grpc_lite_unary_options options = GRPC_LITE_UNARY_OPTIONS_INIT;
+  grpc_lite_client_stream_options stream_options =
+      GRPC_LITE_CLIENT_STREAM_OPTIONS_INIT;
+  grpc_lite_client_stream_callbacks callbacks =
+      GRPC_LITE_CLIENT_STREAM_CALLBACKS_INIT;
   static_assert(std::is_standard_layout_v<grpc_lite_unary_options>);
+  static_assert(std::is_standard_layout_v<grpc_lite_client_stream_options>);
+  static_assert(std::is_standard_layout_v<grpc_lite_client_stream_callbacks>);
   assert(options.struct_size == sizeof(options));
+  assert(stream_options.struct_size == sizeof(stream_options));
+  assert(callbacks.struct_size == sizeof(callbacks));
 
   if (grpc_lite_abi_version() != GRPC_LITE_ABI_VERSION) return 1;
   if (std::string_view(grpc_lite_error_string(GRPC_LITE_OK)) != "ok") return 2;

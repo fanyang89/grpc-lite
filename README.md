@@ -99,7 +99,9 @@ cc app.c \
 ```
 
 The ABI surface provides version and feature discovery, owning Runtime and Metadata
-handles, insecure connected Channels, and blocking raw unary calls. Runtime
+handles, insecure connected Channels, blocking raw unary calls, and cancellable
+event-driven client streams with bounded backpressure. Stream callbacks run on the
+transport loop thread and must not block. Runtime
 initialization must happen before application threads are created and must outlive
 dependent handles. C and C++ compile/link smoke tests run as part of `zig build test`;
 the grpcpp-shaped facade builds on this ABI in later stages.
