@@ -244,6 +244,19 @@ shared serialized storage. With multiple reactors, handler contexts, application
 shared state, and application allocators used across callbacks must still be
 thread-safe. Callbacks run concurrently across reactor threads and must not block.
 
+`ServerStream` itself is a borrowed callback view. A handler that dispatches work to
+another thread must call `ServerStream.retain` and pass the returned owning `ServerCall`.
+The call remains queryable after transport termination, when its commands return
+`CallClosed`; every clone must be deinitialized before the Server. `on_terminal` runs
+exactly once and is the final callback for that call.
+
+Adapters that need to decide response metadata outside `on_start` can register a stream
+handler with `receive_initially_paused = true` and `initial_metadata_mode = .explicit`.
+The worker then calls `ServerCall.sendInitialMetadata`, `resumeReceive`, `send`, and
+`finish`. Initial metadata must be queued before a message or final status; `finish`
+copies its status and trailing metadata before returning. Existing handlers retain the
+default behavior of submitting initial metadata immediately after `on_start`.
+
 Handlers can inspect propagated deadlines with `ServerContext.hasDeadline`,
 `remainingTimeNs`, and `isDeadlineExceeded`. Handlers are not force-cancelled; a response
 returned after the deadline is replaced with `DEADLINE_EXCEEDED`.

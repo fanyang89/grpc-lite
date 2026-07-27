@@ -93,6 +93,8 @@ Raw streaming APIs are planned as all-event-driven while implementation is ongoi
 - Application callbacks run on transport loop threads and must not block.
 - Half-close ends only the local send direction. Explicit cancellation terminates both
   directions and is exposed only for streaming calls.
+- `ServerStream` is callback-borrowed; retained cross-thread server work uses an owning
+  `ServerCall` and releases it before Server teardown.
 - Public objects use explicit allocators, clear ownership, and deterministic `deinit`.
 - Bounded queues and HTTP/2 flow control provide backpressure for each direction.
 - Compression is selected per message, with only `identity` and `gzip` supported.

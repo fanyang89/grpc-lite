@@ -28,6 +28,10 @@ test "stable public API compiles for downstream consumers" {
         _ = grpc.ClientStream;
         _ = grpc.ClientStreamCallbacks;
         _ = grpc.ServerStream;
+        _ = grpc.ServerCall;
+        _ = grpc.ServerCallId;
+        _ = grpc.ServerTerminalReason;
+        _ = grpc.ServerInitialMetadataMode;
         _ = grpc.ServerStreamHandler;
         _ = grpc.log;
         _ = grpc.protobuf;

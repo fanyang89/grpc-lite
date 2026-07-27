@@ -829,21 +829,73 @@ fn rollbackStart(coordinator: *Coordinator) void {
 const StreamCommand = struct {
     target: *Stream,
     action: union(enum) {
+        initial_metadata: struct {
+            entries: metadata.Metadata,
+            compression: Compression,
+        },
         send: []u8,
         finish: struct {
             code: status.Code,
             message: []const u8,
+            trailing_metadata: ?metadata.Metadata,
         },
         resume_receive,
     },
 
     fn deinit(self: *StreamCommand, allocator: std.mem.Allocator) void {
         switch (self.action) {
+            .initial_metadata => |*value| value.entries.deinit(),
             .send => |bytes| allocator.free(bytes),
-            .finish => |value| if (value.message.len != 0) allocator.free(value.message),
+            .finish => |*value| {
+                if (value.message.len != 0) allocator.free(value.message);
+                if (value.trailing_metadata) |*entries| entries.deinit();
+            },
             .resume_receive => {},
         }
         self.* = undefined;
+    }
+};
+
+/// Consumes command-owned storage on both success and failure. The server lock
+/// must be held so notification rollback always removes this exact command.
+fn enqueueStreamCommandLocked(server: *Impl, target: *Stream, command: StreamCommand) !void {
+    var owned_command = command;
+    var command_owned = true;
+    defer if (command_owned) owned_command.deinit(server.shared_allocator);
+
+    const notify = server.stream_commands.items.len == 0;
+    try server.stream_commands.append(server.shared_allocator, command);
+    command_owned = false;
+    target.command_refs += 1;
+    if (notify) server.stream_async.notify() catch |err| {
+        var queued_command = server.stream_commands.pop().?;
+        target.command_refs -= 1;
+        queued_command.deinit(server.shared_allocator);
+        return err;
+    };
+}
+
+const ServerCallControl = struct {
+    allocator: std.mem.Allocator,
+    server: *Impl,
+    target: ?*Stream,
+    references: std.atomic.Value(usize) = .init(1),
+    cancelled: std.atomic.Value(bool) = .init(false),
+    terminal: std.atomic.Value(bool) = .init(false),
+
+    fn handle(self: *ServerCallControl) raw_stream.ServerCall {
+        return raw_stream.ServerCall.init(
+            self,
+            serverCallId,
+            serverCallIsCancelled,
+            serverCallIsTerminal,
+            serverCallSendInitialMetadata,
+            serverCallSend,
+            serverCallFinish,
+            serverCallResumeReceive,
+            serverCallRetain,
+            serverCallRelease,
+        );
     }
 };
 
@@ -935,10 +987,13 @@ const Stream = struct {
     resume_queued: bool = false,
     deferred_stream_credit: usize = 0,
     response_gzip_requested: bool = false,
+    response_headers_queued: bool = false,
     response_headers_submitted: bool = false,
     outbound_reserved_bytes: usize = 0,
     writable_requested: bool = false,
     cancel_called: bool = false,
+    terminal_reason: raw_stream.ServerTerminalReason = .completed,
+    call_control: ?*ServerCallControl = null,
     reset_after_trailers: bool = false,
     reset_submitted: bool = false,
     // Queued and currently processing commands each retain this stream once.
@@ -991,23 +1046,120 @@ const Stream = struct {
     }
 
     fn serverHandle(self: *Stream) raw_stream.ServerStream {
-        return raw_stream.ServerStream.init(self, streamSend, streamFinish, streamResumeReceive);
+        return raw_stream.ServerStream.initRetainable(
+            self,
+            streamSend,
+            streamFinish,
+            streamResumeReceive,
+            serverStreamCallId,
+            serverStreamRetain,
+        );
     }
 };
 
-fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.SendOptions) !void {
-    const target: *Stream = @ptrCast(@alignCast(context));
-    const server = target.connection.server;
-    if (payload.len > server.stream_limits.max_message_size) return error.MessageTooLarge;
-    if (options.compression == .gzip and !target.accepts_response_gzip) return error.CompressionNotAccepted;
+fn serverCallId(context: *anyopaque) raw_stream.ServerCallId {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    return @enumFromInt(@intFromPtr(control));
+}
 
-    const encoded = try frame.encodeWithCompression(server.shared_allocator, payload, options.compression);
-    errdefer server.shared_allocator.free(encoded);
+fn serverCallIsCancelled(context: *anyopaque) bool {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    return control.cancelled.load(.acquire);
+}
+
+fn serverCallIsTerminal(context: *anyopaque) bool {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    return control.terminal.load(.acquire);
+}
+
+fn serverCallRetain(context: *anyopaque) void {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    const previous = control.references.fetchAdd(1, .monotonic);
+    std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
+}
+
+fn serverCallRelease(context: *anyopaque) void {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    const previous = control.references.fetchSub(1, .acq_rel);
+    std.debug.assert(previous != 0);
+    if (previous == 1) control.allocator.destroy(control);
+}
+
+fn serverStreamCallId(context: *anyopaque) raw_stream.ServerCallId {
+    const target: *Stream = @ptrCast(@alignCast(context));
+    const control = target.call_control orelse return @enumFromInt(@intFromPtr(target));
+    return serverCallId(control);
+}
+
+fn serverStreamRetain(context: *anyopaque) !raw_stream.ServerCall {
+    const target: *Stream = @ptrCast(@alignCast(context));
+    const control = target.call_control orelse return error.ServerCallUnavailable;
+    serverCallRetain(control);
+    return control.handle();
+}
+
+fn cloneMetadata(allocator: std.mem.Allocator, entries: []const metadata.Entry) !metadata.Metadata {
+    var result = metadata.Metadata.init(allocator);
+    errdefer result.deinit();
+    for (entries) |entry| try result.append(entry.key, entry.value);
+    return result;
+}
+
+fn serverCallSendInitialMetadata(
+    context: *anyopaque,
+    entries: []const metadata.Entry,
+    response_compression: Compression,
+) !void {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    const server = control.server;
+    const owned_entries = try cloneMetadata(server.shared_allocator, entries);
+    var command = StreamCommand{ .target = undefined, .action = .{ .initial_metadata = .{
+        .entries = owned_entries,
+        .compression = response_compression,
+    } } };
+    var command_owned = true;
+    errdefer if (command_owned) command.deinit(server.shared_allocator);
 
     server.lock();
     defer server.unlock();
-    if (!target.streaming_active or target.finish_queued) return error.StreamFinished;
-    if (target.response_headers_submitted and options.compression == .gzip and target.response_compression != .gzip) {
+    const target = control.target orelse return error.CallClosed;
+    command.target = target;
+    if (!target.streaming_active or target.finish_queued or target.transport_closed) return error.CallClosed;
+    if (target.streaming.?.handler.initial_metadata_mode != .explicit) return error.InitialMetadataNotExplicit;
+    if (target.response_headers_queued) return error.InitialMetadataAlreadySent;
+    target.response_headers_queued = true;
+    target.response_compression = if (target.accepts_response_gzip and response_compression == .gzip)
+        .gzip
+    else
+        .identity;
+    errdefer {
+        target.response_headers_queued = false;
+        target.response_compression = .identity;
+    }
+    command_owned = false;
+    try enqueueStreamCommandLocked(server, target, command);
+}
+
+fn serverCallSend(context: *anyopaque, payload: []const u8, options: raw_stream.SendOptions) !void {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    const server = control.server;
+    if (payload.len > server.stream_limits.max_message_size) return error.MessageTooLarge;
+
+    const encoded = try frame.encodeWithCompression(server.shared_allocator, payload, options.compression);
+    var command = StreamCommand{ .target = undefined, .action = .{ .send = encoded } };
+    var command_owned = true;
+    errdefer if (command_owned) command.deinit(server.shared_allocator);
+
+    server.lock();
+    defer server.unlock();
+    const target = control.target orelse return error.CallClosed;
+    command.target = target;
+    if (!target.streaming_active or target.finish_queued or target.transport_closed) return error.CallClosed;
+    if (!target.response_headers_queued) return error.InitialMetadataRequired;
+    if (options.compression == .gzip and !target.accepts_response_gzip) return error.CompressionNotAccepted;
+    if (target.streaming.?.handler.initial_metadata_mode == .explicit and
+        options.compression == .gzip and target.response_compression != .gzip)
+    {
         return error.ResponseCompressionNotEnabled;
     }
     const outbound_limit = server.stream_limits.max_outbound_buffer_size;
@@ -1019,17 +1171,94 @@ fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.Send
     target.outbound_reserved_bytes += encoded.len;
     errdefer target.outbound_reserved_bytes -= encoded.len;
     if (options.compression == .gzip) target.response_gzip_requested = true;
-    const notify = server.stream_commands.items.len == 0;
-    try server.stream_commands.append(server.shared_allocator, .{
+    command_owned = false;
+    try enqueueStreamCommandLocked(server, target, command);
+}
+
+fn serverCallFinish(
+    context: *anyopaque,
+    final_status: status.Status,
+    trailing_metadata: []const metadata.Entry,
+) !void {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    const server = control.server;
+    const owned_message = if (final_status.message.len == 0)
+        &.{}
+    else
+        try server.shared_allocator.dupe(u8, final_status.message);
+    const owned_metadata = cloneMetadata(server.shared_allocator, trailing_metadata) catch |err| {
+        if (owned_message.len != 0) server.shared_allocator.free(owned_message);
+        return err;
+    };
+    var command = StreamCommand{ .target = undefined, .action = .{ .finish = .{
+        .code = final_status.code,
+        .message = owned_message,
+        .trailing_metadata = owned_metadata,
+    } } };
+    var command_owned = true;
+    errdefer if (command_owned) command.deinit(server.shared_allocator);
+
+    server.lock();
+    defer server.unlock();
+    const target = control.target orelse return error.CallClosed;
+    command.target = target;
+    if (!target.streaming_active or target.finish_queued or target.transport_closed) return error.CallClosed;
+    if (!target.response_headers_queued) return error.InitialMetadataRequired;
+    target.finish_queued = true;
+    errdefer target.finish_queued = false;
+    command_owned = false;
+    try enqueueStreamCommandLocked(server, target, command);
+}
+
+fn serverCallResumeReceive(context: *anyopaque) !void {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    const server = control.server;
+    server.lock();
+    defer server.unlock();
+    const target = control.target orelse return error.CallClosed;
+    if (!target.streaming_active or target.finish_queued or target.transport_closed) return error.CallClosed;
+    if (!target.receive_paused or target.resume_queued) return error.ReceiveNotPaused;
+    target.resume_queued = true;
+    errdefer target.resume_queued = false;
+    try enqueueStreamCommandLocked(server, target, .{
         .target = target,
-        .action = .{ .send = encoded },
+        .action = .resume_receive,
     });
-    target.command_refs += 1;
-    errdefer {
-        _ = server.stream_commands.pop();
-        target.command_refs -= 1;
+}
+
+fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.SendOptions) !void {
+    const target: *Stream = @ptrCast(@alignCast(context));
+    const server = target.connection.server;
+    if (payload.len > server.stream_limits.max_message_size) return error.MessageTooLarge;
+    if (options.compression == .gzip and !target.accepts_response_gzip) return error.CompressionNotAccepted;
+
+    const encoded = try frame.encodeWithCompression(server.shared_allocator, payload, options.compression);
+    var command = StreamCommand{ .target = target, .action = .{ .send = encoded } };
+    var command_owned = true;
+    errdefer if (command_owned) command.deinit(server.shared_allocator);
+
+    server.lock();
+    defer server.unlock();
+    if (!target.streaming_active or target.finish_queued) return error.StreamFinished;
+    if (target.streaming.?.handler.initial_metadata_mode == .explicit and !target.response_headers_queued) {
+        return error.InitialMetadataRequired;
     }
-    if (notify) try server.stream_async.notify();
+    if (target.streaming.?.handler.initial_metadata_mode == .explicit and
+        options.compression == .gzip and target.response_compression != .gzip)
+    {
+        return error.ResponseCompressionNotEnabled;
+    }
+    const outbound_limit = server.stream_limits.max_outbound_buffer_size;
+    if (encoded.len > outbound_limit) return error.OutboundBufferLimitExceeded;
+    if (target.outbound_reserved_bytes > outbound_limit or encoded.len > outbound_limit - target.outbound_reserved_bytes) {
+        target.writable_requested = true;
+        return error.WouldBlock;
+    }
+    target.outbound_reserved_bytes += encoded.len;
+    errdefer target.outbound_reserved_bytes -= encoded.len;
+    if (options.compression == .gzip) target.response_gzip_requested = true;
+    command_owned = false;
+    try enqueueStreamCommandLocked(server, target, command);
 }
 
 fn streamFinish(context: *anyopaque, final_status: status.Status) !void {
@@ -1039,27 +1268,24 @@ fn streamFinish(context: *anyopaque, final_status: status.Status) !void {
         &.{}
     else
         try server.shared_allocator.dupe(u8, final_status.message);
-    errdefer if (owned_message.len != 0) server.shared_allocator.free(owned_message);
+    var command = StreamCommand{ .target = target, .action = .{ .finish = .{
+        .code = final_status.code,
+        .message = owned_message,
+        .trailing_metadata = null,
+    } } };
+    var command_owned = true;
+    errdefer if (command_owned) command.deinit(server.shared_allocator);
 
     server.lock();
     defer server.unlock();
     if (!target.streaming_active or target.finish_queued) return error.StreamFinished;
+    if (target.streaming.?.handler.initial_metadata_mode == .explicit and !target.response_headers_queued) {
+        return error.InitialMetadataRequired;
+    }
     target.finish_queued = true;
     errdefer target.finish_queued = false;
-    const notify = server.stream_commands.items.len == 0;
-    try server.stream_commands.append(server.shared_allocator, .{
-        .target = target,
-        .action = .{ .finish = .{
-            .code = final_status.code,
-            .message = owned_message,
-        } },
-    });
-    target.command_refs += 1;
-    errdefer {
-        _ = server.stream_commands.pop();
-        target.command_refs -= 1;
-    }
-    if (notify) try server.stream_async.notify();
+    command_owned = false;
+    try enqueueStreamCommandLocked(server, target, command);
 }
 
 fn streamResumeReceive(context: *anyopaque) !void {
@@ -1071,17 +1297,10 @@ fn streamResumeReceive(context: *anyopaque) !void {
     if (!target.receive_paused or target.resume_queued) return error.ReceiveNotPaused;
     target.resume_queued = true;
     errdefer target.resume_queued = false;
-    const notify = server.stream_commands.items.len == 0;
-    try server.stream_commands.append(server.shared_allocator, .{
+    try enqueueStreamCommandLocked(server, target, .{
         .target = target,
         .action = .resume_receive,
     });
-    target.command_refs += 1;
-    errdefer {
-        _ = server.stream_commands.pop();
-        target.command_refs -= 1;
-    }
-    if (notify) try server.stream_async.notify();
 }
 
 const Connection = struct {
@@ -1394,7 +1613,9 @@ const Connection = struct {
         var stream_iterator = self.streams.valueIterator();
         while (stream_iterator.next()) |stream_ptr| {
             const stream = stream_ptr.*;
-            if (stream.streaming != null and !stream.trailer_submitted) cancelStreaming(stream);
+            if (stream.streaming != null and !stream.trailer_submitted) {
+                cancelStreaming(stream, connectionTerminalReason(self));
+            }
         }
         if (self.read_active) {
             self.read_cancel_submitted = true;
@@ -1447,14 +1668,18 @@ const Connection = struct {
         var cancel_iterator = self.streams.valueIterator();
         while (cancel_iterator.next()) |stream_ptr| {
             const stream = stream_ptr.*;
-            if (stream.streaming != null and !stream.trailer_submitted) cancelStreaming(stream);
+            if (stream.streaming != null and !stream.trailer_submitted) {
+                cancelStreaming(stream, connectionTerminalReason(self));
+            }
         }
         if (self.session) |session| c.nghttp2_session_del(session);
         self.clearTls();
         var iterator = self.streams.iterator();
         while (iterator.next()) |entry| {
             const stream = entry.value_ptr.*;
-            if (stream.streaming != null and !stream.trailer_submitted) cancelStreaming(stream);
+            if (stream.streaming != null and !stream.trailer_submitted) {
+                cancelStreaming(stream, connectionTerminalReason(self));
+            }
             std.debug.assert(retireStream(stream));
         }
         self.streams.deinit(self.allocator());
@@ -2057,6 +2282,23 @@ fn drainDirtyConnections(server: *Impl) void {
 fn processStreamCommand(server: *Impl, command: StreamCommand) void {
     const target = command.target;
     switch (command.action) {
+        .initial_metadata => |value| {
+            var entries = value.entries;
+            defer entries.deinit();
+            server.lock();
+            const active = target.streaming_active and !target.transport_closed and !target.response_headers_submitted;
+            if (active) {
+                target.response_compression = if (target.accepts_response_gzip and value.compression == .gzip)
+                    .gzip
+                else
+                    .identity;
+                target.response_headers_submitted = true;
+            }
+            server.unlock();
+            if (!active or target.streaming == null) return;
+            const session = target.connection.session orelse return;
+            submitStreamingResponse(session, target, entries.items()) catch target.connection.close();
+        },
         .send => |bytes| {
             server.lock();
             const active = target.streaming_active and !target.transport_closed;
@@ -2079,6 +2321,8 @@ fn processStreamCommand(server: *Impl, command: StreamCommand) void {
             resumeStreamingResponse(target);
         },
         .finish => |value| {
+            var trailing_metadata = value.trailing_metadata;
+            defer if (trailing_metadata) |*entries| entries.deinit();
             server.lock();
             const active = target.streaming_active and !target.transport_closed;
             if (active) target.response_finished = true;
@@ -2088,7 +2332,11 @@ fn processStreamCommand(server: *Impl, command: StreamCommand) void {
                 return;
             }
             target.setOwnedStatus(value.code, value.message, server.shared_allocator);
-            copyStreamingTrailers(target) catch {
+            const metadata_result = if (trailing_metadata) |*entries|
+                copyMetadataEntries(&target.trailing_metadata, entries.items())
+            else
+                copyStreamingTrailers(target);
+            metadata_result catch {
                 target.setStatus(.init(.internal, "metadata allocation failed")) catch {
                     target.connection.close();
                     return;
@@ -2162,9 +2410,11 @@ fn outboundLowWatermark(server: *const Impl) usize {
 
 fn copyStreamingTrailers(target: *Stream) !void {
     const streaming = &(target.streaming orelse return);
-    for (streaming.context.trailing_metadata.items()) |entry| {
-        try target.trailing_metadata.append(entry.key, entry.value);
-    }
+    try copyMetadataEntries(&target.trailing_metadata, streaming.context.trailing_metadata.items());
+}
+
+fn copyMetadataEntries(destination: *metadata.Metadata, entries: []const metadata.Entry) !void {
+    for (entries) |entry| try destination.append(entry.key, entry.value);
 }
 
 fn resumeStreamingResponse(target: *Stream) void {
@@ -2181,6 +2431,7 @@ fn failStreaming(target: *Stream, code: status.Code, text: []const u8) void {
     target.response_finished = true;
     target.finish_queued = true;
     target.reset_after_trailers = true;
+    if (target.terminal_reason == .completed) target.terminal_reason = .local_error;
     const trailers_submitted = target.trailer_submitted;
     server.unlock();
     if (trailers_submitted) {
@@ -2192,6 +2443,18 @@ fn failStreaming(target: *Stream, code: status.Code, text: []const u8) void {
         return;
     };
     copyStreamingTrailers(target) catch {};
+    if (!target.response_headers_submitted) {
+        const session = target.connection.session orelse return;
+        server.lock();
+        target.response_compression = .identity;
+        target.response_headers_queued = true;
+        target.response_headers_submitted = true;
+        server.unlock();
+        submitStreamingResponse(session, target, &.{}) catch {
+            target.connection.close();
+            return;
+        };
+    }
     resumeStreamingResponse(target);
 }
 
@@ -2218,12 +2481,17 @@ fn discardStreamCommands(target: *Stream) void {
 
 fn retireStream(target: *Stream) bool {
     removeStreamDeadline(target);
-    discardStreamCommands(target);
     const server = target.connection.server;
     server.lock();
     target.transport_closed = true;
+    target.streaming_active = false;
+    if (target.call_control) |control| control.target = null;
+    server.unlock();
+    discardStreamCommands(target);
+    server.lock();
     const destroy = target.command_refs == 0;
     server.unlock();
+    notifyServerCallTerminal(target);
     if (destroy) destroyStream(target);
     return destroy;
 }
@@ -2234,7 +2502,31 @@ fn destroyStream(target: *Stream) void {
     allocator.destroy(target);
 }
 
-fn cancelStreaming(target: *Stream) void {
+fn notifyServerCallTerminal(target: *Stream) void {
+    const control = target.call_control orelse return;
+    const notify = !control.terminal.swap(true, .acq_rel);
+    if (notify) {
+        if (target.streaming) |*streaming| {
+            if (streaming.handler.on_terminal) |callback| {
+                callback(streaming.handler.context, serverCallId(control), target.terminal_reason);
+            }
+        }
+    }
+    target.call_control = null;
+    serverCallRelease(control);
+}
+
+fn connectionTerminalReason(connection: *const Connection) raw_stream.ServerTerminalReason {
+    const server = connection.server;
+    server.lock();
+    defer server.unlock();
+    return if (server.shutdown_request == .none)
+        .transport_error
+    else
+        .server_shutdown;
+}
+
+fn cancelStreaming(target: *Stream, reason: raw_stream.ServerTerminalReason) void {
     const streaming = &(target.streaming orelse return);
     removeStreamDeadline(target);
     const server = target.connection.server;
@@ -2244,6 +2536,8 @@ fn cancelStreaming(target: *Stream) void {
         return;
     }
     target.cancel_called = true;
+    target.terminal_reason = reason;
+    if (target.call_control) |control| control.cancelled.store(true, .release);
     target.streaming_active = false;
     target.finish_queued = true;
     target.receive_paused = false;
@@ -2580,30 +2874,46 @@ fn startStreaming(session: *c.nghttp2_session, target: *Stream, handler: raw_str
         submitFailure(session, target, .internal, "metadata allocation failed");
         return;
     };
+    const server = target.connection.server;
+    const call_control = server.shared_allocator.create(ServerCallControl) catch {
+        submitFailure(session, target, .internal, "call allocation failed");
+        return;
+    };
+    call_control.* = .{
+        .allocator = server.shared_allocator,
+        .server = server,
+        .target = target,
+    };
+    target.call_control = call_control;
     target.streaming = .{
         .handler = handler,
-        .decoder = frame.Decoder.initWithCompression(target.allocator, target.connection.server.stream_limits.max_message_size, request_compression),
+        .decoder = frame.Decoder.initWithCompression(target.allocator, server.stream_limits.max_message_size, request_compression),
         .context = context,
     };
     context_owned = false;
-    const server = target.connection.server;
     server.lock();
     target.streaming_active = true;
+    target.receive_paused = handler.receive_initially_paused;
+    target.response_headers_queued = handler.initial_metadata_mode == .automatic_after_start;
     server.unlock();
 
     const streaming = &target.streaming.?;
     handler.on_start(handler.context, target.serverHandle(), &streaming.context) catch {
         failStreaming(target, .internal, "handler failed");
+        return;
     };
-    server.lock();
-    target.response_compression = if (target.accepts_response_gzip and
-        (streaming.context.response_compression == .gzip or target.response_gzip_requested))
-        .gzip
-    else
-        .identity;
-    target.response_headers_submitted = true;
-    server.unlock();
-    submitStreamingResponse(session, target, streaming.context.initial_metadata.items()) catch target.connection.close();
+    if (handler.initial_metadata_mode == .automatic_after_start) {
+        server.lock();
+        target.response_compression = if (target.accepts_response_gzip and
+            (streaming.context.response_compression == .gzip or target.response_gzip_requested))
+            .gzip
+        else
+            .identity;
+        target.response_headers_queued = true;
+        target.response_headers_submitted = true;
+        server.unlock();
+        submitStreamingResponse(session, target, streaming.context.initial_metadata.items()) catch target.connection.close();
+    }
 }
 
 fn receiveStreamingData(target: *Stream, bytes: []const u8) bool {
@@ -2959,8 +3269,12 @@ fn onFrameSent(session: ?*c.nghttp2_session, sent_frame: ?*const c.nghttp2_frame
 fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, stream_error: u32, user_data: ?*anyopaque) callconv(.c) c_int {
     const connection: *Connection = @ptrCast(@alignCast(user_data.?));
     if (connection.streams.fetchRemove(stream_id)) |entry| {
+        const local_failure_reset = entry.value.reset_after_trailers and entry.value.reset_submitted;
         if (entry.value.streaming != null and (stream_error != c.NGHTTP2_NO_ERROR or !entry.value.trailer_submitted)) {
-            cancelStreaming(entry.value);
+            cancelStreaming(
+                entry.value,
+                if (local_failure_reset) entry.value.terminal_reason else .peer_cancelled,
+            );
         }
         _ = retireStream(entry.value);
     }
@@ -3044,7 +3358,7 @@ fn expireDeadlines(server: *Impl, now: u64) void {
                 if (connection.closing or connection.session == null) continue;
                 if (stream.streaming) |_| {
                     if (!stream.streaming_active) continue;
-                    cancelStreaming(stream);
+                    cancelStreaming(stream, .deadline_exceeded);
                     failStreaming(stream, .deadline_exceeded, "deadline exceeded");
                 } else {
                     if (stream.responded) continue;
@@ -3458,7 +3772,7 @@ fn deinitTestConnection(connection: *Connection) void {
     if (connection.session) |session| c.nghttp2_session_del(session);
     var iterator = connection.streams.iterator();
     while (iterator.next()) |entry| {
-        destroyStream(entry.value_ptr.*);
+        std.debug.assert(retireStream(entry.value_ptr.*));
     }
     connection.streams.deinit(connection.allocator());
     drainWriteRequestPool(connection);
@@ -3765,6 +4079,91 @@ test "cross-thread server stream commands retain shared ownership" {
     try std.testing.expect(outbound.allocator.ptr == server.impl.shared_allocator.ptr);
 }
 
+test "retained server call observes cancellation after transport retirement" {
+    const Capture = struct {
+        cancels: usize = 0,
+        terminals: usize = 0,
+        terminal_id: ?raw_stream.ServerCallId = null,
+        terminal_reason: ?raw_stream.ServerTerminalReason = null,
+    };
+    const Handler = struct {
+        fn onStart(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onMessage(
+            _: ?*anyopaque,
+            _: raw_stream.ServerStream,
+            _: *service.ServerContext,
+            _: []const u8,
+            _: Compression,
+        ) !raw_stream.ReceiveAction {
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onCancel(context: ?*anyopaque, stream: raw_stream.ServerStream, _: *service.ServerContext) void {
+            const capture: *Capture = @ptrCast(@alignCast(context.?));
+            var retained = stream.retain() catch unreachable;
+            defer retained.deinit();
+            std.debug.assert(retained.isCancelled());
+            capture.cancels += 1;
+        }
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            call_id: raw_stream.ServerCallId,
+            reason: raw_stream.ServerTerminalReason,
+        ) void {
+            const capture: *Capture = @ptrCast(@alignCast(context.?));
+            capture.terminals += 1;
+            capture.terminal_id = call_id;
+            capture.terminal_reason = reason;
+        }
+    };
+
+    var capture = Capture{};
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    const target = try std.testing.allocator.create(Stream);
+    target.* = Stream.init(std.testing.allocator, &connection, 1);
+    target.streaming = .{
+        .handler = .{
+            .context = &capture,
+            .on_start = Handler.onStart,
+            .on_message = Handler.onMessage,
+            .on_remote_end = Handler.onRemoteEnd,
+            .on_cancel = Handler.onCancel,
+            .on_terminal = Handler.onTerminal,
+        },
+        .decoder = frame.Decoder.init(std.testing.allocator, 1024),
+        .context = service.ServerContext.init(std.testing.allocator),
+    };
+    target.streaming_active = true;
+    const control = try server.impl.shared_allocator.create(ServerCallControl);
+    control.* = .{
+        .allocator = server.impl.shared_allocator,
+        .server = server.impl,
+        .target = target,
+    };
+    target.call_control = control;
+    var retained = try target.serverHandle().retain();
+    defer retained.deinit();
+    const call_id = retained.id();
+
+    cancelStreaming(target, .peer_cancelled);
+    try std.testing.expect(retained.isCancelled());
+    try std.testing.expect(!retained.isTerminal());
+    try std.testing.expect(retireStream(target));
+
+    try std.testing.expect(retained.isTerminal());
+    try std.testing.expectError(error.CallClosed, retained.resumeReceive());
+    try std.testing.expectEqual(@as(usize, 1), capture.cancels);
+    try std.testing.expectEqual(@as(usize, 1), capture.terminals);
+    try std.testing.expectEqual(call_id, capture.terminal_id.?);
+    try std.testing.expectEqual(raw_stream.ServerTerminalReason.peer_cancelled, capture.terminal_reason.?);
+}
+
 test "shared stream command allocation failure does not use local storage" {
     var server = try Server.init(std.testing.allocator, .{});
     defer server.deinit();
@@ -3955,7 +4354,7 @@ test "streaming finish keeps deadline until transport retirement" {
 
     try server.impl.stream_commands.append(server.impl.shared_allocator, .{
         .target = target,
-        .action = .{ .finish = .{ .code = .ok, .message = &.{} } },
+        .action = .{ .finish = .{ .code = .ok, .message = &.{}, .trailing_metadata = null } },
     });
     target.command_refs += 1;
     processStreamCommands(server.impl);
@@ -5043,6 +5442,170 @@ test "raw HTTP/2 bidi stream incrementally exchanges messages" {
     try std.testing.expect(capture.stream1_message_matches);
     try std.testing.expect(capture.stream1_trailing_metadata_matches);
     try std.testing.expect(capture.stream1_ended);
+}
+
+test "retained server call drives an explicitly started response" {
+    const Channel = @import("channel.zig").Channel;
+    const Handler = struct {
+        call: ?raw_stream.ServerCall = null,
+        call_id: ?raw_stream.ServerCallId = null,
+        starts: usize = 0,
+        messages: usize = 0,
+        terminals: usize = 0,
+        terminal_reason: ?raw_stream.ServerTerminalReason = null,
+        done: std.Io.Semaphore = .{},
+
+        fn onStart(
+            context: ?*anyopaque,
+            server_stream: raw_stream.ServerStream,
+            _: *service.ServerContext,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.starts += 1;
+            self.call = try server_stream.retain();
+            self.call_id = self.call.?.id();
+            try self.call.?.sendInitialMetadata(&.{.{ .key = "x-explicit-initial", .value = "yes" }}, .identity);
+            try std.testing.expectError(
+                error.ResponseCompressionNotEnabled,
+                self.call.?.send("mismatched", .{ .compression = .gzip }),
+            );
+            try self.call.?.resumeReceive();
+        }
+
+        fn onMessage(
+            context: ?*anyopaque,
+            _: raw_stream.ServerStream,
+            _: *service.ServerContext,
+            payload: []const u8,
+            _: Compression,
+        ) !raw_stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.messages += 1;
+            try self.call.?.send(payload, .{});
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(
+            context: ?*anyopaque,
+            _: raw_stream.ServerStream,
+            _: *service.ServerContext,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            try self.call.?.finish(.ok, &.{.{ .key = "x-explicit-trailing", .value = "yes" }});
+        }
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            call_id: raw_stream.ServerCallId,
+            reason: raw_stream.ServerTerminalReason,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            std.debug.assert(call_id == self.call_id.?);
+            std.debug.assert(self.call.?.isTerminal());
+            std.debug.assert(!self.call.?.isCancelled());
+            self.terminals += 1;
+            self.terminal_reason = reason;
+            self.done.post(syncIo());
+        }
+    };
+    const ClientCapture = struct {
+        initial_metadata_matches: bool = false,
+        trailing_metadata_matches: bool = false,
+        payload_matches: bool = false,
+        status_ok: bool = false,
+        done: std.Io.Semaphore = .{},
+
+        fn onHeaders(
+            context: ?*anyopaque,
+            _: raw_stream.ClientStream,
+            initial_metadata: *const metadata.Metadata,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.initial_metadata_matches = std.mem.eql(
+                u8,
+                initial_metadata.getFirst("x-explicit-initial") orelse "",
+                "yes",
+            );
+        }
+
+        fn onMessage(
+            context: ?*anyopaque,
+            _: raw_stream.ClientStream,
+            payload: []const u8,
+            _: Compression,
+        ) raw_stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.payload_matches = std.mem.eql(u8, payload, "retained");
+            return .continue_receiving;
+        }
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            _: raw_stream.ClientStream,
+            final_status: status.Status,
+            trailing_metadata: *const metadata.Metadata,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.status_ok = final_status.isOk();
+            self.trailing_metadata_matches = std.mem.eql(
+                u8,
+                trailing_metadata.getFirst("x-explicit-trailing") orelse "",
+                "yes",
+            );
+            self.done.post(syncIo());
+        }
+    };
+
+    var handler = Handler{};
+    defer if (handler.call) |*call| call.deinit();
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    try server.registerStream("/test.Retained/Call", .{
+        .context = &handler,
+        .receive_initially_paused = true,
+        .initial_metadata_mode = .explicit,
+        .on_start = Handler.onStart,
+        .on_message = Handler.onMessage,
+        .on_remote_end = Handler.onRemoteEnd,
+        .on_terminal = Handler.onTerminal,
+    });
+    try server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    defer channel.deinit();
+    var capture = ClientCapture{};
+    var client_stream = try channel.openStream(
+        "/test.Retained/Call",
+        .{},
+        .{
+            .context = &capture,
+            .on_headers = ClientCapture.onHeaders,
+            .on_message = ClientCapture.onMessage,
+            .on_terminal = ClientCapture.onTerminal,
+        },
+    );
+    defer client_stream.deinit();
+    try client_stream.send("retained", .{});
+    try client_stream.closeSend();
+    capture.done.waitUncancelable(syncIo());
+    handler.done.waitUncancelable(syncIo());
+
+    try std.testing.expect(capture.initial_metadata_matches);
+    try std.testing.expect(capture.trailing_metadata_matches);
+    try std.testing.expect(capture.payload_matches);
+    try std.testing.expect(capture.status_ok);
+    try std.testing.expectEqual(@as(usize, 1), handler.starts);
+    try std.testing.expectEqual(@as(usize, 1), handler.messages);
+    try std.testing.expectEqual(@as(usize, 1), handler.terminals);
+    try std.testing.expectEqual(raw_stream.ServerTerminalReason.completed, handler.terminal_reason.?);
+    try std.testing.expect(handler.call.?.isTerminal());
+    try std.testing.expectError(error.CallClosed, handler.call.?.send("late", .{}));
+    var cloned_call = handler.call.?.clone();
+    cloned_call.deinit();
+    handler.call.?.deinit();
+    handler.call = null;
 }
 
 test "malformed streaming input resets only its stream and connection remains reusable" {
