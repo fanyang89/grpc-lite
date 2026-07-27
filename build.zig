@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const manifest = @import("build.zig.zon");
 
 pub const protobuf_codegen = @import("protobuf");
@@ -43,6 +44,10 @@ pub fn build(b: *std.Build) void {
     });
     const protobuf_dependency = b.dependency("protobuf", .{
         .target = target,
+        .optimize = optimize,
+    });
+    const host_protobuf_dependency = b.dependency("protobuf", .{
+        .target = b.graph.host,
         .optimize = optimize,
     });
     const enable_tls = b.option(bool, "tls", "Enable TLS transport support through mbedTLS") orelse false;
@@ -105,6 +110,7 @@ pub fn build(b: *std.Build) void {
 
     const xev = libxev_dependency.module("xev");
     const protobuf = protobuf_dependency.module("protobuf");
+    const host_protobuf = host_protobuf_dependency.module("protobuf");
     applySanitizers(xev, sanitizers);
     applySanitizers(protobuf, sanitizers);
     b.modules.put(
@@ -129,6 +135,79 @@ pub fn build(b: *std.Build) void {
     grpc_lite.addImport("nanozlog", nanozlog_dependency.module("nanozlog"));
     grpc_lite.addImport("protobuf", protobuf);
     const test_step = b.step("test", "Run unit tests");
+
+    const plugin_schema_files = b.addWriteFiles();
+    const plugin_schema_root = plugin_schema_files.add("root.zig",
+        \\const compiler = @import("google/protobuf/compiler.pb.zig");
+        \\pub const CodeGeneratorRequest = compiler.CodeGeneratorRequest;
+        \\pub const CodeGeneratorResponse = compiler.CodeGeneratorResponse;
+    );
+    _ = plugin_schema_files.addCopyFile(
+        host_protobuf_dependency.path("bootstrapped-generator/google/protobuf.pb.zig"),
+        "google/protobuf.pb.zig",
+    );
+    _ = plugin_schema_files.addCopyFile(
+        host_protobuf_dependency.path("bootstrapped-generator/google/protobuf/compiler.pb.zig"),
+        "google/protobuf/compiler.pb.zig",
+    );
+    const protobuf_plugin = b.createModule(.{
+        .root_source_file = plugin_schema_root,
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "protobuf", .module = host_protobuf }},
+    });
+    const grpc_lite_cpp_plugin_module = b.createModule(.{
+        .root_source_file = b.path("tools/protoc-gen-grpc-lite-cpp/main.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protobuf", .module = host_protobuf },
+            .{ .name = "protobuf_plugin", .module = protobuf_plugin },
+        },
+    });
+    const grpc_lite_cpp_plugin = b.addExecutable(.{
+        .name = "protoc-gen-grpc_lite_cpp",
+        .root_module = grpc_lite_cpp_plugin_module,
+    });
+    b.installArtifact(grpc_lite_cpp_plugin);
+
+    const grpc_lite_cpp_plugin_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/protoc-gen-grpc-lite-cpp/generator.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protobuf", .module = host_protobuf },
+            .{ .name = "protobuf_plugin", .module = protobuf_plugin },
+        },
+    });
+    const grpc_lite_cpp_plugin_tests = b.addTest(.{
+        .name = "grpc-lite-cpp-plugin",
+        .root_module = grpc_lite_cpp_plugin_test_module,
+    });
+    test_step.dependOn(&b.addRunArtifact(grpc_lite_cpp_plugin_tests).step);
+
+    const protoc_dependency = host_protobuf_dependency.builder.lazyDependency(
+        protocDependencyName(),
+        .{},
+    ) orelse return;
+    const generate_grpcpp = std.Build.Step.Run.create(b, "run protoc for C++ service glue");
+    generate_grpcpp.addFileArg(protoc_dependency.path(if (builtin.os.tag == .windows)
+        "bin/protoc.exe"
+    else
+        "bin/protoc"));
+    generate_grpcpp.addPrefixedArtifactArg(
+        "--plugin=protoc-gen-grpc_lite_cpp=",
+        grpc_lite_cpp_plugin,
+    );
+    const generated_grpcpp = generate_grpcpp.addPrefixedOutputDirectoryArg(
+        "--grpc_lite_cpp_out=",
+        "generated-grpcpp",
+    );
+    generate_grpcpp.addPrefixedDirectoryArg("-I", b.path("proto"));
+    generate_grpcpp.addFileArg(b.path("proto/echo.proto"));
+
+    const gen_grpcpp_step = b.step("gen-grpcpp", "Generate synchronous C++ service glue");
+    gen_grpcpp_step.dependOn(&generate_grpcpp.step);
 
     if (gperftools_dependency) |dependency| {
         grpc_lite.addObjectFile(native.gperftools_archive.?);
@@ -286,11 +365,37 @@ pub fn build(b: *std.Build) void {
     });
     const run_grpcpp_facade_test = b.addRunArtifact(grpcpp_facade_test);
 
+    const grpcpp_generated_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    applySanitizers(grpcpp_generated_test_module, sanitizers);
+    grpcpp_generated_test_module.addIncludePath(b.path("include"));
+    grpcpp_generated_test_module.addIncludePath(b.path("tests/codegen"));
+    grpcpp_generated_test_module.addIncludePath(generated_grpcpp);
+    grpcpp_generated_test_module.addCSourceFile(.{
+        .file = generated_grpcpp.path(b, "echo.grpc.pb.cc"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+    });
+    grpcpp_generated_test_module.addCSourceFile(.{
+        .file = b.path("tests/grpcpp_generated_test.cc"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+    });
+    grpcpp_generated_test_module.linkLibrary(shared_library);
+    const grpcpp_generated_test = b.addExecutable(.{
+        .name = "grpcpp-generated-test",
+        .root_module = grpcpp_generated_test_module,
+    });
+    const run_grpcpp_generated_test = b.addRunArtifact(grpcpp_generated_test);
+
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_public_api_tests.step);
     test_step.dependOn(&run_c_api_smoke.step);
     test_step.dependOn(&run_cpp_c_api_smoke.step);
     test_step.dependOn(&run_grpcpp_facade_test.step);
+    test_step.dependOn(&run_grpcpp_generated_test.step);
 
     if (!enable_protobuf) return;
     addProtobufSupport(
@@ -577,6 +682,23 @@ const NativeDependencies = struct {
     gperftools_archive: ?std.Build.LazyPath,
     gperftools_force_link: ?std.Build.LazyPath,
 };
+
+fn protocDependencyName() []const u8 {
+    if (builtin.os.tag == .windows) return "protoc-win64";
+    const os = switch (builtin.os.tag) {
+        .linux => "linux",
+        .macos => "osx",
+        else => @panic("protoc is unavailable for this host OS"),
+    };
+    const arch = switch (builtin.cpu.arch) {
+        .x86_64 => "x86_64",
+        .x86 => "x86_32",
+        .aarch64, .aarch64_be => "aarch_64",
+        .s390x => "s390",
+        else => @panic("protoc is unavailable for this host architecture"),
+    };
+    return std.fmt.comptimePrint("protoc-{s}-{s}", .{ os, arch });
+}
 
 fn addNativeDependencies(
     b: *std.Build,

@@ -53,6 +53,10 @@ run = "tests/consumer/run_cpp.sh"
 description = "Generate Zig protobuf sources"
 run = "zig build gen-proto"
 
+[tasks.gen-grpcpp]
+description = "Generate synchronous C++ service glue"
+run = "zig build gen-grpcpp"
+
 [tasks.gen-interop-proto]
 description = "Generate official gRPC interop protobuf sources"
 run = "zig build gen-interop-proto"

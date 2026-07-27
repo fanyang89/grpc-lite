@@ -35,6 +35,7 @@ mise run bench-all
 mise run bench-client
 mise run bench-server
 mise run gen-proto
+mise run gen-grpcpp
 ```
 
 ## Architecture

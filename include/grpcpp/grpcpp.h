@@ -7,5 +7,6 @@
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/support/status.h>
 #include <grpcpp/support/status_code_enum.h>
+#include <grpcpp/support/stub_options.h>
 
 #endif

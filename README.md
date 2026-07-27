@@ -72,6 +72,7 @@ mise run interop-tls
 mise run interop-http2
 mise run interop-http2-edge
 mise run gen-proto
+mise run gen-grpcpp
 ```
 
 See `tests/official/README.md` for the supported interoperability profile and current
@@ -120,6 +121,21 @@ target_link_libraries(app PRIVATE grpc_lite::grpcpp)
 `grpc_lite::grpcpp` links the versioned shared C transport through `grpc_lite::c`.
 The initial facade accepts IPv4 targets; hostname channels require explicit Runtime
 ownership through the lower-level C ABI.
+
+The installed Zig protoc plugin generates synchronous unary service stubs alongside
+the standard protobuf C++ messages. Streaming-only services and streaming methods are
+omitted from this glue.
+
+```bash
+protoc -I proto \
+  --cpp_out=generated \
+  --plugin=protoc-gen-grpc_lite_cpp=zig-out/bin/protoc-gen-grpc_lite_cpp \
+  --grpc_lite_cpp_out=generated \
+  proto/echo.proto
+```
+
+This produces `echo.grpc.pb.h` and `echo.grpc.pb.cc`. Compile both those files
+and the standard `echo.pb.cc`, then link `grpc_lite::grpcpp` and protobuf.
 
 ## Unary Client
 

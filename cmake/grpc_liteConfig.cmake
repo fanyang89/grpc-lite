@@ -16,5 +16,11 @@ if(NOT TARGET grpc_lite::grpcpp)
     INTERFACE_LINK_LIBRARIES grpc_lite::c)
 endif()
 
+if(NOT TARGET grpc_lite::protoc-gen-grpc_lite_cpp)
+  add_executable(grpc_lite::protoc-gen-grpc_lite_cpp IMPORTED)
+  set_target_properties(grpc_lite::protoc-gen-grpc_lite_cpp PROPERTIES
+    IMPORTED_LOCATION "${_grpc_lite_prefix}/bin/protoc-gen-grpc_lite_cpp")
+endif()
+
 unset(_grpc_lite_prefix)
 unset(_grpc_lite_libdir)
