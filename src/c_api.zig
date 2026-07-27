@@ -8,11 +8,12 @@ const Runtime = @import("runtime.zig").Runtime;
 const raw_stream = @import("stream.zig");
 const Server = @import("server.zig").Server;
 const ServerContext = @import("service.zig").ServerContext;
+const StatusCode = @import("status.zig").Code;
 const Status = @import("status.zig").Status;
 const version = @import("version.zig");
 
 pub const abi_major: u16 = 1;
-pub const abi_minor: u16 = 1;
+pub const abi_minor: u16 = 2;
 
 pub const Error = enum(i32) {
     ok = 0,
@@ -35,6 +36,7 @@ pub const Feature = struct {
     pub const tls: u64 = 1 << 4;
     pub const graceful_server_drain: u64 = 1 << 5;
     pub const c_streaming: u64 = 1 << 6;
+    pub const c_server: u64 = 1 << 7;
 };
 
 pub const BytesView = extern struct {
@@ -53,6 +55,10 @@ pub const ChannelHandle = opaque {};
 pub const UnaryResultHandle = opaque {};
 pub const MetadataViewHandle = opaque {};
 pub const ClientStreamHandle = opaque {};
+pub const ServerHandle = opaque {};
+pub const ServerStreamHandle = opaque {};
+pub const ServerCallHandle = opaque {};
+pub const ServerContextHandle = opaque {};
 
 pub const UnaryOptions = extern struct {
     struct_size: usize = @sizeOf(UnaryOptions),
@@ -84,6 +90,33 @@ pub const ClientStreamCallbacks = extern struct {
     on_terminal: ?*const fn (?*anyopaque, *ClientStreamHandle, i32, BytesView, *const MetadataViewHandle) callconv(.c) void = null,
 };
 
+pub const ServerOptions = extern struct {
+    struct_size: usize = @sizeOf(ServerOptions),
+    host: BytesView = .{ .data = "127.0.0.1".ptr, .size = "127.0.0.1".len },
+    port: u32 = 0,
+    reactor_count: u32 = 1,
+    max_message_size: u64 = call.default_max_message_size,
+    max_inbound_buffer_size: u64 = 8 * 1024 * 1024,
+    max_outbound_buffer_size: u64 = 8 * 1024 * 1024,
+};
+
+pub const ServerMethodOptions = extern struct {
+    struct_size: usize = @sizeOf(ServerMethodOptions),
+    receive_initially_paused: u32 = 0,
+    explicit_initial_metadata: u32 = 1,
+};
+
+pub const ServerMethodCallbacks = extern struct {
+    struct_size: usize = @sizeOf(ServerMethodCallbacks),
+    user_data: ?*anyopaque = null,
+    on_start: ?*const fn (?*anyopaque, *ServerStreamHandle, *const ServerContextHandle) callconv(.c) void = null,
+    on_message: ?*const fn (?*anyopaque, *ServerStreamHandle, *const ServerContextHandle, BytesView, u32) callconv(.c) u32 = null,
+    on_remote_end: ?*const fn (?*anyopaque, *ServerStreamHandle, *const ServerContextHandle) callconv(.c) void = null,
+    on_writable: ?*const fn (?*anyopaque, *ServerStreamHandle, *const ServerContextHandle) callconv(.c) void = null,
+    on_cancel: ?*const fn (?*anyopaque, *ServerStreamHandle, *const ServerContextHandle) callconv(.c) void = null,
+    on_terminal: ?*const fn (?*anyopaque, usize, u32) callconv(.c) void = null,
+};
+
 const RuntimeStorage = struct {
     value: Runtime,
 };
@@ -99,9 +132,25 @@ const ClientStreamStorage = struct {
     value: raw_stream.ClientStream,
     ready: std.atomic.Value(bool),
 };
+const ServerStorage = struct {
+    value: Server,
+    methods: std.ArrayListUnmanaged(*ServerMethodStorage) = .empty,
+};
+const ServerMethodStorage = struct {
+    callbacks: ServerMethodCallbacks,
+};
+const BorrowedServerStreamStorage = struct {
+    value: raw_stream.ServerStream,
+};
+const ServerCallStorage = struct {
+    value: raw_stream.ServerCall,
+};
 
 const client_stream_options_v1_size = @offsetOf(ClientStreamOptions, "max_outbound_buffer_size") + @sizeOf(u64);
 const client_stream_callbacks_v1_size = @offsetOf(ClientStreamCallbacks, "on_terminal") + @sizeOf(?*const fn (?*anyopaque, *ClientStreamHandle, i32, BytesView, *const MetadataViewHandle) callconv(.c) void);
+const server_options_v1_size = @offsetOf(ServerOptions, "max_outbound_buffer_size") + @sizeOf(u64);
+const server_method_options_v1_size = @offsetOf(ServerMethodOptions, "explicit_initial_metadata") + @sizeOf(u32);
+const server_method_callbacks_v1_size = @offsetOf(ServerMethodCallbacks, "on_terminal") + @sizeOf(?*const fn (?*anyopaque, usize, u32) callconv(.c) void);
 
 const allocator = std.heap.c_allocator;
 
@@ -119,7 +168,8 @@ pub fn grpc_lite_features() callconv(.c) u64 {
         Feature.gzip |
         Feature.dns |
         Feature.graceful_server_drain |
-        Feature.c_streaming;
+        Feature.c_streaming |
+        Feature.c_server;
     if (build_options.tls) features |= Feature.tls;
     return features;
 }
@@ -363,6 +413,222 @@ pub fn grpc_lite_client_stream_destroy(stream_handle: ?*ClientStreamHandle) call
     allocator.destroy(storage);
 }
 
+pub fn grpc_lite_server_create(
+    options_pointer: ?*const ServerOptions,
+    out_server: ?*?*ServerHandle,
+) callconv(.c) Error {
+    const output = out_server orelse return .invalid_argument;
+    output.* = null;
+    const options = parseServerOptions(options_pointer) orelse return .invalid_argument;
+    const storage = allocator.create(ServerStorage) catch return .out_of_memory;
+    const value = Server.init(allocator, options) catch |err| {
+        allocator.destroy(storage);
+        return mapServerError(err);
+    };
+    storage.* = .{ .value = value };
+    output.* = @ptrCast(storage);
+    return .ok;
+}
+
+pub fn grpc_lite_server_register_stream(
+    server_handle: ?*ServerHandle,
+    full_method_path: BytesView,
+    options_pointer: ?*const ServerMethodOptions,
+    callbacks_pointer: ?*const ServerMethodCallbacks,
+) callconv(.c) Error {
+    const handle = server_handle orelse return .invalid_argument;
+    const path = bytes(full_method_path) orelse return .invalid_argument;
+    const options = parseServerMethodOptions(options_pointer) orelse return .invalid_argument;
+    const callbacks = parseServerMethodCallbacks(callbacks_pointer) orelse return .invalid_argument;
+    const server_storage = serverStorage(handle);
+    const method = allocator.create(ServerMethodStorage) catch return .out_of_memory;
+    errdefer allocator.destroy(method);
+    method.* = .{ .callbacks = callbacks };
+    server_storage.methods.ensureUnusedCapacity(allocator, 1) catch {
+        allocator.destroy(method);
+        return .out_of_memory;
+    };
+    server_storage.value.registerStream(path, .{
+        .context = method,
+        .receive_initially_paused = options.receive_initially_paused == 1,
+        .initial_metadata_mode = if (options.explicit_initial_metadata == 1) .explicit else .automatic_after_start,
+        .on_start = serverMethodOnStart,
+        .on_message = serverMethodOnMessage,
+        .on_remote_end = serverMethodOnRemoteEnd,
+        .on_writable = serverMethodOnWritable,
+        .on_cancel = serverMethodOnCancel,
+        .on_terminal = serverMethodOnTerminal,
+    }) catch |err| {
+        allocator.destroy(method);
+        return mapServerError(err);
+    };
+    server_storage.methods.appendAssumeCapacity(method);
+    return .ok;
+}
+
+pub fn grpc_lite_server_start(server_handle: ?*ServerHandle) callconv(.c) Error {
+    const handle = server_handle orelse return .invalid_argument;
+    serverStorage(handle).value.start() catch |err| return mapServerError(err);
+    return .ok;
+}
+
+pub fn grpc_lite_server_port(server_handle: ?*const ServerHandle, out_port: ?*u32) callconv(.c) Error {
+    const output = out_port orelse return .invalid_argument;
+    output.* = 0;
+    const handle = server_handle orelse return .invalid_argument;
+    output.* = serverStorageConst(handle).value.port() catch |err| return mapServerError(err);
+    return .ok;
+}
+
+pub fn grpc_lite_server_shutdown(server_handle: ?*ServerHandle) callconv(.c) void {
+    const handle = server_handle orelse return;
+    serverStorage(handle).value.shutdown();
+}
+
+pub fn grpc_lite_server_shutdown_gracefully(server_handle: ?*ServerHandle, timeout_ns: u64) callconv(.c) void {
+    const handle = server_handle orelse return;
+    serverStorage(handle).value.shutdownGracefully(timeout_ns);
+}
+
+pub fn grpc_lite_server_wait(server_handle: ?*ServerHandle) callconv(.c) void {
+    const handle = server_handle orelse return;
+    serverStorage(handle).value.wait();
+}
+
+pub fn grpc_lite_server_destroy(server_handle: ?*ServerHandle) callconv(.c) void {
+    const handle = server_handle orelse return;
+    const storage = serverStorage(handle);
+    storage.value.deinit();
+    for (storage.methods.items) |method| allocator.destroy(method);
+    storage.methods.deinit(allocator);
+    allocator.destroy(storage);
+}
+
+pub fn grpc_lite_server_stream_id(stream_handle: ?*const ServerStreamHandle) callconv(.c) usize {
+    const handle = stream_handle orelse return 0;
+    return @intFromEnum(serverStreamStorage(handle).value.id());
+}
+
+pub fn grpc_lite_server_stream_retain(
+    stream_handle: ?*const ServerStreamHandle,
+    out_call: ?*?*ServerCallHandle,
+) callconv(.c) Error {
+    const output = out_call orelse return .invalid_argument;
+    output.* = null;
+    const handle = stream_handle orelse return .invalid_argument;
+    const storage = allocator.create(ServerCallStorage) catch return .out_of_memory;
+    storage.value = serverStreamStorage(handle).value.retain() catch |err| {
+        allocator.destroy(storage);
+        return mapServerError(err);
+    };
+    output.* = @ptrCast(storage);
+    return .ok;
+}
+
+pub fn grpc_lite_server_call_clone(
+    call_handle: ?*const ServerCallHandle,
+    out_call: ?*?*ServerCallHandle,
+) callconv(.c) Error {
+    const output = out_call orelse return .invalid_argument;
+    output.* = null;
+    const handle = call_handle orelse return .invalid_argument;
+    const storage = allocator.create(ServerCallStorage) catch return .out_of_memory;
+    storage.value = serverCallStorageConst(handle).value.clone();
+    output.* = @ptrCast(storage);
+    return .ok;
+}
+
+pub fn grpc_lite_server_call_destroy(call_handle: ?*ServerCallHandle) callconv(.c) void {
+    const handle = call_handle orelse return;
+    const storage = serverCallStorage(handle);
+    storage.value.deinit();
+    allocator.destroy(storage);
+}
+
+pub fn grpc_lite_server_call_id(call_handle: ?*const ServerCallHandle) callconv(.c) usize {
+    const handle = call_handle orelse return 0;
+    return @intFromEnum(serverCallStorageConst(handle).value.id());
+}
+
+pub fn grpc_lite_server_call_is_cancelled(call_handle: ?*const ServerCallHandle) callconv(.c) u32 {
+    const handle = call_handle orelse return 1;
+    return @intFromBool(serverCallStorageConst(handle).value.isCancelled());
+}
+
+pub fn grpc_lite_server_call_is_terminal(call_handle: ?*const ServerCallHandle) callconv(.c) u32 {
+    const handle = call_handle orelse return 1;
+    return @intFromBool(serverCallStorageConst(handle).value.isTerminal());
+}
+
+pub fn grpc_lite_server_call_send_initial_metadata(
+    call_handle: ?*ServerCallHandle,
+    metadata_handle: ?*const MetadataHandle,
+    compression: u32,
+) callconv(.c) Error {
+    const handle = call_handle orelse return .invalid_argument;
+    const algorithm = parseCompression(compression) orelse return .invalid_argument;
+    const entries = if (metadata_handle) |value| metadataStorageConst(value).value.items() else &.{};
+    serverCallStorage(handle).value.sendInitialMetadata(entries, algorithm) catch |err| return mapServerError(err);
+    return .ok;
+}
+
+pub fn grpc_lite_server_call_send(
+    call_handle: ?*ServerCallHandle,
+    payload: BytesView,
+    compression: u32,
+) callconv(.c) Error {
+    const handle = call_handle orelse return .invalid_argument;
+    const payload_bytes = bytes(payload) orelse return .invalid_argument;
+    const algorithm = parseCompression(compression) orelse return .invalid_argument;
+    serverCallStorage(handle).value.send(payload_bytes, .{ .compression = algorithm }) catch |err| return mapServerError(err);
+    return .ok;
+}
+
+pub fn grpc_lite_server_call_finish(
+    call_handle: ?*ServerCallHandle,
+    status_code: u32,
+    status_message: BytesView,
+    trailing_metadata_handle: ?*const MetadataHandle,
+) callconv(.c) Error {
+    const handle = call_handle orelse return .invalid_argument;
+    if (status_code > 16) return .invalid_argument;
+    const message = bytes(status_message) orelse return .invalid_argument;
+    const entries = if (trailing_metadata_handle) |value| metadataStorageConst(value).value.items() else &.{};
+    serverCallStorage(handle).value.finish(
+        .init(StatusCode.fromInt(status_code), message),
+        entries,
+    ) catch |err| return mapServerError(err);
+    return .ok;
+}
+
+pub fn grpc_lite_server_call_resume_receive(call_handle: ?*ServerCallHandle) callconv(.c) Error {
+    const handle = call_handle orelse return .invalid_argument;
+    serverCallStorage(handle).value.resumeReceive() catch |err| return mapServerError(err);
+    return .ok;
+}
+
+pub fn grpc_lite_server_context_request_metadata(
+    context_handle: ?*const ServerContextHandle,
+) callconv(.c) ?*const MetadataViewHandle {
+    const handle = context_handle orelse return null;
+    return metadataViewHandle(&serverContext(handle).request_metadata);
+}
+
+pub fn grpc_lite_server_context_request_compression(context_handle: ?*const ServerContextHandle) callconv(.c) u32 {
+    const handle = context_handle orelse return 0;
+    return @intFromEnum(serverContext(handle).request_compression);
+}
+
+pub fn grpc_lite_server_context_has_deadline(context_handle: ?*const ServerContextHandle) callconv(.c) u32 {
+    const handle = context_handle orelse return 0;
+    return @intFromBool(serverContext(handle).hasDeadline());
+}
+
+pub fn grpc_lite_server_context_remaining_time_ns(context_handle: ?*const ServerContextHandle) callconv(.c) u64 {
+    const handle = context_handle orelse return 0;
+    return serverContext(handle).remainingTimeNs() orelse 0;
+}
+
 pub fn grpc_lite_unary_result_destroy(result_handle: ?*UnaryResultHandle) callconv(.c) void {
     const handle = result_handle orelse return;
     const storage = unaryResultStorage(handle);
@@ -403,6 +669,165 @@ pub fn grpc_lite_unary_result_metadata_at(result_handle: ?*const UnaryResultHand
     if (index >= entries.len) return .out_of_range;
     output.* = .{ .key = view(entries[index].key), .value = view(entries[index].value) };
     return .ok;
+}
+
+fn serverMethodOnStart(
+    context: ?*anyopaque,
+    stream: raw_stream.ServerStream,
+    server_context: *ServerContext,
+) !void {
+    const method = serverMethodContext(context);
+    const callback = method.callbacks.on_start orelse return;
+    var borrowed: BorrowedServerStreamStorage = .{ .value = stream };
+    callback(
+        method.callbacks.user_data,
+        @ptrCast(&borrowed),
+        serverContextHandle(server_context),
+    );
+}
+
+fn serverMethodOnMessage(
+    context: ?*anyopaque,
+    stream: raw_stream.ServerStream,
+    server_context: *ServerContext,
+    payload: []const u8,
+    compression: Compression,
+) !raw_stream.ReceiveAction {
+    const method = serverMethodContext(context);
+    var borrowed: BorrowedServerStreamStorage = .{ .value = stream };
+    return if (method.callbacks.on_message.?(
+        method.callbacks.user_data,
+        @ptrCast(&borrowed),
+        serverContextHandle(server_context),
+        view(payload),
+        @intFromEnum(compression),
+    ) == 0) .continue_receiving else .pause;
+}
+
+fn serverMethodOnRemoteEnd(
+    context: ?*anyopaque,
+    stream: raw_stream.ServerStream,
+    server_context: *ServerContext,
+) !void {
+    const method = serverMethodContext(context);
+    const callback = method.callbacks.on_remote_end orelse return;
+    var borrowed: BorrowedServerStreamStorage = .{ .value = stream };
+    callback(
+        method.callbacks.user_data,
+        @ptrCast(&borrowed),
+        serverContextHandle(server_context),
+    );
+}
+
+fn serverMethodOnWritable(
+    context: ?*anyopaque,
+    stream: raw_stream.ServerStream,
+    server_context: *ServerContext,
+) void {
+    const method = serverMethodContext(context);
+    const callback = method.callbacks.on_writable orelse return;
+    var borrowed: BorrowedServerStreamStorage = .{ .value = stream };
+    callback(
+        method.callbacks.user_data,
+        @ptrCast(&borrowed),
+        serverContextHandle(server_context),
+    );
+}
+
+fn serverMethodOnCancel(
+    context: ?*anyopaque,
+    stream: raw_stream.ServerStream,
+    server_context: *ServerContext,
+) void {
+    const method = serverMethodContext(context);
+    const callback = method.callbacks.on_cancel orelse return;
+    var borrowed: BorrowedServerStreamStorage = .{ .value = stream };
+    callback(
+        method.callbacks.user_data,
+        @ptrCast(&borrowed),
+        serverContextHandle(server_context),
+    );
+}
+
+fn serverMethodOnTerminal(
+    context: ?*anyopaque,
+    call_id: raw_stream.ServerCallId,
+    reason: raw_stream.ServerTerminalReason,
+) void {
+    const method = serverMethodContext(context);
+    const callback = method.callbacks.on_terminal orelse return;
+    callback(method.callbacks.user_data, @intFromEnum(call_id), @intFromEnum(reason));
+}
+
+fn serverMethodContext(context: ?*anyopaque) *ServerMethodStorage {
+    return @ptrCast(@alignCast(context.?));
+}
+
+fn serverContextHandle(context: *ServerContext) *const ServerContextHandle {
+    return @ptrCast(context);
+}
+
+fn serverContext(handle: *const ServerContextHandle) *const ServerContext {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn serverStorage(handle: *ServerHandle) *ServerStorage {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn serverStorageConst(handle: *const ServerHandle) *const ServerStorage {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn serverStreamStorage(handle: *const ServerStreamHandle) *const BorrowedServerStreamStorage {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn serverCallStorage(handle: *ServerCallHandle) *ServerCallStorage {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn serverCallStorageConst(handle: *const ServerCallHandle) *const ServerCallStorage {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn mapServerError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.WouldBlock => .would_block,
+        error.CallClosed, error.ServerCallUnavailable => .closed,
+        error.ServerAlreadyStarted,
+        error.MethodAlreadyRegistered,
+        error.InitialMetadataAlreadySent,
+        error.FinishAlreadyQueued,
+        error.InitialMetadataRequired,
+        error.InitialMetadataNotExplicit,
+        error.ReceiveNotPaused,
+        => .invalid_state,
+        error.InvalidMethodPath,
+        error.InvalidReactorCount,
+        error.InvalidMaxMessageSize,
+        error.InvalidInboundBufferSize,
+        error.InvalidOutboundBufferSize,
+        error.InvalidInitialStreamWindowSize,
+        error.InvalidWriteWatermarks,
+        error.MessageTooLarge,
+        error.CompressionNotConfigured,
+        error.CompressionNotAccepted,
+        error.ResponseCompressionNotEnabled,
+        => .invalid_argument,
+        error.OutboundBufferLimitExceeded => .out_of_range,
+        error.ServerNotRunning,
+        error.BindFailed,
+        error.ListenFailed,
+        error.AddressQueryFailed,
+        error.ListenerInitializationFailed,
+        error.LoopInitializationFailed,
+        error.AsyncInitializationFailed,
+        error.TimerInitializationFailed,
+        => .unavailable,
+        else => .internal,
+    };
 }
 
 fn clientStreamOnHeaders(
@@ -570,6 +995,42 @@ fn parseCompression(value: u32) ?Compression {
         1 => .gzip,
         else => null,
     };
+}
+
+fn parseServerOptions(pointer: ?*const ServerOptions) ?@import("server.zig").Options {
+    const value = pointer orelse return .{};
+    if (value.struct_size < server_options_v1_size or
+        value.port > std.math.maxInt(u16) or
+        value.reactor_count == 0 or
+        value.max_message_size > std.math.maxInt(usize) or
+        value.max_inbound_buffer_size > std.math.maxInt(usize) or
+        value.max_outbound_buffer_size > std.math.maxInt(usize)) return null;
+    const host = bytes(value.host) orelse return null;
+    return .{
+        .host = host,
+        .port = @intCast(value.port),
+        .reactor_count = value.reactor_count,
+        .max_request_size = @intCast(value.max_message_size),
+        .stream_limits = .{
+            .max_message_size = @intCast(value.max_message_size),
+            .max_inbound_buffer_size = @intCast(value.max_inbound_buffer_size),
+            .max_outbound_buffer_size = @intCast(value.max_outbound_buffer_size),
+        },
+    };
+}
+
+fn parseServerMethodOptions(pointer: ?*const ServerMethodOptions) ?ServerMethodOptions {
+    const value = pointer orelse return .{};
+    if (value.struct_size < server_method_options_v1_size or
+        value.receive_initially_paused > 1 or
+        value.explicit_initial_metadata > 1) return null;
+    return value.*;
+}
+
+fn parseServerMethodCallbacks(pointer: ?*const ServerMethodCallbacks) ?ServerMethodCallbacks {
+    const value = pointer orelse return null;
+    if (value.struct_size < server_method_callbacks_v1_size or value.on_message == null) return null;
+    return value.*;
 }
 
 fn metadataStorageConst(handle: *const MetadataHandle) *const MetadataStorage {
@@ -771,22 +1232,46 @@ test "C borrowed metadata view exposes entries" {
 }
 
 test "C client stream completes an event-driven round trip" {
-    const Handler = struct {
-        fn onStart(_: ?*anyopaque, _: raw_stream.ServerStream, _: *ServerContext) !void {}
-
+    const ServerState = struct {
+        worker: ?std.Thread = null,
+        worker_ready: std.atomic.Value(bool) = .init(false),
+    };
+    const ServerCallbacks = struct {
         fn onMessage(
             _: ?*anyopaque,
-            stream: raw_stream.ServerStream,
-            _: *ServerContext,
-            payload: []const u8,
-            _: Compression,
-        ) !raw_stream.ReceiveAction {
-            try stream.send(payload, .{});
-            return .continue_receiving;
+            stream: *ServerStreamHandle,
+            context: *const ServerContextHandle,
+            payload: BytesView,
+            _: u32,
+        ) callconv(.c) u32 {
+            if (grpc_lite_server_context_request_compression(context) != 0) return 1;
+            var call_handle: ?*ServerCallHandle = null;
+            if (grpc_lite_server_stream_retain(stream, &call_handle) != .ok) return 1;
+            defer grpc_lite_server_call_destroy(call_handle);
+            if (grpc_lite_server_call_send_initial_metadata(call_handle, null, 0) != .ok) return 1;
+            if (!std.mem.eql(u8, bytes(payload).?, "hello")) return 1;
+            return 0;
         }
 
-        fn onRemoteEnd(_: ?*anyopaque, stream: raw_stream.ServerStream, _: *ServerContext) !void {
-            try stream.finish(.ok);
+        fn onRemoteEnd(
+            user_data: ?*anyopaque,
+            stream: *ServerStreamHandle,
+            _: *const ServerContextHandle,
+        ) callconv(.c) void {
+            var call_handle: ?*ServerCallHandle = null;
+            if (grpc_lite_server_stream_retain(stream, &call_handle) != .ok) return;
+            const state: *ServerState = @ptrCast(@alignCast(user_data.?));
+            state.worker = std.Thread.spawn(.{}, worker, .{call_handle.?}) catch {
+                grpc_lite_server_call_destroy(call_handle);
+                return;
+            };
+            state.worker_ready.store(true, .release);
+        }
+
+        fn worker(call_handle: *ServerCallHandle) void {
+            defer grpc_lite_server_call_destroy(call_handle);
+            if (grpc_lite_server_call_send(call_handle, view("hello"), 0) != .ok) return;
+            _ = grpc_lite_server_call_finish(call_handle, 0, view(""), null);
         }
     };
     const State = struct {
@@ -825,17 +1310,27 @@ test "C client stream completes an event-driven round trip" {
         }
     };
 
-    var server = try Server.init(std.testing.allocator, .{});
-    defer server.deinit();
-    try server.registerStream("/test.CAbi/Echo", .{
-        .on_start = Handler.onStart,
-        .on_message = Handler.onMessage,
-        .on_remote_end = Handler.onRemoteEnd,
-    });
-    try server.start();
+    var server_state: ServerState = .{};
+    var method_callbacks: ServerMethodCallbacks = .{
+        .user_data = &server_state,
+        .on_message = ServerCallbacks.onMessage,
+        .on_remote_end = ServerCallbacks.onRemoteEnd,
+    };
+    var server_handle: ?*ServerHandle = null;
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_create(null, &server_handle));
+    defer grpc_lite_server_destroy(server_handle);
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_register_stream(
+        server_handle,
+        view("/test.CAbi/Echo"),
+        null,
+        &method_callbacks,
+    ));
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_start(server_handle));
 
     var target_buffer: [32]u8 = undefined;
-    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try server.port()});
+    var port: u32 = 0;
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_port(server_handle, &port));
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{port});
     var channel_handle: ?*ChannelHandle = null;
     try std.testing.expectEqual(Error.ok, grpc_lite_channel_create(null, view(target), &channel_handle));
     defer grpc_lite_channel_destroy(channel_handle);
@@ -864,6 +1359,8 @@ test "C client stream completes an event-driven round trip" {
         attempts += 1;
         try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
     }
+    while (!server_state.worker_ready.load(.acquire)) std.atomic.spinLoopHint();
+    server_state.worker.?.join();
     try std.testing.expect(state.message_seen.load(.acquire));
     try std.testing.expect(state.succeeded.load(.acquire));
 }
