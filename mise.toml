@@ -46,7 +46,7 @@ description = "Build a raw consumer from the package archive"
 run = "tests/consumer/run_raw.sh"
 
 [tasks.test-consumer-cpp]
-description = "Build a C++ facade package consumer"
+description = "Generate, build, and run the C++ package consumer"
 run = "tests/consumer/run_cpp.sh"
 
 [tasks.gen-proto]

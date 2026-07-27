@@ -85,7 +85,13 @@ jobs:
 
       - name: Build raw package consumer
         run: mise run test-consumer
-      - name: Build C++ package consumer
+      - name: Install protobuf C++ tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev
+      - name: Test generated C++ package consumer
         run: mise run test-consumer-cpp
 
   tls-test:

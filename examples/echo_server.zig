@@ -16,6 +16,9 @@ const EchoApi = demo.EchoService(EchoService, error{OutOfMemory});
 fn configureContext(_: *EchoService, context: *grpc.ServerContext) !void {
     try context.addInitialMetadata("x-grpc-lite-service", "demo.EchoService");
     try context.addTrailingMetadata("x-grpc-lite-method", "Echo");
+    if (context.request_metadata.getFirst("x-consumer")) |value| {
+        try context.addInitialMetadata("x-consumer-seen", value);
+    }
 }
 
 pub fn main(init: std.process.Init) !void {

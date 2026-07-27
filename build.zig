@@ -390,6 +390,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_grpcpp_generated_test = b.addRunArtifact(grpcpp_generated_test);
 
+    const cpp_e2e_server = addExample(
+        b,
+        "grpc-lite-cpp-e2e-server",
+        "tests/cpp_e2e_server.zig",
+        grpc_lite,
+    );
+    const install_cpp_e2e_server = b.addInstallArtifact(cpp_e2e_server, .{});
+    const cpp_e2e_server_step = b.step(
+        "install-cpp-e2e-server",
+        "Install the C++ package E2E fixture server",
+    );
+    cpp_e2e_server_step.dependOn(&install_cpp_e2e_server.step);
+
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_public_api_tests.step);
     test_step.dependOn(&run_c_api_smoke.step);

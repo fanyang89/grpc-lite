@@ -137,6 +137,19 @@ protoc -I proto \
 This produces `echo.grpc.pb.h` and `echo.grpc.pb.cc`. Compile both those files
 and the standard `echo.pb.cc`, then link `grpc_lite::grpcpp` and protobuf.
 
+`examples/cpp` contains complete CMake consumers for typed echo calls, metadata and
+large messages, and status/deadline handling. They require `protoc` and the protobuf
+C++ development library. Build them against an installed prefix:
+
+```bash
+cmake -S examples/cpp -B build-cpp -G Ninja \
+  -DCMAKE_PREFIX_PATH="$PWD/zig-out"
+cmake --build build-cpp
+```
+
+`mise run test-consumer-cpp` builds an isolated package snapshot, regenerates the C++
+sources, starts the installed Zig server, and runs all three examples.
+
 ## Unary Client
 
 IPv4 literals require no global setup. Hostname targets use c-ares and require a Runtime
