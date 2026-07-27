@@ -15,6 +15,10 @@ run = "git submodule update --init --depth 1 third_party/nghttp2 third_party/grp
 description = "Build grpc-lite"
 run = "zig build"
 
+[tasks.build-release-safe]
+description = "Build grpc-lite with ReleaseSafe optimization"
+run = "zig build -Doptimize=ReleaseSafe"
+
 [tasks.test]
 description = "Run all tests"
 run = "zig build test --summary all"
@@ -36,10 +40,20 @@ description = "Run all tests with optional TLS support"
 depends = ["prepare-tls-deps"]
 run = "zig build test -Dtls=true --summary all"
 
+[tasks.test-tls-release-safe]
+description = "Run TLS tests with ReleaseSafe optimization"
+depends = ["prepare-tls-deps"]
+run = "zig build test -Dtls=true -Doptimize=ReleaseSafe --summary all"
+
 [tasks.test-tls-tsan]
 description = "Run TLS tests with ThreadSanitizer"
 depends = ["prepare-tls-deps"]
 run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dtls=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
+
+[tasks.test-tls-ubsan]
+description = "Run TLS tests with C undefined behavior detection"
+depends = ["prepare-tls-deps"]
+run = "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Dtls=true -Dsanitize-thread=false -Dsanitize-c=true --summary all"
 
 [tasks.test-consumer]
 description = "Build a raw consumer from the package archive"
@@ -79,34 +93,7 @@ run = "actionlint"
 
 [tasks.interop]
 description = "Run grpcurl against the Zig echo server"
-depends = ["build"]
-run = '''
-set -eu
-port=50091
-./zig-out/bin/grpc-lite-echo-server "$port" >.zig-cache/interop-server.log 2>&1 &
-server_pid=$!
-trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
-
-attempt=0
-until output=$(grpcurl -plaintext -import-path proto -proto echo.proto \
-  -d '{"message":"hello grpc-lite"}' \
-  "127.0.0.1:$port" demo.EchoService/Echo 2>/dev/null); do
-  attempt=$((attempt + 1))
-  if [ "$attempt" -ge 30 ]; then
-    printf '%s\n' "grpcurl interoperability test failed" >&2
-    exit 1
-  fi
-  sleep 0.1
-done
-
-case "$output" in
-  *'"message": "hello grpc-lite"'*) ;;
-  *)
-    printf '%s\n' "$output" >&2
-    exit 1
-    ;;
-esac
-'''
+run = "scripts/interop.sh"
 
 [tasks.interop-official]
 description = "Run official grpc-go unary interoperability tests"
@@ -124,7 +111,3 @@ run = "tests/official/run_http2.sh"
 [tasks.interop-http2-edge]
 description = "Run official gRPC HTTP/2 edge-case server tests"
 run = "tests/official/run_http2_edge.sh"
-
-[tasks.check]
-description = "Run formatting and tests"
-run = "mise run fmt-check && mise run test && mise run interop"

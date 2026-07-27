@@ -8,6 +8,8 @@
 
 Run `mise install` followed by `mise run bootstrap` before the first build.
 
+Before every push, run `mise run check` and require it to pass.
+
 ## Commands
 
 ```bash
