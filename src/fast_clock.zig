@@ -34,9 +34,9 @@ var fallback_reason: std.atomic.Value(u8) = .init(@intFromEnum(FallbackReason.no
 var validation_lock: std.atomic.Value(bool) = .init(false);
 var next_validation_cycles: std.atomic.Value(u64) = .init(0);
 var calibration_sequence: std.atomic.Value(u32) = .init(0);
-var base_cycles: u64 = 0;
-var base_monotonic_ns: u64 = 0;
-var cycles_per_second: u64 = 0;
+var base_cycles: std.atomic.Value(u64) = .init(0);
+var base_monotonic_ns: std.atomic.Value(u64) = .init(0);
+var cycles_per_second: std.atomic.Value(u64) = .init(0);
 var validation_base_cycles: u64 = 0;
 var validation_base_monotonic_ns: u64 = 0;
 var selected_implementation: [32:0]u8 = @splat(0);
@@ -171,9 +171,9 @@ fn predictNs(cycles: u64) !u64 {
             std.atomic.spinLoopHint();
             continue;
         }
-        const calibrated_cycles = base_cycles;
-        const calibrated_ns = base_monotonic_ns;
-        const frequency = cycles_per_second;
+        const calibrated_cycles = base_cycles.load(.monotonic);
+        const calibrated_ns = base_monotonic_ns.load(.monotonic);
+        const frequency = cycles_per_second.load(.monotonic);
         if (calibration_sequence.load(.acquire) != sequence) continue;
         if (cycles < calibrated_cycles) return error.CounterRegression;
         const elapsed_ns = scaleCyclesToNs(cycles - calibrated_cycles, frequency) orelse
@@ -184,9 +184,9 @@ fn predictNs(cycles: u64) !u64 {
 
 fn updateCalibration(cycles: u64, monotonic_ns: u64, frequency: u64) void {
     _ = calibration_sequence.fetchAdd(1, .acq_rel);
-    base_cycles = cycles;
-    base_monotonic_ns = monotonic_ns;
-    cycles_per_second = frequency;
+    base_cycles.store(cycles, .monotonic);
+    base_monotonic_ns.store(monotonic_ns, .monotonic);
+    cycles_per_second.store(frequency, .monotonic);
     _ = calibration_sequence.fetchAdd(1, .release);
 }
 

@@ -320,7 +320,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("tests/c_api_smoke.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
-    c_api_smoke_module.linkLibrary(shared_library);
+    linkCApiTestLibrary(c_api_smoke_module, library, shared_library, native, sanitizers);
     const c_api_smoke = b.addExecutable(.{
         .name = "c-api-smoke",
         .root_module = c_api_smoke_module,
@@ -339,7 +339,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("tests/cpp_c_api_smoke.cc"),
         .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
     });
-    cpp_c_api_smoke_module.linkLibrary(shared_library);
+    linkCApiTestLibrary(cpp_c_api_smoke_module, library, shared_library, native, sanitizers);
     const cpp_c_api_smoke = b.addExecutable(.{
         .name = "cpp-c-api-smoke",
         .root_module = cpp_c_api_smoke_module,
@@ -358,7 +358,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("tests/grpcpp_facade_test.cc"),
         .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
     });
-    grpcpp_facade_test_module.linkLibrary(shared_library);
+    linkCApiTestLibrary(grpcpp_facade_test_module, library, shared_library, native, sanitizers);
     const grpcpp_facade_test = b.addExecutable(.{
         .name = "grpcpp-facade-test",
         .root_module = grpcpp_facade_test_module,
@@ -383,7 +383,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("tests/grpcpp_generated_test.cc"),
         .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
     });
-    grpcpp_generated_test_module.linkLibrary(shared_library);
+    linkCApiTestLibrary(grpcpp_generated_test_module, library, shared_library, native, sanitizers);
     const grpcpp_generated_test = b.addExecutable(.{
         .name = "grpcpp-generated-test",
         .root_module = grpcpp_generated_test_module,
@@ -695,6 +695,23 @@ const NativeDependencies = struct {
     gperftools_archive: ?std.Build.LazyPath,
     gperftools_force_link: ?std.Build.LazyPath,
 };
+
+fn linkCApiTestLibrary(
+    module: *std.Build.Module,
+    library: *std.Build.Step.Compile,
+    shared_library: *std.Build.Step.Compile,
+    native: NativeDependencies,
+    sanitizers: Sanitizers,
+) void {
+    if (sanitizers.thread == true) {
+        module.linkLibrary(library);
+        module.addObjectFile(native.nghttp2_archive);
+        module.addObjectFile(native.cares_archive);
+        if (native.mbedtls_archive) |archive| module.addObjectFile(archive);
+    } else {
+        module.linkLibrary(shared_library);
+    }
+}
 
 fn protocDependencyName() []const u8 {
     if (builtin.os.tag == .windows) return "protoc-win64";
