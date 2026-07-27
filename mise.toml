@@ -45,6 +45,10 @@ run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dtls=true -Dtarg
 description = "Build a raw consumer from the package archive"
 run = "tests/consumer/run_raw.sh"
 
+[tasks.test-consumer-cpp]
+description = "Build a C++ facade package consumer"
+run = "tests/consumer/run_cpp.sh"
+
 [tasks.gen-proto]
 description = "Generate Zig protobuf sources"
 run = "zig build gen-proto"

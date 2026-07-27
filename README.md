@@ -58,6 +58,7 @@ mise run test-ubsan
 mise run test-tls
 mise run test-tls-tsan
 mise run test-consumer
+mise run test-consumer-cpp
 mise run prepare-network-deps
 mise run prepare-tls-deps
 mise run prepare-gperftools
@@ -103,6 +104,22 @@ dependent handles. C and C++ compile/link smoke tests run as part of `zig build 
 the grpcpp-shaped facade builds on this ABI in later stages.
 The installed static archive remains a Zig build artifact and is not a standalone C SDK;
 the C ABI currently targets the versioned shared library.
+
+## Synchronous C++ Facade
+
+The installed C++17 facade provides the common synchronous grpcpp client shape through
+`<grpcpp/grpcpp.h>`. It includes `Status`, `ClientContext`, `CreateChannel`, insecure
+credentials, and the internal blocking unary helper used by regenerated service glue.
+It does not provide grpcpp ABI compatibility or official generated glue.
+
+```cmake
+find_package(grpc_lite 0.3 CONFIG REQUIRED)
+target_link_libraries(app PRIVATE grpc_lite::grpcpp)
+```
+
+`grpc_lite::grpcpp` links the versioned shared C transport through `grpc_lite::c`.
+The initial facade accepts IPv4 targets; hostname channels require explicit Runtime
+ownership through the lower-level C ABI.
 
 ## Unary Client
 

@@ -196,6 +196,21 @@ pub fn build(b: *std.Build) void {
         b.path("include/grpc_lite/grpc_lite.h"),
         "grpc_lite/grpc_lite.h",
     ).step);
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = b.path("include/grpcpp"),
+        .install_dir = .header,
+        .install_subdir = "grpcpp",
+    }).step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+        b.path("cmake/grpc_liteConfig.cmake"),
+        .lib,
+        "cmake/grpc_lite/grpc_liteConfig.cmake",
+    ).step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+        b.path("cmake/grpc_liteConfigVersion.cmake"),
+        .lib,
+        "cmake/grpc_lite/grpc_liteConfigVersion.cmake",
+    ).step);
 
     const unit_tests = b.addTest(.{
         .root_module = grpc_lite,
@@ -252,10 +267,30 @@ pub fn build(b: *std.Build) void {
     });
     const run_cpp_c_api_smoke = b.addRunArtifact(cpp_c_api_smoke);
 
+    const grpcpp_facade_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    applySanitizers(grpcpp_facade_test_module, sanitizers);
+    grpcpp_facade_test_module.addIncludePath(b.path("include"));
+    grpcpp_facade_test_module.addCSourceFile(.{
+        .file = b.path("tests/grpcpp_facade_test.cc"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+    });
+    grpcpp_facade_test_module.linkLibrary(shared_library);
+    const grpcpp_facade_test = b.addExecutable(.{
+        .name = "grpcpp-facade-test",
+        .root_module = grpcpp_facade_test_module,
+    });
+    const run_grpcpp_facade_test = b.addRunArtifact(grpcpp_facade_test);
+
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_public_api_tests.step);
     test_step.dependOn(&run_c_api_smoke.step);
     test_step.dependOn(&run_cpp_c_api_smoke.step);
+    test_step.dependOn(&run_grpcpp_facade_test.step);
 
     if (!enable_protobuf) return;
     addProtobufSupport(

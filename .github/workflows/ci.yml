@@ -85,6 +85,8 @@ jobs:
 
       - name: Build raw package consumer
         run: mise run test-consumer
+      - name: Build C++ package consumer
+        run: mise run test-consumer-cpp
 
   tls-test:
     name: TLS
