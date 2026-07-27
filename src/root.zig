@@ -23,6 +23,16 @@ comptime {
     @export(&c_api.grpc_lite_metadata_add, .{ .name = "grpc_lite_metadata_add" });
     @export(&c_api.grpc_lite_metadata_count, .{ .name = "grpc_lite_metadata_count" });
     @export(&c_api.grpc_lite_metadata_at, .{ .name = "grpc_lite_metadata_at" });
+    @export(&c_api.grpc_lite_channel_create, .{ .name = "grpc_lite_channel_create" });
+    @export(&c_api.grpc_lite_channel_destroy, .{ .name = "grpc_lite_channel_destroy" });
+    @export(&c_api.grpc_lite_channel_call_unary, .{ .name = "grpc_lite_channel_call_unary" });
+    @export(&c_api.grpc_lite_unary_result_destroy, .{ .name = "grpc_lite_unary_result_destroy" });
+    @export(&c_api.grpc_lite_unary_result_status_code, .{ .name = "grpc_lite_unary_result_status_code" });
+    @export(&c_api.grpc_lite_unary_result_status_message, .{ .name = "grpc_lite_unary_result_status_message" });
+    @export(&c_api.grpc_lite_unary_result_payload, .{ .name = "grpc_lite_unary_result_payload" });
+    @export(&c_api.grpc_lite_unary_result_response_compression, .{ .name = "grpc_lite_unary_result_response_compression" });
+    @export(&c_api.grpc_lite_unary_result_metadata_count, .{ .name = "grpc_lite_unary_result_metadata_count" });
+    @export(&c_api.grpc_lite_unary_result_metadata_at, .{ .name = "grpc_lite_unary_result_metadata_at" });
 }
 pub const message = @import("message.zig");
 

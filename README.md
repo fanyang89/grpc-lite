@@ -96,10 +96,11 @@ cc app.c \
   -lgrpc_lite
 ```
 
-The initial ABI surface provides version and feature discovery plus owning Runtime and
-Metadata handles. Runtime initialization must happen before application threads are
-created and must outlive dependent handles. C and C++ compile/link smoke tests run as
-part of `zig build test`; the grpcpp-shaped facade builds on this ABI in later stages.
+The ABI surface provides version and feature discovery, owning Runtime and Metadata
+handles, insecure connected Channels, and blocking raw unary calls. Runtime
+initialization must happen before application threads are created and must outlive
+dependent handles. C and C++ compile/link smoke tests run as part of `zig build test`;
+the grpcpp-shaped facade builds on this ABI in later stages.
 The installed static archive remains a Zig build artifact and is not a standalone C SDK;
 the C ABI currently targets the versioned shared library.
 

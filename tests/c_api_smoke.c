@@ -1,5 +1,6 @@
 #include <grpc_lite/grpc_lite.h>
 
+#include <assert.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -9,6 +10,11 @@ static grpc_lite_bytes_view bytes(const void *data, size_t size) {
 }
 
 int main(void) {
+  grpc_lite_unary_options options = GRPC_LITE_UNARY_OPTIONS_INIT;
+  assert(options.struct_size == sizeof(options));
+  assert(options.max_response_size == UINT64_C(4194304));
+  assert(grpc_lite_unary_result_status_code(NULL) == 2);
+
   grpc_lite_metadata *metadata = NULL;
   grpc_lite_runtime *runtime = NULL;
   grpc_lite_metadata_entry_view entry;

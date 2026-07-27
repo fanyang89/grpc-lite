@@ -38,6 +38,8 @@ typedef uint64_t grpc_lite_feature_bits;
 
 typedef struct grpc_lite_runtime grpc_lite_runtime;
 typedef struct grpc_lite_metadata grpc_lite_metadata;
+typedef struct grpc_lite_channel grpc_lite_channel;
+typedef struct grpc_lite_unary_result grpc_lite_unary_result;
 
 typedef struct grpc_lite_bytes_view {
   const uint8_t *data;
@@ -75,6 +77,56 @@ size_t grpc_lite_metadata_count(const grpc_lite_metadata *metadata);
 /* Returned views are immutable and remain valid until metadata is destroyed. */
 grpc_lite_error grpc_lite_metadata_at(
     const grpc_lite_metadata *metadata,
+    size_t index,
+    grpc_lite_metadata_entry_view *out_entry);
+
+enum {
+  GRPC_LITE_COMPRESSION_IDENTITY = 0,
+  GRPC_LITE_COMPRESSION_GZIP = 1,
+};
+
+typedef struct grpc_lite_unary_options {
+  size_t struct_size;
+  const grpc_lite_metadata *metadata;
+  uint32_t has_timeout;
+  uint32_t request_compression;
+  uint64_t timeout_ns;
+  uint64_t max_response_size;
+} grpc_lite_unary_options;
+
+#define GRPC_LITE_UNARY_OPTIONS_INIT \
+  { sizeof(grpc_lite_unary_options), NULL, 0, GRPC_LITE_COMPRESSION_IDENTITY, \
+    0, UINT64_C(4194304) }
+
+/* Creates a connected insecure channel. Hostnames require a Runtime. */
+grpc_lite_error grpc_lite_channel_create(
+    grpc_lite_runtime *runtime,
+    grpc_lite_bytes_view target,
+    grpc_lite_channel **out_channel);
+/* Must not run concurrently with calls using the channel. */
+void grpc_lite_channel_destroy(grpc_lite_channel *channel);
+
+/* Blocks until the RPC completes. RPC failures are stored in out_result. */
+grpc_lite_error grpc_lite_channel_call_unary(
+    grpc_lite_channel *channel,
+    grpc_lite_bytes_view full_method_path,
+    grpc_lite_bytes_view request,
+    const grpc_lite_unary_options *options,
+    grpc_lite_unary_result **out_result);
+void grpc_lite_unary_result_destroy(grpc_lite_unary_result *result);
+int32_t grpc_lite_unary_result_status_code(const grpc_lite_unary_result *result);
+grpc_lite_bytes_view grpc_lite_unary_result_status_message(
+    const grpc_lite_unary_result *result);
+grpc_lite_bytes_view grpc_lite_unary_result_payload(
+    const grpc_lite_unary_result *result);
+uint32_t grpc_lite_unary_result_response_compression(
+    const grpc_lite_unary_result *result);
+/* trailing == 0 selects initial metadata; any other value selects trailing. */
+size_t grpc_lite_unary_result_metadata_count(
+    const grpc_lite_unary_result *result, uint32_t trailing);
+grpc_lite_error grpc_lite_unary_result_metadata_at(
+    const grpc_lite_unary_result *result,
+    uint32_t trailing,
     size_t index,
     grpc_lite_metadata_entry_view *out_entry);
 
