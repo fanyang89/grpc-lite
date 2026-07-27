@@ -49,8 +49,8 @@ mise run gen-proto
 - c-ares resolves client hostnames to IPv4 candidates on the libxev loop.
 
 Keep C types private to transport modules. Keep protobuf out of `src/root.zig` so the
-raw transport remains independently usable. Do not add grpcpp compatibility without
-expanding the project scope first.
+raw transport remains independently usable. The optional C++ compatibility layer must
+remain outside the raw transport and depend only on its public API or a stable C ABI.
 
 ## Scope Decisions
 
@@ -83,7 +83,8 @@ authoritative: change it before implementing a feature with a different decision
 | Service config and load balancing | Out of scope | No policy layer |
 | xDS, ORCA, ALTS, and cloud credentials | Out of scope | Not required for lite deployments |
 | Cacheable unary GET | Out of scope | Depends on proxy cache semantics |
-| grpcpp compatibility | Out of scope | Zig-native APIs only |
+| grpcpp-shaped synchronous C++ API | Selected | Source-compatible common sync API through regenerated service glue; no ABI compatibility |
+| Full grpcpp compatibility | Out of scope | No official generated glue, CompletionQueue, callback/reactor, generic services, or grpc-core ABI |
 
 ## Raw Streaming Direction
 
