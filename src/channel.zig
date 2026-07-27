@@ -1057,10 +1057,11 @@ const Operation = struct {
             self.setOutcome(.resource_exhausted, "response message too large") catch {};
         } else {
             const code = status.Code.fromInt(self.grpc_status.?);
+            const allocator = self.impl.allocator;
             var decoded_message: ?[]u8 = null;
-            defer if (decoded_message) |value| self.impl.allocator.free(value);
+            defer if (decoded_message) |value| allocator.free(value);
             if (self.grpc_message) |encoded| {
-                decoded_message = message.decode(self.impl.allocator, encoded) catch {
+                decoded_message = message.decode(allocator, encoded) catch {
                     self.setOutcome(.unknown, "invalid grpc-message") catch {};
                     self.finish();
                     return;
@@ -4919,7 +4920,7 @@ test "server drain finishes an accepted RPC and rejects a replacement connection
 
     const Handler = struct {
         server: *server.Server,
-        local_address_available: bool = false,
+        local_address_available: std.atomic.Value(bool) = .init(false),
 
         fn handle(
             self: *@This(),
@@ -4929,7 +4930,7 @@ test "server drain finishes an accepted RPC and rejects a replacement connection
         ) !service.UnaryResponse {
             self.server.shutdownGracefully(5 * std.time.ns_per_s);
             _ = try self.server.localAddress();
-            self.local_address_available = true;
+            self.local_address_available.store(true, .release);
             return service.UnaryResponse.ok(allocator, request);
         }
     };
@@ -4952,7 +4953,7 @@ test "server drain finishes an accepted RPC and rejects a replacement connection
     defer accepted.deinit();
     try std.testing.expect(accepted.status.isOk());
     try std.testing.expectEqualStrings("accepted", accepted.payload);
-    try std.testing.expect(handler.local_address_available);
+    try std.testing.expect(handler.local_address_available.load(.acquire));
 
     const reconnect_deadline = nowNs() +| 5 * std.time.ns_per_s;
     while (channel.impl.connection_generation.load(.monotonic) < 2 and nowNs() < reconnect_deadline) {
