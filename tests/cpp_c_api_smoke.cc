@@ -1,0 +1,25 @@
+#include <grpc_lite/grpc_lite.h>
+
+#include <cstdint>
+#include <cstddef>
+#include <string_view>
+#include <type_traits>
+
+static_assert(std::is_same_v<grpc_lite_error, std::int32_t>);
+static_assert(std::is_same_v<grpc_lite_feature_bits, std::uint64_t>);
+static_assert(sizeof(grpc_lite_bytes_view) == 2 * sizeof(std::size_t));
+static_assert(alignof(grpc_lite_bytes_view) == alignof(std::size_t));
+static_assert(offsetof(grpc_lite_bytes_view, data) == 0);
+static_assert(offsetof(grpc_lite_bytes_view, size) == sizeof(void *));
+static_assert(sizeof(grpc_lite_metadata_entry_view) ==
+              2 * sizeof(grpc_lite_bytes_view));
+
+int main() {
+  if (grpc_lite_abi_version() != GRPC_LITE_ABI_VERSION) return 1;
+  if (std::string_view(grpc_lite_error_string(GRPC_LITE_OK)) != "ok") return 2;
+
+  grpc_lite_metadata *metadata = nullptr;
+  if (grpc_lite_metadata_create(&metadata) != GRPC_LITE_OK) return 3;
+  grpc_lite_metadata_destroy(metadata);
+  return 0;
+}

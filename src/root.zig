@@ -4,11 +4,26 @@ const std = @import("std");
 const build_options = @import("grpc_lite_options");
 
 const c = @import("c.zig");
+const c_api = @import("c_api.zig");
 const cares_adapter = @import("cares_adapter.zig");
 const deadline = @import("deadline.zig");
 const fast_clock = @import("fast_clock.zig");
 const version_info = @import("version.zig");
 const runtime = @import("runtime.zig");
+
+comptime {
+    @export(&c_api.grpc_lite_abi_version, .{ .name = "grpc_lite_abi_version" });
+    @export(&c_api.grpc_lite_library_version, .{ .name = "grpc_lite_library_version" });
+    @export(&c_api.grpc_lite_features, .{ .name = "grpc_lite_features" });
+    @export(&c_api.grpc_lite_error_string, .{ .name = "grpc_lite_error_string" });
+    @export(&c_api.grpc_lite_runtime_create, .{ .name = "grpc_lite_runtime_create" });
+    @export(&c_api.grpc_lite_runtime_destroy, .{ .name = "grpc_lite_runtime_destroy" });
+    @export(&c_api.grpc_lite_metadata_create, .{ .name = "grpc_lite_metadata_create" });
+    @export(&c_api.grpc_lite_metadata_destroy, .{ .name = "grpc_lite_metadata_destroy" });
+    @export(&c_api.grpc_lite_metadata_add, .{ .name = "grpc_lite_metadata_add" });
+    @export(&c_api.grpc_lite_metadata_count, .{ .name = "grpc_lite_metadata_count" });
+    @export(&c_api.grpc_lite_metadata_at, .{ .name = "grpc_lite_metadata_at" });
+}
 pub const message = @import("message.zig");
 
 pub const call = @import("call.zig");
@@ -72,6 +87,7 @@ test "version is available" {
 
 test {
     _ = c;
+    _ = c_api;
     _ = cares_adapter;
     _ = call;
     _ = channel;

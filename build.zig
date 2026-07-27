@@ -184,7 +184,18 @@ pub fn build(b: *std.Build) void {
         .name = "grpc_lite",
         .root_module = grpc_lite,
     });
+    const shared_library = b.addLibrary(.{
+        .name = "grpc_lite",
+        .linkage = .dynamic,
+        .root_module = grpc_lite,
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+    });
     b.installArtifact(library);
+    b.installArtifact(shared_library);
+    b.getInstallStep().dependOn(&b.addInstallHeaderFile(
+        b.path("include/grpc_lite/grpc_lite.h"),
+        "grpc_lite/grpc_lite.h",
+    ).step);
 
     const unit_tests = b.addTest(.{
         .root_module = grpc_lite,
@@ -204,8 +215,47 @@ pub fn build(b: *std.Build) void {
     });
     const run_public_api_tests = b.addRunArtifact(public_api_tests);
 
+    const c_api_smoke_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    applySanitizers(c_api_smoke_module, sanitizers);
+    c_api_smoke_module.addIncludePath(b.path("include"));
+    c_api_smoke_module.addCSourceFile(.{
+        .file = b.path("tests/c_api_smoke.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    c_api_smoke_module.linkLibrary(shared_library);
+    const c_api_smoke = b.addExecutable(.{
+        .name = "c-api-smoke",
+        .root_module = c_api_smoke_module,
+    });
+    const run_c_api_smoke = b.addRunArtifact(c_api_smoke);
+
+    const cpp_c_api_smoke_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    applySanitizers(cpp_c_api_smoke_module, sanitizers);
+    cpp_c_api_smoke_module.addIncludePath(b.path("include"));
+    cpp_c_api_smoke_module.addCSourceFile(.{
+        .file = b.path("tests/cpp_c_api_smoke.cc"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+    });
+    cpp_c_api_smoke_module.linkLibrary(shared_library);
+    const cpp_c_api_smoke = b.addExecutable(.{
+        .name = "cpp-c-api-smoke",
+        .root_module = cpp_c_api_smoke_module,
+    });
+    const run_cpp_c_api_smoke = b.addRunArtifact(cpp_c_api_smoke);
+
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_public_api_tests.step);
+    test_step.dependOn(&run_c_api_smoke.step);
+    test_step.dependOn(&run_cpp_c_api_smoke.step);
 
     if (!enable_protobuf) return;
     addProtobufSupport(
@@ -671,7 +721,7 @@ fn addCpuCycles(
     module.addIncludePath(dependency.path("cpucycles"));
     module.addCSourceFile(.{
         .file = dependency.path("cpucycles/wrapper.c"),
-        .flags = &.{ "-std=gnu99", "-D_GNU_SOURCE=1", "-fwrapv" },
+        .flags = &.{ "-std=gnu99", "-D_GNU_SOURCE=1", "-fwrapv", "-fvisibility=hidden" },
     });
     for (options) |option| {
         const symbol = b.dupe(option);
@@ -682,6 +732,7 @@ fn addCpuCycles(
                 "-std=gnu99",
                 "-D_GNU_SOURCE=1",
                 "-fwrapv",
+                "-fvisibility=hidden",
                 b.fmt("-Dticks=cpucycles_ticks_{s}", .{symbol}),
                 b.fmt("-Dticks_setup=cpucycles_ticks_{s}_setup", .{symbol}),
                 b.fmt("-Dticks_close=cpucycles_ticks_{s}_close", .{symbol}),

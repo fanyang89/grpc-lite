@@ -14,7 +14,7 @@ mbedtls_config_header=${10}
 sanitize_thread=${11}
 sanitize_c=${12}
 
-c_flags=()
+c_flags=(-fvisibility=hidden)
 
 if [[ "$sanitize_thread" == true && "$sanitize_c" == true ]]; then
     printf 'ThreadSanitizer and UndefinedBehaviorSanitizer are mutually exclusive\n' >&2
