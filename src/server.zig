@@ -1037,6 +1037,8 @@ const Stream = struct {
     finish_queued: bool = false,
     receive_paused: bool = false,
     resume_queued: bool = false,
+    resume_requested: bool = false,
+    message_callback_active: bool = false,
     deferred_stream_credit: usize = 0,
     response_gzip_requested: bool = false,
     response_headers_queued: bool = false,
@@ -1269,7 +1271,12 @@ fn serverCallResumeReceive(context: *anyopaque) !void {
     defer server.unlock();
     const target = control.target orelse return error.CallClosed;
     if (!target.streaming_active or target.finish_queued or target.transport_closed) return error.CallClosed;
-    if (!target.receive_paused or target.resume_queued) return error.ReceiveNotPaused;
+    if (target.resume_queued or target.resume_requested) return;
+    if (!target.receive_paused) {
+        if (!target.message_callback_active) return error.ReceiveNotPaused;
+        target.resume_requested = true;
+        return;
+    }
     target.resume_queued = true;
     errdefer target.resume_queued = false;
     try enqueueStreamCommandLocked(server, target, .{
@@ -1346,7 +1353,12 @@ fn streamResumeReceive(context: *anyopaque) !void {
     server.lock();
     defer server.unlock();
     if (!target.streaming_active) return error.StreamFinished;
-    if (!target.receive_paused or target.resume_queued) return error.ReceiveNotPaused;
+    if (target.resume_queued or target.resume_requested) return;
+    if (!target.receive_paused) {
+        if (!target.message_callback_active) return error.ReceiveNotPaused;
+        target.resume_requested = true;
+        return;
+    }
     target.resume_queued = true;
     errdefer target.resume_queued = false;
     try enqueueStreamCommandLocked(server, target, .{
@@ -2601,6 +2613,8 @@ fn cancelStreaming(target: *Stream, reason: raw_stream.ServerTerminalReason) voi
     target.finish_queued = true;
     target.receive_paused = false;
     target.resume_queued = false;
+    target.resume_requested = false;
+    target.message_callback_active = false;
     server.unlock();
     discardStreamCommands(target);
     const reserved_bytes = streaming.clearOutbound();
@@ -3012,6 +3026,14 @@ fn deliverStreamingMessages(target: *Stream) void {
         } orelse break;
         const compression: Compression = if (decoded.compressed) .gzip else .identity;
         streaming.context.request_compression = compression;
+        server.lock();
+        if (!target.streaming_active or target.receive_paused) {
+            server.unlock();
+            target.allocator.free(decoded.payload);
+            return;
+        }
+        target.message_callback_active = true;
+        server.unlock();
         const action_result = streaming.handler.on_message(
             streaming.handler.context,
             target.serverHandle(),
@@ -3021,16 +3043,22 @@ fn deliverStreamingMessages(target: *Stream) void {
         );
         const action = action_result catch {
             target.allocator.free(decoded.payload);
+            server.lock();
+            target.message_callback_active = false;
+            target.resume_requested = false;
+            server.unlock();
             failStreaming(target, .internal, "handler failed");
             return;
         };
         target.allocator.free(decoded.payload);
-        if (action == .pause) {
-            server.lock();
-            if (target.streaming_active) target.receive_paused = true;
-            server.unlock();
-            return;
-        }
+        server.lock();
+        target.message_callback_active = false;
+        const still_active = target.streaming_active;
+        const resume_requested = target.resume_requested;
+        target.resume_requested = false;
+        if (still_active and action == .pause and !resume_requested) target.receive_paused = true;
+        server.unlock();
+        if (!still_active or (action == .pause and !resume_requested)) return;
     }
     if (streaming.remote_end_received) completeStreamingRemoteEnd(target);
 }
@@ -5106,6 +5134,71 @@ test "manual receive credit isolates a paused stream and resumes on loop" {
         @as(i32, c.NGHTTP2_INITIAL_WINDOW_SIZE),
         c.nghttp2_session_get_stream_local_window_size(connection.session, 1),
     );
+}
+
+test "server receive resume latches during message callback" {
+    const Handler = struct {
+        messages: usize = 0,
+
+        fn onStart(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onMessage(
+            context: ?*anyopaque,
+            stream: raw_stream.ServerStream,
+            _: *service.ServerContext,
+            _: []const u8,
+            _: Compression,
+        ) !raw_stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.messages += 1;
+            try stream.resumeReceive();
+            try stream.resumeReceive();
+            return .pause;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+    };
+
+    var handler = Handler{};
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    server.impl.local_allocator_state.enterLoop();
+    defer server.impl.local_allocator_state.leaveLoop();
+
+    var connection = Connection{ .server = server.impl };
+    const target = try std.testing.allocator.create(Stream);
+    target.* = Stream.init(std.testing.allocator, &connection, 1);
+    defer {
+        target.deinit();
+        std.testing.allocator.destroy(target);
+    }
+    target.streaming = .{
+        .handler = .{
+            .context = &handler,
+            .on_start = Handler.onStart,
+            .on_message = Handler.onMessage,
+            .on_remote_end = Handler.onRemoteEnd,
+        },
+        .decoder = frame.Decoder.init(std.testing.allocator, 1024),
+        .context = service.ServerContext.init(std.testing.allocator),
+    };
+    target.streaming_active = true;
+
+    const first = try frame.encode(std.testing.allocator, "first");
+    defer std.testing.allocator.free(first);
+    const second = try frame.encode(std.testing.allocator, "second");
+    defer std.testing.allocator.free(second);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.testing.allocator);
+    try payload.appendSlice(std.testing.allocator, first);
+    try payload.appendSlice(std.testing.allocator, second);
+
+    try std.testing.expect(receiveStreamingData(target, payload.items));
+    try std.testing.expectEqual(@as(usize, 2), handler.messages);
+    try std.testing.expect(!target.receive_paused);
+    try std.testing.expect(!target.resume_requested);
+    try std.testing.expect(!target.message_callback_active);
+    try std.testing.expectError(error.ReceiveNotPaused, target.serverHandle().resumeReceive());
 }
 
 test "server occupied port startup cleans up deterministically" {

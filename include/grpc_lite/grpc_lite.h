@@ -401,6 +401,10 @@ grpc_lite_error grpc_lite_server_call_finish(
     uint32_t status_code,
     grpc_lite_bytes_view status_message,
     const grpc_lite_metadata *trailing_metadata);
+/*
+ * May be called during on_message before a returned PAUSE has been committed.
+ * Repeated resume requests for the same pause are idempotent.
+ */
 grpc_lite_error grpc_lite_server_call_resume_receive(
     grpc_lite_server_call *call);
 
