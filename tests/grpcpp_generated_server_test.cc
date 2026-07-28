@@ -277,6 +277,8 @@ int main() {
 
   raw_channel.Shutdown();
   raw_channel.Wait();
+  channel->Shutdown();
+  channel->Wait();
   stub.reset();
   channel.reset();
   server.ShutdownGracefully(UINT64_C(1000000000));

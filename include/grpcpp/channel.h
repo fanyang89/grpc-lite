@@ -32,10 +32,8 @@ class Channel final : public ChannelInterface,
                       public std::enable_shared_from_this<Channel> {
  public:
   ~Channel() override {
-    if (channel_ready_) {
-      channel_.Shutdown();
-      channel_.Wait();
-    }
+    Shutdown();
+    Wait();
   }
   Channel(const Channel&) = delete;
   Channel& operator=(const Channel&) = delete;
@@ -79,6 +77,13 @@ class Channel final : public ChannelInterface,
     return internal::BlockingCallState::Open(channel_, method, context,
                                              compression_,
                                              weak_from_this().lock());
+  }
+
+  void Shutdown() {
+    if (channel_ready_) channel_.Shutdown();
+  }
+  void Wait() {
+    if (channel_ready_) channel_.Wait();
   }
 
  private:
