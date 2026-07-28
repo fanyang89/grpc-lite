@@ -367,6 +367,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_cpp_c_api_smoke = b.addRunArtifact(cpp_c_api_smoke);
 
+    const cpp_native_api_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    applySanitizers(cpp_native_api_test_module, sanitizers);
+    cpp_native_api_test_module.addIncludePath(b.path("include"));
+    cpp_native_api_test_module.addCSourceFile(.{
+        .file = b.path("tests/cpp_native_api_test.cc"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+    });
+    linkCApiTestLibrary(cpp_native_api_test_module, library, shared_library, native, sanitizers);
+    const cpp_native_api_test = b.addExecutable(.{
+        .name = "cpp-native-api-test",
+        .root_module = cpp_native_api_test_module,
+    });
+    const run_cpp_native_api_test = b.addRunArtifact(cpp_native_api_test);
+
     const grpcpp_facade_test_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -428,6 +447,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_public_api_tests.step);
     test_step.dependOn(&run_c_api_smoke.step);
     test_step.dependOn(&run_cpp_c_api_smoke.step);
+    test_step.dependOn(&run_cpp_native_api_test.step);
     test_step.dependOn(&run_grpcpp_facade_test.step);
     test_step.dependOn(&run_grpcpp_generated_test.step);
 
