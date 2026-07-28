@@ -166,11 +166,13 @@ class QueueExecutor final : public grpc_lite::ServerExecutor {
     return true;
   }
 
-  void WaitForTask() {
+  void WaitForTaskCount(std::size_t count) {
     std::unique_lock<std::mutex> lock(mutex_);
     assert(changed_.wait_for(lock, std::chrono::seconds(5),
-                             [this] { return !tasks_.empty(); }));
+                              [this, count] { return tasks_.size() >= count; }));
   }
+
+  void WaitForTask() { WaitForTaskCount(1); }
 
   void RunOne() {
     Task task;
@@ -351,21 +353,21 @@ void TestSynchronousService() {
   executor.WaitForTask();
   cancelled_context.TryCancel();
   cancelled_client.join();
-  executor.RunOne();
   assert(cancelled_status.error_code() == grpc::StatusCode::CANCELLED);
-  assert(service.unary_calls.load(std::memory_order_relaxed) == 1);
   assert(executor.submitted_methods.front() == "/demo.EchoService/Echo");
 
   grpc::ClientContext cancelled_stream_context;
   request.set_message("cancelled stream");
   auto cancelled_reader =
       stub->ServerStream(&cancelled_stream_context, request);
-  executor.WaitForTask();
+  executor.WaitForTaskCount(2);
   cancelled_stream_context.TryCancel();
   server.Shutdown();
   server.Wait();
   assert(!cancelled_reader->Finish().ok());
   executor.RunOne();
+  executor.RunOne();
+  assert(service.unary_calls.load(std::memory_order_relaxed) == 1);
   assert(service.streaming_calls.load(std::memory_order_relaxed) == 1);
 
   channel->Shutdown();
