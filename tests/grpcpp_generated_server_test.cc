@@ -155,6 +155,77 @@ class EventService final : public demo::EchoService::EventService {
   bool held_ready_ = false;
 };
 
+class QueueExecutor final : public grpc_lite::ServerExecutor {
+ public:
+  bool Submit(std::string_view method, Task task) noexcept override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    submitted_methods.push_back(std::string(method));
+    if (reject) return false;
+    tasks_.push_back(std::move(task));
+    changed_.notify_all();
+    return true;
+  }
+
+  void WaitForTask() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    assert(changed_.wait_for(lock, std::chrono::seconds(5),
+                             [this] { return !tasks_.empty(); }));
+  }
+
+  void RunOne() {
+    Task task;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      assert(!tasks_.empty());
+      task = std::move(tasks_.front());
+      tasks_.erase(tasks_.begin());
+    }
+    task();
+  }
+
+  bool reject = false;
+  std::vector<std::string> submitted_methods;
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  std::vector<Task> tasks_;
+};
+
+class SynchronousService final : public demo::EchoService::Service {
+ public:
+  grpc::Status Echo(grpc::ServerContext* context,
+                    const demo::EchoRequest* request,
+                    demo::EchoReply* response) override {
+    unary_calls.fetch_add(1, std::memory_order_relaxed);
+    assert(!context->IsCancelled());
+    const auto metadata = context->client_metadata().find("x-request");
+    assert(metadata != context->client_metadata().end());
+    context->AddInitialMetadata("x-initial", "sync");
+    context->AddTrailingMetadata("x-trailing", "sync");
+    response->set_message(request->message() + " response");
+    return grpc::Status::OK;
+  }
+
+  grpc::Status ServerStream(
+      grpc::ServerContext* context, const demo::EchoRequest* request,
+      grpc::ServerWriter<demo::EchoReply>* writer) override {
+    streaming_calls.fetch_add(1, std::memory_order_relaxed);
+    context->set_compression_algorithm(GRPC_COMPRESS_NONE);
+    context->AddInitialMetadata("x-initial", "stream");
+    context->AddTrailingMetadata("x-trailing", "stream");
+    for (int index = 0; index < 64; ++index) {
+      demo::EchoReply response;
+      response.set_message(request->message() + std::string(16384, 'x'));
+      if (!writer->Write(response)) return grpc::Status::CANCELLED;
+    }
+    return grpc::Status::OK;
+  }
+
+  std::atomic<int> unary_calls{0};
+  std::atomic<int> streaming_calls{0};
+};
+
 grpc_lite::Status RawCall(grpc_lite::Channel& channel,
                           std::vector<std::string> messages) {
   std::mutex mutex;
@@ -189,6 +260,152 @@ void WaitUntil(const std::function<bool()>& predicate) {
     std::this_thread::yield();
   }
   assert(predicate());
+}
+
+void TestSynchronousService() {
+  grpc_lite::ServerOptions server_options;
+  server_options.max_message_size = 32768;
+  server_options.max_outbound_buffer_size = 65536;
+  grpc_lite::Server server;
+  assert(grpc_lite::Server::Create(server_options, &server).ok());
+  QueueExecutor executor;
+  SynchronousService service;
+  grpc_lite::SynchronousServiceOptions service_options;
+  service_options.response_compression = grpc_lite::Compression::Gzip;
+  auto adapter = service.CreateEventService(executor, service_options);
+  assert(adapter->Register(server).ok());
+  assert(server.Start().ok());
+  std::uint32_t port = 0;
+  assert(server.Port(&port).ok());
+
+  grpc::ChannelArguments channel_arguments;
+  channel_arguments.SetAllowInitialOffline(false);
+  auto channel = grpc::CreateCustomChannel(
+      "127.0.0.1:" + std::to_string(port),
+      grpc::InsecureChannelCredentials(), channel_arguments);
+  auto stub = demo::EchoService::NewStub(channel);
+
+  grpc::ClientContext unary_context;
+  unary_context.AddMetadata("x-request", "metadata");
+  demo::EchoRequest request;
+  request.set_message("sync");
+  demo::EchoReply response;
+  grpc::Status unary_status;
+  std::thread unary_client([&] {
+    unary_status = stub->Echo(&unary_context, request, &response);
+  });
+  executor.WaitForTask();
+  std::thread unary_worker([&] { executor.RunOne(); });
+  unary_worker.join();
+  unary_client.join();
+  assert(unary_status.ok());
+  assert(response.message() == "sync response");
+  assert(unary_context.GetServerInitialMetadata().find("x-initial")->second ==
+         "sync");
+  assert(unary_context.GetServerTrailingMetadata().find("x-trailing")->second ==
+         "sync");
+
+  grpc::ClientContext stream_context;
+  stream_context.AddMetadata("x-request", "metadata");
+  request.set_message("stream");
+  auto reader = stub->ServerStream(&stream_context, request);
+  executor.WaitForTask();
+  std::atomic<bool> stream_worker_done{false};
+  std::thread stream_worker([&] {
+    executor.RunOne();
+    stream_worker_done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  assert(!stream_worker_done.load(std::memory_order_acquire));
+  int response_count = 0;
+  while (reader->Read(&response)) ++response_count;
+  assert(reader->Finish().ok());
+  stream_worker.join();
+  assert(response_count == 64);
+  assert(stream_context.GetServerInitialMetadata().find("x-initial")->second ==
+         "stream");
+  assert(stream_context.GetServerTrailingMetadata().find("x-trailing")->second ==
+         "stream");
+
+  grpc::ClientContext cancelled_context;
+  cancelled_context.AddMetadata("x-request", "metadata");
+  request.set_message("cancelled");
+  grpc::Status cancelled_status;
+  std::thread cancelled_client([&] {
+    cancelled_status = stub->Echo(&cancelled_context, request, &response);
+  });
+  executor.WaitForTask();
+  cancelled_context.TryCancel();
+  cancelled_client.join();
+  executor.RunOne();
+  assert(cancelled_status.error_code() == grpc::StatusCode::CANCELLED);
+  assert(service.unary_calls.load(std::memory_order_relaxed) == 1);
+  assert(executor.submitted_methods.front() == "/demo.EchoService/Echo");
+
+  grpc::ClientContext cancelled_stream_context;
+  request.set_message("cancelled stream");
+  auto cancelled_reader =
+      stub->ServerStream(&cancelled_stream_context, request);
+  executor.WaitForTask();
+  cancelled_stream_context.TryCancel();
+  server.Shutdown();
+  server.Wait();
+  assert(!cancelled_reader->Finish().ok());
+  executor.RunOne();
+  assert(service.streaming_calls.load(std::memory_order_relaxed) == 1);
+
+  channel->Shutdown();
+  channel->Wait();
+  stub.reset();
+  channel.reset();
+  grpc_lite::Server restarted_server;
+  assert(grpc_lite::Server::Create({}, &restarted_server).ok());
+  auto restarted_adapter = service.CreateEventService(executor);
+  assert(restarted_adapter.get() != adapter.get());
+  assert(restarted_adapter->Register(restarted_server).ok());
+  assert(restarted_server.Start().ok());
+  restarted_server.ShutdownGracefully(UINT64_C(1000000000));
+  restarted_server.Wait();
+}
+
+void TestSynchronousErrors() {
+  for (bool reject : {false, true}) {
+    grpc_lite::Server server;
+    assert(grpc_lite::Server::Create({}, &server).ok());
+    QueueExecutor executor;
+    executor.reject = reject;
+    demo::EchoService::Service service;
+    auto adapter = service.CreateEventService(executor);
+    assert(adapter->Register(server).ok());
+    assert(server.Start().ok());
+    std::uint32_t port = 0;
+    assert(server.Port(&port).ok());
+    grpc::ChannelArguments channel_arguments;
+    channel_arguments.SetAllowInitialOffline(false);
+    auto channel = grpc::CreateCustomChannel(
+        "127.0.0.1:" + std::to_string(port),
+        grpc::InsecureChannelCredentials(), channel_arguments);
+    auto stub = demo::EchoService::NewStub(channel);
+    grpc::ClientContext context;
+    demo::EchoRequest request;
+    demo::EchoReply response;
+    grpc::Status status;
+    std::thread client([&] { status = stub->Echo(&context, request, &response); });
+    if (!reject) {
+      executor.WaitForTask();
+      executor.RunOne();
+    }
+    client.join();
+    assert(status.error_code() ==
+           (reject ? grpc::StatusCode::RESOURCE_EXHAUSTED
+                   : grpc::StatusCode::UNIMPLEMENTED));
+    channel->Shutdown();
+    channel->Wait();
+    stub.reset();
+    channel.reset();
+    server.ShutdownGracefully(UINT64_C(1000000000));
+    server.Wait();
+  }
 }
 
 }  // namespace
@@ -308,5 +525,7 @@ int main() {
   partial_channel.Wait();
   partial_server.ShutdownGracefully(UINT64_C(1000000000));
   partial_server.Wait();
+  TestSynchronousService();
+  TestSynchronousErrors();
   return 0;
 }

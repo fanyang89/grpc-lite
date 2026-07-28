@@ -1,7 +1,7 @@
 #ifndef GRPCPP_CHANNEL_ARGUMENTS_H
 #define GRPCPP_CHANNEL_ARGUMENTS_H
 
-#include <grpc_lite/grpc_lite.hpp>
+#include <grpc_lite/cpp/channel.hpp>
 #include <grpcpp/support/status.h>
 
 #include <cmath>

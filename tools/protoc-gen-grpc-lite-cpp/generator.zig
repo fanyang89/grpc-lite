@@ -102,7 +102,7 @@ fn renderHeader(
     try writer.writeAll("\n#define ");
     try writeHeaderGuard(writer, header_name);
     try writer.print(
-        "\n\n#include \"{s}.pb.h\"\n\n#include <grpcpp/grpcpp.h>\n#include <grpcpp/impl/client_streaming_call.h>\n#include <grpcpp/impl/client_unary_call.h>\n\n#include <memory>\n\n",
+        "\n\n#include \"{s}.pb.h\"\n\n#include <grpc_lite/cpp/sync_service.hpp>\n#include <grpcpp/grpcpp.h>\n#include <grpcpp/impl/client_streaming_call.h>\n#include <grpcpp/impl/client_unary_call.h>\n\n#include <memory>\n\n",
         .{stem},
     );
     try openNamespaces(writer, file.package orelse "");
@@ -132,21 +132,26 @@ fn renderServiceDeclaration(
     try writer.writeAll(service_name);
     try writer.writeAll("\"; }\n\n  class StubInterface {\n   public:\n    virtual ~StubInterface() = default;\n");
     for (service.method.items) |method| {
-        try writeMethodDeclaration(writer, method, true);
+        try writeMethodDeclaration(writer, service, method, true);
     }
     try writer.writeAll("  };\n\n  class Stub final : public StubInterface {\n   public:\n    Stub(std::shared_ptr<::grpc::ChannelInterface> channel,\n         const ::grpc::StubOptions& options);\n");
     for (service.method.items) |method| {
-        try writeMethodDeclaration(writer, method, false);
+        try writeMethodDeclaration(writer, service, method, false);
     }
     try writer.writeAll("\n   private:\n    std::shared_ptr<::grpc::ChannelInterface> channel_;\n  };\n\n  static std::unique_ptr<Stub> NewStub(\n      const std::shared_ptr<::grpc::ChannelInterface>& channel,\n      const ::grpc::StubOptions& options = ::grpc::StubOptions());\n\n  // Methods run on reactor threads, must not block or throw, and must return\n  // promptly after dispatch. EventService must outlive its registered Server.\n  class EventService {\n   public:\n    virtual ~EventService() = default;\n    ::grpc_lite::Error Register(::grpc_lite::Server& server);\n");
-    for (service.method.items) |method| try writeEventMethodDeclaration(writer, method);
+    for (service.method.items) |method| try writeEventMethodDeclaration(writer, service, method);
     try writer.writeAll("\n   private:\n");
     for (service.method.items) |method| try writeRegistrationMember(writer, service, method);
-    try writer.writeAll("  };\n};\n\n");
+    try writer.writeAll("  };\n\n  class Service {\n   public:\n    virtual ~Service() = default;\n");
+    for (service.method.items) |method| try writeSynchronousMethodDeclaration(writer, service, method);
+    try writer.writeAll("\n    std::unique_ptr<");
+    try writeIdentifier(writer, service_name);
+    try writer.writeAll("::EventService> CreateEventService(\n        ::grpc_lite::ServerExecutor& executor,\n        ::grpc_lite::SynchronousServiceOptions options = {});\n  };\n};\n\n");
 }
 
 fn writeMethodDeclaration(
     writer: *std.Io.Writer,
+    service: ServiceDescriptorProto,
     method: MethodDescriptorProto,
     pure_virtual: bool,
 ) !void {
@@ -158,13 +163,13 @@ fn writeMethodDeclaration(
         try writer.writeAll("std::unique_ptr<::grpc::ClientReader<");
         try writeCppType(writer, output);
         try writer.writeAll(">> ");
-        try writeIdentifier(writer, name);
+        try writeMethodIdentifier(writer, service, name, .stub);
         try writer.writeAll("(\n        ::grpc::ClientContext* context,\n        const ");
         try writeCppType(writer, input);
         try writer.writeAll("& request)");
     } else {
         try writer.writeAll("::grpc::Status ");
-        try writeIdentifier(writer, name);
+        try writeMethodIdentifier(writer, service, name, .stub);
         try writer.writeAll("(\n        ::grpc::ClientContext* context,\n        const ");
         try writeCppType(writer, input);
         try writer.writeAll("& request,\n        ");
@@ -178,18 +183,37 @@ fn writeMethodDeclaration(
     }
 }
 
-fn writeEventMethodDeclaration(writer: *std.Io.Writer, method: MethodDescriptorProto) !void {
+fn writeEventMethodDeclaration(writer: *std.Io.Writer, service: ServiceDescriptorProto, method: MethodDescriptorProto) !void {
     const name = method.name orelse return error.MissingMethodName;
     const input = method.input_type orelse return error.MissingInputType;
     const output = method.output_type orelse return error.MissingOutputType;
     try writer.writeAll("    virtual void ");
-    try writeIdentifier(writer, name);
+    try writeMethodIdentifier(writer, service, name, .event);
     try writer.writeAll("(const ::grpc_lite::ServerContext& context, ");
     try writeCppType(writer, input);
     try writer.writeAll(" request, ::grpc_lite::");
     try writer.writeAll(if (method.server_streaming orelse false) "ServerStreamingCall<" else "UnaryCall<");
     try writeCppType(writer, output);
     try writer.writeAll("> call) noexcept = 0;\n");
+}
+
+fn writeSynchronousMethodDeclaration(writer: *std.Io.Writer, service: ServiceDescriptorProto, method: MethodDescriptorProto) !void {
+    const name = method.name orelse return error.MissingMethodName;
+    const input = method.input_type orelse return error.MissingInputType;
+    const output = method.output_type orelse return error.MissingOutputType;
+    try writer.writeAll("    virtual ::grpc::Status ");
+    try writeMethodIdentifier(writer, service, name, .synchronous);
+    try writer.writeAll("(::grpc::ServerContext* context, const ");
+    try writeCppType(writer, input);
+    try writer.writeAll("* request, ");
+    if (method.server_streaming orelse false) {
+        try writer.writeAll("::grpc::ServerWriter<");
+        try writeCppType(writer, output);
+        try writer.writeAll(">* writer);\n");
+    } else {
+        try writeCppType(writer, output);
+        try writer.writeAll("* response);\n");
+    }
 }
 
 fn writeRegistrationMember(
@@ -214,34 +238,7 @@ fn writeRegistrationIdentifier(
     service: ServiceDescriptorProto,
     method_name: []const u8,
 ) !void {
-    try writer.writeAll("grpc_lite_registration_");
-    try writeIdentifier(writer, method_name);
-    var suffix_len: usize = 1;
-    while (registrationIdentifierCollides(service, method_name, suffix_len)) {
-        suffix_len += 1;
-    }
-    try writer.splatByteAll('_', suffix_len);
-}
-
-fn registrationIdentifierCollides(
-    service: ServiceDescriptorProto,
-    method_name: []const u8,
-    suffix_len: usize,
-) bool {
-    const prefix = "grpc_lite_registration_";
-    const escaped_len: usize = if (isCppKeyword(method_name)) 1 else 0;
-    const candidate_len = prefix.len + method_name.len + escaped_len + suffix_len;
-    for (service.method.items) |method| {
-        const other = method.name orelse continue;
-        if (isCppKeyword(other) or other.len != candidate_len) continue;
-        if (!std.mem.startsWith(u8, other, prefix)) continue;
-        const name_end = prefix.len + method_name.len;
-        if (!std.mem.eql(u8, other[prefix.len..name_end], method_name)) continue;
-        for (other[name_end..]) |byte| {
-            if (byte != '_') break;
-        } else return true;
-    }
-    return false;
+    try writer.print("grpc_lite_registration_{d}_", .{methodIndex(service, method_name)});
 }
 
 fn renderSource(
@@ -288,7 +285,7 @@ fn renderServiceDefinition(
         }
         try writeIdentifier(writer, service_name);
         try writer.writeAll("::Stub::");
-        try writeIdentifier(writer, method_name);
+        try writeMethodIdentifier(writer, service, method_name, .stub);
         try writer.writeAll("(\n    ::grpc::ClientContext* context, const ");
         try writeCppType(writer, input);
         try writer.writeAll("& request");
@@ -341,10 +338,82 @@ fn renderServiceDefinition(
         try writer.writeAll(if (method.server_streaming orelse false) "ServerStreamingCall<" else "UnaryCall<");
         try writeCppType(writer, output);
         try writer.writeAll("> call) {\n        ");
-        try writeIdentifier(writer, method_name);
+        try writeMethodIdentifier(writer, service, method_name, .event);
         try writer.writeAll("(context, std::move(request), std::move(call));\n      });\n  if (!error.ok()) return error;\n");
     }
     try writer.writeAll("  return {};\n}\n\n");
+
+    for (service.method.items) |method| {
+        const method_name = method.name orelse return error.MissingMethodName;
+        const input = method.input_type orelse return error.MissingInputType;
+        const output = method.output_type orelse return error.MissingOutputType;
+        try writer.writeAll("::grpc::Status ");
+        try writeIdentifier(writer, service_name);
+        try writer.writeAll("::Service::");
+        try writeMethodIdentifier(writer, service, method_name, .synchronous);
+        try writer.writeAll("(::grpc::ServerContext* context, const ");
+        try writeCppType(writer, input);
+        try writer.writeAll("* request, ");
+        if (method.server_streaming orelse false) {
+            try writer.writeAll("::grpc::ServerWriter<");
+            try writeCppType(writer, output);
+            try writer.writeAll(">* writer)");
+        } else {
+            try writeCppType(writer, output);
+            try writer.writeAll("* response)");
+        }
+        try writer.writeAll(" {\n  (void)context;\n  (void)request;\n  (void)");
+        try writer.writeAll(if (method.server_streaming orelse false) "writer" else "response");
+        try writer.writeAll(";\n  return {::grpc::StatusCode::UNIMPLEMENTED, \"\"};\n}\n\n");
+    }
+
+    try writer.writeAll("std::unique_ptr<");
+    try writeIdentifier(writer, service_name);
+    try writer.writeAll("::EventService> ");
+    try writeIdentifier(writer, service_name);
+    try writer.writeAll("::Service::CreateEventService(\n    ::grpc_lite::ServerExecutor& executor,\n    ::grpc_lite::SynchronousServiceOptions options) {\n  class Adapter final : public ");
+    try writeIdentifier(writer, service_name);
+    try writer.writeAll("::EventService {\n   public:\n    Adapter(");
+    try writeIdentifier(writer, service_name);
+    try writer.writeAll("::Service& service, ::grpc_lite::ServerExecutor& executor,\n            ::grpc_lite::SynchronousServiceOptions options)\n        : service_(service), executor_(executor), options_(options) {}\n\n");
+    for (service.method.items) |method| {
+        const method_name = method.name orelse return error.MissingMethodName;
+        const input = method.input_type orelse return error.MissingInputType;
+        const output = method.output_type orelse return error.MissingOutputType;
+        try writer.writeAll("    void ");
+        try writeMethodIdentifier(writer, service, method_name, .event);
+        try writer.writeAll("(const ::grpc_lite::ServerContext& context, ");
+        try writeCppType(writer, input);
+        try writer.writeAll(" request, ::grpc_lite::");
+        try writer.writeAll(if (method.server_streaming orelse false) "ServerStreamingCall<" else "UnaryCall<");
+        try writeCppType(writer, output);
+        try writer.writeAll("> call) noexcept override {\n      ::grpc_lite::internal::");
+        try writer.writeAll(if (method.server_streaming orelse false) "DispatchServerStreaming" else "DispatchUnary");
+        try writer.writeAll("(\n          executor_, \"");
+        try writer.writeByte('/');
+        if (package.len != 0) try writer.print("{s}.", .{package});
+        try writer.print("{s}/{s}\", options_, context, std::move(request),\n          std::move(call), [service = &service_](::grpc::ServerContext* server_context,\n                                                const ", .{ service_name, method_name });
+        try writeCppType(writer, input);
+        try writer.writeAll("* typed_request, ");
+        if (method.server_streaming orelse false) {
+            try writer.writeAll("::grpc::ServerWriter<");
+            try writeCppType(writer, output);
+            try writer.writeAll(">* writer");
+        } else {
+            try writeCppType(writer, output);
+            try writer.writeAll("* response");
+        }
+        try writer.writeAll(") {\n            return service->");
+        try writeMethodIdentifier(writer, service, method_name, .synchronous);
+        try writer.writeAll("(server_context, typed_request, ");
+        try writer.writeAll(if (method.server_streaming orelse false) "writer" else "response");
+        try writer.writeAll(");\n          });\n    }\n\n");
+    }
+    try writer.writeAll("   private:\n    ");
+    try writeIdentifier(writer, service_name);
+    try writer.writeAll("::Service& service_;\n    ::grpc_lite::ServerExecutor& executor_;\n    ::grpc_lite::SynchronousServiceOptions options_;\n  };\n\n  return std::unique_ptr<");
+    try writeIdentifier(writer, service_name);
+    try writer.writeAll("::EventService>(new Adapter(*this, executor, options));\n}\n\n");
 }
 
 fn hasSupportedMethod(service: ServiceDescriptorProto) bool {
@@ -401,6 +470,104 @@ fn writeIdentifier(writer: *std.Io.Writer, identifier: []const u8) !void {
     if (isCppKeyword(identifier)) try writer.writeByte('_');
 }
 
+const MethodScope = enum { stub, event, synchronous };
+
+fn writeMethodIdentifier(
+    writer: *std.Io.Writer,
+    service: ServiceDescriptorProto,
+    identifier: []const u8,
+    scope: MethodScope,
+) !void {
+    try writeIdentifier(writer, identifier);
+    try writer.splatByteAll('_', methodSuffix(service, methodIndex(service, identifier), scope));
+}
+
+fn methodIndex(service: ServiceDescriptorProto, identifier: []const u8) usize {
+    for (service.method.items, 0..) |method, index| {
+        if (std.mem.eql(u8, method.name orelse continue, identifier)) return index;
+    }
+    unreachable;
+}
+
+fn methodSuffix(service: ServiceDescriptorProto, index: usize, scope: MethodScope) usize {
+    const identifier = service.method.items[index].name orelse unreachable;
+    var suffix: usize = 0;
+    while (true) : (suffix += 1) {
+        if (methodCollidesWithReserved(service, identifier, suffix, scope)) continue;
+        for (service.method.items[0..index], 0..) |previous, previous_index| {
+            const previous_name = previous.name orelse unreachable;
+            const candidate_len = renderedIdentifierLen(identifier, suffix);
+            const previous_base_len = renderedIdentifierLen(previous_name, 0);
+            if (candidate_len < previous_base_len) continue;
+            const required_previous_suffix = candidate_len - previous_base_len;
+            if (!renderedIdentifiersEqual(
+                identifier,
+                suffix,
+                previous_name,
+                required_previous_suffix,
+            )) continue;
+            if (required_previous_suffix ==
+                methodSuffix(service, previous_index, scope)) break;
+        } else return suffix;
+    }
+}
+
+fn methodCollidesWithReserved(
+    service: ServiceDescriptorProto,
+    identifier: []const u8,
+    suffix: usize,
+    scope: MethodScope,
+) bool {
+    const reserved: []const []const u8 = switch (scope) {
+        .stub => &.{ "StubInterface", "Stub" },
+        .event => &.{ "EventService", "Register" },
+        .synchronous => &.{ "Service", "CreateEventService" },
+    };
+    for (reserved) |name| {
+        if (renderedIdentifierEquals(identifier, suffix, name)) return true;
+    }
+    if (scope == .event) {
+        for (service.method.items, 0..) |_, registration_index| {
+            var buffer: [64]u8 = undefined;
+            const registration = std.fmt.bufPrint(
+                &buffer,
+                "grpc_lite_registration_{d}_",
+                .{registration_index},
+            ) catch unreachable;
+            if (renderedIdentifierEquals(identifier, suffix, registration)) return true;
+        }
+    }
+    return false;
+}
+
+fn renderedIdentifiersEqual(first: []const u8, first_suffix: usize, second: []const u8, second_suffix: usize) bool {
+    const first_len = renderedIdentifierLen(first, first_suffix);
+    if (first_len != renderedIdentifierLen(second, second_suffix)) return false;
+    for (0..first_len) |index| {
+        if (renderedIdentifierByte(first, first_suffix, index) !=
+            renderedIdentifierByte(second, second_suffix, index)) return false;
+    }
+    return true;
+}
+
+fn renderedIdentifierEquals(identifier: []const u8, suffix: usize, value: []const u8) bool {
+    if (renderedIdentifierLen(identifier, suffix) != value.len) return false;
+    for (value, 0..) |byte, index| {
+        if (renderedIdentifierByte(identifier, suffix, index) != byte) return false;
+    }
+    return true;
+}
+
+fn renderedIdentifierLen(identifier: []const u8, suffix: usize) usize {
+    return identifier.len + @intFromBool(isCppKeyword(identifier)) + suffix;
+}
+
+fn renderedIdentifierByte(identifier: []const u8, suffix: usize, index: usize) u8 {
+    _ = suffix;
+    if (index < identifier.len) return identifier[index];
+    return '_';
+}
+
 fn isCppKeyword(identifier: []const u8) bool {
     const keywords = [_][]const u8{
         "alignas",     "alignof",   "and",              "and_eq",       "asm",      "auto",         "bitand",    "bitor",    "bool",     "break",
@@ -447,6 +614,10 @@ test "generates unary and server streaming client and event service glue" {
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "virtual ::grpc::Status Echo(") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "std::unique_ptr<::grpc::ClientReader<::demo::EchoReply>> Watch(") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "virtual void Watch(const ::grpc_lite::ServerContext& context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "class Service") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "virtual ::grpc::Status Echo(::grpc::ServerContext* context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "::grpc::ServerWriter<::demo::EchoReply>* writer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "CreateEventService(") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "return \"demo.EchoService\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/demo.EchoService/Echo") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/demo.EchoService/Watch") != null);
@@ -547,7 +718,7 @@ test "escapes keywords in generated service methods and types" {
     try std.testing.expect(std.mem.indexOf(u8, header, "delete_(") != null);
 }
 
-test "registration members do not collide with method names" {
+test "registration members do not collide with event methods" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
@@ -555,7 +726,7 @@ test "registration members do not collide with method names" {
     try request.file_to_generate.append(allocator, "collision.proto");
     var file: FileDescriptorProto = .{ .name = "collision.proto" };
     var service: ServiceDescriptorProto = .{ .name = "CollisionService" };
-    inline for (.{ "Foo", "grpc_lite_registration_Foo_" }) |name| {
+    inline for (.{ "grpc_lite_registration_0_", "grpc_lite_registration_0__" }) |name| {
         try service.method.append(allocator, .{
             .name = name,
             .input_type = ".Request",
@@ -568,8 +739,37 @@ test "registration members do not collide with method names" {
     var response: plugin.CodeGeneratorResponse = .{};
     try generate(allocator, request, &response);
     const header = response.file.items[0].content.?;
-    try std.testing.expect(std.mem.indexOf(u8, header, "grpc_lite_registration_Foo__;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, header, "grpc_lite_registration_grpc_lite_registration_Foo__;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "grpc_lite_registration_0_;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "grpc_lite_registration_1_;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "virtual void grpc_lite_registration_0__(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "virtual void grpc_lite_registration_0___(") != null);
+}
+
+test "method identifiers are unique within each generated scope" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var service: ServiceDescriptorProto = .{ .name = "CollisionService" };
+    inline for (.{ "class", "class_", "Service", "Service_", "Register", "Register_", "EventService", "CreateEventService" }) |name| {
+        try service.method.append(allocator, .{
+            .name = name,
+            .input_type = ".Request",
+            .output_type = ".Reply",
+        });
+    }
+    const cases = .{
+        .{ .scope = MethodScope.stub, .expected = &.{ "class_", "class__", "Service", "Service_", "Register", "Register_", "EventService", "CreateEventService" } },
+        .{ .scope = MethodScope.event, .expected = &.{ "class_", "class__", "Service", "Service_", "Register_", "Register__", "EventService_", "CreateEventService" } },
+        .{ .scope = MethodScope.synchronous, .expected = &.{ "class_", "class__", "Service_", "Service__", "Register", "Register_", "EventService", "CreateEventService_" } },
+    };
+    inline for (cases) |case| {
+        inline for (case.expected, 0..) |expected, index| {
+            var output: std.Io.Writer.Allocating = .init(allocator);
+            defer output.deinit();
+            try writeMethodIdentifier(&output.writer, service, service.method.items[index].name.?, case.scope);
+            try std.testing.expectEqualStrings(expected, output.written());
+        }
+    }
 }
 
 test "rejects unsupported parameters" {

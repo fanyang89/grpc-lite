@@ -2,13 +2,68 @@
 #define GRPCPP_SUPPORT_SYNC_STREAM_H
 
 #include <grpcpp/impl/blocking_call.h>
+#include <grpcpp/server_context.h>
 
 #include <climits>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
 
 namespace grpc {
+
+namespace internal {
+template <class Response>
+class ServerWriterAccess;
+}
+
+template <class Response>
+class ServerWriter final {
+ public:
+  ServerWriter(const ServerWriter&) = delete;
+  ServerWriter& operator=(const ServerWriter&) = delete;
+
+  bool Write(const Response& response) {
+    while (!context_->IsCancelled()) {
+      const grpc_lite::Error error = try_write_(response);
+      if (error.ok()) return true;
+      if (error.code() != grpc_lite::ErrorCode::WouldBlock ||
+          !wait_for_writable_()) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+ private:
+  friend class internal::ServerWriterAccess<Response>;
+  ServerWriter(ServerContext* context,
+               std::function<grpc_lite::Error(const Response&)> try_write,
+               std::function<bool()> wait_for_writable)
+      : context_(context),
+        try_write_(std::move(try_write)),
+        wait_for_writable_(std::move(wait_for_writable)) {}
+
+  ServerContext* context_;
+  std::function<grpc_lite::Error(const Response&)> try_write_;
+  std::function<bool()> wait_for_writable_;
+};
+
+namespace internal {
+
+template <class Response>
+class ServerWriterAccess {
+ public:
+  static ServerWriter<Response> Create(
+      ServerContext* context,
+      std::function<grpc_lite::Error(const Response&)> try_write,
+      std::function<bool()> wait_for_writable) {
+    return ServerWriter<Response>(context, std::move(try_write),
+                                  std::move(wait_for_writable));
+  }
+};
+
+}  // namespace internal
 
 template <class Response>
 class ClientReader final {

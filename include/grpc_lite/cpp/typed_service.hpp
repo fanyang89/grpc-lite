@@ -38,7 +38,7 @@ class TypedCallState {
 
   Error SendInitialMetadata(const Metadata* metadata, Compression compression) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (terminal_) return Error(ErrorCode::Closed);
+    if (terminal_ || finish_submitted_) return Error(ErrorCode::Closed);
     if (initial_metadata_sent_) return Error(ErrorCode::InvalidState);
     const Error error = call_.SendInitialMetadata(metadata, compression);
     if (error.ok()) initial_metadata_sent_ = true;
@@ -47,7 +47,7 @@ class TypedCallState {
 
   Error Send(std::string payload, Compression compression) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (terminal_) return Error(ErrorCode::Closed);
+    if (terminal_ || finish_submitted_) return Error(ErrorCode::Closed);
     const Error metadata_error = EnsureInitialMetadata(compression);
     if (!metadata_error.ok()) return metadata_error;
     const Error error = call_.Send(payload, compression);
@@ -57,10 +57,12 @@ class TypedCallState {
 
   Error Finish(Status status, const Metadata* trailing_metadata) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (terminal_) return Error(ErrorCode::Closed);
+    if (terminal_ || finish_submitted_) return Error(ErrorCode::Closed);
     const Error metadata_error = EnsureInitialMetadata(Compression::Identity);
     if (!metadata_error.ok()) return metadata_error;
-    return call_.Finish(std::move(status), trailing_metadata);
+    const Error error = call_.Finish(std::move(status), trailing_metadata);
+    if (error.ok()) finish_submitted_ = true;
+    return error;
   }
 
   void SetOnWritable(std::function<void()> callback) {
@@ -155,6 +157,7 @@ class TypedCallState {
   bool writable_ = true;
   bool cancelled_ = false;
   bool terminal_ = false;
+  bool finish_submitted_ = false;
   bool initial_metadata_sent_ = false;
   std::optional<ServerTerminalReason> terminal_reason_;
 };

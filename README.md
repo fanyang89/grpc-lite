@@ -145,13 +145,13 @@ configuration.
 
 ## Synchronous C++ Facade
 
-The installed C++17 facade provides the common synchronous grpcpp client shape through
-`<grpcpp/grpcpp.h>`. It includes `Status`, `ClientContext`, `CreateChannel`, insecure
-credentials, and the internal blocking unary helper used by regenerated service glue.
-It does not provide grpcpp ABI compatibility or official generated glue.
+The installed C++17 facade provides the common synchronous grpcpp client and generated
+server shapes through `<grpcpp/grpcpp.h>`. It includes `Status`, contexts, channels,
+unary and server-streaming calls, and `ServerWriter<T>`. It does not provide grpcpp ABI
+compatibility or official generated glue.
 
 ```cmake
-find_package(grpc_lite 0.3 CONFIG REQUIRED)
+find_package(grpc_lite 0.4 CONFIG REQUIRED)
 target_link_libraries(app PRIVATE grpc_lite::grpcpp)
 ```
 
@@ -159,9 +159,18 @@ target_link_libraries(app PRIVATE grpc_lite::grpcpp)
 The initial facade accepts IPv4 targets; hostname channels require explicit Runtime
 ownership through the lower-level C ABI.
 
-The installed Zig protoc plugin generates synchronous unary service stubs alongside
-the standard protobuf C++ messages. Streaming-only services and streaming methods are
-omitted from this glue.
+The installed Zig protoc plugin generates synchronous unary and server-streaming stubs
+alongside the standard protobuf C++ messages. Generated services expose both the
+nonblocking `EventService` API and a grpcpp-shaped nested `Service` with virtual methods.
+Create a fresh adapter for each server instance with
+`service.CreateEventService(executor, options)`, register it before `Server::Start`, and
+keep the service, executor, and adapter alive until the server has stopped.
+Drain submitted executor work before destroying the service.
+
+`grpc_lite::ServerExecutor` is application-owned and has a method-aware `Submit` operation.
+It must enqueue without blocking; handlers may block only on executor threads. Executor
+rejection finishes the call with `RESOURCE_EXHAUSTED`. The facade does not create worker
+threads.
 
 ```bash
 protoc -I proto \
