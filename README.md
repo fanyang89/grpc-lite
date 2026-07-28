@@ -59,6 +59,7 @@ mise run test-tls
 mise run test-tls-tsan
 mise run test-consumer
 mise run test-consumer-cpp
+mise run transpile-c
 mise run prepare-network-deps
 mise run prepare-tls-deps
 mise run prepare-gperftools
@@ -138,20 +139,20 @@ target_link_libraries(shared_app PRIVATE grpc_lite::c)
 target_link_libraries(static_app PRIVATE grpc_lite::c_static)
 ```
 
-This source-build integration requires Zig 0.16.0 and currently supports Linux. Set
-`GRPC_LITE_ENABLE_TLS=ON` before `FetchContent_MakeAvailable` to enable TLS, or set
-`GRPC_LITE_ZIG_OPTIMIZE` to override the optimization mode derived from the CMake build
-configuration.
+The source-build integration compiles the checked-in C translation and does not require
+Zig. It currently supports insecure Linux x86_64 builds. Initialize nested submodules
+before configuring, and run `mise run transpile-c` after changing the Zig runtime or C++
+generator.
 
 ## Synchronous C++ Facade
 
-The installed C++17 facade provides the common synchronous grpcpp client and generated
+The C++17 facade provides the common synchronous grpcpp client and generated
 server shapes through `<grpcpp/grpcpp.h>`. It includes `Status`, contexts, channels,
 unary and server-streaming calls, and `ServerWriter<T>`. It does not provide grpcpp ABI
 compatibility or official generated glue.
 
 ```cmake
-find_package(grpc_lite 0.4 CONFIG REQUIRED)
+add_subdirectory(third_party/grpc-lite)
 target_link_libraries(app PRIVATE grpc_lite::grpcpp)
 ```
 

@@ -22,7 +22,18 @@ pub fn createProtocStep(
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const requested_target = b.standardTargetOptions(.{});
+    const transpile_c = b.option(bool, "transpile-c", "Emit the grpc-lite implementation as C source") orelse false;
+    const target = if (transpile_c) blk: {
+        var query = std.Target.Query.fromTarget(&requested_target.result);
+        query.ofmt = .c;
+        break :blk b.resolveTargetQuery(query);
+    } else requested_target;
+    const host_target = if (transpile_c) blk: {
+        var query = std.Target.Query.fromTarget(&b.graph.host.result);
+        query.ofmt = .c;
+        break :blk b.resolveTargetQuery(query);
+    } else b.graph.host;
     const optimize = b.standardOptimizeOption(.{});
     const sanitizers: Sanitizers = .{
         .thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer"),
@@ -47,7 +58,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const host_protobuf_dependency = b.dependency("protobuf", .{
-        .target = b.graph.host,
+        .target = host_target,
         .optimize = optimize,
     });
     const enable_tls = b.option(bool, "tls", "Enable TLS transport support through mbedTLS") orelse false;
@@ -153,13 +164,13 @@ pub fn build(b: *std.Build) void {
     );
     const protobuf_plugin = b.createModule(.{
         .root_source_file = plugin_schema_root,
-        .target = b.graph.host,
+        .target = host_target,
         .optimize = optimize,
         .imports = &.{.{ .name = "protobuf", .module = host_protobuf }},
     });
     const grpc_lite_cpp_plugin_module = b.createModule(.{
         .root_source_file = b.path("tools/protoc-gen-grpc-lite-cpp/main.zig"),
-        .target = b.graph.host,
+        .target = host_target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "protobuf", .module = host_protobuf },
@@ -170,7 +181,7 @@ pub fn build(b: *std.Build) void {
         .name = "protoc-gen-grpc_lite_cpp",
         .root_module = grpc_lite_cpp_plugin_module,
     });
-    b.installArtifact(grpc_lite_cpp_plugin);
+    if (!transpile_c) b.installArtifact(grpc_lite_cpp_plugin);
 
     const grpc_lite_cpp_plugin_test_module = b.createModule(.{
         .root_source_file = b.path("tools/protoc-gen-grpc-lite-cpp/generator.zig"),
@@ -264,6 +275,29 @@ pub fn build(b: *std.Build) void {
         .name = "grpc_lite",
         .root_module = grpc_lite,
     });
+    if (transpile_c) {
+        const install_c_source = b.addInstallFileWithDir(
+            library.getEmittedBin(),
+            .{ .custom = "src" },
+            "grpc_lite.c",
+        );
+        const install_plugin_source = b.addInstallFileWithDir(
+            grpc_lite_cpp_plugin.getEmittedBin(),
+            .{ .custom = "src" },
+            "protoc-gen-grpc_lite_cpp.c",
+        );
+        const zig_header_path = b.pathJoin(&.{ b.graph.zig_lib_directory.path.?, "zig.h" });
+        const install_zig_header = b.addInstallFileWithDir(
+            .{ .cwd_relative = zig_header_path },
+            .header,
+            "zig.h",
+        );
+        const transpile_c_step = b.step("transpile-c", "Emit the grpc-lite implementation as C source");
+        transpile_c_step.dependOn(&install_c_source.step);
+        transpile_c_step.dependOn(&install_plugin_source.step);
+        transpile_c_step.dependOn(&install_zig_header.step);
+        return;
+    }
     const shared_library = b.addLibrary(.{
         .name = "grpc_lite",
         .linkage = .dynamic,

@@ -19,6 +19,10 @@ run = "zig build"
 description = "Build grpc-lite with ReleaseSafe optimization"
 run = "zig build -Doptimize=ReleaseSafe"
 
+[tasks.transpile-c]
+description = "Regenerate C sources for CMake consumers"
+run = "tools/transpile_c.sh"
+
 [tasks.test]
 description = "Run all tests"
 run = "zig build test --summary all"

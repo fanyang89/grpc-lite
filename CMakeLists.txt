@@ -4,95 +4,81 @@ project(grpc_lite VERSION 0.4.0 LANGUAGES C)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "grpc-lite currently supports Linux only")
 endif()
-
-find_program(GRPC_LITE_ZIG_EXECUTABLE NAMES zig REQUIRED)
-execute_process(
-  COMMAND "${GRPC_LITE_ZIG_EXECUTABLE}" version
-  OUTPUT_VARIABLE GRPC_LITE_ZIG_VERSION
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-  COMMAND_ERROR_IS_FATAL ANY)
-if(GRPC_LITE_ZIG_VERSION VERSION_LESS 0.16.0)
-  message(FATAL_ERROR
-    "grpc-lite requires Zig 0.16.0 or newer; found ${GRPC_LITE_ZIG_VERSION}")
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  message(FATAL_ERROR "The checked-in grpc-lite C sources currently support x86_64 only")
 endif()
 
 find_package(Threads REQUIRED)
+include(FetchContent)
 
 option(GRPC_LITE_ENABLE_TLS "Enable TLS transport support through mbedTLS" OFF)
-set(GRPC_LITE_ZIG_OPTIMIZE "" CACHE STRING
-  "Override the Zig optimization mode (Debug, ReleaseSafe, ReleaseFast, ReleaseSmall)")
-set_property(CACHE GRPC_LITE_ZIG_OPTIMIZE PROPERTY STRINGS
-  "" Debug ReleaseSafe ReleaseFast ReleaseSmall)
-
 if(GRPC_LITE_ENABLE_TLS)
-  set(_grpc_lite_tls true)
-else()
-  set(_grpc_lite_tls false)
+  message(FATAL_ERROR "TLS is not yet available in the transpiled C source build")
 endif()
 
-get_property(_grpc_lite_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-if(_grpc_lite_multi_config)
-  set(_grpc_lite_prefix "${CMAKE_CURRENT_BINARY_DIR}/zig-out/$<CONFIG>")
-  set(_grpc_lite_cache_dir "${CMAKE_CURRENT_BINARY_DIR}/zig-cache/$<CONFIG>")
-else()
-  set(_grpc_lite_prefix "${CMAKE_CURRENT_BINARY_DIR}/zig-out")
-  set(_grpc_lite_cache_dir "${CMAKE_CURRENT_BINARY_DIR}/zig-cache")
+set(_grpc_lite_runtime_source "${CMAKE_CURRENT_SOURCE_DIR}/transpiled/src/grpc_lite.c")
+set(_grpc_lite_plugin_source
+  "${CMAKE_CURRENT_SOURCE_DIR}/transpiled/src/protoc-gen-grpc_lite_cpp.c")
+if(NOT EXISTS "${_grpc_lite_runtime_source}" OR NOT EXISTS "${_grpc_lite_plugin_source}")
+  message(FATAL_ERROR "grpc-lite transpiled sources are missing; run 'mise run transpile-c'")
 endif()
 
-if(GRPC_LITE_ZIG_OPTIMIZE)
-  set(_grpc_lite_optimize "${GRPC_LITE_ZIG_OPTIMIZE}")
-else()
-  set(_grpc_lite_optimize
-    "$<IF:$<CONFIG:Debug>,Debug,$<IF:$<CONFIG:Release>,ReleaseFast,$<IF:$<CONFIG:MinSizeRel>,ReleaseSmall,ReleaseSafe>>>")
-endif()
-
-set(_grpc_lite_static_library "${_grpc_lite_prefix}/lib/libgrpc_lite.a")
-set(_grpc_lite_shared_library "${_grpc_lite_prefix}/lib/libgrpc_lite.so")
-set(_grpc_lite_shared_soname "${_grpc_lite_prefix}/lib/libgrpc_lite.so.1")
-set(_grpc_lite_shared_real "${_grpc_lite_prefix}/lib/libgrpc_lite.so.1.0.0")
-
-add_custom_target(grpc_lite_zig_build
-  COMMAND "${CMAKE_COMMAND}" -E make_directory "${_grpc_lite_prefix}"
-  COMMAND "${GRPC_LITE_ZIG_EXECUTABLE}" build install-c-sdk
-    -Dprotobuf=false
-    "-Dtls=${_grpc_lite_tls}"
-    "-Doptimize=${_grpc_lite_optimize}"
-    --prefix "${_grpc_lite_prefix}"
-    --cache-dir "${_grpc_lite_cache_dir}"
-  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-  BYPRODUCTS
-    "${_grpc_lite_static_library}"
-    "${_grpc_lite_shared_library}"
-    "${_grpc_lite_shared_soname}"
-    "${_grpc_lite_shared_real}"
-  COMMENT "Building grpc-lite C libraries with Zig"
-  VERBATIM
-  USES_TERMINAL)
-
-function(_grpc_lite_set_imported_location target filename)
-  set_target_properties(${target} PROPERTIES
-    IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/zig-out/lib/${filename}")
-  if(_grpc_lite_multi_config)
-    foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
-      string(TOUPPER "${config}" config_upper)
-      set_target_properties(${target} PROPERTIES
-        "IMPORTED_LOCATION_${config_upper}"
-          "${CMAKE_CURRENT_BINARY_DIR}/zig-out/${config}/lib/${filename}")
-    endforeach()
+if(NOT TARGET nghttp2)
+  set(ENABLE_LIB_ONLY ON)
+  set(BUILD_SHARED_LIBS OFF)
+  set(BUILD_STATIC_LIBS ON)
+  set(BUILD_TESTING OFF)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nghttp2/CMakeLists.txt")
+    add_subdirectory(third_party/nghttp2 EXCLUDE_FROM_ALL)
+  else()
+    FetchContent_Declare(
+      grpc_lite_nghttp2
+      URL https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99
+      URL_HASH SHA256=3f042e5284ad349f837b65dd5be953b34c007a05259119092dbe6ebeaa73d306
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(grpc_lite_nghttp2)
   endif()
-endfunction()
+endif()
 
-add_library(grpc_lite_c SHARED IMPORTED GLOBAL)
-_grpc_lite_set_imported_location(grpc_lite_c "libgrpc_lite.so")
-set_target_properties(grpc_lite_c PROPERTIES
-  INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/include")
-add_dependencies(grpc_lite_c grpc_lite_zig_build)
+if(NOT TARGET c-ares::cares)
+  set(CARES_STATIC ON)
+  set(CARES_SHARED OFF)
+  set(CARES_INSTALL OFF)
+  set(CARES_BUILD_TESTS OFF)
+  set(CARES_BUILD_TOOLS OFF)
+  FetchContent_Declare(
+    grpc_lite_cares
+    URL https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz
+    URL_HASH SHA256=c222b6d681096f9444d2c4863d2c1174019e27cacca0a4a5c114d36dd7d7bf78
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(grpc_lite_cares)
+endif()
+
+add_library(grpc_lite_c STATIC
+  "${_grpc_lite_runtime_source}"
+  src/cpucycles_compat.c)
+target_compile_features(grpc_lite_c PRIVATE c_std_11)
+set_target_properties(grpc_lite_c PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED TRUE)
+target_include_directories(grpc_lite_c
+  PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/transpiled/include")
+target_link_libraries(grpc_lite_c
+  PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m rt
+  PRIVATE nghttp2 c-ares::cares)
 add_library(grpc_lite::c ALIAS grpc_lite_c)
+add_library(grpc_lite::c_static ALIAS grpc_lite_c)
 
-add_library(grpc_lite_c_static STATIC IMPORTED GLOBAL)
-_grpc_lite_set_imported_location(grpc_lite_c_static "libgrpc_lite.a")
-set_target_properties(grpc_lite_c_static PROPERTIES
-  INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/include"
-  INTERFACE_LINK_LIBRARIES "Threads::Threads;${CMAKE_DL_LIBS};m;rt")
-add_dependencies(grpc_lite_c_static grpc_lite_zig_build)
-add_library(grpc_lite::c_static ALIAS grpc_lite_c_static)
+add_library(grpc_lite_grpcpp INTERFACE)
+target_compile_features(grpc_lite_grpcpp INTERFACE cxx_std_17)
+target_include_directories(grpc_lite_grpcpp INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(grpc_lite_grpcpp INTERFACE grpc_lite_c)
+add_library(grpc_lite::grpcpp ALIAS grpc_lite_grpcpp)
+
+add_executable(grpc_lite_protoc_gen EXCLUDE_FROM_ALL "${_grpc_lite_plugin_source}")
+target_compile_features(grpc_lite_protoc_gen PRIVATE c_std_11)
+set_target_properties(grpc_lite_protoc_gen PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED TRUE)
+target_include_directories(grpc_lite_protoc_gen PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/transpiled/include")
+target_link_libraries(grpc_lite_protoc_gen PRIVATE Threads::Threads ${CMAKE_DL_LIBS} m rt)
+target_link_options(grpc_lite_protoc_gen PRIVATE -nostartfiles)
+set_target_properties(grpc_lite_protoc_gen PROPERTIES OUTPUT_NAME protoc-gen-grpc_lite_cpp)
+add_executable(grpc_lite::protoc-gen-grpc_lite_cpp ALIAS grpc_lite_protoc_gen)

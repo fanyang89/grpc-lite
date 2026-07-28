@@ -47,6 +47,7 @@
         "include",
         "src",
         "tools",
+        "transpiled",
         "examples",
         "tests",
         "proto",
