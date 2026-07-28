@@ -44,6 +44,7 @@
         "build.zig.zon",
         "CMakeLists.txt",
         "cmake",
+        "docs",
         "include",
         "src",
         "tools",
