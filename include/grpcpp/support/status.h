@@ -21,7 +21,8 @@ class Status {
   const std::string& error_message() const { return message_; }
   const std::string& error_details() const { return details_; }
 
-  static const Status OK;
+  static const Status& OK;
+  static const Status& CANCELLED;
 
  private:
   StatusCode code_ = StatusCode::OK;
@@ -29,7 +30,15 @@ class Status {
   std::string details_;
 };
 
-inline const Status Status::OK{};
+namespace internal {
+
+inline const Status kStatusOk{};
+inline const Status kStatusCancelled{StatusCode::CANCELLED, ""};
+
+}  // namespace internal
+
+inline const Status& Status::OK = internal::kStatusOk;
+inline const Status& Status::CANCELLED = internal::kStatusCancelled;
 
 }  // namespace grpc
 

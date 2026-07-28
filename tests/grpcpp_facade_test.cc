@@ -4,6 +4,7 @@
 #include <cassert>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -44,6 +45,12 @@ class UnsupportedCredentials final : public grpc::ChannelCredentials {};
 }  // namespace
 
 int main() {
+  static_assert(std::is_same_v<decltype(grpc::Status::OK), const grpc::Status&>);
+  static_assert(
+      std::is_same_v<decltype(grpc::Status::CANCELLED), const grpc::Status&>);
+  assert(grpc::Status::OK.ok());
+  assert(grpc::Status::CANCELLED.error_code() == grpc::StatusCode::CANCELLED);
+
   grpc::Status denied(grpc::StatusCode::PERMISSION_DENIED, "denied");
   assert(!denied.ok());
   assert(denied.error_code() == grpc::StatusCode::PERMISSION_DENIED);
