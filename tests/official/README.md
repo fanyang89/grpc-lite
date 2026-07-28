@@ -1,7 +1,7 @@
 # Official Interoperability
 
-The official test dependencies are pinned in `go.mod`, the grpc-proto submodule,
-and `third_party/grpc-http2-test`. Run the suites from the repository root:
+The official test dependencies are pinned in `go.mod`, `build.zig.zon`, and
+`third_party/grpc-http2-test`. Run the suites from the repository root:
 
 ```bash
 mise run interop-official

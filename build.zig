@@ -72,6 +72,10 @@ pub fn build(b: *std.Build) void {
         "gperftools",
         "Use tcmalloc and expose CPU and heap profiling APIs",
     ) orelse false;
+    const grpc_proto_dependency = if (enable_protobuf)
+        b.lazyDependency("grpc_proto", .{}) orelse return
+    else
+        null;
     if (target.result.os.tag != .linux) {
         @panic("DNS support is currently limited to Linux");
     }
@@ -556,6 +560,7 @@ pub fn build(b: *std.Build) void {
         b,
         protobuf_codegen,
         protobuf_dependency,
+        grpc_proto_dependency.?,
         protobuf,
         grpc_lite,
         test_step,
@@ -584,6 +589,7 @@ fn addProtobufSupport(
     b: *std.Build,
     comptime protobuf_build: type,
     protobuf_dependency: *std.Build.Dependency,
+    grpc_proto_dependency: *std.Build.Dependency,
     protobuf: *std.Build.Module,
     grpc_lite: *std.Build.Module,
     test_step: *std.Build.Step,
@@ -609,11 +615,11 @@ fn addProtobufSupport(
         .{
             .destination_directory = b.path(".zig-cache/generated-interop"),
             .source_files = &.{
-                b.path("third_party/grpc-proto/grpc/testing/empty.proto"),
-                b.path("third_party/grpc-proto/grpc/testing/messages.proto"),
-                b.path("third_party/grpc-proto/grpc/testing/test.proto"),
+                grpc_proto_dependency.path("grpc/testing/empty.proto"),
+                grpc_proto_dependency.path("grpc/testing/messages.proto"),
+                grpc_proto_dependency.path("grpc/testing/test.proto"),
             },
-            .include_directories = &.{b.path("third_party/grpc-proto")},
+            .include_directories = &.{grpc_proto_dependency.path("")},
         },
     );
     const generate_interop_proto_step = b.step(

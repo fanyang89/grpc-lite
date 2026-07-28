@@ -20,7 +20,6 @@ mise run test-tsan
 mise run test-ubsan
 mise run test-consumer
 mise run test-consumer-cpp
-mise run prepare-network-deps
 mise run prepare-gperftools
 mise run build-gperftools
 mise run test-gperftools

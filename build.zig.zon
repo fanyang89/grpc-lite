@@ -33,6 +33,11 @@
             .url = "https://github.com/Arwalk/zig-protobuf/archive/b794f99323cead7f1794ae68554d0311cc309857.tar.gz",
             .hash = "protobuf-5.0.0-0e82ahZiKwC5Yrh4psANoUzrV_H4CQU1EsOIY9Zdyap_",
         },
+        .grpc_proto = .{
+            .url = "https://codeload.github.com/grpc/grpc-proto/tar.gz/99135b19189588fcc787acb84cff27991787473d",
+            .hash = "N-V-__8AAMvUAgBnxziu_Kuqr4AuJ00Vke6R0R-Rc1A26DRX",
+            .lazy = true,
+        },
         .gperftools = .{
             .url = "https://codeload.github.com/fanyang89/gperftools/tar.gz/1a01cd2cf8f7000845d343fa8e0bbac70378858b",
             .hash = "N-V-__8AAGKVkABvsDVHhSU8seHKvtJ8Q23b9Y0OMiFVWt-y",

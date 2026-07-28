@@ -170,3 +170,8 @@ if [[ -e "$protobuf_path" || -L "$protobuf_path" ]]; then
     printf '%s\n' 'raw consumer unexpectedly resolved zig-protobuf' >&2
     exit 1
 fi
+grpc_proto_path="$consumer/zig-pkg/N-V-__8AAMvUAgBnxziu_Kuqr4AuJ00Vke6R0R-Rc1A26DRX"
+if [[ -e "$grpc_proto_path" || -L "$grpc_proto_path" ]]; then
+    printf '%s\n' 'raw consumer unexpectedly resolved grpc-proto' >&2
+    exit 1
+fi
