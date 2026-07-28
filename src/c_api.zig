@@ -3,6 +3,7 @@ const build_options = @import("grpc_lite_options");
 const call = @import("call.zig");
 const channel = @import("channel.zig");
 const Compression = @import("compression.zig").Compression;
+const event_logger = @import("logger.zig");
 const metadata = @import("metadata.zig");
 const Runtime = @import("runtime.zig").Runtime;
 const raw_stream = @import("stream.zig");
@@ -13,7 +14,7 @@ const Status = @import("status.zig").Status;
 const version = @import("version.zig");
 
 pub const abi_major: u16 = 1;
-pub const abi_minor: u16 = 3;
+pub const abi_minor: u16 = 4;
 
 pub const Error = enum(i32) {
     ok = 0,
@@ -38,11 +39,15 @@ pub const Feature = struct {
     pub const c_streaming: u64 = 1 << 6;
     pub const c_server: u64 = 1 << 7;
     pub const managed_channel: u64 = 1 << 8;
+    pub const logging_callback: u64 = 1 << 9;
 };
 
-pub const BytesView = extern struct {
-    data: ?[*]const u8 = null,
-    size: usize = 0,
+pub const BytesView = event_logger.BytesView;
+
+pub const Logger = extern struct {
+    struct_size: usize = @sizeOf(Logger),
+    user_data: ?*anyopaque = null,
+    log: ?event_logger.Callback = null,
 };
 
 pub const MetadataEntryView = extern struct {
@@ -77,6 +82,7 @@ pub const ChannelOptions = extern struct {
     max_backoff_ns: u64 = 120 * std.time.ns_per_s,
     multiplier_millis: u32 = 1600,
     jitter_percent: u32 = 20,
+    logger: ?*const Logger = null,
 };
 
 pub const ClientStreamOptions = extern struct {
@@ -108,6 +114,7 @@ pub const ServerOptions = extern struct {
     max_message_size: u64 = call.default_max_message_size,
     max_inbound_buffer_size: u64 = 8 * 1024 * 1024,
     max_outbound_buffer_size: u64 = 8 * 1024 * 1024,
+    logger: ?*const Logger = null,
 };
 
 pub const ServerMethodOptions = extern struct {
@@ -165,6 +172,11 @@ const channel_options_v1_size = @offsetOf(ChannelOptions, "jitter_percent") + @s
 
 const allocator = std.heap.c_allocator;
 
+const ChannelCreateOptions = struct {
+    reconnect: ?channel.ReconnectOptions = null,
+    logger: event_logger.Logger = .{},
+};
+
 pub fn grpc_lite_abi_version() callconv(.c) u32 {
     return (@as(u32, abi_major) << 16) | abi_minor;
 }
@@ -181,7 +193,8 @@ pub fn grpc_lite_features() callconv(.c) u64 {
         Feature.graceful_server_drain |
         Feature.c_streaming |
         Feature.c_server |
-        Feature.managed_channel;
+        Feature.managed_channel |
+        Feature.logging_callback;
     if (build_options.tls) features |= Feature.tls;
     return features;
 }
@@ -302,7 +315,7 @@ pub fn grpc_lite_channel_create(
     target: BytesView,
     out_channel: ?*?*ChannelHandle,
 ) callconv(.c) Error {
-    return createChannel(runtime_handle, target, null, out_channel);
+    return createChannel(runtime_handle, target, .{}, out_channel);
 }
 
 pub fn grpc_lite_channel_create_managed(
@@ -311,17 +324,17 @@ pub fn grpc_lite_channel_create_managed(
     options_pointer: ?*const ChannelOptions,
     out_channel: ?*?*ChannelHandle,
 ) callconv(.c) Error {
-    const reconnect = parseChannelOptions(options_pointer) orelse {
+    const options = parseChannelOptions(options_pointer) orelse {
         if (out_channel) |output| output.* = null;
         return .invalid_argument;
     };
-    return createChannel(runtime_handle, target, reconnect, out_channel);
+    return createChannel(runtime_handle, target, options, out_channel);
 }
 
 fn createChannel(
     runtime_handle: ?*RuntimeHandle,
     target: BytesView,
-    reconnect: ?channel.ReconnectOptions,
+    options: ChannelCreateOptions,
     out_channel: ?*?*ChannelHandle,
 ) Error {
     const output = out_channel orelse return .invalid_argument;
@@ -331,7 +344,8 @@ fn createChannel(
     errdefer allocator.destroy(storage);
     storage.value = channel.Channel.init(allocator, target_bytes, .{
         .runtime = if (runtime_handle) |handle| &runtimeStorage(handle).value else null,
-        .reconnect = reconnect,
+        .reconnect = options.reconnect,
+        .logger = options.logger,
     }) catch |err| return switch (err) {
         error.OutOfMemory => .out_of_memory,
         error.InvalidTarget, error.InvalidReconnectOptions => .invalid_argument,
@@ -1008,8 +1022,8 @@ fn parseUnaryOptions(pointer: ?*const UnaryOptions) ?call.Options {
     };
 }
 
-fn parseChannelOptions(pointer: ?*const ChannelOptions) ?channel.ReconnectOptions {
-    const value = pointer orelse return .{};
+fn parseChannelOptions(pointer: ?*const ChannelOptions) ?ChannelCreateOptions {
+    const value = pointer orelse return .{ .reconnect = .{} };
     if (value.struct_size < channel_options_v1_size or
         value.allow_initial_offline > 1 or
         value.initial_backoff_ns == 0 or
@@ -1017,11 +1031,17 @@ fn parseChannelOptions(pointer: ?*const ChannelOptions) ?channel.ReconnectOption
         value.multiplier_millis < 1000 or
         value.jitter_percent > 100) return null;
     return .{
-        .allow_initial_offline = value.allow_initial_offline == 1,
-        .initial_backoff_ns = value.initial_backoff_ns,
-        .max_backoff_ns = value.max_backoff_ns,
-        .multiplier_millis = value.multiplier_millis,
-        .jitter_percent = @intCast(value.jitter_percent),
+        .reconnect = .{
+            .allow_initial_offline = value.allow_initial_offline == 1,
+            .initial_backoff_ns = value.initial_backoff_ns,
+            .max_backoff_ns = value.max_backoff_ns,
+            .multiplier_millis = value.multiplier_millis,
+            .jitter_percent = @intCast(value.jitter_percent),
+        },
+        .logger = if (value.struct_size >= @sizeOf(ChannelOptions))
+            parseLogger(value.logger) orelse return null
+        else
+            .{},
     };
 }
 
@@ -1078,7 +1098,17 @@ fn parseServerOptions(pointer: ?*const ServerOptions) ?@import("server.zig").Opt
             .max_inbound_buffer_size = @intCast(value.max_inbound_buffer_size),
             .max_outbound_buffer_size = @intCast(value.max_outbound_buffer_size),
         },
+        .logger = if (value.struct_size >= @sizeOf(ServerOptions))
+            parseLogger(value.logger) orelse return null
+        else
+            .{},
     };
+}
+
+fn parseLogger(pointer: ?*const Logger) ?event_logger.Logger {
+    const value = pointer orelse return .{};
+    if (value.struct_size < @sizeOf(Logger) or value.log == null) return null;
+    return .{ .context = value.user_data, .callback = value.log };
 }
 
 fn parseServerMethodOptions(pointer: ?*const ServerMethodOptions) ?ServerMethodOptions {
@@ -1117,6 +1147,7 @@ test "C ABI reports version and build features" {
     try std.testing.expectEqualStrings(version.string, std.mem.span(grpc_lite_library_version()));
     try std.testing.expect(grpc_lite_features() & Feature.streaming != 0);
     try std.testing.expect(grpc_lite_features() & Feature.managed_channel != 0);
+    try std.testing.expect(grpc_lite_features() & Feature.logging_callback != 0);
     try std.testing.expectEqualStrings(
         "invalid argument",
         std.mem.span(grpc_lite_error_string(@intFromEnum(Error.invalid_argument))),
@@ -1141,6 +1172,72 @@ test "C managed channel options have stable layout and defaults" {
     try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_s), options.max_backoff_ns);
     try std.testing.expectEqual(@as(u32, 1600), options.multiplier_millis);
     try std.testing.expectEqual(@as(u32, 20), options.jitter_percent);
+    try std.testing.expectEqual(null, options.logger);
+}
+
+test "C logger validates layout and channel option compatibility" {
+    const Callback = struct {
+        fn log(_: ?*anyopaque, _: u32, _: BytesView) callconv(.c) void {}
+    };
+    var logger: Logger = .{ .log = Callback.log };
+    try std.testing.expectEqual(@sizeOf(Logger), logger.struct_size);
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Logger, "struct_size"));
+    try std.testing.expectEqual(@sizeOf(usize), @offsetOf(Logger, "user_data"));
+
+    var options: ChannelOptions = .{ .logger = &logger };
+    const parsed = parseChannelOptions(&options).?;
+    try std.testing.expect(parsed.logger.callback != null);
+
+    options.struct_size = channel_options_v1_size;
+    try std.testing.expect(parseChannelOptions(&options).?.logger.callback == null);
+
+    options.struct_size = @sizeOf(ChannelOptions);
+    logger.struct_size = @sizeOf(Logger) - 1;
+    try std.testing.expectEqual(null, parseChannelOptions(&options));
+
+    logger.struct_size = @sizeOf(Logger);
+    var server_options: ServerOptions = .{ .logger = &logger };
+    try std.testing.expect(parseServerOptions(&server_options).?.logger.callback != null);
+    server_options.struct_size = server_options_v1_size;
+    try std.testing.expect(parseServerOptions(&server_options).?.logger.callback == null);
+    server_options.struct_size = @sizeOf(ServerOptions);
+    logger.struct_size = @sizeOf(Logger) - 1;
+    try std.testing.expectEqual(null, parseServerOptions(&server_options));
+}
+
+test "C server reports ordered lifecycle logs" {
+    const Capture = struct {
+        state: std.atomic.Value(u8) = .init(0),
+
+        fn log(context: ?*anyopaque, _: u32, message: BytesView) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            const text = bytes(message) orelse return;
+            const expected: ?struct { before: u8, after: u8 } = if (std.mem.indexOf(u8, text, "server started") != null)
+                .{ .before = 0, .after = 1 }
+            else if (std.mem.indexOf(u8, text, "server drain requested") != null)
+                .{ .before = 1, .after = 2 }
+            else if (std.mem.indexOf(u8, text, "server stopped") != null)
+                .{ .before = 2, .after = 3 }
+            else
+                null;
+            if (expected) |transition| {
+                if (self.state.cmpxchgStrong(transition.before, transition.after, .acq_rel, .acquire) != null) {
+                    self.state.store(255, .release);
+                }
+            }
+        }
+    };
+
+    var capture: Capture = .{};
+    const logger: Logger = .{ .user_data = &capture, .log = Capture.log };
+    const options: ServerOptions = .{ .logger = &logger };
+    var handle: ?*ServerHandle = null;
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_create(&options, &handle));
+    defer grpc_lite_server_destroy(handle);
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_start(handle));
+    grpc_lite_server_shutdown_gracefully(handle, std.time.ns_per_s);
+    grpc_lite_server_wait(handle);
+    try std.testing.expectEqual(@as(u8, 3), capture.state.load(.acquire));
 }
 
 test "C managed channel validates options and clears outputs" {
@@ -1192,6 +1289,20 @@ test "C managed channel validates options and clears outputs" {
 }
 
 test "C managed channel may start before its endpoint" {
+    const Capture = struct {
+        saw_reconnect: std.atomic.Value(bool) = .init(false),
+
+        fn log(context: ?*anyopaque, level: u32, message: BytesView) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            const text = bytes(message) orelse return;
+            if (level == @intFromEnum(event_logger.Level.debug) and
+                std.mem.indexOf(u8, text, "channel reconnect scheduled") != null)
+            {
+                self.saw_reconnect.store(true, .release);
+            }
+        }
+    };
+
     var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var reservation = try address.listen(std.testing.io, .{});
     var local_address: std.posix.sockaddr.in = undefined;
@@ -1206,11 +1317,14 @@ test "C managed channel may start before its endpoint" {
 
     var target_buffer: [32]u8 = undefined;
     const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{port});
+    var capture: Capture = .{};
+    const logger: Logger = .{ .user_data = &capture, .log = Capture.log };
     const options: ChannelOptions = .{
         .allow_initial_offline = 1,
         .initial_backoff_ns = std.time.ns_per_hour,
         .max_backoff_ns = std.time.ns_per_hour,
         .jitter_percent = 0,
+        .logger = &logger,
     };
     var handle: ?*ChannelHandle = null;
     try std.testing.expectEqual(Error.ok, grpc_lite_channel_create_managed(
@@ -1219,6 +1333,11 @@ test "C managed channel may start before its endpoint" {
         &options,
         &handle,
     ));
+    var attempts: usize = 0;
+    while (!capture.saw_reconnect.load(.acquire) and attempts < 1000) : (attempts += 1) {
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(capture.saw_reconnect.load(.acquire));
     grpc_lite_channel_shutdown(handle);
     grpc_lite_channel_wait(handle);
     grpc_lite_channel_destroy(handle);

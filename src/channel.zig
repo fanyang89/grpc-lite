@@ -11,6 +11,7 @@ const fast_clock = @import("fast_clock.zig");
 const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
+const event_logger = @import("logger.zig");
 const socket_options = @import("socket_options.zig");
 const status = @import("status.zig");
 const stream = @import("stream.zig");
@@ -84,6 +85,7 @@ const ChannelOptions = struct {
     runtime: ?*Runtime = null,
     tls: ?TlsOptions = null,
     reconnect: ?ReconnectOptions = null,
+    logger: event_logger.Logger = .{},
 };
 
 pub const Options = ChannelOptions;
@@ -225,6 +227,7 @@ pub const Channel = struct {
             .reconnect_options = options.reconnect,
             .reconnect_backoff_ns = if (options.reconnect) |reconnect| reconnect.initial_backoff_ns else 0,
             .reconnect_random_state = std.hash.Wyhash.hash(nowNs(), target),
+            .logger = options.logger,
             .async_handle = undefined,
             .deadline_timer = undefined,
         };
@@ -394,7 +397,10 @@ pub const Channel = struct {
             notify = true;
         }
         impl.mutex.unlock(syncIo());
-        if (notify) impl.async_handle.notify() catch {};
+        if (notify) {
+            impl.logger.write(.info, "channel shutdown requested target={s}", .{impl.authority});
+            impl.async_handle.notify() catch {};
+        }
     }
 
     /// Waits for the channel event loop after shutdown.
@@ -491,6 +497,7 @@ const Impl = struct {
     reconnect_backoff_pending_reset: bool = false,
     ever_active: bool = false,
     reconnect_random_state: u64,
+    logger: event_logger.Logger,
     tls_handshake_needs_write: bool = false,
     tls_session: ?*tls_record.Session = null,
     tls_plaintext: ?[]u8 = null,
@@ -1427,6 +1434,7 @@ const CleartextWriteBatch = struct {
 
 fn runLoop(impl: *Impl) void {
     impl.loop = xev.Loop.init(.{}) catch {
+        impl.logger.write(.err, "channel event loop initialization failed target={s}", .{impl.authority});
         impl.signalStartup(false);
         impl.markStopped();
         return;
@@ -1434,6 +1442,7 @@ fn runLoop(impl: *Impl) void {
     impl.loop_initialized = true;
     if (impl.literal_address == null) {
         impl.resolver.init(impl.allocator, &impl.loop) catch {
+            impl.logger.write(.err, "channel resolver initialization failed target={s}", .{impl.authority});
             impl.signalStartup(false);
             impl.loop.deinit();
             impl.loop_initialized = false;
@@ -1449,7 +1458,8 @@ fn runLoop(impl: *Impl) void {
     startConnection(impl) catch {
         scheduleReconnect(impl, "connection failed");
     };
-    impl.loop.run(.until_done) catch {
+    impl.loop.run(.until_done) catch |err| {
+        impl.logger.write(.err, "channel event loop failed target={s} error={s}", .{ impl.authority, @errorName(err) });
         beginStop(impl, "event loop failed");
         impl.loop.run(.until_done) catch @panic("event loop failed while stopping");
     };
@@ -1633,6 +1643,7 @@ fn activateConnection(impl: *Impl) !void {
     impl.accepting_streams = true;
     impl.mutex.unlock(syncIo());
     impl.ever_active = true;
+    impl.logger.write(.info, "channel connected target={s}", .{impl.authority});
     impl.reconnect_backoff_pending_reset = impl.reconnect_attempt != 0;
     impl.signalStartup(true);
     processPending(impl);
@@ -2674,6 +2685,11 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
     }
     if (native_frame.*.hd.type == c.NGHTTP2_GOAWAY) {
         if (impl.connection_state == .active) {
+            impl.logger.write(
+                .info,
+                "channel received GOAWAY target={s} last_stream_id={d} error_code={d}",
+                .{ impl.authority, native_frame.*.goaway.last_stream_id, native_frame.*.goaway.error_code },
+            );
             impl.connection_state = .draining;
             impl.mutex.lockUncancelable(syncIo());
             impl.accepting_streams = false;
@@ -2929,11 +2945,13 @@ fn beginReconnect(impl: *Impl) void {
 fn handleTransportFailure(impl: *Impl, reason: []const u8) void {
     if (impl.stopping_on_loop or impl.connection_state == .closing or impl.connection_state == .backing_off) return;
     if (!canReconnect(impl)) {
+        impl.logger.write(.err, "channel stopped target={s} reason={s}", .{ impl.authority, reason });
         beginStop(impl, reason);
         return;
     }
 
     impl.connection_state = .closing;
+    impl.logger.write(.warn, "channel connection lost target={s} reason={s}", .{ impl.authority, reason });
     impl.reconnect_after_close = true;
     impl.connected = false;
     clearResolvedAddresses(impl);
@@ -3017,7 +3035,13 @@ fn scheduleReconnect(impl: *Impl, reason: []const u8) void {
     impl.reconnect_backoff_ns = nextReconnectBackoffNs(options, impl.reconnect_backoff_ns);
     impl.reconnect_attempt +|= 1;
     const deadline = nowNs() +| delay;
+    impl.logger.write(
+        .debug,
+        "channel reconnect scheduled target={s} attempt={d} delay_ns={d} reason={s}",
+        .{ impl.authority, impl.reconnect_attempt, delay, reason },
+    );
     deadlineHeapInsertOrUpdate(impl, .{ .reconnect = impl }, deadline) catch {
+        impl.logger.write(.err, "channel reconnect scheduling failed target={s}", .{impl.authority});
         beginStop(impl, "reconnect scheduling failed");
         return;
     };
@@ -3675,6 +3699,7 @@ fn initTestImpl(impl: *Impl, serialized_allocator: *SerializedAllocator, host: [
         .reconnect_options = null,
         .reconnect_backoff_ns = 0,
         .reconnect_random_state = 1,
+        .logger = .{},
     };
     impl.allocator = serialized_allocator.allocator();
 }

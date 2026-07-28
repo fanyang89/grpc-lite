@@ -9,6 +9,15 @@ static grpc_lite_bytes_view bytes(const void *data, size_t size) {
   return value;
 }
 
+static void on_log(
+    void *user_data,
+    uint32_t level,
+    grpc_lite_bytes_view message) {
+  (void)user_data;
+  (void)level;
+  (void)message;
+}
+
 static uint32_t on_message(
     void *user_data,
     grpc_lite_client_stream *stream,
@@ -51,6 +60,7 @@ static uint32_t on_server_message(
 int main(void) {
   grpc_lite_unary_options options = GRPC_LITE_UNARY_OPTIONS_INIT;
   grpc_lite_channel_options channel_options = GRPC_LITE_CHANNEL_OPTIONS_INIT;
+  grpc_lite_logger logger = GRPC_LITE_LOGGER_INIT;
   grpc_lite_client_stream_options stream_options =
       GRPC_LITE_CLIENT_STREAM_OPTIONS_INIT;
   grpc_lite_client_stream_callbacks callbacks =
@@ -63,8 +73,12 @@ int main(void) {
   callbacks.on_message = on_message;
   callbacks.on_terminal = on_terminal;
   method_callbacks.on_message = on_server_message;
+  logger.log = on_log;
+  channel_options.logger = &logger;
+  server_options.logger = &logger;
   assert(options.struct_size == sizeof(options));
   assert(channel_options.struct_size == sizeof(channel_options));
+  assert(logger.struct_size == sizeof(logger));
   assert(stream_options.struct_size == sizeof(stream_options));
   assert(callbacks.struct_size == sizeof(callbacks));
   assert(server_options.struct_size == sizeof(server_options));
@@ -90,6 +104,7 @@ int main(void) {
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_C_STREAMING) == 0) return 11;
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_C_SERVER) == 0) return 12;
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_MANAGED_CHANNEL) == 0) return 13;
+  if ((grpc_lite_features() & GRPC_LITE_FEATURE_LOGGING_CALLBACK) == 0) return 14;
   if (grpc_lite_metadata_create(&metadata) != GRPC_LITE_OK) return 4;
   if (grpc_lite_metadata_add(
           metadata,

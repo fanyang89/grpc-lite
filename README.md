@@ -110,6 +110,12 @@ initialization must happen before application threads are created and must outli
 dependent handles. C and C++ compile/link smoke tests run as part of `zig build test`;
 the grpcpp-shaped facade builds on this ABI in later stages.
 
+Channel and Server options accept an optional `grpc_lite_logger`. It reports transport
+lifecycle events such as connection recovery, GOAWAY, startup, and graceful drain.
+Callbacks run synchronously on API caller or transport threads and may run concurrently.
+Logger configuration is borrowed during handle creation, while its user data must
+outlive the owning handle.
+
 `grpc_lite_channel_create_managed` creates a durable Channel. Set
 `allow_initial_offline` when creation must return before the first connection succeeds.
 The Channel reconnects after transport failures without replaying submitted RPCs.

@@ -9,6 +9,7 @@ const fast_clock = @import("fast_clock.zig");
 const frame = @import("frame.zig");
 const message = @import("message.zig");
 const metadata = @import("metadata.zig");
+const event_logger = @import("logger.zig");
 const service = @import("service.zig");
 const socket_options = @import("socket_options.zig");
 const status = @import("status.zig");
@@ -220,6 +221,7 @@ pub const Options = struct {
     write_high_watermark_bytes: usize = 1024 * 1024,
     write_low_watermark_bytes: usize = 512 * 1024,
     tls: ?TlsOptions = null,
+    logger: event_logger.Logger = .{},
 };
 
 pub const LocalAddress = struct {
@@ -345,8 +347,28 @@ pub const Server = struct {
             .graceful => .draining,
             .immediate => .stopping,
         };
+        const log_drain = coordinator.state == .draining;
+        const drain_timeout_ns = coordinator.drain_timeout_ns;
+        coordinator.log_mutex.lockUncancelable(coordinator.io());
         coordinator.condition.broadcast(coordinator.io());
         coordinator.unlock();
+        self.impl.logger.write(
+            .info,
+            "server started address={s}:{d}",
+            .{ self.impl.local_host[0..self.impl.local_host_len], self.impl.local_port },
+        );
+        if (log_drain) {
+            self.impl.logger.write(
+                .info,
+                "server drain requested address={s}:{d} timeout_ns={d}",
+                .{
+                    self.impl.local_host[0..self.impl.local_host_len],
+                    self.impl.local_port,
+                    drain_timeout_ns,
+                },
+            );
+        }
+        coordinator.log_mutex.unlock(coordinator.io());
     }
 
     pub fn localAddress(self: *const Server) !LocalAddress {
@@ -380,8 +402,18 @@ pub const Server = struct {
         coordinator.unlock();
         for (coordinator.reactors[0..launched_count]) |reactor| waitForReactor(reactor);
         coordinator.lock();
-        if (coordinator.state != .initialized) coordinator.state = .stopped;
+        const log_stopped = coordinator.state != .initialized and coordinator.state != .stopped;
+        if (log_stopped) coordinator.state = .stopped;
+        if (log_stopped) coordinator.log_mutex.lockUncancelable(coordinator.io());
         coordinator.unlock();
+        if (log_stopped) {
+            self.impl.logger.write(
+                .info,
+                "server stopped address={s}:{d}",
+                .{ self.impl.local_host[0..self.impl.local_host_len], self.impl.local_port },
+            );
+            coordinator.log_mutex.unlock(coordinator.io());
+        }
     }
 
     pub fn deinit(self: *Server) void {
@@ -400,9 +432,16 @@ pub const Server = struct {
     fn requestShutdown(self: *Server, request: ShutdownRequest, timeout_ns: u64) void {
         const coordinator = self.coordinator;
         coordinator.lock();
+        var log_drain = false;
         switch (coordinator.state) {
             .initialized => coordinator.state = .stopped,
-            .starting, .running => coordinator.state = if (request == .graceful) .draining else .stopping,
+            .starting => {
+                coordinator.state = if (request == .graceful) .draining else .stopping;
+            },
+            .running => {
+                coordinator.state = if (request == .graceful) .draining else .stopping;
+                log_drain = request == .graceful;
+            },
             .draining => {
                 if (request == .immediate) coordinator.state = .stopping;
             },
@@ -414,7 +453,17 @@ pub const Server = struct {
         }
         const launched_count = coordinator.launched_count;
         const initialized = coordinator.state == .stopped and !coordinator.start_in_progress and launched_count == 0;
+        if (log_drain) coordinator.log_mutex.lockUncancelable(coordinator.io());
         coordinator.unlock();
+
+        if (log_drain) {
+            self.impl.logger.write(
+                .info,
+                "server drain requested address={s}:{d} timeout_ns={d}",
+                .{ self.impl.local_host[0..self.impl.local_host_len], self.impl.local_port, timeout_ns },
+            );
+            coordinator.log_mutex.unlock(coordinator.io());
+        }
 
         if (initialized) {
             for (coordinator.reactors) |reactor| shutdownReactor(reactor, request, timeout_ns);
@@ -496,6 +545,7 @@ const Coordinator = struct {
     reactors: []*Impl,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
+    log_mutex: std.Io.Mutex = .init,
     state: State = .initialized,
     shutdown_request: ShutdownRequest = .none,
     drain_timeout_ns: u64 = 0,
@@ -541,6 +591,7 @@ const Impl = struct {
     initial_stream_window_size: u32,
     write_high_watermark_bytes: usize,
     write_low_watermark_bytes: usize,
+    logger: event_logger.Logger,
     handlers: std.StringHashMapUnmanaged(service.UnaryHandler) = .empty,
     stream_handlers: std.StringHashMapUnmanaged(raw_stream.ServerHandler) = .empty,
     stream_commands: std.ArrayList(StreamCommand) = .empty,
@@ -694,6 +745,7 @@ fn initImpl(shared_allocator: std.mem.Allocator, options: Options) !*Impl {
         .initial_stream_window_size = options.initial_stream_window_size,
         .write_high_watermark_bytes = options.write_high_watermark_bytes,
         .write_low_watermark_bytes = options.write_low_watermark_bytes,
+        .logger = options.logger,
         .io_threaded = io_threaded,
         .tls_config = null,
         .tls_handshake_timeout_ns = if (options.tls) |tls_options| tls_options.handshake_timeout_ns else 0,
@@ -1964,7 +2016,13 @@ fn runLoop(server: *Impl) void {
     const setup_result = setupLoop(server);
     if (setup_result) |_| {
         server.signalStarted(null);
-        server.loop.run(.until_done) catch {};
+        server.loop.run(.until_done) catch |err| {
+            server.logger.write(
+                .err,
+                "server event loop failed address={s}:{d} error={s}",
+                .{ server.local_host[0..server.local_host_len], server.local_port, @errorName(err) },
+            );
+        };
         server.stream_async.deinit();
         server.shutdown_async.deinit();
         server.loop.deinit();
@@ -1974,6 +2032,7 @@ fn runLoop(server: *Impl) void {
         server.condition.broadcast(server.io());
         server.unlock();
     } else |err| {
+        server.logger.write(.err, "server startup failed address={s}:{d} error={s}", .{ server.host, server.configured_port, @errorName(err) });
         server.signalStarted(err);
     }
 }
@@ -4726,11 +4785,26 @@ test "multi-reactor server binds one ephemeral and fixed port" {
 }
 
 test "multi-reactor startup failure rolls back launched shards" {
-    var server = try Server.init(std.testing.allocator, .{ .reactor_count = 4 });
+    const Capture = struct {
+        started: std.atomic.Value(bool) = .init(false),
+
+        fn log(context: ?*anyopaque, _: u32, log_message: event_logger.BytesView) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            const text = log_message.data.?[0..log_message.size];
+            if (std.mem.indexOf(u8, text, "server started") != null) self.started.store(true, .release);
+        }
+    };
+
+    var capture: Capture = .{};
+    var server = try Server.init(std.testing.allocator, .{
+        .reactor_count = 4,
+        .logger = .{ .context = &capture, .callback = Capture.log },
+    });
     defer server.deinit();
     server.coordinator.reactors[1].test_fail_startup = true;
 
     try std.testing.expectError(error.AsyncInitializationFailed, server.start());
+    try std.testing.expect(!capture.started.load(.acquire));
     for (server.coordinator.reactors) |reactor| {
         try std.testing.expect(reactor.thread == null);
         try std.testing.expect(!reactor.listener_initialized or reactor.listener_closed or reactor.state == .stopped);

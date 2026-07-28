@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define GRPC_LITE_ABI_MAJOR 1u
-#define GRPC_LITE_ABI_MINOR 3u
+#define GRPC_LITE_ABI_MINOR 4u
 #define GRPC_LITE_ABI_VERSION \
   ((GRPC_LITE_ABI_MAJOR << 16) | GRPC_LITE_ABI_MINOR)
 
@@ -39,6 +39,7 @@ typedef uint64_t grpc_lite_feature_bits;
 #define GRPC_LITE_FEATURE_C_STREAMING (UINT64_C(1) << 6)
 #define GRPC_LITE_FEATURE_C_SERVER (UINT64_C(1) << 7)
 #define GRPC_LITE_FEATURE_MANAGED_CHANNEL (UINT64_C(1) << 8)
+#define GRPC_LITE_FEATURE_LOGGING_CALLBACK (UINT64_C(1) << 9)
 
 typedef struct grpc_lite_runtime grpc_lite_runtime;
 typedef struct grpc_lite_metadata grpc_lite_metadata;
@@ -55,6 +56,32 @@ typedef struct grpc_lite_bytes_view {
   const uint8_t *data;
   size_t size;
 } grpc_lite_bytes_view;
+
+enum {
+  GRPC_LITE_LOG_DEBUG = 0,
+  GRPC_LITE_LOG_INFO = 1,
+  GRPC_LITE_LOG_WARN = 2,
+  GRPC_LITE_LOG_ERROR = 3,
+};
+
+typedef struct grpc_lite_logger {
+  size_t struct_size;
+  void *user_data;
+  void (*log)(
+      void *user_data,
+      uint32_t level,
+      grpc_lite_bytes_view message);
+} grpc_lite_logger;
+
+#define GRPC_LITE_LOGGER_INIT \
+  { sizeof(grpc_lite_logger), NULL, NULL }
+
+/*
+ * Log callbacks run synchronously on API caller or transport threads and may run
+ * concurrently. They should return promptly and must not call back into the originating
+ * handle. The message is borrowed for the call.
+ * Logger storage is borrowed during handle creation; user_data must outlive the handle.
+ */
 
 typedef struct grpc_lite_metadata_entry_view {
   grpc_lite_bytes_view key;
@@ -115,11 +142,12 @@ typedef struct grpc_lite_channel_options {
   uint64_t max_backoff_ns;
   uint32_t multiplier_millis;
   uint32_t jitter_percent;
+  const grpc_lite_logger *logger;
 } grpc_lite_channel_options;
 
 #define GRPC_LITE_CHANNEL_OPTIONS_INIT \
   { sizeof(grpc_lite_channel_options), 0, UINT64_C(1000000000), \
-    UINT64_C(120000000000), 1600, 20 }
+    UINT64_C(120000000000), 1600, 20, NULL }
 
 /* Creates a connected insecure channel. Hostnames require a Runtime. */
 grpc_lite_error grpc_lite_channel_create(
@@ -260,12 +288,13 @@ typedef struct grpc_lite_server_options {
   uint64_t max_message_size;
   uint64_t max_inbound_buffer_size;
   uint64_t max_outbound_buffer_size;
+  const grpc_lite_logger *logger;
 } grpc_lite_server_options;
 
 #define GRPC_LITE_SERVER_OPTIONS_INIT \
   { sizeof(grpc_lite_server_options), \
     { (const uint8_t *)"127.0.0.1", sizeof("127.0.0.1") - 1 }, 0, 1, \
-    UINT64_C(4194304), UINT64_C(8388608), UINT64_C(8388608) }
+    UINT64_C(4194304), UINT64_C(8388608), UINT64_C(8388608), NULL }
 
 typedef struct grpc_lite_server_method_options {
   size_t struct_size;

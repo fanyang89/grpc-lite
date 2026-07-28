@@ -14,6 +14,8 @@ static_assert(offsetof(grpc_lite_bytes_view, data) == 0);
 static_assert(offsetof(grpc_lite_bytes_view, size) == sizeof(void *));
 static_assert(sizeof(grpc_lite_metadata_entry_view) ==
               2 * sizeof(grpc_lite_bytes_view));
+static_assert(std::is_standard_layout_v<grpc_lite_logger>);
+static_assert(offsetof(grpc_lite_logger, struct_size) == 0);
 static_assert(std::is_standard_layout_v<grpc_lite_channel_options>);
 static_assert(offsetof(grpc_lite_channel_options, struct_size) == 0);
 static_assert(offsetof(grpc_lite_channel_options, allow_initial_offline) ==
@@ -30,6 +32,7 @@ static_assert(offsetof(grpc_lite_channel_options, jitter_percent) ==
 int main() {
   grpc_lite_unary_options options = GRPC_LITE_UNARY_OPTIONS_INIT;
   grpc_lite_channel_options channel_options = GRPC_LITE_CHANNEL_OPTIONS_INIT;
+  grpc_lite_logger logger = GRPC_LITE_LOGGER_INIT;
   grpc_lite_client_stream_options stream_options =
       GRPC_LITE_CLIENT_STREAM_OPTIONS_INIT;
   grpc_lite_client_stream_callbacks callbacks =
@@ -47,6 +50,7 @@ int main() {
   static_assert(std::is_standard_layout_v<grpc_lite_server_method_callbacks>);
   assert(options.struct_size == sizeof(options));
   assert(channel_options.struct_size == sizeof(channel_options));
+  assert(logger.struct_size == sizeof(logger));
   assert(stream_options.struct_size == sizeof(stream_options));
   assert(callbacks.struct_size == sizeof(callbacks));
   assert(server_options.struct_size == sizeof(server_options));
@@ -56,6 +60,7 @@ int main() {
   if (grpc_lite_abi_version() != GRPC_LITE_ABI_VERSION) return 1;
   if (std::string_view(grpc_lite_error_string(GRPC_LITE_OK)) != "ok") return 2;
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_MANAGED_CHANNEL) == 0) return 4;
+  if ((grpc_lite_features() & GRPC_LITE_FEATURE_LOGGING_CALLBACK) == 0) return 6;
   assert(channel_options.initial_backoff_ns == UINT64_C(1000000000));
   assert(channel_options.max_backoff_ns == UINT64_C(120000000000));
   grpc_lite_channel *channel = reinterpret_cast<grpc_lite_channel *>(1);
