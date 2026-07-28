@@ -72,8 +72,9 @@ commit them whenever their Zig implementation, dependencies, or Zig version chan
 
 ## Coverage
 
-`mise run coverage` builds the core Debug test binary and runs it through kcov. The task
-requires `kcov` on `PATH` and writes a Cobertura report below `coverage/`. The dedicated
+`mise run coverage` builds the core Debug test binary with the LLVM backend and runs it
+through kcov. The task uses `kcov` on `PATH` by default, or the Docker image named by
+`KCOV_IMAGE`, and writes a non-empty Cobertura report below `coverage/`. The dedicated
 GitHub Actions workflow uploads that report to Codecov using OIDC authentication.
 
 ## Gperftools

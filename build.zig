@@ -359,8 +359,12 @@ pub fn build(b: *std.Build) void {
         .root_module = grpc_lite,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    const coverage_tests = b.addTest(.{
+        .root_module = grpc_lite,
+        .use_llvm = true,
+    });
     const install_coverage_tests = b.addInstallFileWithDir(
-        unit_tests.getEmittedBin(),
+        coverage_tests.getEmittedBin(),
         .{ .custom = "coverage" },
         "grpc-lite-tests",
     );

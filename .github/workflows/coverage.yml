@@ -20,6 +20,8 @@ jobs:
     name: Core Zig coverage
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    env:
+      KCOV_IMAGE: kcov/kcov@sha256:481289ae32e55e5b733019515acd10948a4f76dfed381765577db909664fc603
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,10 +32,8 @@ jobs:
       - name: Install mise tools
         uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4
 
-      - name: Install kcov
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes binutils kcov
+      - name: Pull kcov image
+        run: docker pull "$KCOV_IMAGE"
 
       - name: Generate coverage
         run: mise run coverage
