@@ -301,6 +301,15 @@ pub fn build(b: *std.Build) void {
         .install_dir = .header,
         .install_subdir = "grpcpp",
     }).step);
+    b.getInstallStep().dependOn(&b.addInstallHeaderFile(
+        b.path("include/grpc_lite/grpc_lite.hpp"),
+        "grpc_lite/grpc_lite.hpp",
+    ).step);
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = b.path("include/grpc_lite/cpp"),
+        .install_dir = .header,
+        .install_subdir = "grpc_lite/cpp",
+    }).step);
     b.getInstallStep().dependOn(&b.addInstallFileWithDir(
         b.path("cmake/grpc_liteConfig.cmake"),
         .lib,
