@@ -30,8 +30,38 @@ pub fn generate(
 
     for (request.file_to_generate.items) |name| {
         const file = files.get(name) orelse return error.MissingFileDescriptor;
+        if (try validateFile(allocator, file, response)) return;
+    }
+
+    for (request.file_to_generate.items) |name| {
+        const file = files.get(name) orelse return error.MissingFileDescriptor;
         try appendFile(allocator, file, response);
     }
+}
+
+fn validateFile(
+    allocator: std.mem.Allocator,
+    file: *const FileDescriptorProto,
+    response: *plugin.CodeGeneratorResponse,
+) !bool {
+    for (file.service.items) |service| {
+        for (service.method.items) |method| {
+            if (!(method.client_streaming orelse false)) continue;
+            const service_name = service.name orelse return error.MissingServiceName;
+            const method_name = method.name orelse return error.MissingMethodName;
+            const cardinality = if (method.server_streaming orelse false)
+                "bidirectional streaming"
+            else
+                "client streaming";
+            response.@"error" = try std.fmt.allocPrint(
+                allocator,
+                "unsupported method {s}.{s}: {s} is not implemented",
+                .{ service_name, method_name, cardinality },
+            );
+            return true;
+        }
+    }
+    return false;
 }
 
 fn appendFile(
@@ -72,13 +102,13 @@ fn renderHeader(
     try writer.writeAll("\n#define ");
     try writeHeaderGuard(writer, header_name);
     try writer.print(
-        "\n\n#include \"{s}.pb.h\"\n\n#include <grpcpp/grpcpp.h>\n#include <grpcpp/impl/client_unary_call.h>\n\n#include <memory>\n\n",
+        "\n\n#include \"{s}.pb.h\"\n\n#include <grpcpp/grpcpp.h>\n#include <grpcpp/impl/client_streaming_call.h>\n#include <grpcpp/impl/client_unary_call.h>\n\n#include <memory>\n\n",
         .{stem},
     );
     try openNamespaces(writer, file.package orelse "");
 
     for (file.service.items) |service| {
-        if (!hasUnaryMethod(service)) continue;
+        if (!hasSupportedMethod(service)) continue;
         try renderServiceDeclaration(writer, file.package orelse "", service);
     }
 
@@ -102,15 +132,17 @@ fn renderServiceDeclaration(
     try writer.writeAll(service_name);
     try writer.writeAll("\"; }\n\n  class StubInterface {\n   public:\n    virtual ~StubInterface() = default;\n");
     for (service.method.items) |method| {
-        if (isStreaming(method)) continue;
         try writeMethodDeclaration(writer, method, true);
     }
     try writer.writeAll("  };\n\n  class Stub final : public StubInterface {\n   public:\n    Stub(std::shared_ptr<::grpc::ChannelInterface> channel,\n         const ::grpc::StubOptions& options);\n");
     for (service.method.items) |method| {
-        if (isStreaming(method)) continue;
         try writeMethodDeclaration(writer, method, false);
     }
-    try writer.writeAll("\n   private:\n    std::shared_ptr<::grpc::ChannelInterface> channel_;\n  };\n\n  static std::unique_ptr<Stub> NewStub(\n      const std::shared_ptr<::grpc::ChannelInterface>& channel,\n      const ::grpc::StubOptions& options = ::grpc::StubOptions());\n};\n\n");
+    try writer.writeAll("\n   private:\n    std::shared_ptr<::grpc::ChannelInterface> channel_;\n  };\n\n  static std::unique_ptr<Stub> NewStub(\n      const std::shared_ptr<::grpc::ChannelInterface>& channel,\n      const ::grpc::StubOptions& options = ::grpc::StubOptions());\n\n  // Methods run on reactor threads, must not block or throw, and must return\n  // promptly after dispatch. EventService must outlive its registered Server.\n  class EventService {\n   public:\n    virtual ~EventService() = default;\n    ::grpc_lite::Error Register(::grpc_lite::Server& server);\n");
+    for (service.method.items) |method| try writeEventMethodDeclaration(writer, method);
+    try writer.writeAll("\n   private:\n");
+    for (service.method.items) |method| try writeRegistrationMember(writer, service, method);
+    try writer.writeAll("  };\n};\n\n");
 }
 
 fn writeMethodDeclaration(
@@ -121,18 +153,95 @@ fn writeMethodDeclaration(
     const name = method.name orelse return error.MissingMethodName;
     const input = method.input_type orelse return error.MissingInputType;
     const output = method.output_type orelse return error.MissingOutputType;
-    try writer.writeAll("    virtual ::grpc::Status ");
-    try writeIdentifier(writer, name);
-    try writer.writeAll("(\n        ::grpc::ClientContext* context,\n        const ");
-    try writeCppType(writer, input);
-    try writer.writeAll("& request,\n        ");
-    try writeCppType(writer, output);
-    try writer.writeAll("* response)");
+    try writer.writeAll("    virtual ");
+    if (method.server_streaming orelse false) {
+        try writer.writeAll("std::unique_ptr<::grpc::ClientReader<");
+        try writeCppType(writer, output);
+        try writer.writeAll(">> ");
+        try writeIdentifier(writer, name);
+        try writer.writeAll("(\n        ::grpc::ClientContext* context,\n        const ");
+        try writeCppType(writer, input);
+        try writer.writeAll("& request)");
+    } else {
+        try writer.writeAll("::grpc::Status ");
+        try writeIdentifier(writer, name);
+        try writer.writeAll("(\n        ::grpc::ClientContext* context,\n        const ");
+        try writeCppType(writer, input);
+        try writer.writeAll("& request,\n        ");
+        try writeCppType(writer, output);
+        try writer.writeAll("* response)");
+    }
     if (pure_virtual) {
         try writer.writeAll(" = 0;\n");
     } else {
         try writer.writeAll(" override;\n");
     }
+}
+
+fn writeEventMethodDeclaration(writer: *std.Io.Writer, method: MethodDescriptorProto) !void {
+    const name = method.name orelse return error.MissingMethodName;
+    const input = method.input_type orelse return error.MissingInputType;
+    const output = method.output_type orelse return error.MissingOutputType;
+    try writer.writeAll("    virtual void ");
+    try writeIdentifier(writer, name);
+    try writer.writeAll("(const ::grpc_lite::ServerContext& context, ");
+    try writeCppType(writer, input);
+    try writer.writeAll(" request, ::grpc_lite::");
+    try writer.writeAll(if (method.server_streaming orelse false) "ServerStreamingCall<" else "UnaryCall<");
+    try writeCppType(writer, output);
+    try writer.writeAll("> call) noexcept = 0;\n");
+}
+
+fn writeRegistrationMember(
+    writer: *std.Io.Writer,
+    service: ServiceDescriptorProto,
+    method: MethodDescriptorProto,
+) !void {
+    const name = method.name orelse return error.MissingMethodName;
+    const input = method.input_type orelse return error.MissingInputType;
+    const output = method.output_type orelse return error.MissingOutputType;
+    try writer.writeAll("    ::grpc_lite::internal::TypedMethodRegistration<");
+    try writeCppType(writer, input);
+    try writer.writeAll(", ");
+    try writeCppType(writer, output);
+    try writer.print(", {s}> ", .{if (method.server_streaming orelse false) "true" else "false"});
+    try writeRegistrationIdentifier(writer, service, name);
+    try writer.writeAll(";\n");
+}
+
+fn writeRegistrationIdentifier(
+    writer: *std.Io.Writer,
+    service: ServiceDescriptorProto,
+    method_name: []const u8,
+) !void {
+    try writer.writeAll("grpc_lite_registration_");
+    try writeIdentifier(writer, method_name);
+    var suffix_len: usize = 1;
+    while (registrationIdentifierCollides(service, method_name, suffix_len)) {
+        suffix_len += 1;
+    }
+    try writer.splatByteAll('_', suffix_len);
+}
+
+fn registrationIdentifierCollides(
+    service: ServiceDescriptorProto,
+    method_name: []const u8,
+    suffix_len: usize,
+) bool {
+    const prefix = "grpc_lite_registration_";
+    const escaped_len: usize = if (isCppKeyword(method_name)) 1 else 0;
+    const candidate_len = prefix.len + method_name.len + escaped_len + suffix_len;
+    for (service.method.items) |method| {
+        const other = method.name orelse continue;
+        if (isCppKeyword(other) or other.len != candidate_len) continue;
+        if (!std.mem.startsWith(u8, other, prefix)) continue;
+        const name_end = prefix.len + method_name.len;
+        if (!std.mem.eql(u8, other[prefix.len..name_end], method_name)) continue;
+        for (other[name_end..]) |byte| {
+            if (byte != '_') break;
+        } else return true;
+    }
+    return false;
 }
 
 fn renderSource(
@@ -150,7 +259,7 @@ fn renderSource(
     try openNamespaces(writer, file.package orelse "");
     const package = file.package orelse "";
     for (file.service.items) |service| {
-        if (!hasUnaryMethod(service)) continue;
+        if (!hasSupportedMethod(service)) continue;
         try renderServiceDefinition(writer, package, service);
     }
     try closeNamespaces(writer, package);
@@ -167,22 +276,45 @@ fn renderServiceDefinition(
     try writer.writeAll("::Stub::Stub(std::shared_ptr<::grpc::ChannelInterface> channel,\n                  const ::grpc::StubOptions& options)\n    : channel_(std::move(channel)) {\n  (void)options;\n}\n\n");
 
     for (service.method.items) |method| {
-        if (isStreaming(method)) continue;
         const method_name = method.name orelse return error.MissingMethodName;
         const input = method.input_type orelse return error.MissingInputType;
         const output = method.output_type orelse return error.MissingOutputType;
-        try writer.writeAll("::grpc::Status ");
+        if (method.server_streaming orelse false) {
+            try writer.writeAll("std::unique_ptr<::grpc::ClientReader<");
+            try writeCppType(writer, output);
+            try writer.writeAll(">> ");
+        } else {
+            try writer.writeAll("::grpc::Status ");
+        }
         try writeIdentifier(writer, service_name);
         try writer.writeAll("::Stub::");
         try writeIdentifier(writer, method_name);
         try writer.writeAll("(\n    ::grpc::ClientContext* context, const ");
         try writeCppType(writer, input);
-        try writer.writeAll("& request,\n    ");
-        try writeCppType(writer, output);
-        try writer.writeAll("* response) {\n  static const ::grpc::internal::RpcMethod method(\"");
+        try writer.writeAll("& request");
+        if (!(method.server_streaming orelse false)) {
+            try writer.writeAll(",\n    ");
+            try writeCppType(writer, output);
+            try writer.writeAll("* response");
+        }
+        try writer.writeAll(") {\n  static const ::grpc::internal::RpcMethod method(\"");
         try writer.writeByte('/');
         if (package.len != 0) try writer.print("{s}.", .{package});
-        try writer.print("{s}/{s}\");\n  return ::grpc::internal::BlockingUnaryCall(\n      channel_.get(), method, context, request, response);\n}}\n\n", .{ service_name, method_name });
+        try writer.print("{s}/{s}\");\n  return ::grpc::internal::{s}", .{
+            service_name,
+            method_name,
+            if (method.server_streaming orelse false) "BlockingServerStreamingCall" else "BlockingUnaryCall",
+        });
+        if (method.server_streaming orelse false) {
+            try writer.writeByte('<');
+            try writeCppType(writer, input);
+            try writer.writeAll(", ");
+            try writeCppType(writer, output);
+            try writer.writeByte('>');
+        }
+        try writer.print("(\n      channel_.get(), method, context, request{s});\n}}\n\n", .{
+            if (method.server_streaming orelse false) "" else ", response",
+        });
     }
 
     try writer.writeAll("std::unique_ptr<");
@@ -190,14 +322,33 @@ fn renderServiceDefinition(
     try writer.writeAll("::Stub> ");
     try writeIdentifier(writer, service_name);
     try writer.writeAll("::NewStub(\n    const std::shared_ptr<::grpc::ChannelInterface>& channel,\n    const ::grpc::StubOptions& options) {\n  return std::unique_ptr<Stub>(new Stub(channel, options));\n}\n\n");
+
+    try writer.writeAll("::grpc_lite::Error ");
+    try writeIdentifier(writer, service_name);
+    try writer.writeAll("::EventService::Register(::grpc_lite::Server& server) {\n  ::grpc_lite::Error error;\n");
+    for (service.method.items) |method| {
+        const method_name = method.name orelse return error.MissingMethodName;
+        const input = method.input_type orelse return error.MissingInputType;
+        const output = method.output_type orelse return error.MissingOutputType;
+        try writer.writeAll("  error = ");
+        try writeRegistrationIdentifier(writer, service, method_name);
+        try writer.writeAll(".Register(server, \"");
+        try writer.writeByte('/');
+        if (package.len != 0) try writer.print("{s}.", .{package});
+        try writer.print("{s}/{s}\",\n      [this](const ::grpc_lite::ServerContext& context, ", .{ service_name, method_name });
+        try writeCppType(writer, input);
+        try writer.writeAll(" request, ::grpc_lite::");
+        try writer.writeAll(if (method.server_streaming orelse false) "ServerStreamingCall<" else "UnaryCall<");
+        try writeCppType(writer, output);
+        try writer.writeAll("> call) {\n        ");
+        try writeIdentifier(writer, method_name);
+        try writer.writeAll("(context, std::move(request), std::move(call));\n      });\n  if (!error.ok()) return error;\n");
+    }
+    try writer.writeAll("  return {};\n}\n\n");
 }
 
-fn isStreaming(method: MethodDescriptorProto) bool {
-    return (method.client_streaming orelse false) or (method.server_streaming orelse false);
-}
-
-fn hasUnaryMethod(service: ServiceDescriptorProto) bool {
-    for (service.method.items) |method| if (!isStreaming(method)) return true;
+fn hasSupportedMethod(service: ServiceDescriptorProto) bool {
+    for (service.method.items) |method| if (!(method.client_streaming orelse false)) return true;
     return false;
 }
 
@@ -267,7 +418,7 @@ fn isCppKeyword(identifier: []const u8) bool {
     return false;
 }
 
-test "generates unary glue and skips streaming methods" {
+test "generates unary and server streaming client and event service glue" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
@@ -281,10 +432,9 @@ test "generates unary glue and skips streaming methods" {
         .output_type = ".demo.EchoReply",
     });
     try service.method.append(allocator, .{
-        .name = "Chat",
+        .name = "Watch",
         .input_type = ".demo.EchoRequest",
         .output_type = ".demo.EchoReply",
-        .client_streaming = true,
         .server_streaming = true,
     });
     try file.service.append(allocator, service);
@@ -295,9 +445,70 @@ test "generates unary glue and skips streaming methods" {
     try std.testing.expectEqual(@as(usize, 2), response.file.items.len);
     try std.testing.expectEqualStrings("demo/echo.grpc.pb.h", response.file.items[0].name.?);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "virtual ::grpc::Status Echo(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "std::unique_ptr<::grpc::ClientReader<::demo::EchoReply>> Watch(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "virtual void Watch(const ::grpc_lite::ServerContext& context") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "return \"demo.EchoService\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "Chat") == null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/demo.EchoService/Echo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/demo.EchoService/Watch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "BlockingServerStreamingCall") != null);
+}
+
+test "generates a server streaming only service" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var request: plugin.CodeGeneratorRequest = .{};
+    try request.file_to_generate.append(allocator, "watch.proto");
+    var file: FileDescriptorProto = .{ .name = "watch.proto" };
+    var service: ServiceDescriptorProto = .{ .name = "WatchService" };
+    try service.method.append(allocator, .{
+        .name = "Watch",
+        .input_type = ".WatchRequest",
+        .output_type = ".WatchReply",
+        .server_streaming = true,
+    });
+    try file.service.append(allocator, service);
+    try request.proto_file.append(allocator, file);
+
+    var response: plugin.CodeGeneratorResponse = .{};
+    try generate(allocator, request, &response);
+    try std.testing.expectEqual(@as(usize, 2), response.file.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "class WatchService final") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/WatchService/Watch") != null);
+}
+
+test "rejects unsupported request streaming cardinalities" {
+    inline for (.{
+        .{ .server_streaming = false, .cardinality = "client streaming" },
+        .{ .server_streaming = true, .cardinality = "bidirectional streaming" },
+    }) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const allocator = arena_state.allocator();
+        var request: plugin.CodeGeneratorRequest = .{};
+        try request.file_to_generate.append(allocator, "chat.proto");
+        var file: FileDescriptorProto = .{ .name = "chat.proto" };
+        var service: ServiceDescriptorProto = .{ .name = "ChatService" };
+        try service.method.append(allocator, .{
+            .name = "Chat",
+            .input_type = ".ChatRequest",
+            .output_type = ".ChatReply",
+            .client_streaming = true,
+            .server_streaming = case.server_streaming,
+        });
+        try file.service.append(allocator, service);
+        try request.proto_file.append(allocator, file);
+
+        var response: plugin.CodeGeneratorResponse = .{};
+        try generate(allocator, request, &response);
+        try std.testing.expectEqual(@as(usize, 0), response.file.items.len);
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "unsupported method ChatService.Chat: {s} is not implemented",
+            .{case.cardinality},
+        );
+        try std.testing.expectEqualStrings(expected, response.@"error".?);
+    }
 }
 
 test "escapes C++20 keywords" {
@@ -308,6 +519,57 @@ test "escapes C++20 keywords" {
     output.clearRetainingCapacity();
     try writeIdentifier(&output.writer, "mutable");
     try std.testing.expectEqualStrings("mutable_", output.written());
+}
+
+test "escapes keywords in generated service methods and types" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var request: plugin.CodeGeneratorRequest = .{};
+    try request.file_to_generate.append(allocator, "keyword.proto");
+    var file: FileDescriptorProto = .{ .name = "keyword.proto", .package = "concept" };
+    var service: ServiceDescriptorProto = .{ .name = "class" };
+    try service.method.append(allocator, .{
+        .name = "delete",
+        .input_type = ".concept.new",
+        .output_type = ".concept.return",
+        .server_streaming = true,
+    });
+    try file.service.append(allocator, service);
+    try request.proto_file.append(allocator, file);
+
+    var response: plugin.CodeGeneratorResponse = .{};
+    try generate(allocator, request, &response);
+    const header = response.file.items[0].content.?;
+    try std.testing.expect(std.mem.indexOf(u8, header, "namespace concept_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "class class_ final") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "::concept_::new_& request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "delete_(") != null);
+}
+
+test "registration members do not collide with method names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var request: plugin.CodeGeneratorRequest = .{};
+    try request.file_to_generate.append(allocator, "collision.proto");
+    var file: FileDescriptorProto = .{ .name = "collision.proto" };
+    var service: ServiceDescriptorProto = .{ .name = "CollisionService" };
+    inline for (.{ "Foo", "grpc_lite_registration_Foo_" }) |name| {
+        try service.method.append(allocator, .{
+            .name = name,
+            .input_type = ".Request",
+            .output_type = ".Reply",
+        });
+    }
+    try file.service.append(allocator, service);
+    try request.proto_file.append(allocator, file);
+
+    var response: plugin.CodeGeneratorResponse = .{};
+    try generate(allocator, request, &response);
+    const header = response.file.items[0].content.?;
+    try std.testing.expect(std.mem.indexOf(u8, header, "grpc_lite_registration_Foo__;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "grpc_lite_registration_grpc_lite_registration_Foo__;") != null);
 }
 
 test "rejects unsupported parameters" {

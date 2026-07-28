@@ -205,7 +205,7 @@ pub fn build(b: *std.Build) void {
         "generated-grpcpp",
     );
     generate_grpcpp.addPrefixedDirectoryArg("-I", b.path("proto"));
-    generate_grpcpp.addFileArg(b.path("proto/echo.proto"));
+    generate_grpcpp.addFileArg(b.path("proto/cpp_codegen.proto"));
 
     const gen_grpcpp_step = b.step("gen-grpcpp", "Generate synchronous C++ service glue");
     gen_grpcpp_step.dependOn(&generate_grpcpp.step);
@@ -435,12 +435,12 @@ pub fn build(b: *std.Build) void {
     grpcpp_generated_test_module.addIncludePath(b.path("tests/codegen"));
     grpcpp_generated_test_module.addIncludePath(generated_grpcpp);
     grpcpp_generated_test_module.addCSourceFile(.{
-        .file = generated_grpcpp.path(b, "echo.grpc.pb.cc"),
-        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+        .file = generated_grpcpp.path(b, "cpp_codegen.grpc.pb.cc"),
+        .flags = &.{ "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror" },
     });
     grpcpp_generated_test_module.addCSourceFile(.{
         .file = b.path("tests/grpcpp_generated_test.cc"),
-        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+        .flags = &.{ "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror" },
     });
     linkCApiTestLibrary(grpcpp_generated_test_module, library, shared_library, native, sanitizers);
     const grpcpp_generated_test = b.addExecutable(.{
@@ -448,6 +448,31 @@ pub fn build(b: *std.Build) void {
         .root_module = grpcpp_generated_test_module,
     });
     const run_grpcpp_generated_test = b.addRunArtifact(grpcpp_generated_test);
+
+    const grpcpp_generated_server_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    applySanitizers(grpcpp_generated_server_test_module, sanitizers);
+    grpcpp_generated_server_test_module.addIncludePath(b.path("include"));
+    grpcpp_generated_server_test_module.addIncludePath(b.path("tests/codegen"));
+    grpcpp_generated_server_test_module.addIncludePath(generated_grpcpp);
+    grpcpp_generated_server_test_module.addCSourceFile(.{
+        .file = generated_grpcpp.path(b, "cpp_codegen.grpc.pb.cc"),
+        .flags = &.{ "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror" },
+    });
+    grpcpp_generated_server_test_module.addCSourceFile(.{
+        .file = b.path("tests/grpcpp_generated_server_test.cc"),
+        .flags = &.{ "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror" },
+    });
+    linkCApiTestLibrary(grpcpp_generated_server_test_module, library, shared_library, native, sanitizers);
+    const grpcpp_generated_server_test = b.addExecutable(.{
+        .name = "grpcpp-generated-server-test",
+        .root_module = grpcpp_generated_server_test_module,
+    });
+    const run_grpcpp_generated_server_test = b.addRunArtifact(grpcpp_generated_server_test);
 
     const cpp_e2e_server = addExample(
         b,
@@ -470,6 +495,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_grpcpp_facade_test.step);
     test_step.dependOn(&run_grpcpp_streaming_facade_test.step);
     test_step.dependOn(&run_grpcpp_generated_test.step);
+    test_step.dependOn(&run_grpcpp_generated_server_test.step);
 
     if (!enable_protobuf) return;
     addProtobufSupport(

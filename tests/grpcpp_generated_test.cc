@@ -1,7 +1,8 @@
-#include "echo.grpc.pb.h"
+#include "cpp_codegen.grpc.pb.h"
 
 #include <cassert>
 #include <string>
+#include <type_traits>
 
 namespace {
 
@@ -17,6 +18,22 @@ class FakeChannel final : public grpc::ChannelInterface {
 };
 
 }  // namespace
+
+using ServerStreamSignature =
+    std::unique_ptr<grpc::ClientReader<demo::EchoReply>> (
+        demo::EchoService::StubInterface::*)(grpc::ClientContext*,
+                                             const demo::EchoRequest&);
+static_assert(std::is_same_v<decltype(&demo::EchoService::StubInterface::ServerStream),
+                             ServerStreamSignature>);
+
+class CompileEventService final : public demo::EchoService::EventService {
+ public:
+  void Echo(const grpc_lite::ServerContext&, demo::EchoRequest,
+            grpc_lite::UnaryCall<demo::EchoReply>) noexcept override {}
+  void ServerStream(
+      const grpc_lite::ServerContext&, demo::EchoRequest,
+      grpc_lite::ServerStreamingCall<demo::EchoReply>) noexcept override {}
+};
 
 int main() {
   auto channel = std::make_shared<FakeChannel>();

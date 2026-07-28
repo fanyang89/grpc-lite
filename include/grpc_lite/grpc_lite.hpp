@@ -7,5 +7,6 @@
 #include <grpc_lite/cpp/runtime.hpp>
 #include <grpc_lite/cpp/server.hpp>
 #include <grpc_lite/cpp/status.hpp>
+#include <grpc_lite/cpp/typed_service.hpp>
 
 #endif
