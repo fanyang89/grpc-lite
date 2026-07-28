@@ -27,8 +27,7 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  auto channel =
-      grpc::CreateChannel(argv[1], grpc::InsecureChannelCredentials());
+  auto channel = example::CreateChannel(argv[1]);
   auto stub = demo::EchoService::NewStub(channel);
 
   demo::EchoRequest request;

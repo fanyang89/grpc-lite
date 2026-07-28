@@ -5,9 +5,17 @@
 
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <string>
 
 namespace example {
+
+inline std::shared_ptr<grpc::Channel> CreateChannel(const std::string& target) {
+  grpc::ChannelArguments arguments;
+  arguments.SetAllowInitialOffline(false);
+  return grpc::CreateCustomChannel(
+      target, grpc::InsecureChannelCredentials(), arguments);
+}
 
 inline bool Check(bool condition, const std::string& message) {
   if (condition) return true;

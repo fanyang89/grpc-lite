@@ -12,8 +12,7 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  auto channel =
-      grpc::CreateChannel(argv[1], grpc::InsecureChannelCredentials());
+  auto channel = example::CreateChannel(argv[1]);
   auto stub = demo::EchoService::NewStub(channel);
   if (!example::Check(std::string(demo::EchoService::service_full_name()) ==
                           "demo.EchoService",
