@@ -31,6 +31,8 @@ jobs:
 
       - name: Install mise tools
         uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4
+        with:
+          version: 2026.7.14
 
       - name: Pull kcov image
         run: docker pull "$KCOV_IMAGE"
