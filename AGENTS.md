@@ -83,7 +83,8 @@ authoritative: change it before implementing a feature with a different decision
 | IPv6 | Out of scope | No AAAA, Happy Eyeballs, or IPv6 listeners |
 | Reflection and health services | Out of scope | Not part of the lite profile |
 | Interceptors and middleware | Out of scope | Keep the core API small |
-| Retry policies and connection backoff | Out of scope | Applications retry explicitly |
+| Connection recovery and backoff | Selected | Channels reconnect without replaying RPCs |
+| Retry policies | Out of scope | Applications retry explicitly |
 | Service config and load balancing | Out of scope | No policy layer |
 | xDS, ORCA, ALTS, and cloud credentials | Out of scope | Not required for lite deployments |
 | Cacheable unary GET | Out of scope | Depends on proxy cache semantics |
