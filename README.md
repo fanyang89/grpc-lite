@@ -131,7 +131,7 @@ include(FetchContent)
 FetchContent_Declare(
   grpc_lite
   GIT_REPOSITORY https://github.com/fanyang89/grpc-lite.git
-  GIT_TAG v0.3.1)
+  GIT_TAG v0.4.0)
 FetchContent_MakeAvailable(grpc_lite)
 
 target_link_libraries(shared_app PRIVATE grpc_lite::c)

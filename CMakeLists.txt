@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(grpc_lite VERSION 0.3.1 LANGUAGES C)
+project(grpc_lite VERSION 0.4.0 LANGUAGES C)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "grpc-lite currently supports Linux only")
