@@ -23,8 +23,16 @@ class ServerExecutor {
   virtual bool Submit(std::string_view method, Task task) noexcept = 0;
 };
 
+class ServerAdmission {
+ public:
+  virtual ~ServerAdmission() = default;
+  virtual Status Admit(std::string_view method,
+                       const ServerContext& context) noexcept = 0;
+};
+
 struct SynchronousServiceOptions {
   Compression response_compression = Compression::Identity;
+  ServerAdmission* admission = nullptr;
 };
 
 namespace internal {
@@ -114,6 +122,13 @@ void DispatchUnary(ServerExecutor& executor, std::string_view method,
                    SynchronousServiceOptions options,
                    const ServerContext& native_context, Request request,
                    UnaryCall<Response> call, Handler handler) noexcept {
+  if (options.admission) {
+    Status status = options.admission->Admit(method, native_context);
+    if (!status.ok()) {
+      call.Finish(std::move(status));
+      return;
+    }
+  }
   struct State {
     State(const ServerContext& native_context, Request request,
           UnaryCall<Response> call, Handler handler,
@@ -179,9 +194,16 @@ void DispatchUnary(ServerExecutor& executor, std::string_view method,
 template <class Request, class Response, class Handler>
 void DispatchServerStreaming(ServerExecutor& executor, std::string_view method,
                              SynchronousServiceOptions options,
-                             const ServerContext& native_context, Request request,
-                             ServerStreamingCall<Response> call,
-                             Handler handler) noexcept {
+                              const ServerContext& native_context, Request request,
+                              ServerStreamingCall<Response> call,
+                              Handler handler) noexcept {
+  if (options.admission) {
+    Status status = options.admission->Admit(method, native_context);
+    if (!status.ok()) {
+      call.Finish(std::move(status));
+      return;
+    }
+  }
   struct State {
     State(const ServerContext& native_context, Request request,
           ServerStreamingCall<Response> call, Handler handler,

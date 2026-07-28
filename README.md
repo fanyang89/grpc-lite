@@ -170,7 +170,8 @@ Drain submitted executor work before destroying the service.
 `grpc_lite::ServerExecutor` is application-owned and has a method-aware `Submit` operation.
 It must enqueue without blocking; handlers may block only on executor threads. Executor
 rejection finishes the call with `RESOURCE_EXHAUSTED`. The facade does not create worker
-threads.
+threads. `SynchronousServiceOptions::admission` may point to an application-owned,
+nonblocking reactor admission hook that rejects calls before they enter the executor.
 
 ```bash
 protoc -I proto \

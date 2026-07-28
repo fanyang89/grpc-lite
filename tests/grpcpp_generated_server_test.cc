@@ -192,6 +192,20 @@ class QueueExecutor final : public grpc_lite::ServerExecutor {
   std::vector<Task> tasks_;
 };
 
+class RejectAdmission final : public grpc_lite::ServerAdmission {
+ public:
+  grpc_lite::Status Admit(
+      std::string_view method,
+      const grpc_lite::ServerContext& context) noexcept override {
+    called.store(true, std::memory_order_release);
+    assert(method == "/demo.EchoService/Echo");
+    assert(context.request_metadata().empty());
+    return {grpc_lite::StatusCode::FailedPrecondition, "rejected"};
+  }
+
+  std::atomic<bool> called{false};
+};
+
 class SynchronousService final : public demo::EchoService::Service {
  public:
   grpc::Status Echo(grpc::ServerContext* context,
@@ -406,6 +420,38 @@ void TestSynchronousErrors() {
     server.ShutdownGracefully(UINT64_C(1000000000));
     server.Wait();
   }
+
+  grpc_lite::Server server;
+  assert(grpc_lite::Server::Create({}, &server).ok());
+  QueueExecutor executor;
+  RejectAdmission admission;
+  demo::EchoService::Service service;
+  grpc_lite::SynchronousServiceOptions options;
+  options.admission = &admission;
+  auto adapter = service.CreateEventService(executor, options);
+  assert(adapter->Register(server).ok());
+  assert(server.Start().ok());
+  std::uint32_t port = 0;
+  assert(server.Port(&port).ok());
+  grpc::ChannelArguments channel_arguments;
+  channel_arguments.SetAllowInitialOffline(false);
+  auto channel = grpc::CreateCustomChannel(
+      "127.0.0.1:" + std::to_string(port),
+      grpc::InsecureChannelCredentials(), channel_arguments);
+  auto stub = demo::EchoService::NewStub(channel);
+  grpc::ClientContext context;
+  demo::EchoRequest request;
+  demo::EchoReply response;
+  const grpc::Status status = stub->Echo(&context, request, &response);
+  assert(status.error_code() == grpc::StatusCode::FAILED_PRECONDITION);
+  assert(admission.called.load(std::memory_order_acquire));
+  assert(executor.submitted_methods.empty());
+  channel->Shutdown();
+  channel->Wait();
+  stub.reset();
+  channel.reset();
+  server.ShutdownGracefully(UINT64_C(1000000000));
+  server.Wait();
 }
 
 }  // namespace
