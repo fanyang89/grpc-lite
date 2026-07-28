@@ -5,6 +5,7 @@ test "stable public API compiles for downstream consumers" {
     comptime {
         _ = grpc.Channel;
         _ = grpc.ChannelOptions;
+        _ = grpc.ReconnectOptions;
         _ = grpc.ClientTlsOptions;
         _ = grpc.Runtime;
         _ = grpc.CallOptions;

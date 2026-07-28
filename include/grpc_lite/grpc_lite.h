@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define GRPC_LITE_ABI_MAJOR 1u
-#define GRPC_LITE_ABI_MINOR 2u
+#define GRPC_LITE_ABI_MINOR 3u
 #define GRPC_LITE_ABI_VERSION \
   ((GRPC_LITE_ABI_MAJOR << 16) | GRPC_LITE_ABI_MINOR)
 
@@ -38,6 +38,7 @@ typedef uint64_t grpc_lite_feature_bits;
 #define GRPC_LITE_FEATURE_GRACEFUL_SERVER_DRAIN (UINT64_C(1) << 5)
 #define GRPC_LITE_FEATURE_C_STREAMING (UINT64_C(1) << 6)
 #define GRPC_LITE_FEATURE_C_SERVER (UINT64_C(1) << 7)
+#define GRPC_LITE_FEATURE_MANAGED_CHANNEL (UINT64_C(1) << 8)
 
 typedef struct grpc_lite_runtime grpc_lite_runtime;
 typedef struct grpc_lite_metadata grpc_lite_metadata;
@@ -107,12 +108,46 @@ typedef struct grpc_lite_unary_options {
   { sizeof(grpc_lite_unary_options), NULL, 0, GRPC_LITE_COMPRESSION_IDENTITY, \
     0, UINT64_C(4194304) }
 
+typedef struct grpc_lite_channel_options {
+  size_t struct_size;
+  uint32_t allow_initial_offline;
+  uint64_t initial_backoff_ns;
+  uint64_t max_backoff_ns;
+  uint32_t multiplier_millis;
+  uint32_t jitter_percent;
+} grpc_lite_channel_options;
+
+#define GRPC_LITE_CHANNEL_OPTIONS_INIT \
+  { sizeof(grpc_lite_channel_options), 0, UINT64_C(1000000000), \
+    UINT64_C(120000000000), 1600, 20 }
+
 /* Creates a connected insecure channel. Hostnames require a Runtime. */
 grpc_lite_error grpc_lite_channel_create(
     grpc_lite_runtime *runtime,
     grpc_lite_bytes_view target,
     grpc_lite_channel **out_channel);
-/* Must not run concurrently with calls using the channel. */
+/*
+ * Creates an insecure channel that reconnects after connection loss.
+ * NULL options select GRPC_LITE_CHANNEL_OPTIONS_INIT defaults. With
+ * allow_initial_offline set, creation may succeed before the first connection.
+ * Hostnames require a Runtime. The target and options are borrowed for this call.
+ */
+grpc_lite_error grpc_lite_channel_create_managed(
+    grpc_lite_runtime *runtime,
+    grpc_lite_bytes_view target,
+    const grpc_lite_channel_options *options,
+    grpc_lite_channel **out_channel);
+/*
+ * Starts shutdown and promptly completes active calls. Thread-safe with calls.
+ * grpc_lite_channel_wait blocks until shutdown completes and must be called only
+ * after shutdown. Neither function releases the handle; NULL is a no-op.
+ */
+void grpc_lite_channel_shutdown(grpc_lite_channel *channel);
+void grpc_lite_channel_wait(grpc_lite_channel *channel);
+/*
+ * Implicitly shuts down and waits, then releases the handle. Requires exclusive
+ * access after all concurrent calls have returned. NULL is a no-op.
+ */
 void grpc_lite_channel_destroy(grpc_lite_channel *channel);
 
 /* Blocks until the RPC completes. RPC failures are stored in out_result. */

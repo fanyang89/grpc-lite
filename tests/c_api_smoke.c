@@ -50,6 +50,7 @@ static uint32_t on_server_message(
 
 int main(void) {
   grpc_lite_unary_options options = GRPC_LITE_UNARY_OPTIONS_INIT;
+  grpc_lite_channel_options channel_options = GRPC_LITE_CHANNEL_OPTIONS_INIT;
   grpc_lite_client_stream_options stream_options =
       GRPC_LITE_CLIENT_STREAM_OPTIONS_INIT;
   grpc_lite_client_stream_callbacks callbacks =
@@ -63,16 +64,23 @@ int main(void) {
   callbacks.on_terminal = on_terminal;
   method_callbacks.on_message = on_server_message;
   assert(options.struct_size == sizeof(options));
+  assert(channel_options.struct_size == sizeof(channel_options));
   assert(stream_options.struct_size == sizeof(stream_options));
   assert(callbacks.struct_size == sizeof(callbacks));
   assert(server_options.struct_size == sizeof(server_options));
   assert(method_options.struct_size == sizeof(method_options));
   assert(method_callbacks.struct_size == sizeof(method_callbacks));
   assert(options.max_response_size == UINT64_C(4194304));
+  assert(channel_options.allow_initial_offline == 0);
+  assert(channel_options.initial_backoff_ns == UINT64_C(1000000000));
+  assert(channel_options.max_backoff_ns == UINT64_C(120000000000));
+  assert(channel_options.multiplier_millis == 1600);
+  assert(channel_options.jitter_percent == 20);
   assert(grpc_lite_unary_result_status_code(NULL) == 2);
 
   grpc_lite_metadata *metadata = NULL;
   grpc_lite_runtime *runtime = NULL;
+  grpc_lite_channel *channel = NULL;
   grpc_lite_metadata_entry_view entry;
   const uint8_t binary[] = {0, 1, 2};
 
@@ -81,6 +89,7 @@ int main(void) {
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_STREAMING) == 0) return 3;
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_C_STREAMING) == 0) return 11;
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_C_SERVER) == 0) return 12;
+  if ((grpc_lite_features() & GRPC_LITE_FEATURE_MANAGED_CHANNEL) == 0) return 13;
   if (grpc_lite_metadata_create(&metadata) != GRPC_LITE_OK) return 4;
   if (grpc_lite_metadata_add(
           metadata,
@@ -96,5 +105,16 @@ int main(void) {
 
   if (grpc_lite_runtime_create(&runtime) != GRPC_LITE_OK) return 10;
   grpc_lite_runtime_destroy(runtime);
+  channel_options.allow_initial_offline = 1;
+  channel_options.initial_backoff_ns = UINT64_C(10000000000);
+  channel_options.max_backoff_ns = UINT64_C(10000000000);
+  if (grpc_lite_channel_create_managed(
+          NULL,
+          bytes("127.0.0.1:1", sizeof("127.0.0.1:1") - 1),
+          &channel_options,
+          &channel) != GRPC_LITE_OK) return 14;
+  grpc_lite_channel_shutdown(channel);
+  grpc_lite_channel_wait(channel);
+  grpc_lite_channel_destroy(channel);
   return 0;
 }

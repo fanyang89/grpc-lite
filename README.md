@@ -99,14 +99,23 @@ cc app.c \
 ```
 
 The ABI surface provides version and feature discovery, owning Runtime and Metadata
-handles, insecure connected Channels, blocking raw unary calls, and cancellable
-event-driven client streams with bounded backpressure. Stream callbacks run on the
+handles, insecure connected or managed Channels, blocking raw unary calls, and
+cancellable event-driven client streams with bounded backpressure. Managed Channels
+may be created before their endpoint is available and reconnect with bounded exponential
+backoff. Stream callbacks run on the
 transport loop thread and must not block. The C server API supports event-driven
 method registration, retained cross-thread calls, explicit metadata, streaming
 responses, cancellation observation, and graceful drain. Runtime
 initialization must happen before application threads are created and must outlive
 dependent handles. C and C++ compile/link smoke tests run as part of `zig build test`;
 the grpcpp-shaped facade builds on this ABI in later stages.
+
+`grpc_lite_channel_create_managed` creates a durable Channel. Set
+`allow_initial_offline` when creation must return before the first connection succeeds.
+The Channel reconnects after transport failures without replaying submitted RPCs.
+Unsubmitted unary calls retain their original deadline while waiting for a connection.
+Use `grpc_lite_channel_shutdown` to stop admission and active work, then
+`grpc_lite_channel_wait` before exclusive destruction when calls may be concurrent.
 Direct compiler invocation should use the versioned shared library. CMake consumers can
 also build and link the static archive directly from source with FetchContent; the
 static target carries its required Linux system libraries:
@@ -184,9 +193,15 @@ defer runtime.deinit();
 
 var channel = try grpc.Channel.init(allocator, "api.example.com:50051", .{
     .runtime = &runtime,
+    .reconnect = .{ .allow_initial_offline = true },
 });
 defer channel.deinit();
 ```
+
+Reconnect backoff defaults to the gRPC connection-backoff parameters: a one-second
+initial delay, 1.6 multiplier, 120-second cap, and 20 percent jitter. A successful
+connection resets the backoff. Connection recovery never retries an RPC that may have
+reached the server; applications remain responsible for RPC retry policy.
 
 `Channel.callUnary` supports concurrent callers. `Channel.shutdown` may run while calls
 are active; join those caller threads before giving `Channel.deinit` exclusive access.

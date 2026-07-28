@@ -13,7 +13,7 @@ const Status = @import("status.zig").Status;
 const version = @import("version.zig");
 
 pub const abi_major: u16 = 1;
-pub const abi_minor: u16 = 2;
+pub const abi_minor: u16 = 3;
 
 pub const Error = enum(i32) {
     ok = 0,
@@ -37,6 +37,7 @@ pub const Feature = struct {
     pub const graceful_server_drain: u64 = 1 << 5;
     pub const c_streaming: u64 = 1 << 6;
     pub const c_server: u64 = 1 << 7;
+    pub const managed_channel: u64 = 1 << 8;
 };
 
 pub const BytesView = extern struct {
@@ -67,6 +68,15 @@ pub const UnaryOptions = extern struct {
     request_compression: u32 = 0,
     timeout_ns: u64 = 0,
     max_response_size: u64 = call.default_max_message_size,
+};
+
+pub const ChannelOptions = extern struct {
+    struct_size: usize = @sizeOf(ChannelOptions),
+    allow_initial_offline: u32 = 0,
+    initial_backoff_ns: u64 = std.time.ns_per_s,
+    max_backoff_ns: u64 = 120 * std.time.ns_per_s,
+    multiplier_millis: u32 = 1600,
+    jitter_percent: u32 = 20,
 };
 
 pub const ClientStreamOptions = extern struct {
@@ -151,6 +161,7 @@ const client_stream_callbacks_v1_size = @offsetOf(ClientStreamCallbacks, "on_ter
 const server_options_v1_size = @offsetOf(ServerOptions, "max_outbound_buffer_size") + @sizeOf(u64);
 const server_method_options_v1_size = @offsetOf(ServerMethodOptions, "explicit_initial_metadata") + @sizeOf(u32);
 const server_method_callbacks_v1_size = @offsetOf(ServerMethodCallbacks, "on_terminal") + @sizeOf(?*const fn (?*anyopaque, usize, u32) callconv(.c) void);
+const channel_options_v1_size = @offsetOf(ChannelOptions, "jitter_percent") + @sizeOf(u32);
 
 const allocator = std.heap.c_allocator;
 
@@ -169,7 +180,8 @@ pub fn grpc_lite_features() callconv(.c) u64 {
         Feature.dns |
         Feature.graceful_server_drain |
         Feature.c_streaming |
-        Feature.c_server;
+        Feature.c_server |
+        Feature.managed_channel;
     if (build_options.tls) features |= Feature.tls;
     return features;
 }
@@ -290,6 +302,28 @@ pub fn grpc_lite_channel_create(
     target: BytesView,
     out_channel: ?*?*ChannelHandle,
 ) callconv(.c) Error {
+    return createChannel(runtime_handle, target, null, out_channel);
+}
+
+pub fn grpc_lite_channel_create_managed(
+    runtime_handle: ?*RuntimeHandle,
+    target: BytesView,
+    options_pointer: ?*const ChannelOptions,
+    out_channel: ?*?*ChannelHandle,
+) callconv(.c) Error {
+    const reconnect = parseChannelOptions(options_pointer) orelse {
+        if (out_channel) |output| output.* = null;
+        return .invalid_argument;
+    };
+    return createChannel(runtime_handle, target, reconnect, out_channel);
+}
+
+fn createChannel(
+    runtime_handle: ?*RuntimeHandle,
+    target: BytesView,
+    reconnect: ?channel.ReconnectOptions,
+    out_channel: ?*?*ChannelHandle,
+) Error {
     const output = out_channel orelse return .invalid_argument;
     output.* = null;
     const target_bytes = bytes(target) orelse return .invalid_argument;
@@ -297,14 +331,25 @@ pub fn grpc_lite_channel_create(
     errdefer allocator.destroy(storage);
     storage.value = channel.Channel.init(allocator, target_bytes, .{
         .runtime = if (runtime_handle) |handle| &runtimeStorage(handle).value else null,
+        .reconnect = reconnect,
     }) catch |err| return switch (err) {
         error.OutOfMemory => .out_of_memory,
-        error.InvalidTarget => .invalid_argument,
+        error.InvalidTarget, error.InvalidReconnectOptions => .invalid_argument,
         error.RuntimeRequired, error.RuntimeNotInitialized => .invalid_state,
         else => .unavailable,
     };
     output.* = @ptrCast(storage);
     return .ok;
+}
+
+pub fn grpc_lite_channel_shutdown(channel_handle: ?*ChannelHandle) callconv(.c) void {
+    const handle = channel_handle orelse return;
+    channelStorage(handle).value.shutdown();
+}
+
+pub fn grpc_lite_channel_wait(channel_handle: ?*ChannelHandle) callconv(.c) void {
+    const handle = channel_handle orelse return;
+    channelStorage(handle).value.wait();
 }
 
 pub fn grpc_lite_channel_destroy(channel_handle: ?*ChannelHandle) callconv(.c) void {
@@ -963,6 +1008,23 @@ fn parseUnaryOptions(pointer: ?*const UnaryOptions) ?call.Options {
     };
 }
 
+fn parseChannelOptions(pointer: ?*const ChannelOptions) ?channel.ReconnectOptions {
+    const value = pointer orelse return .{};
+    if (value.struct_size < channel_options_v1_size or
+        value.allow_initial_offline > 1 or
+        value.initial_backoff_ns == 0 or
+        value.max_backoff_ns < value.initial_backoff_ns or
+        value.multiplier_millis < 1000 or
+        value.jitter_percent > 100) return null;
+    return .{
+        .allow_initial_offline = value.allow_initial_offline == 1,
+        .initial_backoff_ns = value.initial_backoff_ns,
+        .max_backoff_ns = value.max_backoff_ns,
+        .multiplier_millis = value.multiplier_millis,
+        .jitter_percent = @intCast(value.jitter_percent),
+    };
+}
+
 fn parseClientStreamOptions(pointer: ?*const ClientStreamOptions) ?raw_stream.Options {
     const value = pointer orelse return .{};
     if (value.struct_size < client_stream_options_v1_size or value.has_timeout > 1) return null;
@@ -1054,6 +1116,7 @@ test "C ABI reports version and build features" {
     try std.testing.expectEqual((@as(u32, abi_major) << 16) | abi_minor, grpc_lite_abi_version());
     try std.testing.expectEqualStrings(version.string, std.mem.span(grpc_lite_library_version()));
     try std.testing.expect(grpc_lite_features() & Feature.streaming != 0);
+    try std.testing.expect(grpc_lite_features() & Feature.managed_channel != 0);
     try std.testing.expectEqualStrings(
         "invalid argument",
         std.mem.span(grpc_lite_error_string(@intFromEnum(Error.invalid_argument))),
@@ -1062,6 +1125,103 @@ test "C ABI reports version and build features" {
     try std.testing.expectEqual(2 * @sizeOf(usize), @sizeOf(BytesView));
     try std.testing.expectEqual(@alignOf(usize), @alignOf(BytesView));
     try std.testing.expectEqual(2 * @sizeOf(BytesView), @sizeOf(MetadataEntryView));
+}
+
+test "C managed channel options have stable layout and defaults" {
+    const options: ChannelOptions = .{};
+    try std.testing.expectEqual(@sizeOf(ChannelOptions), options.struct_size);
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(ChannelOptions, "struct_size"));
+    try std.testing.expectEqual(@sizeOf(usize), @offsetOf(ChannelOptions, "allow_initial_offline"));
+    try std.testing.expectEqual(2 * @sizeOf(usize), @offsetOf(ChannelOptions, "initial_backoff_ns"));
+    try std.testing.expectEqual(@offsetOf(ChannelOptions, "initial_backoff_ns") + @sizeOf(u64), @offsetOf(ChannelOptions, "max_backoff_ns"));
+    try std.testing.expectEqual(@offsetOf(ChannelOptions, "max_backoff_ns") + @sizeOf(u64), @offsetOf(ChannelOptions, "multiplier_millis"));
+    try std.testing.expectEqual(@offsetOf(ChannelOptions, "multiplier_millis") + @sizeOf(u32), @offsetOf(ChannelOptions, "jitter_percent"));
+    try std.testing.expectEqual(@as(u32, 0), options.allow_initial_offline);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), options.initial_backoff_ns);
+    try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_s), options.max_backoff_ns);
+    try std.testing.expectEqual(@as(u32, 1600), options.multiplier_millis);
+    try std.testing.expectEqual(@as(u32, 20), options.jitter_percent);
+}
+
+test "C managed channel validates options and clears outputs" {
+    var output: ?*ChannelHandle = @ptrFromInt(1);
+    var options: ChannelOptions = .{};
+    options.struct_size = channel_options_v1_size - 1;
+    try std.testing.expectEqual(Error.invalid_argument, grpc_lite_channel_create_managed(
+        null,
+        view("127.0.0.1:1"),
+        &options,
+        &output,
+    ));
+    try std.testing.expectEqual(null, output);
+
+    const invalid_options = [_]ChannelOptions{
+        .{ .allow_initial_offline = 2 },
+        .{ .initial_backoff_ns = 0 },
+        .{ .initial_backoff_ns = 2, .max_backoff_ns = 1 },
+        .{ .multiplier_millis = 999 },
+        .{ .jitter_percent = 101 },
+    };
+    for (invalid_options) |invalid| {
+        output = @ptrFromInt(1);
+        try std.testing.expectEqual(Error.invalid_argument, grpc_lite_channel_create_managed(
+            null,
+            view("127.0.0.1:1"),
+            &invalid,
+            &output,
+        ));
+        try std.testing.expectEqual(null, output);
+    }
+
+    output = @ptrFromInt(1);
+    try std.testing.expectEqual(Error.invalid_argument, grpc_lite_channel_create_managed(
+        null,
+        view("invalid"),
+        null,
+        &output,
+    ));
+    try std.testing.expectEqual(null, output);
+    try std.testing.expectEqual(Error.invalid_argument, grpc_lite_channel_create_managed(
+        null,
+        view("127.0.0.1:1"),
+        null,
+        null,
+    ));
+    grpc_lite_channel_shutdown(null);
+    grpc_lite_channel_wait(null);
+}
+
+test "C managed channel may start before its endpoint" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var reservation = try address.listen(std.testing.io, .{});
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        reservation.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+    const port = std.mem.bigToNative(u16, local_address.port);
+    reservation.deinit(std.testing.io);
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{port});
+    const options: ChannelOptions = .{
+        .allow_initial_offline = 1,
+        .initial_backoff_ns = std.time.ns_per_hour,
+        .max_backoff_ns = std.time.ns_per_hour,
+        .jitter_percent = 0,
+    };
+    var handle: ?*ChannelHandle = null;
+    try std.testing.expectEqual(Error.ok, grpc_lite_channel_create_managed(
+        null,
+        view(target),
+        &options,
+        &handle,
+    ));
+    grpc_lite_channel_shutdown(handle);
+    grpc_lite_channel_wait(handle);
+    grpc_lite_channel_destroy(handle);
 }
 
 test "C metadata owns duplicate binary entries" {

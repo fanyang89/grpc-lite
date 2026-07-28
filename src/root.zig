@@ -26,6 +26,9 @@ comptime {
     @export(&c_api.grpc_lite_metadata_view_count, .{ .name = "grpc_lite_metadata_view_count" });
     @export(&c_api.grpc_lite_metadata_view_at, .{ .name = "grpc_lite_metadata_view_at" });
     @export(&c_api.grpc_lite_channel_create, .{ .name = "grpc_lite_channel_create" });
+    @export(&c_api.grpc_lite_channel_create_managed, .{ .name = "grpc_lite_channel_create_managed" });
+    @export(&c_api.grpc_lite_channel_shutdown, .{ .name = "grpc_lite_channel_shutdown" });
+    @export(&c_api.grpc_lite_channel_wait, .{ .name = "grpc_lite_channel_wait" });
     @export(&c_api.grpc_lite_channel_destroy, .{ .name = "grpc_lite_channel_destroy" });
     @export(&c_api.grpc_lite_channel_call_unary, .{ .name = "grpc_lite_channel_call_unary" });
     @export(&c_api.grpc_lite_channel_open_stream, .{ .name = "grpc_lite_channel_open_stream" });
@@ -87,6 +90,7 @@ pub const UnaryCallCallbacks = call.Callbacks;
 pub const Compression = compression.Compression;
 pub const Channel = channel.Channel;
 pub const ChannelOptions = channel.Options;
+pub const ReconnectOptions = channel.ReconnectOptions;
 pub const ClientTlsOptions = channel.TlsOptions;
 pub const Metadata = metadata.Metadata;
 pub const MetadataEntry = metadata.Entry;

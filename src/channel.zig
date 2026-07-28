@@ -68,6 +68,14 @@ pub const TlsOptions = struct {
     handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
 };
 
+pub const ReconnectOptions = struct {
+    allow_initial_offline: bool = false,
+    initial_backoff_ns: u64 = std.time.ns_per_s,
+    max_backoff_ns: u64 = 120 * std.time.ns_per_s,
+    multiplier_millis: u32 = 1600,
+    jitter_percent: u8 = 20,
+};
+
 const ChannelOptions = struct {
     user_agent: []const u8 = version.user_agent,
     initial_stream_window_size: u32 = 64 * 1024,
@@ -75,6 +83,7 @@ const ChannelOptions = struct {
     write_low_watermark_bytes: usize = 512 * 1024,
     runtime: ?*Runtime = null,
     tls: ?TlsOptions = null,
+    reconnect: ?ReconnectOptions = null,
 };
 
 pub const Options = ChannelOptions;
@@ -179,6 +188,7 @@ pub const Channel = struct {
         if (options.tls) |tls_options| {
             if (tls_options.handshake_timeout_ns == 0) return error.InvalidTlsHandshakeTimeout;
         }
+        if (options.reconnect) |reconnect| try validateReconnectOptions(reconnect);
         try validateTransportOptions(
             options.initial_stream_window_size,
             options.write_high_watermark_bytes,
@@ -212,6 +222,9 @@ pub const Channel = struct {
             .write_low_watermark_bytes = options.write_low_watermark_bytes,
             .tls_config = null,
             .tls_handshake_timeout_ns = if (options.tls) |tls_options| tls_options.handshake_timeout_ns else 0,
+            .reconnect_options = options.reconnect,
+            .reconnect_backoff_ns = if (options.reconnect) |reconnect| reconnect.initial_backoff_ns else 0,
+            .reconnect_random_state = std.hash.Wyhash.hash(nowNs(), target),
             .async_handle = undefined,
             .deadline_timer = undefined,
         };
@@ -265,6 +278,7 @@ pub const Channel = struct {
             impl.writes.deinit(impl.allocator);
             std.debug.assert(impl.deadline_heap.items.len == 0);
             std.debug.assert(impl.deadline_heap_index == null);
+            std.debug.assert(impl.reconnect_heap_index == null);
             impl.deadline_heap.deinit(impl.allocator);
             if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
             return error.ConnectionFailed;
@@ -389,6 +403,9 @@ pub const Channel = struct {
         impl.mutex.lockUncancelable(syncIo());
         const thread = impl.thread;
         impl.thread = null;
+        if (thread == null) {
+            while (impl.state != .stopped) impl.condition.waitUncancelable(syncIo(), &impl.mutex);
+        }
         impl.mutex.unlock(syncIo());
         if (thread) |running_thread| running_thread.join();
     }
@@ -409,6 +426,7 @@ pub const Channel = struct {
         impl.writes.deinit(impl.allocator);
         std.debug.assert(impl.deadline_heap.items.len == 0);
         std.debug.assert(impl.deadline_heap_index == null);
+        std.debug.assert(impl.reconnect_heap_index == null);
         impl.deadline_heap.deinit(impl.allocator);
         if (comptime build_options.tls) {
             if (impl.tls_config) |config| config.destroy();
@@ -428,7 +446,7 @@ pub const Channel = struct {
 };
 
 const State = enum { starting, running, stopping, stopped };
-const ConnectionState = enum { resolving, connecting, handshaking, active, draining, closing };
+const ConnectionState = enum { resolving, connecting, handshaking, active, draining, backing_off, closing };
 const ResolveState = enum { idle, pending, ready, failed, cancelled };
 
 const TestObserver = if (builtin.is_test) struct {
@@ -440,6 +458,7 @@ const TestObserver = if (builtin.is_test) struct {
     connect_observed_sem: std.Io.Semaphore = .{},
     connect_release: std.Io.Semaphore = .{},
     connect_cancel_confirmed: std.atomic.Value(bool) = .init(false),
+    operation_submitted: std.atomic.Value(bool) = .init(false),
     deadline_timer_callbacks: std.atomic.Value(usize) = .init(0),
     deadline_timer_armed: std.atomic.Value(bool) = .init(false),
     deadline_timer_target_ns: std.atomic.Value(u64) = .init(0),
@@ -462,6 +481,16 @@ const Impl = struct {
     tls_handshake_timeout_ns: u64 = 0,
     tls_handshake_deadline_ns: ?u64 = null,
     deadline_heap_index: ?usize = null,
+    reconnect_options: ?ReconnectOptions,
+    reconnect_attempt: u32 = 0,
+    reconnect_backoff_ns: u64,
+    reconnect_deadline_ns: ?u64 = null,
+    reconnect_heap_index: ?usize = null,
+    reconnect_after_close: bool = false,
+    discard_writes_after_cancel: bool = false,
+    reconnect_backoff_pending_reset: bool = false,
+    ever_active: bool = false,
+    reconnect_random_state: u64,
     tls_handshake_needs_write: bool = false,
     tls_session: ?*tls_record.Session = null,
     tls_plaintext: ?[]u8 = null,
@@ -1098,6 +1127,7 @@ const DeadlineTarget = union(enum) {
     operation: *Operation,
     client_stream: *ClientStreamState,
     tls_handshake: *Impl,
+    reconnect: *Impl,
 };
 
 const DeadlineEntry = struct {
@@ -1110,6 +1140,7 @@ fn deadlineTargetIndex(target: DeadlineTarget) *?usize {
         .operation => |operation| &operation.deadline_heap_index,
         .client_stream => |client_stream| &client_stream.deadline_heap_index,
         .tls_handshake => |impl| &impl.deadline_heap_index,
+        .reconnect => |impl| &impl.reconnect_heap_index,
     };
 }
 
@@ -1125,6 +1156,10 @@ fn deadlineTargetsEqual(a: DeadlineTarget, b: DeadlineTarget) bool {
         },
         .tls_handshake => |impl| switch (b) {
             .tls_handshake => |other| impl == other,
+            else => false,
+        },
+        .reconnect => |impl| switch (b) {
+            .reconnect => |other| impl == other,
             else => false,
         },
     };
@@ -1277,6 +1312,11 @@ fn clearTlsHandshakeDeadline(impl: *Impl) void {
     impl.tls_handshake_deadline_ns = null;
 }
 
+fn clearReconnectDeadline(impl: *Impl) void {
+    _ = deadlineHeapRemove(impl, .{ .reconnect = impl });
+    impl.reconnect_deadline_ns = null;
+}
+
 const WriteRequest = struct {
     request: xev.WriteRequest = undefined,
     impl: *Impl,
@@ -1403,9 +1443,11 @@ fn runLoop(impl: *Impl) void {
         impl.resolver_initialized = true;
     }
     impl.async_handle.wait(&impl.loop, &impl.async_completion, Impl, impl, onAsync);
+    if (impl.reconnect_options) |options| {
+        if (options.allow_initial_offline) impl.signalStartup(true);
+    }
     startConnection(impl) catch {
-        impl.signalStartup(false);
-        beginStop(impl, "connection failed");
+        scheduleReconnect(impl, "connection failed");
     };
     impl.loop.run(.until_done) catch {
         beginStop(impl, "event loop failed");
@@ -1424,6 +1466,7 @@ fn runLoop(impl: *Impl) void {
     }
     std.debug.assert(impl.deadline_heap.items.len == 0);
     std.debug.assert(impl.deadline_heap_index == null);
+    std.debug.assert(impl.reconnect_heap_index == null);
     std.debug.assert(impl.waiting_operation_head == null);
     std.debug.assert(impl.waiting_operation_tail == null);
     impl.markStopped();
@@ -1455,10 +1498,16 @@ fn startConnection(impl: *Impl) !void {
     impl.connection_state = .connecting;
     _ = impl.connection_generation.fetchAdd(1, .monotonic);
 
-    try initializeSession(impl);
+    initializeSession(impl) catch {
+        beginStop(impl, "connection setup failed");
+        return;
+    };
     if (comptime build_options.tls) {
         if (impl.tls_config) |config| {
-            impl.tls_session = try tls_record.Session.create(impl.allocator, config, impl.host);
+            impl.tls_session = tls_record.Session.create(impl.allocator, config, impl.host) catch {
+                beginStop(impl, "TLS setup failed");
+                return;
+            };
         }
     }
     impl.connect_active = true;
@@ -1486,12 +1535,10 @@ fn continueResolvedConnection(impl: *Impl) void {
     switch (impl.resolve_state) {
         .pending, .idle => return,
         .ready => startConnection(impl) catch {
-            impl.signalStartup(false);
-            beginStop(impl, "name resolution failed");
+            scheduleReconnect(impl, "name resolution failed");
         },
         .failed, .cancelled => {
-            impl.signalStartup(false);
-            beginStop(impl, "name resolution failed");
+            scheduleReconnect(impl, "name resolution failed");
         },
     }
 }
@@ -1532,8 +1579,7 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
     defer submitCloseIfReady(impl, loop);
     result catch {
         if (impl.literal_address != null) {
-            impl.signalStartup(false);
-            beginStop(impl, "connection failed");
+            failConnectionCandidate(impl, "connection failed");
         } else {
             if (impl.session) |session| c.nghttp2_session_del(session);
             impl.session = null;
@@ -1543,8 +1589,7 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
         return .disarm;
     };
     socket_options.enableTcpNoDelay(impl.tcp.fd) catch {
-        impl.signalStartup(false);
-        beginStop(impl, "connection failed");
+        failConnectionCandidate(impl, "connection failed");
         return .disarm;
     };
     impl.mutex.lockUncancelable(syncIo());
@@ -1573,20 +1618,22 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
         return .disarm;
     }
     activateConnection(impl) catch {
-        impl.signalStartup(false);
-        beginStop(impl, "connection failed");
+        handleTransportFailure(impl, "connection failed");
     };
     return .disarm;
 }
 
 fn activateConnection(impl: *Impl) !void {
     clearTlsHandshakeDeadline(impl);
+    clearReconnectDeadline(impl);
     clearResolvedAddresses(impl);
     impl.connection_state = .active;
     try flush(impl);
     impl.mutex.lockUncancelable(syncIo());
     impl.accepting_streams = true;
     impl.mutex.unlock(syncIo());
+    impl.ever_active = true;
+    impl.reconnect_backoff_pending_reset = impl.reconnect_attempt != 0;
     impl.signalStartup(true);
     processPending(impl);
 }
@@ -1625,7 +1672,7 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
             }
             scheduleDeadlineTimer(impl);
         },
-        .connecting, .closing => scheduleDeadlineTimer(impl),
+        .connecting, .backing_off, .closing => scheduleDeadlineTimer(impl),
     }
     return .rearm;
 }
@@ -1679,7 +1726,7 @@ fn processPending(impl: *Impl) void {
         };
     }
     flush(impl) catch {
-        beginStop(impl, "connection failed");
+        handleTransportFailure(impl, "connection failed");
         return;
     };
     scheduleDeadlineTimer(impl);
@@ -1740,12 +1787,12 @@ fn processStreamWakes(impl: *Impl) void {
             };
         }
         processClientStreamCommands(client_stream) catch {
-            beginStop(impl, "stream command failed");
+            handleTransportFailure(impl, "stream command failed");
             return;
         };
     }
     if (impl.connected and (impl.connection_state == .active or impl.connection_state == .draining)) flush(impl) catch {
-        beginStop(impl, "connection failed");
+        handleTransportFailure(impl, "connection failed");
         return;
     };
     scheduleDeadlineTimer(impl);
@@ -2179,6 +2226,7 @@ fn submitOperation(impl: *Impl, operation: *Operation) !void {
     if (stream_id < 0) return error.NativeFailure;
     operation.stream_id = stream_id;
     impl.operations.putAssumeCapacity(stream_id, operation);
+    if (comptime builtin.is_test) impl.test_observer.operation_submitted.store(true, .release);
 }
 
 fn readRequestData(
@@ -2401,7 +2449,7 @@ fn onRead(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev
         }
     }
     receiveHttp2(impl, impl.read_buffer[0..bytes_read]) catch {
-        beginStop(impl, "HTTP/2 connection failed");
+        handleTransportFailure(impl, "HTTP/2 connection failed");
         return .disarm;
     };
     impl.read_active = true;
@@ -2412,7 +2460,7 @@ fn closeOrReconnectAfterReadFailure(impl: *Impl, reason: []const u8) void {
     if (impl.connection_state == .draining and impl.operations.count() == 0 and impl.streams.count() == 0) {
         beginReconnect(impl);
     } else {
-        beginStop(impl, reason);
+        handleTransportFailure(impl, reason);
     }
 }
 
@@ -2458,7 +2506,7 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
     impl.allocator.free(write.bytes);
     releaseWriteRequest(impl, write);
     if (!write_succeeded and generation == impl.connection_generation.load(.monotonic) and impl.connection_state != .closing) {
-        beginStop(impl, "connection write failed");
+        handleTransportFailure(impl, "connection write failed");
     }
     if (write_succeeded and
         generation == impl.connection_generation.load(.monotonic) and
@@ -2471,11 +2519,14 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
             impl.write_wake_queued = true;
             impl.async_handle.notify() catch {
                 impl.write_wake_queued = false;
-                beginStop(impl, "connection write failed");
+                handleTransportFailure(impl, "connection write failed");
             };
         }
     }
-    if (impl.stopping_on_loop) discardQueuedWrites(impl);
+    if (impl.stopping_on_loop or impl.discard_writes_after_cancel) {
+        discardQueuedWrites(impl);
+        impl.discard_writes_after_cancel = false;
+    }
     submitCloseIfReady(impl, loop);
     return .disarm;
 }
@@ -2615,8 +2666,13 @@ fn onDataChunk(
 
 fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
     const native_frame = received_frame.?;
+    const impl: *Impl = @ptrCast(@alignCast(user_data.?));
+    if (native_frame.*.hd.type == c.NGHTTP2_SETTINGS and impl.reconnect_backoff_pending_reset) {
+        impl.reconnect_attempt = 0;
+        impl.reconnect_backoff_ns = impl.reconnect_options.?.initial_backoff_ns;
+        impl.reconnect_backoff_pending_reset = false;
+    }
     if (native_frame.*.hd.type == c.NGHTTP2_GOAWAY) {
-        const impl: *Impl = @ptrCast(@alignCast(user_data.?));
         if (impl.connection_state == .active) {
             impl.connection_state = .draining;
             impl.mutex.lockUncancelable(syncIo());
@@ -2629,7 +2685,6 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
         }
         return 0;
     }
-    const impl: *Impl = @ptrCast(@alignCast(user_data.?));
     if (native_frame.*.hd.type == c.NGHTTP2_HEADERS) {
         const end_stream = native_frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
         if (impl.operations.get(native_frame.*.hd.stream_id)) |operation| {
@@ -2795,6 +2850,13 @@ fn expireDeadlines(impl: *Impl, now: u64) !void {
                 if (impl.connection_state != .handshaking or impl.tls_session == null) continue;
                 failConnectionCandidate(impl, "TLS handshake timed out");
             },
+            .reconnect => |target_impl| {
+                std.debug.assert(target_impl == impl);
+                if (impl.reconnect_deadline_ns != entry.expires_at_ns) continue;
+                impl.reconnect_deadline_ns = null;
+                if (impl.connection_state != .backing_off) continue;
+                startConnection(impl) catch scheduleReconnect(impl, "connection failed");
+            },
             .operation => |operation| {
                 if (operation.deadline_ns != entry.expires_at_ns or operation.deadline_expired) continue;
                 if (operation.waiting_queued) {
@@ -2843,6 +2905,7 @@ fn expireDeadlines(impl: *Impl, now: u64) !void {
 fn beginReconnect(impl: *Impl) void {
     if (impl.connection_state != .draining or impl.operations.count() != 0 or impl.streams.count() != 0) return;
     impl.connection_state = .closing;
+    impl.reconnect_after_close = false;
     impl.connected = false;
     clearResolvedAddresses(impl);
     if (impl.session) |session| {
@@ -2863,11 +2926,138 @@ fn beginReconnect(impl: *Impl) void {
     submitCloseIfReady(impl, &impl.loop);
 }
 
-fn failConnectionCandidate(impl: *Impl, reason: []const u8) void {
-    if (impl.literal_address != null or impl.next_address >= impl.resolved_addresses.len) {
+fn handleTransportFailure(impl: *Impl, reason: []const u8) void {
+    if (impl.stopping_on_loop or impl.connection_state == .closing or impl.connection_state == .backing_off) return;
+    if (!canReconnect(impl)) {
+        beginStop(impl, reason);
+        return;
+    }
+
+    impl.connection_state = .closing;
+    impl.reconnect_after_close = true;
+    impl.connected = false;
+    clearResolvedAddresses(impl);
+    clearTlsHandshakeDeadline(impl);
+    impl.mutex.lockUncancelable(syncIo());
+    impl.accepting_streams = false;
+    impl.mutex.unlock(syncIo());
+
+    while (impl.operations.count() != 0) {
+        var iterator = impl.operations.iterator();
+        const entry = iterator.next().?;
+        const operation = entry.value_ptr.*;
+        std.debug.assert(impl.operations.remove(entry.key_ptr.*));
+        removeOperationDeadline(impl, operation);
+        operation.setOutcome(.unavailable, reason) catch {};
+        operation.finish();
+    }
+    while (true) {
+        impl.mutex.lockUncancelable(syncIo());
+        var iterator = impl.stream_states.keyIterator();
+        const client_stream = if (iterator.next()) |entry| entry.* else null;
+        impl.mutex.unlock(syncIo());
+        const target = client_stream orelse break;
+        terminalizeStream(target, .init(.unavailable, reason));
+        releaseStreamLoopOwnership(target);
+    }
+    impl.streams.clearRetainingCapacity();
+
+    if (impl.session) |session| c.nghttp2_session_del(session);
+    impl.session = null;
+    clearTlsConnection(impl);
+    if (impl.read_active and !impl.read_cancel_submitted) {
+        impl.read_cancel_submitted = true;
+        impl.loop.cancel(
+            &impl.read_completion,
+            &impl.read_cancel_completion,
+            Impl,
+            impl,
+            onReadCanceled,
+        );
+    }
+    if (impl.write_queue.head) |request| {
+        if (request.completion.state() == .active) {
+            if (!impl.write_cancel_submitted) {
+                impl.discard_writes_after_cancel = true;
+                impl.write_cancel_submitted = true;
+                impl.loop.cancel(
+                    &request.completion,
+                    &impl.write_cancel_completion,
+                    Impl,
+                    impl,
+                    onWriteCanceled,
+                );
+            }
+        } else {
+            discardQueuedWrites(impl);
+            impl.discard_writes_after_cancel = false;
+        }
+    }
+    submitCloseIfReady(impl, &impl.loop);
+    scheduleDeadlineTimer(impl);
+}
+
+fn canReconnect(impl: *const Impl) bool {
+    const options = impl.reconnect_options orelse return false;
+    return impl.ever_active or options.allow_initial_offline;
+}
+
+fn scheduleReconnect(impl: *Impl, reason: []const u8) void {
+    if (!canReconnect(impl)) {
         impl.signalStartup(false);
         beginStop(impl, reason);
         return;
+    }
+    clearResolvedAddresses(impl);
+    impl.connection_state = .backing_off;
+    impl.reconnect_after_close = false;
+    impl.signalStartup(true);
+    const options = impl.reconnect_options.?;
+    const delay = jitterReconnectBackoffNs(options, impl.reconnect_backoff_ns, nextReconnectRandom(impl));
+    impl.reconnect_backoff_ns = nextReconnectBackoffNs(options, impl.reconnect_backoff_ns);
+    impl.reconnect_attempt +|= 1;
+    const deadline = nowNs() +| delay;
+    deadlineHeapInsertOrUpdate(impl, .{ .reconnect = impl }, deadline) catch {
+        beginStop(impl, "reconnect scheduling failed");
+        return;
+    };
+    impl.reconnect_deadline_ns = deadline;
+    scheduleDeadlineTimer(impl);
+}
+
+fn nextReconnectRandom(impl: *Impl) u64 {
+    var value = impl.reconnect_random_state;
+    if (value == 0) value = 0x9e3779b97f4a7c15;
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    impl.reconnect_random_state = value;
+    return value;
+}
+
+fn nextReconnectBackoffNs(options: ReconnectOptions, current: u64) u64 {
+    const scaled = std.math.mul(u64, current, options.multiplier_millis) catch return options.max_backoff_ns;
+    return @min(scaled / 1000, options.max_backoff_ns);
+}
+
+fn jitterReconnectBackoffNs(options: ReconnectOptions, base: u64, random: u64) u64 {
+    const spread = base / 100 * options.jitter_percent;
+    if (spread == 0) return base;
+    const width = std.math.mul(u64, spread, 2) catch std.math.maxInt(u64);
+    const offset = random % (width +| 1);
+    return @min(base - spread +| offset, options.max_backoff_ns);
+}
+
+fn failConnectionCandidate(impl: *Impl, reason: []const u8) void {
+    if (impl.literal_address != null or impl.next_address >= impl.resolved_addresses.len) {
+        if (!canReconnect(impl)) {
+            impl.signalStartup(false);
+            beginStop(impl, reason);
+            return;
+        }
+        impl.reconnect_after_close = true;
+    } else {
+        impl.reconnect_after_close = false;
     }
     impl.connection_state = .closing;
     impl.connected = false;
@@ -2930,7 +3120,11 @@ fn onTcpClosed(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _
     impl.mutex.unlock(syncIo());
     if (!running) return .disarm;
 
-    startConnection(impl) catch beginStop(impl, "connection failed");
+    if (impl.reconnect_after_close) {
+        scheduleReconnect(impl, "connection failed");
+    } else {
+        startConnection(impl) catch scheduleReconnect(impl, "connection failed");
+    }
     return .disarm;
 }
 
@@ -2962,6 +3156,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     impl.connection_state = .closing;
     impl.connected = false;
     clearTlsHandshakeDeadline(impl);
+    clearReconnectDeadline(impl);
     if (impl.resolver_initialized) impl.resolver.shutdown();
     impl.mutex.lockUncancelable(syncIo());
     impl.accepting_streams = false;
@@ -3246,6 +3441,15 @@ fn validateTransportOptions(initial_stream_window_size: u32, high: usize, low: u
     if (low == 0 or low >= high) return error.InvalidWriteWatermarks;
 }
 
+fn validateReconnectOptions(options: ReconnectOptions) !void {
+    if (options.initial_backoff_ns == 0 or
+        options.max_backoff_ns < options.initial_backoff_ns or
+        options.multiplier_millis < 1000 or options.jitter_percent > 100)
+    {
+        return error.InvalidReconnectOptions;
+    }
+}
+
 fn canFlushWrites(queued: usize, high: usize) bool {
     return queued < high;
 }
@@ -3468,6 +3672,9 @@ fn initTestImpl(impl: *Impl, serialized_allocator: *SerializedAllocator, host: [
         .initial_stream_window_size = 64 * 1024,
         .write_high_watermark_bytes = 1024 * 1024,
         .write_low_watermark_bytes = 512 * 1024,
+        .reconnect_options = null,
+        .reconnect_backoff_ns = 0,
+        .reconnect_random_state = 1,
     };
     impl.allocator = serialized_allocator.allocator();
 }
@@ -3705,6 +3912,284 @@ test "channel transport options reject unsafe windows and watermarks" {
             .write_low_watermark_bytes = 8,
         }),
     );
+}
+
+test "reconnect backoff is bounded exponential with deterministic jitter" {
+    const options: ReconnectOptions = .{
+        .initial_backoff_ns = 100,
+        .max_backoff_ns = 1_000,
+        .multiplier_millis = 2000,
+        .jitter_percent = 20,
+    };
+    try std.testing.expectEqual(@as(u64, 80), jitterReconnectBackoffNs(options, 100, 0));
+    try std.testing.expectEqual(@as(u64, 120), jitterReconnectBackoffNs(options, 100, 40));
+    try std.testing.expectEqual(@as(u64, 200), nextReconnectBackoffNs(options, 100));
+    try std.testing.expectEqual(@as(u64, 1_000), nextReconnectBackoffNs(options, 800));
+    try std.testing.expectEqual(@as(u64, 1_000), jitterReconnectBackoffNs(options, 1_000, 400));
+    try std.testing.expectError(error.InvalidReconnectOptions, validateReconnectOptions(.{
+        .initial_backoff_ns = 2,
+        .max_backoff_ns = 1,
+    }));
+}
+
+test "allow_initial_offline queues unary until the server becomes available" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const Handler = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Worker = struct {
+        channel: *Channel,
+        done: std.atomic.Value(bool) = .init(false),
+        code: status.Code = .unknown,
+
+        fn run(self: *@This()) void {
+            var result = self.channel.callUnary(
+                std.testing.allocator,
+                "/test.Reconnect/InitialOffline",
+                "queued",
+                .{ .timeout_ns = 5 * std.time.ns_per_s },
+            ) catch {
+                self.done.store(true, .release);
+                return;
+            };
+            defer result.deinit();
+            self.code = result.status.code;
+            self.done.store(true, .release);
+        }
+    };
+
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var reservation = try address.listen(std.testing.io, .{});
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        reservation.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+    const port = std.mem.bigToNative(u16, local_address.port);
+    reservation.deinit(std.testing.io);
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{port});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .reconnect = .{
+            .allow_initial_offline = true,
+            .initial_backoff_ns = 10 * std.time.ns_per_ms,
+            .max_backoff_ns = 10 * std.time.ns_per_ms,
+            .jitter_percent = 0,
+        },
+    });
+    defer channel.deinit();
+
+    var worker = Worker{ .channel = &channel };
+    const worker_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{ .port = port });
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Reconnect/InitialOffline",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+    const completed = waitForTestFlag(&worker.done, 5 * std.time.ns_per_s);
+    if (!completed) channel.shutdown();
+    worker_thread.join();
+
+    try std.testing.expect(completed);
+    try std.testing.expectEqual(status.Code.ok, worker.code);
+    try std.testing.expectEqual(@as(usize, 1), handler.calls.load(.acquire));
+    channel.shutdown();
+    channel.wait();
+    try std.testing.expectEqual(@as(u32, 0), channel.impl.reconnect_attempt);
+}
+
+test "ordinary connection loss reconnects without replaying a submitted unary" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const Handler = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Worker = struct {
+        channel: *Channel,
+        done: std.atomic.Value(bool) = .init(false),
+        code: status.Code = .unknown,
+
+        fn run(self: *@This()) void {
+            var result = self.channel.callUnary(
+                std.testing.allocator,
+                "/test.Reconnect/NoReplay",
+                "first",
+                .{ .timeout_ns = 5 * std.time.ns_per_s },
+            ) catch {
+                self.done.store(true, .release);
+                return;
+            };
+            defer result.deinit();
+            self.code = result.status.code;
+            self.done.store(true, .release);
+        }
+    };
+
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try address.listen(std.testing.io, .{});
+    var listener_open = true;
+    defer if (listener_open) listener.deinit(std.testing.io);
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        listener.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+    const port = std.mem.bigToNative(u16, local_address.port);
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{port});
+
+    const InitWorker = struct {
+        target: []const u8,
+        channel: ?Channel = null,
+
+        fn run(self: *@This()) void {
+            self.channel = Channel.init(std.testing.allocator, self.target, .{
+                .reconnect = .{
+                    .initial_backoff_ns = 10 * std.time.ns_per_ms,
+                    .max_backoff_ns = 10 * std.time.ns_per_ms,
+                    .jitter_percent = 0,
+                },
+            }) catch null;
+        }
+    };
+    var init_worker = InitWorker{ .target = target };
+    const init_thread = try std.Thread.spawn(.{}, InitWorker.run, .{&init_worker});
+    var peer = try listener.accept(std.testing.io);
+    init_thread.join();
+    var channel = init_worker.channel orelse return error.ChannelInitFailed;
+    defer channel.deinit();
+
+    var worker = Worker{ .channel = &channel };
+    const worker_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    try std.testing.expect(waitForTestFlag(
+        &channel.impl.test_observer.operation_submitted,
+        5 * std.time.ns_per_s,
+    ));
+    peer.close(std.testing.io);
+    const first_completed = waitForTestFlag(&worker.done, 5 * std.time.ns_per_s);
+    if (!first_completed) channel.shutdown();
+    worker_thread.join();
+    try std.testing.expect(first_completed);
+    try std.testing.expectEqual(status.Code.unavailable, worker.code);
+
+    listener.deinit(std.testing.io);
+    listener_open = false;
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{ .port = port });
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Reconnect/NoReplay",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var second = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Reconnect/NoReplay",
+        "second",
+        .{ .timeout_ns = 5 * std.time.ns_per_s },
+    );
+    defer second.deinit();
+    try std.testing.expect(second.status.isOk());
+    try std.testing.expectEqualStrings("second", second.payload);
+    try std.testing.expectEqual(@as(usize, 1), handler.calls.load(.acquire));
+}
+
+test "queued unary deadline expires during reconnect backoff" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var reservation = try address.listen(std.testing.io, .{});
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        reservation.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+    const port = std.mem.bigToNative(u16, local_address.port);
+    reservation.deinit(std.testing.io);
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{port});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .reconnect = .{
+            .allow_initial_offline = true,
+            .initial_backoff_ns = std.time.ns_per_s,
+            .max_backoff_ns = std.time.ns_per_s,
+            .jitter_percent = 0,
+        },
+    });
+    defer channel.deinit();
+
+    var result = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Reconnect/Deadline",
+        "expires",
+        .{ .timeout_ns = 10 * std.time.ns_per_ms },
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(status.Code.deadline_exceeded, result.status.code);
+}
+
+test "channel shutdown cancels reconnect backoff and drains" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var reservation = try address.listen(std.testing.io, .{});
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        reservation.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+    const port = std.mem.bigToNative(u16, local_address.port);
+    reservation.deinit(std.testing.io);
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{port});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .reconnect = .{
+            .allow_initial_offline = true,
+            .initial_backoff_ns = std.time.ns_per_hour,
+            .max_backoff_ns = std.time.ns_per_hour,
+            .jitter_percent = 0,
+        },
+    });
+    defer channel.deinit();
+
+    channel.shutdown();
+    const first_waiter = try std.Thread.spawn(.{}, Channel.wait, .{&channel});
+    const second_waiter = try std.Thread.spawn(.{}, Channel.wait, .{&channel});
+    first_waiter.join();
+    second_waiter.join();
+    try std.testing.expectEqual(State.stopped, channel.impl.state);
+    try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
+    try std.testing.expect(channel.impl.reconnect_heap_index == null);
 }
 
 test "client stream handle outlives channel teardown" {
