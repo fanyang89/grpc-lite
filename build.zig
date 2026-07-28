@@ -359,6 +359,13 @@ pub fn build(b: *std.Build) void {
         .root_module = grpc_lite,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    const install_coverage_tests = b.addInstallFileWithDir(
+        unit_tests.getEmittedBin(),
+        .{ .custom = "coverage" },
+        "grpc-lite-tests",
+    );
+    const coverage_bin_step = b.step("coverage-bin", "Build the core test binary for coverage");
+    coverage_bin_step.dependOn(&install_coverage_tests.step);
 
     const public_api_module = b.createModule(.{
         .root_source_file = b.path("tests/public_api_test.zig"),

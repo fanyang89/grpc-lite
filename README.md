@@ -1,6 +1,7 @@
 # grpc-lite
 
 [![CI](https://github.com/fanyang89/grpc-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/fanyang89/grpc-lite/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/fanyang89/grpc-lite/graph/badge.svg)](https://codecov.io/gh/fanyang89/grpc-lite)
 [![Release](https://img.shields.io/github/v/release/fanyang89/grpc-lite)](https://github.com/fanyang89/grpc-lite/releases)
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/)
 [![License](https://img.shields.io/github/license/fanyang89/grpc-lite)](LICENSE)

@@ -28,6 +28,7 @@ Useful focused tasks:
 mise run build
 mise run test
 mise run test-release-safe
+mise run coverage
 mise run test-tsan
 mise run test-ubsan
 mise run test-tls
@@ -68,6 +69,12 @@ result under `transpiled/` is committed so CMake source consumers do not need Zi
 
 CI compiles both generated C translation units with the system compiler. Regenerate and
 commit them whenever their Zig implementation, dependencies, or Zig version changes.
+
+## Coverage
+
+`mise run coverage` builds the core Debug test binary and runs it through kcov. The task
+requires `kcov` on `PATH` and writes a Cobertura report below `coverage/`. The dedicated
+GitHub Actions workflow uploads that report to Codecov using OIDC authentication.
 
 ## Gperftools
 
