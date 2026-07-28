@@ -85,7 +85,7 @@ jobs:
 
       - name: Build raw package consumer
         run: mise run test-consumer
-      - name: Test CMake FetchContent C consumers
+      - name: Compile transpiled C runtime and plugin
         run: mise run test-consumer-cmake-c
       - name: Install protobuf C++ tools
         run: |

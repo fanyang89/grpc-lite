@@ -12,9 +12,26 @@ find_package(Threads REQUIRED)
 include(FetchContent)
 
 option(GRPC_LITE_ENABLE_TLS "Enable TLS transport support through mbedTLS" OFF)
+set(GRPC_LITE_NGHTTP2_URL "" CACHE STRING "Optional nghttp2 source tarball URL")
+set(GRPC_LITE_NGHTTP2_URL_HASH "" CACHE STRING "Optional nghttp2 tarball hash (ALGO=value)")
+set(GRPC_LITE_CARES_URL "" CACHE STRING "Optional c-ares source tarball URL")
+set(GRPC_LITE_CARES_URL_HASH "" CACHE STRING "Optional c-ares tarball hash (ALGO=value)")
 if(GRPC_LITE_ENABLE_TLS)
   message(FATAL_ERROR "TLS is not yet available in the transpiled C source build")
 endif()
+
+function(_grpc_lite_declare_archive name url hash)
+  if(hash)
+    FetchContent_Declare(${name}
+      URL "${url}"
+      URL_HASH "${hash}"
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  else()
+    FetchContent_Declare(${name}
+      URL "${url}"
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  endif()
+endfunction()
 
 set(_grpc_lite_runtime_source "${CMAKE_CURRENT_SOURCE_DIR}/transpiled/src/grpc_lite.c")
 set(_grpc_lite_plugin_source
@@ -29,14 +46,19 @@ if(NOT TARGET nghttp2)
   set(BUILD_STATIC_LIBS ON)
   set(BUILD_TESTING OFF)
   set(ENABLE_DOC OFF)
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nghttp2/CMakeLists.txt")
+  if(GRPC_LITE_NGHTTP2_URL)
+    _grpc_lite_declare_archive(
+      grpc_lite_nghttp2
+      "${GRPC_LITE_NGHTTP2_URL}"
+      "${GRPC_LITE_NGHTTP2_URL_HASH}")
+    FetchContent_MakeAvailable(grpc_lite_nghttp2)
+  elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nghttp2/CMakeLists.txt")
     add_subdirectory(third_party/nghttp2 EXCLUDE_FROM_ALL)
   else()
-    FetchContent_Declare(
+    _grpc_lite_declare_archive(
       grpc_lite_nghttp2
-      URL https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99
-      URL_HASH SHA256=3f042e5284ad349f837b65dd5be953b34c007a05259119092dbe6ebeaa73d306
-      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+      "https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99"
+      "SHA256=3f042e5284ad349f837b65dd5be953b34c007a05259119092dbe6ebeaa73d306")
     FetchContent_MakeAvailable(grpc_lite_nghttp2)
   endif()
 endif()
@@ -47,11 +69,17 @@ if(NOT TARGET c-ares::cares)
   set(CARES_INSTALL OFF CACHE BOOL "" FORCE)
   set(CARES_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(CARES_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(
-    grpc_lite_cares
-    URL https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz
-    URL_HASH SHA256=c222b6d681096f9444d2c4863d2c1174019e27cacca0a4a5c114d36dd7d7bf78
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  if(GRPC_LITE_CARES_URL)
+    _grpc_lite_declare_archive(
+      grpc_lite_cares
+      "${GRPC_LITE_CARES_URL}"
+      "${GRPC_LITE_CARES_URL_HASH}")
+  else()
+    _grpc_lite_declare_archive(
+      grpc_lite_cares
+      "https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz"
+      "SHA256=c222b6d681096f9444d2c4863d2c1174019e27cacca0a4a5c114d36dd7d7bf78")
+  endif()
   FetchContent_MakeAvailable(grpc_lite_cares)
 endif()
 

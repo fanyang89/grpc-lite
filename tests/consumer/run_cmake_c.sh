@@ -35,4 +35,5 @@ cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DGRPC_LITE_SOURCE_DIR="$package_source"
 cmake --build "$work_dir/build"
+cmake --build "$work_dir/build" --target grpc_lite_protoc_gen
 ctest --test-dir "$work_dir/build" --output-on-failure

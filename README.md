@@ -144,6 +144,17 @@ Zig. It currently supports insecure Linux x86_64 builds. Initialize nested submo
 before configuring, and run `mise run transpile-c` after changing the Zig runtime or C++
 generator.
 
+Dependency mirrors may provide source tarballs at configure time. Hashes are optional
+for custom URLs and use CMake's `ALGO=value` format:
+
+```bash
+cmake -S . -B build \
+  -DGRPC_LITE_NGHTTP2_URL=https://mirror.example/nghttp2.tar.gz \
+  -DGRPC_LITE_NGHTTP2_URL_HASH=SHA256=... \
+  -DGRPC_LITE_CARES_URL=https://mirror.example/c-ares.tar.gz \
+  -DGRPC_LITE_CARES_URL_HASH=SHA256=...
+```
+
 ## Synchronous C++ Facade
 
 The C++17 facade provides the common synchronous grpcpp client and generated
