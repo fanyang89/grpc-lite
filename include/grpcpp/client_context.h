@@ -3,15 +3,29 @@
 
 #include <chrono>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 
 namespace grpc {
 
 class Channel;
+namespace internal {
+class CancellationTarget {
+ public:
+  virtual ~CancellationTarget() = default;
+  virtual void Cancel() noexcept = 0;
+};
+class BlockingCallState;
+}  // namespace internal
 
 class ClientContext {
  public:
   using MetadataMap = std::multimap<std::string, std::string>;
+
+  ClientContext() = default;
+  ClientContext(const ClientContext&) = delete;
+  ClientContext& operator=(const ClientContext&) = delete;
 
   void AddMetadata(const std::string& key, const std::string& value) {
     metadata_.emplace(key, value);
@@ -62,8 +76,43 @@ class ClientContext {
   const MetadataMap& GetServerInitialMetadata() const { return initial_metadata_; }
   const MetadataMap& GetServerTrailingMetadata() const { return trailing_metadata_; }
 
+  void TryCancel() noexcept {
+    std::shared_ptr<internal::CancellationTarget> target;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (terminal_) return;
+      cancelled_ = true;
+      target = cancellation_target_.lock();
+    }
+    if (target) target->Cancel();
+  }
+
  private:
   friend class Channel;
+  friend class internal::BlockingCallState;
+
+  bool RegisterCancellation(
+      const std::shared_ptr<internal::CancellationTarget>& target) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (cancelled_ || terminal_) return false;
+    cancellation_target_ = target;
+    return true;
+  }
+  void SetInitialMetadata(MetadataMap initial_metadata) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    initial_metadata_ = std::move(initial_metadata);
+  }
+  void CompleteCall(const internal::CancellationTarget* target,
+                    MetadataMap initial_metadata,
+                    MetadataMap trailing_metadata) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto active = cancellation_target_.lock();
+    if (active && active.get() != target) return;
+    initial_metadata_ = std::move(initial_metadata);
+    trailing_metadata_ = std::move(trailing_metadata);
+    cancellation_target_.reset();
+    terminal_ = true;
+  }
 
   MetadataMap metadata_;
   MetadataMap initial_metadata_;
@@ -71,6 +120,10 @@ class ClientContext {
   long double deadline_seconds_ = 0;
   int deadline_extreme_ = 0;
   bool has_deadline_ = false;
+  mutable std::mutex mutex_;
+  std::weak_ptr<internal::CancellationTarget> cancellation_target_;
+  bool cancelled_ = false;
+  bool terminal_ = false;
 };
 
 }  // namespace grpc

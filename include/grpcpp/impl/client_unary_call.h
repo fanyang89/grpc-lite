@@ -4,6 +4,8 @@
 #include <grpcpp/channel.h>
 
 #include <string>
+#include <climits>
+#include <utility>
 
 namespace grpc::internal {
 
@@ -31,10 +33,15 @@ Status BlockingUnaryCall(ChannelInterface* channel, const RpcMethod& method,
   Status status = channel->CallUnary(method.name(), context, request_bytes,
                                      &response_bytes);
   if (!status.ok()) return status;
-  if (!response->ParseFromArray(response_bytes.data(),
-                                static_cast<int>(response_bytes.size()))) {
+  if (response_bytes.size() > static_cast<std::size_t>(INT_MAX)) {
+    return {StatusCode::RESOURCE_EXHAUSTED, "response is too large to parse"};
+  }
+  Response parsed_response;
+  if (!parsed_response.ParseFromArray(response_bytes.data(),
+                                      static_cast<int>(response_bytes.size()))) {
     return {StatusCode::INTERNAL, "failed to parse response"};
   }
+  *response = std::move(parsed_response);
   return status;
 }
 

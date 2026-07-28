@@ -405,6 +405,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_grpcpp_facade_test = b.addRunArtifact(grpcpp_facade_test);
 
+    const grpcpp_streaming_facade_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    applySanitizers(grpcpp_streaming_facade_test_module, sanitizers);
+    grpcpp_streaming_facade_test_module.addIncludePath(b.path("include"));
+    grpcpp_streaming_facade_test_module.addCSourceFile(.{
+        .file = b.path("tests/grpcpp_streaming_facade_test.cc"),
+        .flags = &.{ "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror" },
+    });
+    linkCApiTestLibrary(grpcpp_streaming_facade_test_module, library, shared_library, native, sanitizers);
+    const grpcpp_streaming_facade_test = b.addExecutable(.{
+        .name = "grpcpp-streaming-facade-test",
+        .root_module = grpcpp_streaming_facade_test_module,
+    });
+    const run_grpcpp_streaming_facade_test = b.addRunArtifact(grpcpp_streaming_facade_test);
+
     const grpcpp_generated_test_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -449,6 +468,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_cpp_c_api_smoke.step);
     test_step.dependOn(&run_cpp_native_api_test.step);
     test_step.dependOn(&run_grpcpp_facade_test.step);
+    test_step.dependOn(&run_grpcpp_streaming_facade_test.step);
     test_step.dependOn(&run_grpcpp_generated_test.step);
 
     if (!enable_protobuf) return;
