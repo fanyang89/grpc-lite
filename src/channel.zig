@@ -538,6 +538,7 @@ const Impl = struct {
     read_active: bool = false,
     read_cancel_submitted: bool = false,
     write_cancel_submitted: bool = false,
+    write_cancel_target: ?*xev.Completion = null,
     close_submitted: bool = false,
     close_completed: bool = false,
     deadline_timer_armed: bool = false,
@@ -2998,6 +2999,7 @@ fn handleTransportFailure(impl: *Impl, reason: []const u8) void {
             if (!impl.write_cancel_submitted) {
                 impl.discard_writes_after_cancel = true;
                 impl.write_cancel_submitted = true;
+                impl.write_cancel_target = &request.completion;
                 impl.loop.cancel(
                     &request.completion,
                     &impl.write_cancel_completion,
@@ -3167,9 +3169,17 @@ fn onReadCanceled(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.Can
     return .disarm;
 }
 
-fn onWriteCanceled(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.CancelError!void) xev.CallbackAction {
+fn onWriteCanceled(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev.CancelError!void) xev.CallbackAction {
     const impl = impl_.?;
+    if (result) |_| {} else |err| {
+        if (err == error.NotFound) {
+            if (impl.write_cancel_target) |target| {
+                if (target.state() == .active) return .rearm;
+            }
+        }
+    }
     impl.write_cancel_submitted = false;
+    impl.write_cancel_target = null;
     submitCloseIfReady(impl, loop);
     return .disarm;
 }
@@ -3271,6 +3281,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
         if (request.completion.state() == .active) {
             if (!impl.write_cancel_submitted) {
                 impl.write_cancel_submitted = true;
+                impl.write_cancel_target = &request.completion;
                 impl.loop.cancel(
                     &request.completion,
                     &impl.write_cancel_completion,

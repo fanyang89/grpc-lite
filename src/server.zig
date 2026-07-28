@@ -1382,6 +1382,7 @@ const Connection = struct {
     read_active: bool = false,
     read_cancel_submitted: bool = false,
     write_cancel_submitted: bool = false,
+    write_cancel_target: ?*xev.Completion = null,
     close_submitted: bool = false,
     close_completed: bool = false,
     read_completion: xev.Completion = .{},
@@ -1694,6 +1695,7 @@ const Connection = struct {
         if (self.write_queue.head) |request| {
             if (request.completion.state() == .active) {
                 self.write_cancel_submitted = true;
+                self.write_cancel_target = &request.completion;
                 loop.cancel(
                     &request.completion,
                     &self.write_cancel_completion,
@@ -2277,9 +2279,17 @@ fn onReadCanceled(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion,
     return .disarm;
 }
 
-fn onWriteCanceled(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.CancelError!void) xev.CallbackAction {
+fn onWriteCanceled(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, result: xev.CancelError!void) xev.CallbackAction {
     const conn = connection orelse return .disarm;
+    if (result) |_| {} else |err| {
+        if (err == error.NotFound) {
+            if (conn.write_cancel_target) |target| {
+                if (target.state() == .active) return .rearm;
+            }
+        }
+    }
     conn.write_cancel_submitted = false;
+    conn.write_cancel_target = null;
     conn.submitCloseIfReady(loop);
     conn.finishCloseIfReady();
     return .disarm;
