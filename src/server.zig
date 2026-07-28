@@ -5230,9 +5230,9 @@ test "graceful shutdown exits when idle and is idempotent" {
     defer server.deinit();
     try server.start();
 
-    server.shutdownGracefully(std.time.ns_per_s);
     const address = try server.localAddress();
     try std.testing.expect(address.port != 0);
+    server.shutdownGracefully(std.time.ns_per_s);
     server.shutdownGracefully(0);
     server.wait();
 
