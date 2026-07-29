@@ -13,6 +13,8 @@ force_link_source=$9
 mbedtls_config_header=${10}
 sanitize_thread=${11}
 sanitize_c=${12}
+enable_gperftools=${13}
+enable_tcmalloc=${14}
 
 c_flags=(-fvisibility=hidden)
 
@@ -106,28 +108,47 @@ case "$library" in
         exit 0
         ;;
     gperftools)
+        enable_heap_profiler=false
+        if [[ "$enable_gperftools" == true && "$enable_tcmalloc" == true ]]; then
+            enable_heap_profiler=true
+        fi
         CC="$cc" CXX="$cxx" cmake "${common_options[@]}" \
             -DBUILD_TESTING=OFF \
-            -DGPERFTOOLS_BUILD_CPU_PROFILER=ON \
-            -DGPERFTOOLS_BUILD_HEAP_PROFILER=ON \
+            -DGPERFTOOLS_BUILD_CPU_PROFILER="$enable_gperftools" \
+            -DGPERFTOOLS_BUILD_HEAP_PROFILER="$enable_heap_profiler" \
             -DGPERFTOOLS_BUILD_DEBUGALLOC=OFF \
             -Dgperftools_build_minimal=OFF \
             -Dgperftools_build_benchmark=OFF \
             -Dgperftools_enable_libunwind=OFF \
             -Dgperftools_enable_frame_pointers=ON
-        cmake --build "$build_dir" --target tcmalloc profiler
-        archive="$build_dir/libtcmalloc_and_profiler.a"
+        if [[ "$enable_heap_profiler" == true ]]; then
+            targets=(tcmalloc profiler)
+            archives=(libtcmalloc.a libprofiler.a libstacktrace.a liblow_level_alloc.a libcommon.a)
+        elif [[ "$enable_tcmalloc" == true ]]; then
+            targets=(tcmalloc_minimal)
+            archives=(libtcmalloc_minimal.a libcommon.a)
+        else
+            targets=(profiler)
+            archives=(libprofiler.a libstacktrace.a libcommon.a)
+        fi
+        cmake --build "$build_dir" --target "${targets[@]}"
+        archive="$build_dir/libgrpc_lite_gperftools.a"
         rm -f "$archive"
         {
             printf 'CREATE %s\n' "$archive"
-            printf 'ADDLIB %s/libtcmalloc.a\n' "$build_dir"
-            printf 'ADDLIB %s/libprofiler.a\n' "$build_dir"
-            printf 'ADDLIB %s/libstacktrace.a\n' "$build_dir"
-            printf 'ADDLIB %s/liblow_level_alloc.a\n' "$build_dir"
-            printf 'ADDLIB %s/libcommon.a\n' "$build_dir"
+            for dependency in "${archives[@]}"; do
+                printf 'ADDLIB %s/%s\n' "$build_dir" "$dependency"
+            done
             printf 'SAVE\nEND\n'
         } | "$zig_exe" ar -M
-        "$zig_exe" cc -target "$target_triple" "${c_flags[@]}" -c "$force_link_source" \
+        gperftools_define=0
+        tcmalloc_define=0
+        [[ "$enable_gperftools" == true ]] && gperftools_define=1
+        [[ "$enable_tcmalloc" == true ]] && tcmalloc_define=1
+        "$zig_exe" cc -target "$target_triple" "${c_flags[@]}" \
+            -DGRPC_LITE_ENABLE_GPERFTOOLS="$gperftools_define" \
+            -DGRPC_LITE_ENABLE_TCMALLOC="$tcmalloc_define" \
+            -c "$force_link_source" \
             -o "$build_dir/gperftools_force_link.o"
         exit 0
         ;;

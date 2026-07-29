@@ -34,6 +34,8 @@ UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 
 .mise/tasks/prepare-gperftools
 zig build test -Dgperftools=true --summary all
+zig build test -Dgperftools=true -Dtcmalloc=false --summary all
+zig build test -Dgperftools=false -Dtcmalloc=true --summary all
 
 scripts/interop.sh
 tests/official/run_unary.sh

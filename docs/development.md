@@ -89,8 +89,12 @@ mise run test-gperftools
 ```
 
 Downstream Zig packages pass `.gperftools = true` and import
-`grpc_lite_gperftools`. Enabling it replaces the final process C allocator with tcmalloc;
-`perf.allocator` exposes the same allocator to Zig APIs.
+`grpc_lite_gperftools`. For compatibility, this also replaces the final process C
+allocator with tcmalloc; `perf.allocator` exposes the same allocator to Zig APIs.
+Pass `.tcmalloc = false` to retain CPU profiling without replacing the allocator, or
+pass `.tcmalloc = true, .gperftools = false` to enable only minimal tcmalloc. Heap
+profiling and guarded allocation sampling require both options; the base MallocExtension
+APIs require tcmalloc.
 
 ```zig
 const grpc = @import("grpc_lite");
@@ -106,7 +110,7 @@ var server = try grpc.Server.init(perf.allocator, .{
 ```
 
 CPU and heap profilers are process-global and may also use `CPUPROFILE` and `HEAPPROFILE`.
-Gperftools cannot be combined with ThreadSanitizer and is Linux-only.
+Tcmalloc cannot be combined with ThreadSanitizer. Both options are Linux-only.
 
 ## Benchmarks
 

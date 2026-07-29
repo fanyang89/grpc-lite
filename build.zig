@@ -70,8 +70,13 @@ pub fn build(b: *std.Build) void {
     const enable_gperftools = b.option(
         bool,
         "gperftools",
-        "Use tcmalloc and expose CPU and heap profiling APIs",
+        "Expose gperftools profiling APIs (enables tcmalloc by default)",
     ) orelse false;
+    const enable_tcmalloc = b.option(
+        bool,
+        "tcmalloc",
+        "Replace the process C allocator with tcmalloc (defaults to gperftools)",
+    ) orelse enable_gperftools;
     const grpc_proto_dependency = if (enable_protobuf)
         b.lazyDependency("grpc_proto", .{}) orelse return
     else
@@ -79,11 +84,11 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag != .linux) {
         @panic("DNS support is currently limited to Linux");
     }
-    if (enable_gperftools and target.result.os.tag != .linux) {
+    if ((enable_gperftools or enable_tcmalloc) and target.result.os.tag != .linux) {
         @panic("gperftools support is currently limited to Linux");
     }
-    if (enable_gperftools and sanitizers.thread == true) {
-        @panic("gperftools/tcmalloc is incompatible with ThreadSanitizer");
+    if (enable_tcmalloc and sanitizers.thread == true) {
+        @panic("tcmalloc is incompatible with ThreadSanitizer");
     }
     const grpc_lite_options = b.addOptions();
     grpc_lite_options.addOption([]const u8, "version", manifest.version);
@@ -96,16 +101,21 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     applySanitizers(grpc_lite, sanitizers);
-    const grpc_lite_gperftools = if (enable_gperftools)
-        b.addModule("grpc_lite_gperftools", .{
+    const grpc_lite_gperftools = if (enable_gperftools or enable_tcmalloc) blk: {
+        const options = b.addOptions();
+        options.addOption(bool, "cpu_profiler", enable_gperftools);
+        options.addOption(bool, "tcmalloc", enable_tcmalloc);
+        break :blk b.addModule("grpc_lite_gperftools", .{
             .root_source_file = b.path("src/gperftools.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
-        })
-    else
-        null;
-    const gperftools_dependency = if (enable_gperftools)
+            .imports = &.{
+                .{ .name = "grpc_lite", .module = grpc_lite },
+                .{ .name = "grpc_lite_gperftools_options", .module = options.createModule() },
+            },
+        });
+    } else null;
+    const gperftools_dependency = if (enable_gperftools or enable_tcmalloc)
         b.lazyDependency("gperftools", .{}) orelse return
     else
         null;
@@ -122,6 +132,8 @@ pub fn build(b: *std.Build) void {
         target,
         optimize,
         sanitizers,
+        enable_gperftools,
+        enable_tcmalloc,
     );
 
     const xev = libxev_dependency.module("xev");
@@ -250,23 +262,26 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(gperftools_tests).step);
 
-        const gperftools_env_module = b.createModule(.{
-            .root_source_file = b.path("tests/gperftools_env_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
-        });
-        applySanitizers(gperftools_env_module, sanitizers);
-        gperftools_env_module.omit_frame_pointer = false;
-        const gperftools_env_test = b.addExecutable(.{
-            .name = "gperftools-env-test",
-            .root_module = gperftools_env_module,
-        });
-        const run_gperftools_env_test = b.addSystemCommand(&.{"bash"});
-        run_gperftools_env_test.addFileArg(b.path("tests/run_gperftools_env_test.sh"));
-        run_gperftools_env_test.addArtifactArg(gperftools_env_test);
-        _ = run_gperftools_env_test.addOutputDirectoryArg("profiles");
-        test_step.dependOn(&run_gperftools_env_test.step);
+        if (enable_gperftools) {
+            const gperftools_env_module = b.createModule(.{
+                .root_source_file = b.path("tests/gperftools_env_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
+            });
+            applySanitizers(gperftools_env_module, sanitizers);
+            gperftools_env_module.omit_frame_pointer = false;
+            const gperftools_env_test = b.addExecutable(.{
+                .name = "gperftools-env-test",
+                .root_module = gperftools_env_module,
+            });
+            const run_gperftools_env_test = b.addSystemCommand(&.{"bash"});
+            run_gperftools_env_test.addFileArg(b.path("tests/run_gperftools_env_test.sh"));
+            run_gperftools_env_test.addArtifactArg(gperftools_env_test);
+            _ = run_gperftools_env_test.addOutputDirectoryArg("profiles");
+            run_gperftools_env_test.addArg(if (enable_tcmalloc) "true" else "false");
+            test_step.dependOn(&run_gperftools_env_test.step);
+        }
     }
 
     if (target.result.os.tag == .linux) {
@@ -886,6 +901,8 @@ fn addNativeDependencies(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     sanitizers: Sanitizers,
+    enable_gperftools: bool,
+    enable_tcmalloc: bool,
 ) NativeDependencies {
     const target_triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
     const cc = b.fmt("{s} cc -target {s}", .{ b.graph.zig_exe, target_triple });
@@ -905,6 +922,8 @@ fn addNativeDependencies(
         cxx,
         target_triple,
         sanitizers,
+        false,
+        false,
     );
     const build_cares = addNativeBuild(
         b,
@@ -915,6 +934,8 @@ fn addNativeDependencies(
         cxx,
         target_triple,
         sanitizers,
+        false,
+        false,
     );
     const build_mbedtls = if (mbedtls_source_dir) |source_dir|
         addNativeBuild(
@@ -926,6 +947,8 @@ fn addNativeDependencies(
             cxx,
             target_triple,
             sanitizers,
+            false,
+            false,
         )
     else
         null;
@@ -940,6 +963,8 @@ fn addNativeDependencies(
             cxx,
             target_triple,
             sanitizers,
+            enable_gperftools,
+            enable_tcmalloc,
         )
     else
         null;
@@ -950,7 +975,7 @@ fn addNativeDependencies(
         .cares_archive = build_cares.path(b, "lib/libcares.a"),
         .cares_include = build_cares.path(b, "include"),
         .mbedtls_archive = if (build_mbedtls) |output| output.path(b, "libmbedtls_combined.a") else null,
-        .gperftools_archive = if (build_gperftools) |output| output.path(b, "libtcmalloc_and_profiler.a") else null,
+        .gperftools_archive = if (build_gperftools) |output| output.path(b, "libgrpc_lite_gperftools.a") else null,
         .gperftools_force_link = if (build_gperftools) |output| output.path(b, "gperftools_force_link.o") else null,
     };
 }
@@ -964,6 +989,8 @@ fn addNativeBuild(
     cxx: []const u8,
     target_triple: []const u8,
     sanitizers: Sanitizers,
+    enable_gperftools: bool,
+    enable_tcmalloc: bool,
 ) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{"bash"});
     run.addFileArg(b.path("tools/build_native.sh"));
@@ -982,6 +1009,8 @@ fn addNativeBuild(
     run.addArgs(&.{
         if (sanitizers.thread == true) "true" else "false",
         if (sanitizers.c == .full) "true" else "false",
+        if (enable_gperftools) "true" else "false",
+        if (enable_tcmalloc) "true" else "false",
     });
     return output;
 }

@@ -2,19 +2,16 @@ const std = @import("std");
 const perf = @import("grpc_lite_gperftools");
 
 test "tcmalloc replaces the C allocator" {
+    if (!perf.has_tcmalloc) return error.SkipZigTest;
     const memory = try perf.allocator.alloc(u8, 4096);
     defer perf.allocator.free(memory);
 
     try std.testing.expect(perf.owns(memory.ptr));
     try std.testing.expect(perf.getNumericProperty("generic.current_allocated_bytes") != null);
-
-    const previous_interval = perf.guardedSamplingInterval();
-    defer perf.setGuardedSamplingInterval(previous_interval);
-    perf.setGuardedSamplingInterval(4096);
-    try std.testing.expectEqual(@as(i64, 4096), perf.guardedSamplingInterval());
 }
 
-test "CPU and heap profilers are available" {
+test "CPU profiler is available" {
+    if (!perf.has_cpu_profiler) return error.SkipZigTest;
     const pid = std.os.linux.getpid();
     var cpu_path_buffer: [128]u8 = undefined;
     const cpu_profile = try std.fmt.bufPrintZ(
@@ -30,7 +27,16 @@ test "CPU and heap profilers are available" {
     perf.flushCpuProfiler();
     perf.stopCpuProfiler();
     try std.testing.expect(!perf.cpuProfilerRunning());
+}
 
+test "heap profiler is available with tcmalloc" {
+    if (!perf.has_heap_profiler) return error.SkipZigTest;
+    const previous_interval = perf.guardedSamplingInterval();
+    defer perf.setGuardedSamplingInterval(previous_interval);
+    perf.setGuardedSamplingInterval(4096);
+    try std.testing.expectEqual(@as(i64, 4096), perf.guardedSamplingInterval());
+
+    const pid = std.os.linux.getpid();
     var heap_prefix_buffer: [128]u8 = undefined;
     const heap_prefix = try std.fmt.bufPrintZ(
         &heap_prefix_buffer,
