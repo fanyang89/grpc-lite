@@ -74,6 +74,7 @@ class ServerCall {
   bool terminal() const {
     return call_ != nullptr && grpc_lite_server_call_is_terminal(call_) != 0;
   }
+  void Abort() { grpc_lite_server_call_abort(call_); }
 
   Error SendInitialMetadata(
       const Metadata* metadata = nullptr,

@@ -105,6 +105,7 @@ int main(void) {
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_C_SERVER) == 0) return 12;
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_MANAGED_CHANNEL) == 0) return 13;
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_LOGGING_CALLBACK) == 0) return 14;
+  grpc_lite_server_call_abort(NULL);
   if (grpc_lite_metadata_create(&metadata) != GRPC_LITE_OK) return 4;
   if (grpc_lite_metadata_add(
           metadata,

@@ -148,6 +148,7 @@ pub const ServerCall = struct {
         id: *const fn (*anyopaque) ServerCallId,
         is_cancelled: *const fn (*anyopaque) bool,
         is_terminal: *const fn (*anyopaque) bool,
+        abort: *const fn (*anyopaque) void,
         send_initial_metadata: *const fn (*anyopaque, []const metadata.Entry, Compression) anyerror!void,
         send: *const fn (*anyopaque, []const u8, SendOptions) anyerror!void,
         finish: *const fn (*anyopaque, status.Status, []const metadata.Entry) anyerror!void,
@@ -168,11 +169,40 @@ pub const ServerCall = struct {
         comptime retain_fn: *const fn (*anyopaque) void,
         comptime release_fn: *const fn (*anyopaque) void,
     ) ServerCall {
+        return initAbortable(
+            context,
+            id_fn,
+            is_cancelled_fn,
+            is_terminal_fn,
+            unsupportedServerCallAbort,
+            send_initial_metadata_fn,
+            send_fn,
+            finish_fn,
+            resume_receive_fn,
+            retain_fn,
+            release_fn,
+        );
+    }
+
+    pub fn initAbortable(
+        context: *anyopaque,
+        comptime id_fn: *const fn (*anyopaque) ServerCallId,
+        comptime is_cancelled_fn: *const fn (*anyopaque) bool,
+        comptime is_terminal_fn: *const fn (*anyopaque) bool,
+        comptime abort_fn: *const fn (*anyopaque) void,
+        comptime send_initial_metadata_fn: *const fn (*anyopaque, []const metadata.Entry, Compression) anyerror!void,
+        comptime send_fn: *const fn (*anyopaque, []const u8, SendOptions) anyerror!void,
+        comptime finish_fn: *const fn (*anyopaque, status.Status, []const metadata.Entry) anyerror!void,
+        comptime resume_receive_fn: *const fn (*anyopaque) anyerror!void,
+        comptime retain_fn: *const fn (*anyopaque) void,
+        comptime release_fn: *const fn (*anyopaque) void,
+    ) ServerCall {
         const Functions = struct {
             var value: VTable = .{
                 .id = id_fn,
                 .is_cancelled = is_cancelled_fn,
                 .is_terminal = is_terminal_fn,
+                .abort = abort_fn,
                 .send_initial_metadata = send_initial_metadata_fn,
                 .send = send_fn,
                 .finish = finish_fn,
@@ -194,6 +224,12 @@ pub const ServerCall = struct {
 
     pub fn isTerminal(self: ServerCall) bool {
         return self.vtable.is_terminal(self.context);
+    }
+
+    /// Makes an allocation-free request for local termination. The reactor sends
+    /// RST_STREAM(INTERNAL_ERROR), or closes the connection if reset submission fails.
+    pub fn abort(self: ServerCall) void {
+        self.vtable.abort(self.context);
     }
 
     pub fn sendInitialMetadata(
@@ -230,6 +266,8 @@ pub const ServerCall = struct {
         self.* = undefined;
     }
 };
+
+fn unsupportedServerCallAbort(_: *anyopaque) void {}
 
 /// Borrowed command handle valid only while its server stream is active.
 pub const ServerStream = struct {

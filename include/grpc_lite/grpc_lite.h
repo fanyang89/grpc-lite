@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define GRPC_LITE_ABI_MAJOR 1u
-#define GRPC_LITE_ABI_MINOR 4u
+#define GRPC_LITE_ABI_MINOR 5u
 #define GRPC_LITE_ABI_VERSION \
   ((GRPC_LITE_ABI_MAJOR << 16) | GRPC_LITE_ABI_MINOR)
 
@@ -388,6 +388,9 @@ void grpc_lite_server_call_destroy(grpc_lite_server_call *call);
 size_t grpc_lite_server_call_id(const grpc_lite_server_call *call);
 uint32_t grpc_lite_server_call_is_cancelled(const grpc_lite_server_call *call);
 uint32_t grpc_lite_server_call_is_terminal(const grpc_lite_server_call *call);
+/* Allocation-free emergency request. Sends RST_STREAM(INTERNAL_ERROR), or closes */
+/* the connection if reset submission fails. Inactive calls are unchanged. */
+void grpc_lite_server_call_abort(grpc_lite_server_call *call);
 grpc_lite_error grpc_lite_server_call_send_initial_metadata(
     grpc_lite_server_call *call,
     const grpc_lite_metadata *metadata,

@@ -97,6 +97,11 @@ borrowed callback view. Cross-thread work must retain an owning `ServerCall`, re
 clone before Server teardown, and treat `CallClosed` as terminal. `on_terminal` runs once
 and is the final callback for a call.
 
+If copying or enqueueing a retained-call response command fails, `ServerCall.abort` makes
+an allocation-free, thread-safe emergency request. The reactor submits
+`RST_STREAM(INTERNAL_ERROR)` without status trailers; if nghttp2 cannot allocate the reset
+command, grpc-lite closes the connection to guarantee local cleanup.
+
 `send`, `finish`, `sendInitialMetadata`, and `resumeReceive` copy command data into bounded
 shared storage. Handlers that decide metadata outside `on_start` can use
 `receive_initially_paused = true` and `initial_metadata_mode = .explicit`.

@@ -64,6 +64,7 @@ void TestInvalidObjects() {
   assert(call.id() == 0);
   assert(!call.cancelled());
   assert(!call.terminal());
+  call.Abort();
   assert(call.Clone(&clone).code() == grpc_lite::ErrorCode::InvalidState);
   assert(call.Send("x").code() == grpc_lite::ErrorCode::InvalidState);
   assert(call.ResumeReceive().code() == grpc_lite::ErrorCode::InvalidState);

@@ -936,11 +936,12 @@ const ServerCallControl = struct {
     terminal: std.atomic.Value(bool) = .init(false),
 
     fn handle(self: *ServerCallControl) raw_stream.ServerCall {
-        return raw_stream.ServerCall.init(
+        return raw_stream.ServerCall.initAbortable(
             self,
             serverCallId,
             serverCallIsCancelled,
             serverCallIsTerminal,
+            serverCallAbort,
             serverCallSendInitialMetadata,
             serverCallSend,
             serverCallFinish,
@@ -1053,6 +1054,7 @@ const Stream = struct {
     // Queued and currently processing commands each retain this stream once.
     command_refs: usize = 0,
     transport_closed: bool = false,
+    force_abort_requested: bool = false,
 
     fn init(allocator: std.mem.Allocator, connection: *Connection, id: i32) Stream {
         return .{
@@ -1124,6 +1126,20 @@ fn serverCallIsCancelled(context: *anyopaque) bool {
 fn serverCallIsTerminal(context: *anyopaque) bool {
     const control: *ServerCallControl = @ptrCast(@alignCast(context));
     return control.terminal.load(.acquire);
+}
+
+fn serverCallAbort(context: *anyopaque) void {
+    const control: *ServerCallControl = @ptrCast(@alignCast(context));
+    const server = control.server;
+    server.lock();
+    const notify = if (control.target) |target| blk: {
+        if (!target.streaming_active or target.transport_closed or target.force_abort_requested) break :blk false;
+        target.force_abort_requested = true;
+        target.finish_queued = true;
+        break :blk true;
+    } else false;
+    if (notify and server.stream_async_initialized) server.stream_async.notify() catch {};
+    server.unlock();
 }
 
 fn serverCallRetain(context: *anyopaque) void {
@@ -2037,6 +2053,10 @@ fn runLoop(server: *Impl) void {
                 .{ server.local_host[0..server.local_host_len], server.local_port, @errorName(err) },
             );
         };
+        server.lock();
+        server.stream_async_initialized = false;
+        server.shutdown_async_initialized = false;
+        server.unlock();
         server.stream_async.deinit();
         server.shutdown_async.deinit();
         server.loop.deinit();
@@ -2060,8 +2080,14 @@ fn setupLoop(server: *Impl) StartupError!void {
     }
 
     errdefer {
-        if (server.stream_async_initialized) server.stream_async.deinit();
-        if (server.shutdown_async_initialized) server.shutdown_async.deinit();
+        if (server.stream_async_initialized) {
+            server.stream_async.deinit();
+            server.stream_async_initialized = false;
+        }
+        if (server.shutdown_async_initialized) {
+            server.shutdown_async.deinit();
+            server.shutdown_async_initialized = false;
+        }
         if (server.listener_initialized) closeFd(server.listener.fd);
     }
 
@@ -2326,6 +2352,7 @@ fn onStreamAsync(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.A
 }
 
 fn processStreamCommands(server: *Impl) void {
+    processForcedServerCallAborts(server);
     var commands: std.ArrayList(StreamCommand) = .empty;
     server.lock();
     std.mem.swap(std.ArrayList(StreamCommand), &commands, &server.stream_commands);
@@ -2340,6 +2367,19 @@ fn processStreamCommands(server: *Impl) void {
     }
 
     drainDirtyConnections(server);
+}
+
+fn processForcedServerCallAborts(server: *Impl) void {
+    for (server.connections.items) |connection| {
+        var iterator = connection.streams.valueIterator();
+        while (iterator.next()) |target_ptr| {
+            const target = target_ptr.*;
+            server.lock();
+            const requested = target.force_abort_requested;
+            server.unlock();
+            if (requested) forceAbortStreaming(target);
+        }
+    }
 }
 
 fn drainDirtyConnections(server: *Impl) void {
@@ -2539,6 +2579,39 @@ fn failStreaming(target: *Stream, code: status.Code, text: []const u8) void {
     resumeStreamingResponse(target);
 }
 
+fn forceAbortStreaming(target: *Stream) void {
+    const server = target.connection.server;
+    server.lock();
+    const active = target.force_abort_requested and target.streaming_active and !target.transport_closed;
+    target.force_abort_requested = false;
+    if (active) {
+        target.streaming_active = false;
+        target.response_finished = true;
+        target.finish_queued = true;
+        target.receive_paused = false;
+        target.resume_queued = false;
+        target.reset_after_trailers = true;
+        target.terminal_reason = .local_error;
+    }
+    server.unlock();
+    if (!active) return;
+
+    removeStreamDeadline(target);
+    discardStreamCommands(target);
+    const reserved_bytes = target.streaming.?.clearOutbound();
+    releaseOutboundReservation(target, reserved_bytes, false);
+    const session = target.connection.session orelse {
+        target.connection.close();
+        return;
+    };
+    if (c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, target.id, c.NGHTTP2_INTERNAL_ERROR) != 0) {
+        target.connection.close();
+        return;
+    }
+    target.reset_submitted = true;
+    _ = server.enqueueDirtyConnection(target.connection);
+}
+
 fn discardStreamCommands(target: *Stream) void {
     const server = target.connection.server;
     server.lock();
@@ -2617,7 +2690,7 @@ fn cancelStreaming(target: *Stream, reason: raw_stream.ServerTerminalReason) voi
         return;
     }
     target.cancel_called = true;
-    target.terminal_reason = reason;
+    if (target.terminal_reason == .completed) target.terminal_reason = reason;
     if (target.call_control) |control| control.cancelled.store(true, .release);
     target.streaming_active = false;
     target.finish_queued = true;
@@ -4259,6 +4332,114 @@ test "retained server call observes cancellation after transport retirement" {
     try std.testing.expectEqual(@as(usize, 1), capture.terminals);
     try std.testing.expectEqual(call_id, capture.terminal_id.?);
     try std.testing.expectEqual(raw_stream.ServerTerminalReason.peer_cancelled, capture.terminal_reason.?);
+}
+
+test "retained server call abort is allocation free and submits a reset" {
+    const Capture = struct {
+        call: ?raw_stream.ServerCall = null,
+        terminals: usize = 0,
+        terminal_reason: ?raw_stream.ServerTerminalReason = null,
+    };
+    const Handler = struct {
+        fn onStart(context: ?*anyopaque, stream: raw_stream.ServerStream, _: *service.ServerContext) !void {
+            const capture: *Capture = @ptrCast(@alignCast(context.?));
+            capture.call = try stream.retain();
+        }
+
+        fn onMessage(
+            _: ?*anyopaque,
+            _: raw_stream.ServerStream,
+            _: *service.ServerContext,
+            _: []const u8,
+            _: Compression,
+        ) !raw_stream.ReceiveAction {
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            _: raw_stream.ServerCallId,
+            reason: raw_stream.ServerTerminalReason,
+        ) void {
+            const capture: *Capture = @ptrCast(@alignCast(context.?));
+            capture.terminals += 1;
+            capture.terminal_reason = reason;
+        }
+    };
+
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var capture = Capture{};
+    defer if (capture.call) |*call| call.deinit();
+    try server.registerStream("/test.Echo/Unary", .{
+        .context = &capture,
+        .on_start = Handler.onStart,
+        .on_message = Handler.onMessage,
+        .on_remote_end = Handler.onRemoteEnd,
+        .on_terminal = Handler.onTerminal,
+    });
+
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer deinitTestConnection(&connection);
+    try server.impl.connections.append(server.impl.localAllocator(), &connection);
+    defer {
+        server.impl.removeDirtyConnection(&connection);
+        _ = server.impl.connections.pop();
+    }
+    try feedTestRequest(&connection, .{});
+    const target = connection.streams.get(1).?;
+    try std.testing.expect(capture.call != null);
+
+    const original_backing = server.coordinator.serialized_allocator.backing;
+    defer server.coordinator.serialized_allocator.backing = original_backing;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    server.coordinator.serialized_allocator.backing = failing.allocator();
+    capture.call.?.abort();
+    capture.call.?.abort();
+    server.coordinator.serialized_allocator.backing = original_backing;
+    try std.testing.expect(target.force_abort_requested);
+    try std.testing.expect(target.finish_queued);
+
+    processForcedServerCallAborts(server.impl);
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    while (true) {
+        var bytes: [*c]const u8 = null;
+        const length = c.nghttp2_session_mem_send2(connection.session, &bytes);
+        try std.testing.expect(length >= 0);
+        if (length == 0) break;
+        try output.appendSlice(std.testing.allocator, bytes[0..@intCast(length)]);
+    }
+    var reset_count: usize = 0;
+    var offset: usize = 0;
+    while (offset + 9 <= output.items.len) {
+        const payload_length = (@as(usize, output.items[offset]) << 16) |
+            (@as(usize, output.items[offset + 1]) << 8) |
+            output.items[offset + 2];
+        const end = offset + 9 + payload_length;
+        try std.testing.expect(end <= output.items.len);
+        const stream_id = (@as(u32, output.items[offset + 5] & 0x7f) << 24) |
+            (@as(u32, output.items[offset + 6]) << 16) |
+            (@as(u32, output.items[offset + 7]) << 8) |
+            output.items[offset + 8];
+        if (stream_id == 1 and output.items[offset + 3] == c.NGHTTP2_RST_STREAM) {
+            try std.testing.expectEqual(@as(usize, 4), payload_length);
+            const error_code = (@as(u32, output.items[offset + 9]) << 24) |
+                (@as(u32, output.items[offset + 10]) << 16) |
+                (@as(u32, output.items[offset + 11]) << 8) |
+                output.items[offset + 12];
+            try std.testing.expectEqual(@as(u32, c.NGHTTP2_INTERNAL_ERROR), error_code);
+            reset_count += 1;
+        }
+        offset = end;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reset_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.terminals);
+    try std.testing.expectEqual(raw_stream.ServerTerminalReason.local_error, capture.terminal_reason.?);
+    try std.testing.expect(capture.call.?.isTerminal());
 }
 
 test "shared stream command allocation failure does not use local storage" {

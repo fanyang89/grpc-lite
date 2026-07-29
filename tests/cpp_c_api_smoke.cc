@@ -72,6 +72,7 @@ int main() {
   assert(channel == nullptr);
   grpc_lite_channel_shutdown(nullptr);
   grpc_lite_channel_wait(nullptr);
+  grpc_lite_server_call_abort(nullptr);
 
   grpc_lite_metadata *metadata = nullptr;
   if (grpc_lite_metadata_create(&metadata) != GRPC_LITE_OK) return 3;

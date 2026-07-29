@@ -52,6 +52,7 @@ comptime {
     @export(&c_api.grpc_lite_server_call_id, .{ .name = "grpc_lite_server_call_id" });
     @export(&c_api.grpc_lite_server_call_is_cancelled, .{ .name = "grpc_lite_server_call_is_cancelled" });
     @export(&c_api.grpc_lite_server_call_is_terminal, .{ .name = "grpc_lite_server_call_is_terminal" });
+    @export(&c_api.grpc_lite_server_call_abort, .{ .name = "grpc_lite_server_call_abort" });
     @export(&c_api.grpc_lite_server_call_send_initial_metadata, .{ .name = "grpc_lite_server_call_send_initial_metadata" });
     @export(&c_api.grpc_lite_server_call_send, .{ .name = "grpc_lite_server_call_send" });
     @export(&c_api.grpc_lite_server_call_finish, .{ .name = "grpc_lite_server_call_finish" });

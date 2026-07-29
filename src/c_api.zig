@@ -14,7 +14,7 @@ const Status = @import("status.zig").Status;
 const version = @import("version.zig");
 
 pub const abi_major: u16 = 1;
-pub const abi_minor: u16 = 4;
+pub const abi_minor: u16 = 5;
 
 pub const Error = enum(i32) {
     ok = 0,
@@ -617,6 +617,11 @@ pub fn grpc_lite_server_call_is_cancelled(call_handle: ?*const ServerCallHandle)
 pub fn grpc_lite_server_call_is_terminal(call_handle: ?*const ServerCallHandle) callconv(.c) u32 {
     const handle = call_handle orelse return 1;
     return @intFromBool(serverCallStorageConst(handle).value.isTerminal());
+}
+
+pub fn grpc_lite_server_call_abort(call_handle: ?*ServerCallHandle) callconv(.c) void {
+    const handle = call_handle orelse return;
+    serverCallStorage(handle).value.abort();
 }
 
 pub fn grpc_lite_server_call_send_initial_metadata(
@@ -1496,6 +1501,7 @@ test "C stream ABI validates extensible options and callbacks" {
     try std.testing.expectEqual(Error.invalid_argument, grpc_lite_client_stream_send(null, view("x"), 0));
     grpc_lite_client_stream_cancel(null);
     grpc_lite_client_stream_destroy(null);
+    grpc_lite_server_call_abort(null);
 }
 
 test "C borrowed metadata view exposes entries" {

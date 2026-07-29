@@ -33,6 +33,10 @@ C and C++ callback code runs synchronously on API caller or transport threads, m
 concurrently, and must not block unless the specific synchronous facade contract permits
 it.
 
+`grpc_lite_server_call_abort` and `grpc_lite::ServerCall::Abort` make an allocation-free,
+thread-safe emergency termination request for a retained server call. The reactor resets
+the stream with `INTERNAL_ERROR`, or closes the connection if reset submission fails.
+
 ## Managed Channels
 
 `grpc_lite_channel_create_managed` creates a durable Channel. Set
