@@ -464,6 +464,7 @@ const TestObserver = if (builtin.is_test) struct {
     connect_observed_sem: std.Io.Semaphore = .{},
     connect_release: std.Io.Semaphore = .{},
     connect_cancel_confirmed: std.atomic.Value(bool) = .init(false),
+    reconnect_scheduled: std.atomic.Value(bool) = .init(false),
     operation_submitted: std.atomic.Value(bool) = .init(false),
     deadline_timer_callbacks: std.atomic.Value(usize) = .init(0),
     deadline_timer_armed: std.atomic.Value(bool) = .init(false),
@@ -3048,6 +3049,7 @@ fn scheduleReconnect(impl: *Impl, reason: []const u8) void {
         return;
     };
     impl.reconnect_deadline_ns = deadline;
+    if (comptime builtin.is_test) impl.test_observer.reconnect_scheduled.store(true, .release);
     scheduleDeadlineTimer(impl);
 }
 
@@ -4022,12 +4024,18 @@ test "allow_initial_offline queues unary until the server becomes available" {
     var channel = try Channel.init(std.testing.allocator, target, .{
         .reconnect = .{
             .allow_initial_offline = true,
-            .initial_backoff_ns = 10 * std.time.ns_per_ms,
-            .max_backoff_ns = 10 * std.time.ns_per_ms,
+            .initial_backoff_ns = std.time.ns_per_s,
+            .max_backoff_ns = std.time.ns_per_s,
             .jitter_percent = 0,
         },
     });
     defer channel.deinit();
+    // Let the initial socket close before starting the server loop. TSan cannot
+    // distinguish an io_uring fd reuse from the socket it replaced.
+    try std.testing.expect(waitForTestFlag(
+        &channel.impl.test_observer.reconnect_scheduled,
+        5 * std.time.ns_per_s,
+    ));
 
     var worker = Worker{ .channel = &channel };
     const worker_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
