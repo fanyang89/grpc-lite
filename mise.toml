@@ -1,5 +1,5 @@
 [tools]
-zig = "latest"
+zig = "0.16.0"
 cmake = "4.3.4"
 ninja = "1.13.2"
 grpcurl = "1.9.3"
