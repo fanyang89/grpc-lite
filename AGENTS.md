@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-- Zig 0.16.0
+- Latest stable Zig release through mise
 - CMake and Ninja for upstream C dependencies
 - mise for tool versions and project tasks
 

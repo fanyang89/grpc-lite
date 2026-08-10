@@ -147,7 +147,7 @@ operations are messages on persistent streams. `repeated` is intentionally compr
 
 ## Dependencies
 
-- Zig 0.16.0
+- Latest stable Zig release through mise (minimum 0.16.0)
 - nghttp2 1.69.0
 - c-ares 1.34.8
 - libcpucycles 20260625
