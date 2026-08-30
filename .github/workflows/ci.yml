@@ -200,6 +200,13 @@ jobs:
       - name: Run grpcurl interop
         run: mise run interop
 
+      - name: Install protobuf C++ tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev
+
       - name: Run official insecure interop
         run: mise run interop-official
 
