@@ -15,6 +15,11 @@ cc app.c \
   -lgrpc_lite
 ```
 
+The transport, low-level C++ API, and `grpc_lite::grpcpp` facade do not require
+Protobuf or Abseil. Typed generated C++ services use the official Protobuf runtime as an
+optional external dependency. grpc-lite does not fetch, vendor, or select a Protobuf or
+Abseil version for downstream applications.
+
 The C ABI uses opaque handles, fixed-width error codes, and pointer-length byte views.
 Memory allocated by the library must be released by its matching destroy function.
 
@@ -63,6 +68,20 @@ target_link_libraries(c_app PRIVATE grpc_lite::c)
 target_link_libraries(cpp_app PRIVATE grpc_lite::grpcpp)
 ```
 
+Typed C++ source builds opt into the official Protobuf integration explicitly:
+
+```cmake
+find_package(Protobuf REQUIRED)
+set(GRPC_LITE_ENABLE_PROTOBUF ON)
+add_subdirectory(third_party/grpc-lite)
+
+target_link_libraries(typed_cpp_app PRIVATE grpc_lite::grpcpp_protobuf)
+```
+
+`grpc_lite::grpcpp_protobuf_lite` is also defined when the Protobuf package exports
+`protobuf::libprotobuf-lite`. The top-level application must select a single compatible
+Protobuf dependency graph; grpc-lite never downloads a second copy.
+
 `grpc_lite::c` and `grpc_lite::c_static` both refer to the source-built static transport.
 An installed package exposes the versioned shared transport through `grpc_lite::c` and
 the static archive through `grpc_lite::c_static`.
@@ -98,9 +117,10 @@ Hostname channels require explicit Runtime ownership. Use
 - `grpc::Status` and status codes
 - `grpc::ClientContext` and `grpc::ServerContext`
 - Channels and channel arguments
-- unary and server-streaming client calls
+- unary, client-streaming, server-streaming, and bidirectional client calls
 - generated nested `Service` classes
-- `grpc::ServerWriter<T>` with bounded response backpressure
+- `grpc::ServerReader<T>`, `grpc::ServerWriter<T>`, and
+  `grpc::ServerReaderWriter<W, R>` with bounded request and response backpressure
 
 It is source-compatible with this selected API subset, not ABI-compatible with grpcpp.
 It does not provide official generated glue, CompletionQueue, callbacks/reactors, generic
@@ -111,9 +131,13 @@ low-level C++ or C API when hostname resolution requires explicit Runtime owners
 
 ## Generated Services
 
-The protoc plugin generates synchronous unary and server-streaming stubs beside standard
-protobuf C++ messages. Generated services expose both nonblocking `EventService` and a
-grpcpp-shaped nested `Service` with virtual methods.
+The protoc plugin generates synchronous glue for unary, client-streaming,
+server-streaming, and bidirectional methods beside standard protobuf C++ messages.
+Generated services expose both `EventService` and a grpcpp-shaped nested `Service` with
+virtual methods. Existing official gRPC
+`*.grpc.pb.cc` files must be regenerated with the grpc-lite plugin; relinking official
+generated service glue is not supported. Standard `*.pb.h` and `*.pb.cc` message files
+continue to come from the selected official `protoc` release.
 
 ```bash
 protoc -I proto \
@@ -123,7 +147,18 @@ protoc -I proto \
   proto/echo.proto
 ```
 
-Compile `echo.grpc.pb.cc` and `echo.pb.cc`, then link `grpc_lite::grpcpp` and protobuf.
+An installed package exposes the optional integration through a CMake component:
+
+```cmake
+find_package(grpc_lite 0.4 CONFIG REQUIRED COMPONENTS protobuf)
+target_link_libraries(echo_proto PUBLIC grpc_lite::grpcpp_protobuf)
+```
+
+The component locates the application's official Protobuf package and propagates
+`protobuf::libprotobuf`; it does not make Protobuf a dependency of the raw targets. Use
+`grpc_lite::grpcpp_protobuf_lite` only with messages generated for the lite runtime.
+Keep `protoc` and the linked runtime on compatible releases so their generated-code
+version checks agree.
 
 Create a fresh adapter for every server instance:
 
@@ -133,7 +168,10 @@ server.RegisterService(adapter.get());
 ```
 
 Keep the service, executor, and adapter alive until the Server has stopped. Drain
-submitted executor work before destroying the service.
+submitted executor work before destroying the service. Direct `EventService`
+implementations receive client-streaming and bidirectional call handles on reactor
+threads; move those handles to application workers before calling their blocking `Read`
+helpers.
 
 `grpc_lite::ServerExecutor` is application-owned. `Submit` must enqueue without blocking;
 handlers may block only on executor threads. Rejection completes the call with
@@ -150,5 +188,13 @@ cmake -S examples/cpp -B build-cpp -G Ninja \
 cmake --build build-cpp
 ```
 
-`mise run test-consumer-cpp` packages the project, regenerates C++ sources, starts the
-installed server, and runs the examples.
+`mise run test-consumer-cpp` packages the project, resolves the installed package's
+`protobuf` component, regenerates C++ sources, starts the installed server, and runs the
+examples.
+
+## Abseil Policy
+
+grpc-lite does not expose Abseil in its selected grpcpp-shaped API and does not install
+substitute `absl/*` headers. Abseil used internally by a chosen Protobuf release remains
+that package's transitive dependency. Applications that include Abseil directly must
+continue to provide it or migrate those call sites separately.

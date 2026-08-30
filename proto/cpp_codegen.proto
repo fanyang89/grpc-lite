@@ -13,6 +13,8 @@ message EchoReply {
 service EchoService {
   rpc Echo(EchoRequest) returns (EchoReply);
   rpc ServerStream(EchoRequest) returns (stream EchoReply);
+  rpc ClientStream(stream EchoRequest) returns (EchoReply);
+  rpc BidiStream(stream EchoRequest) returns (stream EchoReply);
 }
 
 service CollisionService {

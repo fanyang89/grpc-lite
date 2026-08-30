@@ -104,7 +104,7 @@ description = "Run grpcurl against the Zig echo server"
 run = "scripts/interop.sh"
 
 [tasks.interop-official]
-description = "Run official grpc-go unary interoperability tests"
+description = "Run official grpc-go and generated C++ interoperability tests"
 run = "tests/official/run_unary.sh"
 
 [tasks.interop-tls]

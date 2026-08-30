@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(grpc_lite_cpp_examples LANGUAGES CXX)
 
-find_package(Protobuf REQUIRED)
-find_package(grpc_lite 0.3 CONFIG REQUIRED)
+find_package(grpc_lite 0.4 CONFIG REQUIRED COMPONENTS protobuf)
 
 if(NOT TARGET protobuf::protoc)
   message(FATAL_ERROR "protobuf::protoc is missing")
@@ -45,8 +44,7 @@ add_library(grpc_lite_cpp_example_proto STATIC
 target_include_directories(grpc_lite_cpp_example_proto PUBLIC "${generated_dir}")
 target_link_libraries(grpc_lite_cpp_example_proto
   PUBLIC
-    grpc_lite::grpcpp
-    protobuf::libprotobuf)
+    grpc_lite::grpcpp_protobuf)
 
 foreach(example IN ITEMS basic_echo metadata_and_large errors_and_deadline)
   add_executable("grpc_lite_cpp_${example}" "${example}.cc")

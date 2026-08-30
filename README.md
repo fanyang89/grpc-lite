@@ -67,6 +67,11 @@ target_link_libraries(c_app PRIVATE grpc_lite::c)
 target_link_libraries(cpp_app PRIVATE grpc_lite::grpcpp)
 ```
 
+Typed generated C++ services keep the official Protobuf runtime as an explicit external
+dependency; the raw transport and grpcpp-shaped facade do not require Protobuf or
+Abseil. See [the C and C++ API guide](docs/c-cpp-api.md) for the opt-in CMake component
+and code-generation workflow.
+
 The source CMake build currently targets insecure Linux x86_64. The native Zig build
 supports Linux x86_64 and arm64, with TLS available through an optional mbedTLS build.
 
@@ -83,6 +88,8 @@ official grpc-go peers and public HTTP/2 framing suites on x86_64 and arm64.
 | Metadata, deadlines, gzip, GOAWAY, drain | Supported |
 | TLS 1.2+, ALPN `h2`, explicit PEM credentials | Optional |
 | grpcpp-shaped synchronous common API | Selected subset |
+| Official Protobuf C++ runtime | Optional external typed-code dependency |
+| General Abseil compatibility | Out of scope |
 | IPv6, mTLS, retries, reflection, xDS | Out of scope |
 
 See [the official interoperability profile](tests/official/README.md) for current cases

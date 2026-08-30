@@ -29,7 +29,7 @@ class TypedCallState {
   }
   bool terminal() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return terminal_ || call_.terminal();
+    return finish_submitted_ || terminal_ || call_.terminal();
   }
   std::size_t id() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -65,6 +65,12 @@ class TypedCallState {
     return error;
   }
 
+  Error ResumeReceive() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (terminal_ || finish_submitted_) return Error(ErrorCode::Closed);
+    return call_.ResumeReceive();
+  }
+
   void SetOnWritable(std::function<void()> callback) {
     bool invoke = false;
     {
@@ -83,8 +89,7 @@ class TypedCallState {
     }
     if (invoke && callback) callback();
   }
-  void SetOnTerminal(
-      std::function<void(ServerTerminalReason)> callback) {
+  void SetOnTerminal(std::function<void(ServerTerminalReason)> callback) {
     std::optional<ServerTerminalReason> reason;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -96,9 +101,8 @@ class TypedCallState {
 
   bool WaitForWritable() {
     std::unique_lock<std::mutex> lock(mutex_);
-    writable_cv_.wait(lock, [this] {
-      return writable_ || cancelled_ || terminal_;
-    });
+    writable_cv_.wait(lock,
+                      [this] { return writable_ || cancelled_ || terminal_; });
     return writable_ && !cancelled_ && !terminal_;
   }
 
@@ -171,6 +175,117 @@ inline Status SendErrorStatus(Error error) {
   return {StatusCode::Internal, std::string(error.message())};
 }
 
+template <class Response>
+Error FinishResponse(const std::shared_ptr<TypedCallState>& state,
+                     Response response, Status status,
+                     const Metadata* trailing_metadata,
+                     Compression compression) {
+  if (!status.ok()) return state->Finish(std::move(status), trailing_metadata);
+  std::string payload;
+  if (!response.SerializeToString(&payload)) {
+    return state->Finish({StatusCode::Internal, "failed to serialize response"},
+                         trailing_metadata);
+  }
+  const Error send_error = state->Send(std::move(payload), compression);
+  if (!send_error.ok()) {
+    const Error finish_error =
+        state->Finish(SendErrorStatus(send_error), trailing_metadata);
+    return finish_error.ok() ? send_error : finish_error;
+  }
+  return state->Finish({}, trailing_metadata);
+}
+
+template <class Request>
+class TypedRequestStreamState {
+ public:
+  explicit TypedRequestStreamState(std::shared_ptr<TypedCallState> call)
+      : call_(std::move(call)) {}
+
+  ReceiveAction OnMessage(std::string payload) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (rejected_ || remote_end_ || terminal_) return ReceiveAction::Pause;
+    if (message_) {
+      rejected_ = true;
+      call_->Finish({StatusCode::Internal, "request backpressure violated"},
+                    nullptr);
+      changed_.notify_all();
+      return ReceiveAction::Pause;
+    }
+    if (payload.size() >
+        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      rejected_ = true;
+      call_->Finish(
+          {StatusCode::ResourceExhausted, "request is too large to parse"},
+          nullptr);
+      changed_.notify_all();
+      return ReceiveAction::Pause;
+    }
+    Request parsed;
+    if (!parsed.ParseFromArray(payload.data(), static_cast<int>(payload.size()))) {
+      rejected_ = true;
+      call_->Finish({StatusCode::InvalidArgument, "failed to parse request"},
+                    nullptr);
+      changed_.notify_all();
+      return ReceiveAction::Pause;
+    }
+    message_.emplace(std::move(parsed));
+    changed_.notify_all();
+    return ReceiveAction::Pause;
+  }
+
+  void OnRemoteEnd() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    remote_end_ = true;
+    changed_.notify_all();
+  }
+
+  void OnCancel() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cancelled_ = true;
+    changed_.notify_all();
+  }
+
+  void OnTerminal() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    terminal_ = true;
+    changed_.notify_all();
+  }
+
+  // This helper is for application worker threads, never reactor callbacks.
+  bool Read(Request* request) {
+    if (request == nullptr) return false;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      changed_.wait(lock, [this] {
+        return message_.has_value() || remote_end_ || rejected_ || cancelled_ ||
+               terminal_;
+      });
+      if (!message_) return false;
+      *request = std::move(*message_);
+      message_.reset();
+    }
+    const Error resume_error = call_->ResumeReceive();
+    if (!resume_error.ok() && resume_error.code() != ErrorCode::Closed &&
+        resume_error.code() != ErrorCode::Unavailable) {
+      call_->Finish({StatusCode::Internal, "failed to resume request stream"},
+                    nullptr);
+    }
+    return true;
+  }
+
+  const std::shared_ptr<TypedCallState>& call() const { return call_; }
+
+ private:
+  std::shared_ptr<TypedCallState> call_;
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  std::optional<Request> message_;
+  bool remote_end_ = false;
+  bool rejected_ = false;
+  bool cancelled_ = false;
+  bool terminal_ = false;
+};
+
 }  // namespace internal
 
 template <class Response>
@@ -196,20 +311,9 @@ class UnaryCall {
                const Metadata* trailing_metadata = nullptr,
                Compression compression = Compression::Identity) {
     if (!state_) return Error(ErrorCode::InvalidState);
-    if (!status.ok()) return state_->Finish(std::move(status), trailing_metadata);
-    std::string payload;
-    if (!response.SerializeToString(&payload)) {
-      return state_->Finish(
-          {StatusCode::Internal, "failed to serialize response"},
-          trailing_metadata);
-    }
-    const Error send_error = state_->Send(std::move(payload), compression);
-    if (!send_error.ok()) {
-      const Error finish_error =
-          state_->Finish(internal::SendErrorStatus(send_error), trailing_metadata);
-      return finish_error.ok() ? send_error : finish_error;
-    }
-    return state_->Finish({}, trailing_metadata);
+    return internal::FinishResponse(state_, std::move(response),
+                                    std::move(status), trailing_metadata,
+                                    compression);
   }
   Error Finish(Status status, const Metadata* trailing_metadata = nullptr) {
     if (!state_) return Error(ErrorCode::InvalidState);
@@ -218,8 +322,7 @@ class UnaryCall {
   void SetOnCancel(std::function<void()> callback) {
     if (state_) state_->SetOnCancel(std::move(callback));
   }
-  void SetOnTerminal(
-      std::function<void(ServerTerminalReason)> callback) {
+  void SetOnTerminal(std::function<void(ServerTerminalReason)> callback) {
     if (state_) state_->SetOnTerminal(std::move(callback));
   }
 
@@ -231,8 +334,7 @@ template <class Response>
 class ServerStreamingCall {
  public:
   ServerStreamingCall() = default;
-  explicit ServerStreamingCall(
-      std::shared_ptr<internal::TypedCallState> state)
+  explicit ServerStreamingCall(std::shared_ptr<internal::TypedCallState> state)
       : state_(std::move(state)) {}
   ServerStreamingCall(const ServerStreamingCall&) = delete;
   ServerStreamingCall& operator=(const ServerStreamingCall&) = delete;
@@ -271,8 +373,7 @@ class ServerStreamingCall {
   void SetOnCancel(std::function<void()> callback) {
     if (state_) state_->SetOnCancel(std::move(callback));
   }
-  void SetOnTerminal(
-      std::function<void(ServerTerminalReason)> callback) {
+  void SetOnTerminal(std::function<void(ServerTerminalReason)> callback) {
     if (state_) state_->SetOnTerminal(std::move(callback));
   }
 
@@ -280,15 +381,122 @@ class ServerStreamingCall {
   std::shared_ptr<internal::TypedCallState> state_;
 };
 
+template <class Request, class Response>
+class ClientStreamingCall {
+ public:
+  ClientStreamingCall() = default;
+  explicit ClientStreamingCall(
+      std::shared_ptr<internal::TypedRequestStreamState<Request>> state)
+      : state_(std::move(state)) {}
+  ClientStreamingCall(const ClientStreamingCall&) = delete;
+  ClientStreamingCall& operator=(const ClientStreamingCall&) = delete;
+  ClientStreamingCall(ClientStreamingCall&&) noexcept = default;
+  ClientStreamingCall& operator=(ClientStreamingCall&&) noexcept = default;
+
+  bool cancelled() const { return state_ && state_->call()->cancelled(); }
+  bool terminal() const { return !state_ || state_->call()->terminal(); }
+  bool Read(Request* request) { return state_ && state_->Read(request); }
+  Error SendInitialMetadata(
+      const Metadata* metadata = nullptr,
+      Compression compression = Compression::Identity) {
+    if (!state_) return Error(ErrorCode::InvalidState);
+    return state_->call()->SendInitialMetadata(metadata, compression);
+  }
+  Error Finish(Response response, Status status = {},
+               const Metadata* trailing_metadata = nullptr,
+               Compression compression = Compression::Identity) {
+    if (!state_) return Error(ErrorCode::InvalidState);
+    return internal::FinishResponse(state_->call(), std::move(response),
+                                    std::move(status), trailing_metadata,
+                                    compression);
+  }
+  Error Finish(Status status, const Metadata* trailing_metadata = nullptr) {
+    if (!state_) return Error(ErrorCode::InvalidState);
+    return state_->call()->Finish(std::move(status), trailing_metadata);
+  }
+  void SetOnCancel(std::function<void()> callback) {
+    if (state_) state_->call()->SetOnCancel(std::move(callback));
+  }
+  void SetOnTerminal(std::function<void(ServerTerminalReason)> callback) {
+    if (state_) state_->call()->SetOnTerminal(std::move(callback));
+  }
+
+ private:
+  std::shared_ptr<internal::TypedRequestStreamState<Request>> state_;
+};
+
+template <class Request, class Response>
+class BidirectionalStreamingCall {
+ public:
+  BidirectionalStreamingCall() = default;
+  explicit BidirectionalStreamingCall(
+      std::shared_ptr<internal::TypedRequestStreamState<Request>> state)
+      : state_(std::move(state)) {}
+  BidirectionalStreamingCall(const BidirectionalStreamingCall&) = delete;
+  BidirectionalStreamingCall& operator=(const BidirectionalStreamingCall&) =
+      delete;
+  BidirectionalStreamingCall(BidirectionalStreamingCall&&) noexcept = default;
+  BidirectionalStreamingCall& operator=(BidirectionalStreamingCall&&) noexcept =
+      default;
+
+  bool cancelled() const { return state_ && state_->call()->cancelled(); }
+  bool terminal() const { return !state_ || state_->call()->terminal(); }
+  bool Read(Request* request) { return state_ && state_->Read(request); }
+  Error SendInitialMetadata(
+      const Metadata* metadata = nullptr,
+      Compression compression = Compression::Identity) {
+    if (!state_) return Error(ErrorCode::InvalidState);
+    return state_->call()->SendInitialMetadata(metadata, compression);
+  }
+  Error TryWrite(const Response& response,
+                 Compression compression = Compression::Identity) {
+    if (!state_) return Error(ErrorCode::InvalidState);
+    std::string payload;
+    if (!response.SerializeToString(&payload)) {
+      const Error finish_error = state_->call()->Finish(
+          {StatusCode::Internal, "failed to serialize response"}, nullptr);
+      return finish_error.ok() ? Error(ErrorCode::Internal) : finish_error;
+    }
+    return state_->call()->Send(std::move(payload), compression);
+  }
+  bool WaitForWritable() {
+    return state_ && state_->call()->WaitForWritable();
+  }
+  Error Finish(Status status = {},
+               const Metadata* trailing_metadata = nullptr) {
+    if (!state_) return Error(ErrorCode::InvalidState);
+    return state_->call()->Finish(std::move(status), trailing_metadata);
+  }
+  void SetOnWritable(std::function<void()> callback) {
+    if (state_) state_->call()->SetOnWritable(std::move(callback));
+  }
+  void SetOnCancel(std::function<void()> callback) {
+    if (state_) state_->call()->SetOnCancel(std::move(callback));
+  }
+  void SetOnTerminal(std::function<void(ServerTerminalReason)> callback) {
+    if (state_) state_->call()->SetOnTerminal(std::move(callback));
+  }
+
+ private:
+  std::shared_ptr<internal::TypedRequestStreamState<Request>> state_;
+};
+
 namespace internal {
 
-template <class Request, class Response, bool ServerStreaming>
+template <class Request, class Response, bool ClientStreaming,
+          bool ServerStreaming>
 class TypedMethodRegistration {
  public:
-  using Call = std::conditional_t<ServerStreaming,
-                                  ServerStreamingCall<Response>,
-                                  UnaryCall<Response>>;
-  using Handler = std::function<void(const ServerContext&, Request, Call)>;
+  using Call = std::conditional_t<
+      ClientStreaming,
+      std::conditional_t<ServerStreaming,
+                         BidirectionalStreamingCall<Request, Response>,
+                         ClientStreamingCall<Request, Response>>,
+      std::conditional_t<ServerStreaming, ServerStreamingCall<Response>,
+                         UnaryCall<Response>>>;
+  using Handler = std::conditional_t<
+      ClientStreaming, std::function<void(const ServerContext&, Call)>,
+      std::function<void(const ServerContext&, Request, Call)>>;
 
   TypedMethodRegistration() : impl_(std::make_shared<Impl>()) {}
   ~TypedMethodRegistration() { impl_->Disable(); }
@@ -305,34 +513,48 @@ class TypedMethodRegistration {
               const ServerContext& server_context)
         : typed_call(std::move(call)),
           context(server_context),
-          call_id(typed_call->id()) {}
+          call_id(typed_call->id()) {
+      if constexpr (ClientStreaming) {
+        request_stream =
+            std::make_shared<TypedRequestStreamState<Request>>(typed_call);
+      }
+    }
 
-    void OnMessage(std::string payload) {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (rejected || dispatched) return;
-      if (request_count != 0) {
-        rejected = true;
-        typed_call->Finish(
-            {StatusCode::InvalidArgument, "duplicate request message"}, nullptr);
-        return;
+    ReceiveAction OnMessage(std::string payload) {
+      if constexpr (ClientStreaming) {
+        return request_stream->OnMessage(std::move(payload));
+      } else {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (rejected || dispatched) return ReceiveAction::Continue;
+        if (request_count != 0) {
+          rejected = true;
+          typed_call->Finish(
+              {StatusCode::InvalidArgument, "duplicate request message"},
+              nullptr);
+          return ReceiveAction::Continue;
+        }
+        request_count = 1;
+        if (payload.size() > static_cast<std::size_t>(
+                                 std::numeric_limits<int>::max())) {
+          rejected = true;
+          typed_call->Finish(
+              {StatusCode::ResourceExhausted,
+               "request is too large to parse"},
+              nullptr);
+          return ReceiveAction::Continue;
+        }
+        Request parsed;
+        if (!parsed.ParseFromArray(payload.data(),
+                                   static_cast<int>(payload.size()))) {
+          rejected = true;
+          typed_call->Finish(
+              {StatusCode::InvalidArgument, "failed to parse request"},
+              nullptr);
+          return ReceiveAction::Continue;
+        }
+        request.emplace(std::move(parsed));
+        return ReceiveAction::Continue;
       }
-      request_count = 1;
-      if (payload.size() > static_cast<std::size_t>(
-                               std::numeric_limits<int>::max())) {
-        rejected = true;
-        typed_call->Finish(
-            {StatusCode::ResourceExhausted, "request is too large to parse"},
-            nullptr);
-        return;
-      }
-      Request parsed;
-      if (!parsed.ParseFromArray(payload.data(), static_cast<int>(payload.size()))) {
-        rejected = true;
-        typed_call->Finish(
-            {StatusCode::InvalidArgument, "failed to parse request"}, nullptr);
-        return;
-      }
-      request.emplace(std::move(parsed));
     }
 
     std::optional<Request> TakeRequest() {
@@ -341,7 +563,8 @@ class TypedMethodRegistration {
       if (request_count != 1 || !request) {
         rejected = true;
         typed_call->Finish(
-            {StatusCode::InvalidArgument, "request message is missing"}, nullptr);
+            {StatusCode::InvalidArgument, "request message is missing"},
+            nullptr);
         return std::nullopt;
       }
       dispatched = true;
@@ -350,6 +573,7 @@ class TypedMethodRegistration {
 
     std::mutex mutex;
     std::shared_ptr<TypedCallState> typed_call;
+    std::shared_ptr<TypedRequestStreamState<Request>> request_stream;
     ServerContext context;
     std::size_t call_id;
     std::optional<Request> request;
@@ -375,33 +599,54 @@ class TypedMethodRegistration {
         if (!stream.Retain(&call).ok()) return;
         auto state = std::make_shared<CallState>(
             std::make_shared<TypedCallState>(std::move(call)), context);
-        std::lock_guard<std::mutex> lock(self->mutex);
-        self->calls[state->call_id] = std::move(state);
+        {
+          std::lock_guard<std::mutex> lock(self->mutex);
+          self->calls[state->call_id] = state;
+        }
+        if constexpr (ClientStreaming) {
+          Handler handler;
+          {
+            std::lock_guard<std::mutex> lock(self->mutex);
+            handler = self->application_handler;
+          }
+          if (handler) {
+            handler(state->context, Call(state->request_stream));
+          } else {
+            state->typed_call->Finish(
+                {StatusCode::Unavailable, "event service is unavailable"},
+                nullptr);
+          }
+        }
       };
       callbacks.on_message =
           [self](ServerStream& stream, const ServerContext&,
                  std::string payload, Compression) {
             const auto state = self->Find(stream);
-            if (state) state->OnMessage(std::move(payload));
-            return ReceiveAction::Continue;
+            return state ? state->OnMessage(std::move(payload))
+                         : ReceiveAction::Pause;
           };
       callbacks.on_remote_end = [self](ServerStream& stream,
                                        const ServerContext&) {
         const auto state = self->Find(stream);
         if (!state) return;
-        std::optional<Request> request = state->TakeRequest();
-        if (!request) return;
-        Handler handler;
-        {
-          std::lock_guard<std::mutex> lock(self->mutex);
-          handler = self->application_handler;
-        }
-        if (handler) {
-          handler(state->context, std::move(*request), Call(state->typed_call));
+        if constexpr (ClientStreaming) {
+          state->request_stream->OnRemoteEnd();
         } else {
-          state->typed_call->Finish(
-              {StatusCode::Unavailable, "event service is unavailable"},
-              nullptr);
+          std::optional<Request> request = state->TakeRequest();
+          if (!request) return;
+          Handler handler;
+          {
+            std::lock_guard<std::mutex> lock(self->mutex);
+            handler = self->application_handler;
+          }
+          if (handler) {
+            handler(state->context, std::move(*request),
+                    Call(state->typed_call));
+          } else {
+            state->typed_call->Finish(
+                {StatusCode::Unavailable, "event service is unavailable"},
+                nullptr);
+          }
         }
       };
       callbacks.on_writable = [self](ServerStream& stream,
@@ -412,7 +657,9 @@ class TypedMethodRegistration {
       callbacks.on_cancel = [self](ServerStream& stream,
                                    const ServerContext&) {
         const auto state = self->Find(stream);
-        if (state) state->typed_call->OnCancel();
+        if (!state) return;
+        if constexpr (ClientStreaming) state->request_stream->OnCancel();
+        state->typed_call->OnCancel();
       };
       callbacks.on_terminal = [self](std::size_t call_id,
                                      ServerTerminalReason reason) {
@@ -424,6 +671,7 @@ class TypedMethodRegistration {
           state = std::move(found->second);
           self->calls.erase(found);
         }
+        if constexpr (ClientStreaming) state->request_stream->OnTerminal();
         state->typed_call->OnTerminal(reason);
       };
 

@@ -25,8 +25,20 @@ using ServerStreamSignature =
     std::unique_ptr<grpc::ClientReader<demo::EchoReply>> (
         demo::EchoService::StubInterface::*)(grpc::ClientContext*,
                                              const demo::EchoRequest&);
+using ClientStreamSignature =
+    std::unique_ptr<grpc::ClientWriter<demo::EchoRequest>> (
+        demo::EchoService::StubInterface::*)(grpc::ClientContext*,
+                                             demo::EchoReply*);
+using BidiStreamSignature =
+    std::unique_ptr<grpc::ClientReaderWriter<demo::EchoRequest,
+                                             demo::EchoReply>> (
+        demo::EchoService::StubInterface::*)(grpc::ClientContext*);
 static_assert(std::is_same_v<decltype(&demo::EchoService::StubInterface::ServerStream),
                              ServerStreamSignature>);
+static_assert(std::is_same_v<decltype(&demo::EchoService::StubInterface::ClientStream),
+                             ClientStreamSignature>);
+static_assert(std::is_same_v<decltype(&demo::EchoService::StubInterface::BidiStream),
+                             BidiStreamSignature>);
 
 class CompileEventService final : public demo::EchoService::EventService {
  public:
@@ -35,6 +47,14 @@ class CompileEventService final : public demo::EchoService::EventService {
   void ServerStream(
       const grpc_lite::ServerContext&, demo::EchoRequest,
       grpc_lite::ServerStreamingCall<demo::EchoReply>) noexcept override {}
+  void ClientStream(
+      const grpc_lite::ServerContext&,
+      grpc_lite::ClientStreamingCall<demo::EchoRequest,
+                                     demo::EchoReply>) noexcept override {}
+  void BidiStream(
+      const grpc_lite::ServerContext&,
+      grpc_lite::BidirectionalStreamingCall<demo::EchoRequest,
+                                            demo::EchoReply>) noexcept override {}
 };
 
 class CompileCollisionEventService final
@@ -61,11 +81,24 @@ using UnaryServiceSignature = grpc::Status (demo::EchoService::Service::*)(
 using StreamingServiceSignature = grpc::Status (demo::EchoService::Service::*)(
     grpc::ServerContext*, const demo::EchoRequest*,
     grpc::ServerWriter<demo::EchoReply>*);
+using ClientStreamingServiceSignature =
+    grpc::Status (demo::EchoService::Service::*)(
+        grpc::ServerContext*, grpc::ServerReader<demo::EchoRequest>*,
+        demo::EchoReply*);
+using BidiStreamingServiceSignature =
+    grpc::Status (demo::EchoService::Service::*)(
+        grpc::ServerContext*,
+        grpc::ServerReaderWriter<demo::EchoReply, demo::EchoRequest>*);
 static_assert(std::is_same_v<decltype(&demo::EchoService::Service::Echo),
                              UnaryServiceSignature>);
 static_assert(
     std::is_same_v<decltype(&demo::EchoService::Service::ServerStream),
                    StreamingServiceSignature>);
+static_assert(
+    std::is_same_v<decltype(&demo::EchoService::Service::ClientStream),
+                   ClientStreamingServiceSignature>);
+static_assert(std::is_same_v<decltype(&demo::EchoService::Service::BidiStream),
+                             BidiStreamingServiceSignature>);
 
 static_assert(std::is_abstract_v<grpc_lite::ServerExecutor>);
 

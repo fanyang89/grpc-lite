@@ -643,6 +643,19 @@ fn addProtobufSupport(
     );
     generate_interop_proto_step.dependOn(&generate_interop_proto.step);
 
+    const install_cpp_interop_protos = b.step(
+        "install-cpp-interop-protos",
+        "Install official protobuf sources for C++ interop tests",
+    );
+    inline for (.{ "empty.proto", "messages.proto", "test.proto" }) |name| {
+        const install_proto = b.addInstallFileWithDir(
+            grpc_proto_dependency.path("grpc/testing/" ++ name),
+            .{ .custom = "share/grpc-lite/interop-proto/grpc/testing" },
+            name,
+        );
+        install_cpp_interop_protos.dependOn(&install_proto.step);
+    }
+
     const demo_proto = b.createModule(.{
         .root_source_file = b.path(".zig-cache/generated/demo.pb.zig"),
         .target = target,
