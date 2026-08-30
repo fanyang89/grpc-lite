@@ -269,6 +269,162 @@ void DispatchServerStreaming(ServerExecutor& executor, std::string_view method,
   }
 }
 
+template <class Request, class Response, class Handler>
+void DispatchClientStreaming(ServerExecutor& executor, std::string_view method,
+                             SynchronousServiceOptions options,
+                             const ServerContext& native_context,
+                             ClientStreamingCall<Request, Response> call,
+                             Handler handler) noexcept {
+  if (options.admission) {
+    Status status = options.admission->Admit(method, native_context);
+    if (!status.ok()) {
+      call.Finish(std::move(status));
+      return;
+    }
+  }
+  struct State {
+    State(const ServerContext& native_context,
+          ClientStreamingCall<Request, Response> call, Handler handler,
+          SynchronousServiceOptions options)
+        : call(std::move(call)),
+          context(grpc::internal::ServerContextAccess::Create(
+              native_context, [this] { return this->call.cancelled(); },
+              GrpcCompression(options.response_compression))),
+          handler(std::move(handler)) {}
+
+    void Run() {
+      if (!admission.BeginStart() || !admission.CommitStart()) return;
+      auto reader = grpc::internal::ServerReaderAccess<Request>::Create(
+          &context, [this](Request* request) { return call.Read(request); });
+      Response response;
+      const grpc::Status status = handler(&context, &reader, &response);
+      if (call.cancelled() || call.terminal()) return;
+      const Error metadata_error = SendInitialMetadata(call, context);
+      if (!metadata_error.ok()) {
+        call.Finish({StatusCode::Internal,
+                     "failed to send initial metadata"});
+        return;
+      }
+      if (status.ok()) {
+        Metadata trailing;
+        const Error trailing_error = CopyMetadata(
+            grpc::internal::ServerContextAccess::TrailingMetadata(context),
+            &trailing);
+        if (!trailing_error.ok()) {
+          call.Finish({StatusCode::Internal, "failed to copy metadata"});
+          return;
+        }
+        call.Finish(std::move(response), {}, &trailing,
+                    NativeCompression(
+                        grpc::internal::ServerContextAccess::Compression(
+                            context)));
+      } else {
+        Finish(call, context, status);
+      }
+    }
+
+    ClientStreamingCall<Request, Response> call;
+    grpc::ServerContext context;
+    Handler handler;
+    CallAdmissionGate admission;
+  };
+
+  auto state = std::make_shared<State>(native_context, std::move(call),
+                                       std::move(handler), options);
+  const std::weak_ptr<State> observer = state;
+  state->call.SetOnCancel([observer] {
+    if (const auto state = observer.lock()) state->admission.Stop();
+  });
+  state->call.SetOnTerminal([observer](ServerTerminalReason) {
+    if (const auto state = observer.lock()) state->admission.Stop();
+  });
+  if (!executor.Submit(method, [state] { state->Run(); })) {
+    state->admission.Stop();
+    state->call.Finish(
+        {StatusCode::ResourceExhausted, "executor rejected the call"});
+  }
+}
+
+template <class Request, class Response, class Handler>
+void DispatchBidirectionalStreaming(
+    ServerExecutor& executor, std::string_view method,
+    SynchronousServiceOptions options, const ServerContext& native_context,
+    BidirectionalStreamingCall<Request, Response> call,
+    Handler handler) noexcept {
+  if (options.admission) {
+    Status status = options.admission->Admit(method, native_context);
+    if (!status.ok()) {
+      call.Finish(std::move(status));
+      return;
+    }
+  }
+  struct State {
+    State(const ServerContext& native_context,
+          BidirectionalStreamingCall<Request, Response> call, Handler handler,
+          SynchronousServiceOptions options)
+        : call(std::move(call)),
+          context(grpc::internal::ServerContextAccess::Create(
+              native_context, [this] { return this->call.cancelled(); },
+              GrpcCompression(options.response_compression))),
+          handler(std::move(handler)) {}
+
+    Error TryWrite(const Response& response) {
+      if (!initial_metadata_sent) {
+        const Error error = SendInitialMetadata(call, context);
+        if (!error.ok()) return error;
+        initial_metadata_sent = true;
+      }
+      return call.TryWrite(
+          response, NativeCompression(
+                        grpc::internal::ServerContextAccess::Compression(
+                            context)));
+    }
+
+    void Run() {
+      if (!admission.BeginStart() || !admission.CommitStart()) return;
+      auto stream =
+          grpc::internal::ServerReaderWriterAccess<Response, Request>::Create(
+              &context,
+              [this](Request* request) { return call.Read(request); },
+              [this](const Response& response) { return TryWrite(response); },
+              [this] { return call.WaitForWritable(); });
+      const grpc::Status status = handler(&context, &stream);
+      if (call.cancelled() || call.terminal()) return;
+      if (!initial_metadata_sent) {
+        const Error error = SendInitialMetadata(call, context);
+        if (!error.ok()) {
+          call.Finish({StatusCode::Internal,
+                       "failed to send initial metadata"});
+          return;
+        }
+        initial_metadata_sent = true;
+      }
+      Finish(call, context, status);
+    }
+
+    BidirectionalStreamingCall<Request, Response> call;
+    grpc::ServerContext context;
+    Handler handler;
+    bool initial_metadata_sent = false;
+    CallAdmissionGate admission;
+  };
+
+  auto state = std::make_shared<State>(native_context, std::move(call),
+                                       std::move(handler), options);
+  const std::weak_ptr<State> observer = state;
+  state->call.SetOnCancel([observer] {
+    if (const auto state = observer.lock()) state->admission.Stop();
+  });
+  state->call.SetOnTerminal([observer](ServerTerminalReason) {
+    if (const auto state = observer.lock()) state->admission.Stop();
+  });
+  if (!executor.Submit(method, [state] { state->Run(); })) {
+    state->admission.Stop();
+    state->call.Finish(
+        {StatusCode::ResourceExhausted, "executor rejected the call"});
+  }
+}
+
 }  // namespace internal
 }  // namespace grpc_lite
 

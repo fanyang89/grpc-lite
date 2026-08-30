@@ -113,6 +113,52 @@ class EventService final : public demo::EchoService::EventService {
     });
   }
 
+  void ClientStream(
+      const grpc_lite::ServerContext&,
+      grpc_lite::ClientStreamingCall<demo::EchoRequest, demo::EchoReply>
+          call) noexcept override {
+    AddWorker([this, call = std::move(call)]() mutable {
+      client_stream_starts.fetch_add(1, std::memory_order_release);
+      demo::EchoRequest request;
+      std::string joined;
+      while (call.Read(&request)) {
+        if (!joined.empty()) joined += ",";
+        joined += request.message();
+      }
+      if (call.cancelled() || call.terminal()) return;
+      if (joined == "error") {
+        assert(call
+                   .Finish({grpc_lite::StatusCode::InvalidArgument,
+                            "client stream rejected"})
+                   .ok());
+        return;
+      }
+      demo::EchoReply response;
+      response.set_message(joined);
+      assert(call.Finish(std::move(response)).ok());
+    });
+  }
+
+  void BidiStream(
+      const grpc_lite::ServerContext&,
+      grpc_lite::BidirectionalStreamingCall<demo::EchoRequest,
+                                            demo::EchoReply> call) noexcept override {
+    AddWorker([call = std::move(call)]() mutable {
+      demo::EchoRequest request;
+      while (call.Read(&request)) {
+        demo::EchoReply response;
+        response.set_message(request.message() + " response");
+        grpc_lite::Error error = call.TryWrite(response);
+        while (error.code() == grpc_lite::ErrorCode::WouldBlock) {
+          if (!call.WaitForWritable()) return;
+          error = call.TryWrite(response);
+        }
+        assert(error.ok());
+      }
+      assert(call.Finish().ok());
+    });
+  }
+
   void WaitForHeld() {
     std::unique_lock<std::mutex> lock(held_mutex_);
     assert(held_changed_.wait_for(lock, std::chrono::seconds(5),
@@ -139,6 +185,7 @@ class EventService final : public demo::EchoService::EventService {
   std::atomic<int> terminals{0};
   std::atomic<int> cancellation_terminals{0};
   std::atomic<int> writable_signals{0};
+  std::atomic<int> client_stream_starts{0};
 
  private:
   template <class Work>
@@ -238,12 +285,43 @@ class SynchronousService final : public demo::EchoService::Service {
     return grpc::Status::OK;
   }
 
+  grpc::Status ClientStream(grpc::ServerContext*,
+                            grpc::ServerReader<demo::EchoRequest>* reader,
+                            demo::EchoReply* response) override {
+    client_streaming_calls.fetch_add(1, std::memory_order_relaxed);
+    demo::EchoRequest request;
+    std::string joined;
+    while (reader->Read(&request)) {
+      if (!joined.empty()) joined += ",";
+      joined += request.message();
+    }
+    response->set_message(joined);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BidiStream(
+      grpc::ServerContext*,
+      grpc::ServerReaderWriter<demo::EchoReply, demo::EchoRequest>* stream)
+      override {
+    bidi_calls.fetch_add(1, std::memory_order_relaxed);
+    demo::EchoRequest request;
+    while (stream->Read(&request)) {
+      demo::EchoReply response;
+      response.set_message(request.message() + " response");
+      if (!stream->Write(response)) return grpc::Status::CANCELLED;
+    }
+    return grpc::Status::OK;
+  }
+
   std::atomic<int> unary_calls{0};
   std::atomic<int> streaming_calls{0};
+  std::atomic<int> client_streaming_calls{0};
+  std::atomic<int> bidi_calls{0};
 };
 
-grpc_lite::Status RawCall(grpc_lite::Channel& channel,
-                          std::vector<std::string> messages) {
+grpc_lite::Status RawCall(
+    grpc_lite::Channel& channel, std::vector<std::string> messages,
+    std::string method = "/demo.EchoService/Echo") {
   std::mutex mutex;
   std::condition_variable changed;
   bool done = false;
@@ -258,8 +336,7 @@ grpc_lite::Status RawCall(grpc_lite::Channel& channel,
   };
   grpc_lite::ClientStream stream;
   assert(grpc_lite::ClientStream::Open(
-             channel, "/demo.EchoService/Echo", {}, std::move(callbacks),
-             &stream)
+             channel, method, {}, std::move(callbacks), &stream)
              .ok());
   for (const auto& message : messages) assert(stream.Send(message).ok());
   assert(stream.CloseSend().ok());
@@ -343,6 +420,36 @@ void TestSynchronousService() {
   assert(stream_context.GetServerTrailingMetadata().find("x-trailing")->second ==
          "stream");
 
+  grpc::ClientContext client_stream_context;
+  auto writer = stub->ClientStream(&client_stream_context, &response);
+  request.set_message("sync client one");
+  assert(writer->Write(request));
+  request.set_message("sync client two");
+  assert(writer->Write(request));
+  assert(writer->WritesDone());
+  executor.WaitForTask();
+  std::thread client_stream_worker([&] { executor.RunOne(); });
+  assert(writer->Finish().ok());
+  client_stream_worker.join();
+  assert(response.message() == "sync client one,sync client two");
+
+  grpc::ClientContext bidi_context;
+  auto bidi = stub->BidiStream(&bidi_context);
+  request.set_message("sync bidi one");
+  assert(bidi->Write(request));
+  request.set_message("sync bidi two");
+  assert(bidi->Write(request));
+  assert(bidi->WritesDone());
+  executor.WaitForTask();
+  std::thread bidi_worker([&] { executor.RunOne(); });
+  std::vector<std::string> bidi_responses;
+  while (bidi->Read(&response)) bidi_responses.push_back(response.message());
+  assert(bidi->Finish().ok());
+  bidi_worker.join();
+  assert((bidi_responses ==
+          std::vector<std::string>{"sync bidi one response",
+                                   "sync bidi two response"}));
+
   grpc::ClientContext cancelled_context;
   cancelled_context.AddMetadata("x-request", "metadata");
   request.set_message("cancelled");
@@ -369,6 +476,8 @@ void TestSynchronousService() {
   executor.RunOne();
   assert(service.unary_calls.load(std::memory_order_relaxed) == 1);
   assert(service.streaming_calls.load(std::memory_order_relaxed) == 1);
+  assert(service.client_streaming_calls.load(std::memory_order_relaxed) == 1);
+  assert(service.bidi_calls.load(std::memory_order_relaxed) == 1);
 
   channel->Shutdown();
   channel->Wait();
@@ -509,6 +618,59 @@ int main() {
   assert(service.context_ok.load(std::memory_order_relaxed));
   assert(service.context_copy_ok.load(std::memory_order_relaxed));
 
+  grpc::ClientContext client_stream_context;
+  auto writer = stub->ClientStream(&client_stream_context, &response);
+  request.set_message("client one");
+  assert(writer->Write(request));
+  request.set_message("client two");
+  assert(writer->Write(request));
+  assert(writer->WritesDone());
+  assert(writer->Finish().ok());
+  assert(response.message() == "client one,client two");
+
+  grpc::ClientContext rejected_stream_context;
+  response.set_message("unchanged");
+  auto rejected_writer =
+      stub->ClientStream(&rejected_stream_context, &response);
+  request.set_message("error");
+  assert(rejected_writer->Write(request));
+  assert(rejected_writer->WritesDone());
+  const grpc::Status rejected_status = rejected_writer->Finish();
+  assert(rejected_status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+  assert(response.message() == "unchanged");
+
+  const int starts_before_cancel =
+      service.client_stream_starts.load(std::memory_order_acquire);
+  grpc::ClientContext cancelled_stream_context;
+  auto cancelled_writer =
+      stub->ClientStream(&cancelled_stream_context, &response);
+  WaitUntil([&] {
+    return service.client_stream_starts.load(std::memory_order_acquire) >
+           starts_before_cancel;
+  });
+  cancelled_stream_context.TryCancel();
+  assert(cancelled_writer->Finish().error_code() ==
+         grpc::StatusCode::CANCELLED);
+
+  grpc::ClientContext bidi_context;
+  auto bidi = stub->BidiStream(&bidi_context);
+  responses.clear();
+  std::thread bidi_reader([&] {
+    demo::EchoReply bidi_response;
+    while (bidi->Read(&bidi_response)) {
+      responses.push_back(bidi_response.message());
+    }
+  });
+  request.set_message("bidi one");
+  assert(bidi->Write(request));
+  request.set_message("bidi two");
+  assert(bidi->Write(request));
+  assert(bidi->WritesDone());
+  bidi_reader.join();
+  assert(bidi->Finish().ok());
+  assert((responses == std::vector<std::string>{"bidi one response",
+                                                "bidi two response"}));
+
   grpc_lite::Channel raw_channel;
   assert(grpc_lite::Channel::CreateManaged(
              nullptr, "127.0.0.1:" + std::to_string(port), {}, &raw_channel)
@@ -519,6 +681,9 @@ int main() {
          grpc_lite::StatusCode::InvalidArgument);
   assert(RawCall(raw_channel, {"one", "two"}).code() ==
          grpc_lite::StatusCode::InvalidArgument);
+  assert(RawCall(raw_channel, {"!malformed"},
+                 "/demo.EchoService/ClientStream")
+             .code() == grpc_lite::StatusCode::InvalidArgument);
 
   grpc::ClientContext cancellation_context;
   request.set_message("hold");

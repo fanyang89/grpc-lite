@@ -200,7 +200,7 @@ jobs:
       - name: Run grpcurl interop
         run: mise run interop
 
-      - name: Run official unary interop
+      - name: Run official insecure interop
         run: mise run interop-official
 
       - name: Run official TLS interop

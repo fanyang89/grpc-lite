@@ -87,7 +87,9 @@ authoritative: change it before implementing a feature with a different decision
 | Service config and load balancing | Out of scope | No policy layer |
 | xDS, ORCA, ALTS, and cloud credentials | Out of scope | Not required for lite deployments |
 | Cacheable unary GET | Out of scope | Depends on proxy cache semantics |
-| grpcpp-shaped synchronous C++ API | Selected | Source-compatible common sync API through regenerated service glue; no ABI compatibility |
+| grpcpp-shaped synchronous C++ API | Selected | Regenerated unary and all streaming cardinalities; source-compatible common sync API with no ABI compatibility |
+| Official Protobuf C++ runtime integration | Selected | Optional external dependency for typed C++ code; keep it out of the raw transport |
+| General Abseil API compatibility | Out of scope | Do not install substitute `absl/*` headers; direct application use remains an application dependency |
 | Full grpcpp compatibility | Out of scope | No official generated glue, CompletionQueue, callback/reactor, generic services, or grpc-core ABI |
 
 ## Raw Streaming Direction

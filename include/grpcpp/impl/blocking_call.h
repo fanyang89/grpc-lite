@@ -185,13 +185,21 @@ class BlockingCallState final : public CancellationTarget,
     if (stream_) stream_->Cancel();
   }
 
-  Status SendAndClose(const std::string& payload) {
-    Status status = RunCommand([&](grpc_lite::ClientStream& stream) {
+  Status Send(const std::string& payload) {
+    return RunCommand([&](grpc_lite::ClientStream& stream) {
       return stream.Send(payload, compression_);
     });
-    if (!status.ok()) return status;
+  }
+
+  Status CloseSend() {
     return RunCommand(
         [](grpc_lite::ClientStream& stream) { return stream.CloseSend(); });
+  }
+
+  Status SendAndClose(const std::string& payload) {
+    Status status = Send(payload);
+    if (!status.ok()) return status;
+    return CloseSend();
   }
 
   bool Read(std::string* output) {

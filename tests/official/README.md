@@ -17,7 +17,9 @@ mise run interop-http2-edge
 | grpc-lite client to grpc-go server | `empty_unary`, `large_unary`, `special_status_message`, `unimplemented_method`, `unimplemented_service` | Pass |
 | grpc-go client to grpc-lite server | `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
 | grpc-lite client to grpc-go server | `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
-| dedicated grpc-go client to grpc-lite server | `half_duplex` | Pass; responses begin after the client half-closes |
+| grpc-go client to generated C++ server | `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
+| generated C++ client to grpc-go server | `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
+| dedicated grpc-go client to grpc-lite and generated C++ servers | `half_duplex` | Pass; responses begin after the client half-closes |
 | grpc-go client to grpc-lite server | `cancel_after_begin`, `cancel_after_first_response`, `timeout_on_sleeping_server` | Pass |
 | grpc-lite client to grpc-go server | `cancel_after_begin`, `cancel_after_first_response`, `timeout_on_sleeping_server` | Pass |
 | grpc-lite compression integration | `client_compressed_unary`, `server_compressed_unary` | Pass; grpc-go v1.82.1 does not expose these cases through its interop client |

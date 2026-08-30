@@ -12,6 +12,7 @@ find_package(Threads REQUIRED)
 include(FetchContent)
 
 option(GRPC_LITE_ENABLE_TLS "Enable TLS transport support through mbedTLS" OFF)
+option(GRPC_LITE_ENABLE_PROTOBUF "Expose optional official Protobuf C++ integration targets" OFF)
 set(GRPC_LITE_NGHTTP2_URL "" CACHE STRING "Optional nghttp2 source tarball URL")
 set(GRPC_LITE_NGHTTP2_URL_HASH "" CACHE STRING "Optional nghttp2 tarball hash (ALGO=value)")
 set(GRPC_LITE_CARES_URL "" CACHE STRING "Optional c-ares source tarball URL")
@@ -102,6 +103,25 @@ target_compile_features(grpc_lite_grpcpp INTERFACE cxx_std_17)
 target_include_directories(grpc_lite_grpcpp INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(grpc_lite_grpcpp INTERFACE grpc_lite_c)
 add_library(grpc_lite::grpcpp ALIAS grpc_lite_grpcpp)
+
+if(GRPC_LITE_ENABLE_PROTOBUF)
+  find_package(Protobuf REQUIRED)
+  if(NOT TARGET protobuf::libprotobuf)
+    message(FATAL_ERROR "protobuf::libprotobuf is missing")
+  endif()
+  add_library(grpc_lite_grpcpp_protobuf INTERFACE)
+  target_link_libraries(grpc_lite_grpcpp_protobuf
+    INTERFACE grpc_lite_grpcpp protobuf::libprotobuf)
+  add_library(grpc_lite::grpcpp_protobuf ALIAS grpc_lite_grpcpp_protobuf)
+
+  if(TARGET protobuf::libprotobuf-lite)
+    add_library(grpc_lite_grpcpp_protobuf_lite INTERFACE)
+    target_link_libraries(grpc_lite_grpcpp_protobuf_lite
+      INTERFACE grpc_lite_grpcpp protobuf::libprotobuf-lite)
+    add_library(grpc_lite::grpcpp_protobuf_lite
+      ALIAS grpc_lite_grpcpp_protobuf_lite)
+  endif()
+endif()
 
 add_executable(grpc_lite_protoc_gen EXCLUDE_FROM_ALL "${_grpc_lite_plugin_source}")
 target_compile_features(grpc_lite_protoc_gen PRIVATE c_std_11)

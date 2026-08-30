@@ -30,38 +30,8 @@ pub fn generate(
 
     for (request.file_to_generate.items) |name| {
         const file = files.get(name) orelse return error.MissingFileDescriptor;
-        if (try validateFile(allocator, file, response)) return;
-    }
-
-    for (request.file_to_generate.items) |name| {
-        const file = files.get(name) orelse return error.MissingFileDescriptor;
         try appendFile(allocator, file, response);
     }
-}
-
-fn validateFile(
-    allocator: std.mem.Allocator,
-    file: *const FileDescriptorProto,
-    response: *plugin.CodeGeneratorResponse,
-) !bool {
-    for (file.service.items) |service| {
-        for (service.method.items) |method| {
-            if (!(method.client_streaming orelse false)) continue;
-            const service_name = service.name orelse return error.MissingServiceName;
-            const method_name = method.name orelse return error.MissingMethodName;
-            const cardinality = if (method.server_streaming orelse false)
-                "bidirectional streaming"
-            else
-                "client streaming";
-            response.@"error" = try std.fmt.allocPrint(
-                allocator,
-                "unsupported method {s}.{s}: {s} is not implemented",
-                .{ service_name, method_name, cardinality },
-            );
-            return true;
-        }
-    }
-    return false;
 }
 
 fn appendFile(
@@ -158,24 +128,43 @@ fn writeMethodDeclaration(
     const name = method.name orelse return error.MissingMethodName;
     const input = method.input_type orelse return error.MissingInputType;
     const output = method.output_type orelse return error.MissingOutputType;
+    const client_streaming = method.client_streaming orelse false;
+    const server_streaming = method.server_streaming orelse false;
     try writer.writeAll("    virtual ");
-    if (method.server_streaming orelse false) {
+    if (client_streaming and server_streaming) {
+        try writer.writeAll("std::unique_ptr<::grpc::ClientReaderWriter<");
+        try writeCppType(writer, input);
+        try writer.writeAll(", ");
+        try writeCppType(writer, output);
+        try writer.writeAll(">> ");
+    } else if (client_streaming) {
+        try writer.writeAll("std::unique_ptr<::grpc::ClientWriter<");
+        try writeCppType(writer, input);
+        try writer.writeAll(">> ");
+    } else if (server_streaming) {
         try writer.writeAll("std::unique_ptr<::grpc::ClientReader<");
         try writeCppType(writer, output);
         try writer.writeAll(">> ");
-        try writeMethodIdentifier(writer, service, name, .stub);
-        try writer.writeAll("(\n        ::grpc::ClientContext* context,\n        const ");
-        try writeCppType(writer, input);
-        try writer.writeAll("& request)");
     } else {
         try writer.writeAll("::grpc::Status ");
-        try writeMethodIdentifier(writer, service, name, .stub);
-        try writer.writeAll("(\n        ::grpc::ClientContext* context,\n        const ");
-        try writeCppType(writer, input);
-        try writer.writeAll("& request,\n        ");
-        try writeCppType(writer, output);
-        try writer.writeAll("* response)");
     }
+    try writeMethodIdentifier(writer, service, name, .stub);
+    try writer.writeAll("(\n        ::grpc::ClientContext* context");
+    if (client_streaming and !server_streaming) {
+        try writer.writeAll(",\n        ");
+        try writeCppType(writer, output);
+        try writer.writeAll("* response");
+    } else if (!client_streaming) {
+        try writer.writeAll(",\n        const ");
+        try writeCppType(writer, input);
+        try writer.writeAll("& request");
+        if (!server_streaming) {
+            try writer.writeAll(",\n        ");
+            try writeCppType(writer, output);
+            try writer.writeAll("* response");
+        }
+    }
+    try writer.writeByte(')');
     if (pure_virtual) {
         try writer.writeAll(" = 0;\n");
     } else {
@@ -187,13 +176,30 @@ fn writeEventMethodDeclaration(writer: *std.Io.Writer, service: ServiceDescripto
     const name = method.name orelse return error.MissingMethodName;
     const input = method.input_type orelse return error.MissingInputType;
     const output = method.output_type orelse return error.MissingOutputType;
+    const client_streaming = method.client_streaming orelse false;
+    const server_streaming = method.server_streaming orelse false;
     try writer.writeAll("    virtual void ");
     try writeMethodIdentifier(writer, service, name, .event);
     try writer.writeAll("(const ::grpc_lite::ServerContext& context, ");
-    try writeCppType(writer, input);
-    try writer.writeAll(" request, ::grpc_lite::");
-    try writer.writeAll(if (method.server_streaming orelse false) "ServerStreamingCall<" else "UnaryCall<");
-    try writeCppType(writer, output);
+    if (!client_streaming) {
+        try writeCppType(writer, input);
+        try writer.writeAll(" request, ");
+    }
+    try writer.writeAll("::grpc_lite::");
+    if (client_streaming and server_streaming) {
+        try writer.writeAll("BidirectionalStreamingCall<");
+        try writeCppType(writer, input);
+        try writer.writeAll(", ");
+        try writeCppType(writer, output);
+    } else if (client_streaming) {
+        try writer.writeAll("ClientStreamingCall<");
+        try writeCppType(writer, input);
+        try writer.writeAll(", ");
+        try writeCppType(writer, output);
+    } else {
+        try writer.writeAll(if (server_streaming) "ServerStreamingCall<" else "UnaryCall<");
+        try writeCppType(writer, output);
+    }
     try writer.writeAll("> call) noexcept = 0;\n");
 }
 
@@ -201,18 +207,35 @@ fn writeSynchronousMethodDeclaration(writer: *std.Io.Writer, service: ServiceDes
     const name = method.name orelse return error.MissingMethodName;
     const input = method.input_type orelse return error.MissingInputType;
     const output = method.output_type orelse return error.MissingOutputType;
+    const client_streaming = method.client_streaming orelse false;
+    const server_streaming = method.server_streaming orelse false;
     try writer.writeAll("    virtual ::grpc::Status ");
     try writeMethodIdentifier(writer, service, name, .synchronous);
-    try writer.writeAll("(::grpc::ServerContext* context, const ");
-    try writeCppType(writer, input);
-    try writer.writeAll("* request, ");
-    if (method.server_streaming orelse false) {
-        try writer.writeAll("::grpc::ServerWriter<");
+    try writer.writeAll("(::grpc::ServerContext* context, ");
+    if (client_streaming and server_streaming) {
+        try writer.writeAll("::grpc::ServerReaderWriter<");
         try writeCppType(writer, output);
-        try writer.writeAll(">* writer);\n");
-    } else {
+        try writer.writeAll(", ");
+        try writeCppType(writer, input);
+        try writer.writeAll(">* stream);\n");
+    } else if (client_streaming) {
+        try writer.writeAll("::grpc::ServerReader<");
+        try writeCppType(writer, input);
+        try writer.writeAll(">* reader, ");
         try writeCppType(writer, output);
         try writer.writeAll("* response);\n");
+    } else {
+        try writer.writeAll("const ");
+        try writeCppType(writer, input);
+        try writer.writeAll("* request, ");
+        if (server_streaming) {
+            try writer.writeAll("::grpc::ServerWriter<");
+            try writeCppType(writer, output);
+            try writer.writeAll(">* writer);\n");
+        } else {
+            try writeCppType(writer, output);
+            try writer.writeAll("* response);\n");
+        }
     }
 }
 
@@ -228,7 +251,10 @@ fn writeRegistrationMember(
     try writeCppType(writer, input);
     try writer.writeAll(", ");
     try writeCppType(writer, output);
-    try writer.print(", {s}> ", .{if (method.server_streaming orelse false) "true" else "false"});
+    try writer.print(", {s}, {s}> ", .{
+        if (method.client_streaming orelse false) "true" else "false",
+        if (method.server_streaming orelse false) "true" else "false",
+    });
     try writeRegistrationIdentifier(writer, service, name);
     try writer.writeAll(";\n");
 }
@@ -276,7 +302,19 @@ fn renderServiceDefinition(
         const method_name = method.name orelse return error.MissingMethodName;
         const input = method.input_type orelse return error.MissingInputType;
         const output = method.output_type orelse return error.MissingOutputType;
-        if (method.server_streaming orelse false) {
+        const client_streaming = method.client_streaming orelse false;
+        const server_streaming = method.server_streaming orelse false;
+        if (client_streaming and server_streaming) {
+            try writer.writeAll("std::unique_ptr<::grpc::ClientReaderWriter<");
+            try writeCppType(writer, input);
+            try writer.writeAll(", ");
+            try writeCppType(writer, output);
+            try writer.writeAll(">> ");
+        } else if (client_streaming) {
+            try writer.writeAll("std::unique_ptr<::grpc::ClientWriter<");
+            try writeCppType(writer, input);
+            try writer.writeAll(">> ");
+        } else if (server_streaming) {
             try writer.writeAll("std::unique_ptr<::grpc::ClientReader<");
             try writeCppType(writer, output);
             try writer.writeAll(">> ");
@@ -286,32 +324,52 @@ fn renderServiceDefinition(
         try writeIdentifier(writer, service_name);
         try writer.writeAll("::Stub::");
         try writeMethodIdentifier(writer, service, method_name, .stub);
-        try writer.writeAll("(\n    ::grpc::ClientContext* context, const ");
-        try writeCppType(writer, input);
-        try writer.writeAll("& request");
-        if (!(method.server_streaming orelse false)) {
-            try writer.writeAll(",\n    ");
+        try writer.writeAll("(\n    ::grpc::ClientContext* context");
+        if (client_streaming and !server_streaming) {
+            try writer.writeAll(", ");
             try writeCppType(writer, output);
             try writer.writeAll("* response");
+        } else if (!client_streaming) {
+            try writer.writeAll(", const ");
+            try writeCppType(writer, input);
+            try writer.writeAll("& request");
+            if (!server_streaming) {
+                try writer.writeAll(",\n    ");
+                try writeCppType(writer, output);
+                try writer.writeAll("* response");
+            }
         }
         try writer.writeAll(") {\n  static const ::grpc::internal::RpcMethod method(\"");
         try writer.writeByte('/');
         if (package.len != 0) try writer.print("{s}.", .{package});
-        try writer.print("{s}/{s}\");\n  return ::grpc::internal::{s}", .{
+        try writer.print("{s}/{s}\");\n  return ::grpc::internal::", .{
             service_name,
             method_name,
-            if (method.server_streaming orelse false) "BlockingServerStreamingCall" else "BlockingUnaryCall",
         });
-        if (method.server_streaming orelse false) {
+        if (client_streaming and server_streaming) {
+            try writer.writeAll("BlockingBidiStreamingCall");
+        } else if (client_streaming) {
+            try writer.writeAll("BlockingClientStreamingCall");
+        } else if (server_streaming) {
+            try writer.writeAll("BlockingServerStreamingCall");
+        } else {
+            try writer.writeAll("BlockingUnaryCall");
+        }
+        if (client_streaming or server_streaming) {
             try writer.writeByte('<');
             try writeCppType(writer, input);
             try writer.writeAll(", ");
             try writeCppType(writer, output);
             try writer.writeByte('>');
         }
-        try writer.print("(\n      channel_.get(), method, context, request{s});\n}}\n\n", .{
-            if (method.server_streaming orelse false) "" else ", response",
-        });
+        try writer.writeAll("(\n      channel_.get(), method, context");
+        if (client_streaming and !server_streaming) {
+            try writer.writeAll(", response");
+        } else if (!client_streaming) {
+            try writer.writeAll(", request");
+            if (!server_streaming) try writer.writeAll(", response");
+        }
+        try writer.writeAll(");\n}\n\n");
     }
 
     try writer.writeAll("std::unique_ptr<");
@@ -327,19 +385,38 @@ fn renderServiceDefinition(
         const method_name = method.name orelse return error.MissingMethodName;
         const input = method.input_type orelse return error.MissingInputType;
         const output = method.output_type orelse return error.MissingOutputType;
+        const client_streaming = method.client_streaming orelse false;
+        const server_streaming = method.server_streaming orelse false;
         try writer.writeAll("  error = ");
         try writeRegistrationIdentifier(writer, service, method_name);
         try writer.writeAll(".Register(server, \"");
         try writer.writeByte('/');
         if (package.len != 0) try writer.print("{s}.", .{package});
         try writer.print("{s}/{s}\",\n      [this](const ::grpc_lite::ServerContext& context, ", .{ service_name, method_name });
-        try writeCppType(writer, input);
-        try writer.writeAll(" request, ::grpc_lite::");
-        try writer.writeAll(if (method.server_streaming orelse false) "ServerStreamingCall<" else "UnaryCall<");
-        try writeCppType(writer, output);
+        if (!client_streaming) {
+            try writeCppType(writer, input);
+            try writer.writeAll(" request, ");
+        }
+        try writer.writeAll("::grpc_lite::");
+        if (client_streaming and server_streaming) {
+            try writer.writeAll("BidirectionalStreamingCall<");
+            try writeCppType(writer, input);
+            try writer.writeAll(", ");
+            try writeCppType(writer, output);
+        } else if (client_streaming) {
+            try writer.writeAll("ClientStreamingCall<");
+            try writeCppType(writer, input);
+            try writer.writeAll(", ");
+            try writeCppType(writer, output);
+        } else {
+            try writer.writeAll(if (server_streaming) "ServerStreamingCall<" else "UnaryCall<");
+            try writeCppType(writer, output);
+        }
         try writer.writeAll("> call) {\n        ");
         try writeMethodIdentifier(writer, service, method_name, .event);
-        try writer.writeAll("(context, std::move(request), std::move(call));\n      });\n  if (!error.ok()) return error;\n");
+        try writer.writeAll("(context, ");
+        if (!client_streaming) try writer.writeAll("std::move(request), ");
+        try writer.writeAll("std::move(call));\n      });\n  if (!error.ok()) return error;\n");
     }
     try writer.writeAll("  return {};\n}\n\n");
 
@@ -347,23 +424,47 @@ fn renderServiceDefinition(
         const method_name = method.name orelse return error.MissingMethodName;
         const input = method.input_type orelse return error.MissingInputType;
         const output = method.output_type orelse return error.MissingOutputType;
+        const client_streaming = method.client_streaming orelse false;
+        const server_streaming = method.server_streaming orelse false;
         try writer.writeAll("::grpc::Status ");
         try writeIdentifier(writer, service_name);
         try writer.writeAll("::Service::");
         try writeMethodIdentifier(writer, service, method_name, .synchronous);
-        try writer.writeAll("(::grpc::ServerContext* context, const ");
-        try writeCppType(writer, input);
-        try writer.writeAll("* request, ");
-        if (method.server_streaming orelse false) {
-            try writer.writeAll("::grpc::ServerWriter<");
+        try writer.writeAll("(::grpc::ServerContext* context, ");
+        if (client_streaming and server_streaming) {
+            try writer.writeAll("::grpc::ServerReaderWriter<");
             try writeCppType(writer, output);
-            try writer.writeAll(">* writer)");
-        } else {
+            try writer.writeAll(", ");
+            try writeCppType(writer, input);
+            try writer.writeAll(">* stream)");
+        } else if (client_streaming) {
+            try writer.writeAll("::grpc::ServerReader<");
+            try writeCppType(writer, input);
+            try writer.writeAll(">* reader, ");
             try writeCppType(writer, output);
             try writer.writeAll("* response)");
+        } else {
+            try writer.writeAll("const ");
+            try writeCppType(writer, input);
+            try writer.writeAll("* request, ");
+            if (server_streaming) {
+                try writer.writeAll("::grpc::ServerWriter<");
+                try writeCppType(writer, output);
+                try writer.writeAll(">* writer)");
+            } else {
+                try writeCppType(writer, output);
+                try writer.writeAll("* response)");
+            }
         }
-        try writer.writeAll(" {\n  (void)context;\n  (void)request;\n  (void)");
-        try writer.writeAll(if (method.server_streaming orelse false) "writer" else "response");
+        try writer.writeAll(" {\n  (void)context;\n  (void)");
+        if (client_streaming and server_streaming) {
+            try writer.writeAll("stream");
+        } else if (client_streaming) {
+            try writer.writeAll("reader;\n  (void)response");
+        } else {
+            try writer.writeAll("request;\n  (void)");
+            try writer.writeAll(if (server_streaming) "writer" else "response");
+        }
         try writer.writeAll(";\n  return {::grpc::StatusCode::UNIMPLEMENTED, \"\"};\n}\n\n");
     }
 
@@ -380,33 +481,82 @@ fn renderServiceDefinition(
         const method_name = method.name orelse return error.MissingMethodName;
         const input = method.input_type orelse return error.MissingInputType;
         const output = method.output_type orelse return error.MissingOutputType;
+        const client_streaming = method.client_streaming orelse false;
+        const server_streaming = method.server_streaming orelse false;
         try writer.writeAll("    void ");
         try writeMethodIdentifier(writer, service, method_name, .event);
         try writer.writeAll("(const ::grpc_lite::ServerContext& context, ");
-        try writeCppType(writer, input);
-        try writer.writeAll(" request, ::grpc_lite::");
-        try writer.writeAll(if (method.server_streaming orelse false) "ServerStreamingCall<" else "UnaryCall<");
-        try writeCppType(writer, output);
+        if (!client_streaming) {
+            try writeCppType(writer, input);
+            try writer.writeAll(" request, ");
+        }
+        try writer.writeAll("::grpc_lite::");
+        if (client_streaming and server_streaming) {
+            try writer.writeAll("BidirectionalStreamingCall<");
+            try writeCppType(writer, input);
+            try writer.writeAll(", ");
+            try writeCppType(writer, output);
+        } else if (client_streaming) {
+            try writer.writeAll("ClientStreamingCall<");
+            try writeCppType(writer, input);
+            try writer.writeAll(", ");
+            try writeCppType(writer, output);
+        } else {
+            try writer.writeAll(if (server_streaming) "ServerStreamingCall<" else "UnaryCall<");
+            try writeCppType(writer, output);
+        }
         try writer.writeAll("> call) noexcept override {\n      ::grpc_lite::internal::");
-        try writer.writeAll(if (method.server_streaming orelse false) "DispatchServerStreaming" else "DispatchUnary");
+        if (client_streaming and server_streaming) {
+            try writer.writeAll("DispatchBidirectionalStreaming");
+        } else if (client_streaming) {
+            try writer.writeAll("DispatchClientStreaming");
+        } else if (server_streaming) {
+            try writer.writeAll("DispatchServerStreaming");
+        } else {
+            try writer.writeAll("DispatchUnary");
+        }
         try writer.writeAll("(\n          executor_, \"");
         try writer.writeByte('/');
         if (package.len != 0) try writer.print("{s}.", .{package});
-        try writer.print("{s}/{s}\", options_, context, std::move(request),\n          std::move(call), [service = &service_](::grpc::ServerContext* server_context,\n                                                const ", .{ service_name, method_name });
-        try writeCppType(writer, input);
-        try writer.writeAll("* typed_request, ");
-        if (method.server_streaming orelse false) {
-            try writer.writeAll("::grpc::ServerWriter<");
+        try writer.print("{s}/{s}\", options_, context, ", .{ service_name, method_name });
+        if (!client_streaming) try writer.writeAll("std::move(request),\n          ");
+        try writer.writeAll("std::move(call), [service = &service_](::grpc::ServerContext* server_context,\n                                                ");
+        if (client_streaming and server_streaming) {
+            try writer.writeAll("::grpc::ServerReaderWriter<");
             try writeCppType(writer, output);
-            try writer.writeAll(">* writer");
-        } else {
+            try writer.writeAll(", ");
+            try writeCppType(writer, input);
+            try writer.writeAll(">* stream");
+        } else if (client_streaming) {
+            try writer.writeAll("::grpc::ServerReader<");
+            try writeCppType(writer, input);
+            try writer.writeAll(">* reader, ");
             try writeCppType(writer, output);
             try writer.writeAll("* response");
+        } else {
+            try writer.writeAll("const ");
+            try writeCppType(writer, input);
+            try writer.writeAll("* typed_request, ");
+            if (server_streaming) {
+                try writer.writeAll("::grpc::ServerWriter<");
+                try writeCppType(writer, output);
+                try writer.writeAll(">* writer");
+            } else {
+                try writeCppType(writer, output);
+                try writer.writeAll("* response");
+            }
         }
         try writer.writeAll(") {\n            return service->");
         try writeMethodIdentifier(writer, service, method_name, .synchronous);
-        try writer.writeAll("(server_context, typed_request, ");
-        try writer.writeAll(if (method.server_streaming orelse false) "writer" else "response");
+        try writer.writeAll("(server_context, ");
+        if (client_streaming and server_streaming) {
+            try writer.writeAll("stream");
+        } else if (client_streaming) {
+            try writer.writeAll("reader, response");
+        } else {
+            try writer.writeAll("typed_request, ");
+            try writer.writeAll(if (server_streaming) "writer" else "response");
+        }
         try writer.writeAll(");\n          });\n    }\n\n");
     }
     try writer.writeAll("   private:\n    ");
@@ -417,8 +567,7 @@ fn renderServiceDefinition(
 }
 
 fn hasSupportedMethod(service: ServiceDescriptorProto) bool {
-    for (service.method.items) |method| if (!(method.client_streaming orelse false)) return true;
-    return false;
+    return service.method.items.len != 0;
 }
 
 fn openNamespaces(writer: *std.Io.Writer, package: []const u8) !void {
@@ -585,7 +734,7 @@ fn isCppKeyword(identifier: []const u8) bool {
     return false;
 }
 
-test "generates unary and server streaming client and event service glue" {
+test "generates all streaming cardinalities" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
@@ -604,6 +753,19 @@ test "generates unary and server streaming client and event service glue" {
         .output_type = ".demo.EchoReply",
         .server_streaming = true,
     });
+    try service.method.append(allocator, .{
+        .name = "Collect",
+        .input_type = ".demo.EchoRequest",
+        .output_type = ".demo.EchoReply",
+        .client_streaming = true,
+    });
+    try service.method.append(allocator, .{
+        .name = "Chat",
+        .input_type = ".demo.EchoRequest",
+        .output_type = ".demo.EchoReply",
+        .client_streaming = true,
+        .server_streaming = true,
+    });
     try file.service.append(allocator, service);
     try request.proto_file.append(allocator, file);
 
@@ -613,15 +775,25 @@ test "generates unary and server streaming client and event service glue" {
     try std.testing.expectEqualStrings("demo/echo.grpc.pb.h", response.file.items[0].name.?);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "virtual ::grpc::Status Echo(") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "std::unique_ptr<::grpc::ClientReader<::demo::EchoReply>> Watch(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "std::unique_ptr<::grpc::ClientWriter<::demo::EchoRequest>> Collect(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "std::unique_ptr<::grpc::ClientReaderWriter<::demo::EchoRequest, ::demo::EchoReply>> Chat(") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "virtual void Watch(const ::grpc_lite::ServerContext& context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "::grpc_lite::ClientStreamingCall<::demo::EchoRequest, ::demo::EchoReply> call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "::grpc_lite::BidirectionalStreamingCall<::demo::EchoRequest, ::demo::EchoReply> call") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "class Service") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "virtual ::grpc::Status Echo(::grpc::ServerContext* context") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "::grpc::ServerWriter<::demo::EchoReply>* writer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "::grpc::ServerReader<::demo::EchoRequest>* reader") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "::grpc::ServerReaderWriter<::demo::EchoReply, ::demo::EchoRequest>* stream") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "CreateEventService(") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "return \"demo.EchoService\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/demo.EchoService/Echo") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/demo.EchoService/Watch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/demo.EchoService/Collect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/demo.EchoService/Chat") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "BlockingServerStreamingCall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "BlockingClientStreamingCall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "BlockingBidiStreamingCall") != null);
 }
 
 test "generates a server streaming only service" {
@@ -648,38 +820,28 @@ test "generates a server streaming only service" {
     try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/WatchService/Watch") != null);
 }
 
-test "rejects unsupported request streaming cardinalities" {
-    inline for (.{
-        .{ .server_streaming = false, .cardinality = "client streaming" },
-        .{ .server_streaming = true, .cardinality = "bidirectional streaming" },
-    }) |case| {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_state.deinit();
-        const allocator = arena_state.allocator();
-        var request: plugin.CodeGeneratorRequest = .{};
-        try request.file_to_generate.append(allocator, "chat.proto");
-        var file: FileDescriptorProto = .{ .name = "chat.proto" };
-        var service: ServiceDescriptorProto = .{ .name = "ChatService" };
-        try service.method.append(allocator, .{
-            .name = "Chat",
-            .input_type = ".ChatRequest",
-            .output_type = ".ChatReply",
-            .client_streaming = true,
-            .server_streaming = case.server_streaming,
-        });
-        try file.service.append(allocator, service);
-        try request.proto_file.append(allocator, file);
+test "generates a request streaming only service" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var request: plugin.CodeGeneratorRequest = .{};
+    try request.file_to_generate.append(allocator, "collect.proto");
+    var file: FileDescriptorProto = .{ .name = "collect.proto" };
+    var service: ServiceDescriptorProto = .{ .name = "CollectService" };
+    try service.method.append(allocator, .{
+        .name = "Collect",
+        .input_type = ".Request",
+        .output_type = ".Reply",
+        .client_streaming = true,
+    });
+    try file.service.append(allocator, service);
+    try request.proto_file.append(allocator, file);
 
-        var response: plugin.CodeGeneratorResponse = .{};
-        try generate(allocator, request, &response);
-        try std.testing.expectEqual(@as(usize, 0), response.file.items.len);
-        const expected = try std.fmt.allocPrint(
-            allocator,
-            "unsupported method ChatService.Chat: {s} is not implemented",
-            .{case.cardinality},
-        );
-        try std.testing.expectEqualStrings(expected, response.@"error".?);
-    }
+    var response: plugin.CodeGeneratorResponse = .{};
+    try generate(allocator, request, &response);
+    try std.testing.expectEqual(@as(usize, 2), response.file.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[0].content.?, "class CollectService final") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.file.items[1].content.?, "/CollectService/Collect") != null);
 }
 
 test "escapes C++20 keywords" {

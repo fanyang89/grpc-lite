@@ -5,6 +5,7 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work_dir="$project_root/.zig-cache/official"
 zig_server_port=${ZIG_SERVER_PORT:-$((20000 + $$ % 10000))}
 go_server_port=${GO_SERVER_PORT:-$((zig_server_port + 1))}
+cpp_server_port=${CPP_SERVER_PORT:-$((go_server_port + 1))}
 soak_iterations=${SOAK_ITERATIONS:-10}
 soak_max_failures=${SOAK_MAX_FAILURES:-0}
 soak_overall_timeout_seconds=${SOAK_OVERALL_TIMEOUT_SECONDS:-10}
@@ -102,6 +103,19 @@ printf '%s\n' 'Building grpc-go v1.82.1 interop binaries...'
   go build -mod=readonly -o "$work_dir/grpc-go-interop-server" google.golang.org/grpc/interop/server && \
   go build -mod=readonly -o "$work_dir/grpc-go-half-duplex-client" half_duplex_client.go)
 
+printf '%s\n' 'Building generated C++ interop binaries...'
+rm -rf "$work_dir/cpp-proto-stage" "$work_dir/cpp-build"
+(cd "$project_root" && \
+  zig build install-cpp-interop-protos --prefix "$work_dir/cpp-proto-stage")
+cmake \
+  -S "$project_root/tests/official/cpp" \
+  -B "$work_dir/cpp-build" \
+  -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$project_root/zig-out" \
+  -DGRPC_LITE_INTEROP_PROTO_ROOT="$work_dir/cpp-proto-stage/share/grpc-lite/interop-proto"
+cmake --build "$work_dir/cpp-build"
+
 peer_log="$work_dir/grpc-lite-server.log"
 "$project_root/zig-out/bin/grpc-lite-interop-server" \
   --port="$zig_server_port" --use_tls=false >"$peer_log" 2>&1 &
@@ -148,6 +162,25 @@ for test_case in "${soak_cases[@]}"; do
 done
 stop_peer
 
+peer_log="$work_dir/grpc-lite-cpp-server.log"
+"$work_dir/cpp-build/grpc-lite-cpp-interop-server" \
+  --port="$cpp_server_port" --use_tls=false >"$peer_log" 2>&1 &
+peer_pid=$!
+wait_for_peer "$cpp_server_port"
+for test_case in "${streaming_cases[@]}"; do
+  run_case 'grpc-go client -> generated C++ server' "$test_case" \
+    "$work_dir/grpc-go-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$cpp_server_port" \
+    --test_case="$test_case" \
+    --use_tls=false
+done
+run_case 'grpc-go client -> generated C++ server' 'half_duplex' \
+  "$work_dir/grpc-go-half-duplex-client" \
+  --server_host=127.0.0.1 \
+  --server_port="$cpp_server_port"
+stop_peer
+
 peer_log="$work_dir/grpc-go-server.log"
 "$work_dir/grpc-go-interop-server" \
   --port="$go_server_port" --use_tls=false >"$peer_log" 2>&1 &
@@ -188,11 +221,20 @@ for test_case in "${soak_cases[@]}"; do
     --soak_overall_timeout_seconds="$soak_overall_timeout_seconds" \
     --use_tls=false
 done
+for test_case in "${streaming_cases[@]}"; do
+  run_case 'generated C++ client -> grpc-go server' "$test_case" \
+    "$work_dir/cpp-build/grpc-lite-cpp-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$go_server_port" \
+    --test_case="$test_case" \
+    --use_tls=false
+done
 stop_peer
 
 printf '%s\n' "All 10 bidirectional unary runs passed."
-printf '%s\n' "All 8 bidirectional streaming runs passed."
-printf '%s\n' "The dedicated grpc-go half-duplex run passed."
+printf '%s\n' "All 8 raw bidirectional streaming runs passed."
+printf '%s\n' "All 8 generated C++ streaming interop runs passed."
+printf '%s\n' "Both raw and generated C++ half-duplex server runs passed."
 printf '%s\n' "All 6 bidirectional streaming cancellation and deadline runs passed."
 printf '%s\n' "All 4 bidirectional soak runs passed: rpc_soak and channel_soak in each direction ($soak_iterations iteration(s) each)."
 

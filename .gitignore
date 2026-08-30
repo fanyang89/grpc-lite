@@ -2,6 +2,7 @@
 /.idea/
 /.mise.local.toml
 /.opencode/
+/.pi/
 /.vscode/
 **/.zig-cache/
 /golden/
