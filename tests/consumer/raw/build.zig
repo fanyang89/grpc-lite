@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
         .@"sanitize-thread" = sanitize_thread,
         .@"sanitize-c" = sanitize_c,
         .gperftools = enable_gperftools,
+        .protobuf = false,
         .tls = enable_tls,
     });
     const root_module = b.createModule(.{

@@ -56,7 +56,7 @@ mkdir -p "$output_dir" "$cache_dir" "$global_cache_dir"
     taskset -c "$selected_cpu" zig build transpile-c -j1 \
         -Dtarget=x86_64-linux-gnu \
         -Dtranspile-c=true \
-        -Dprotobuf=false \
+        -Dprotobuf=true \
         -Doptimize=ReleaseSafe \
         --seed 0 \
         --cache-dir "$cache_dir" \

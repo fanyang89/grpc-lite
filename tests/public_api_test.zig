@@ -35,7 +35,6 @@ test "stable public API compiles for downstream consumers" {
         _ = grpc.ServerInitialMetadataMode;
         _ = grpc.ServerStreamHandler;
         _ = grpc.log;
-        _ = grpc.protobuf;
         _ = grpc.xev;
     }
 

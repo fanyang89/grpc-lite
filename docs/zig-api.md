@@ -203,12 +203,17 @@ malformed input only on the affected RPC.
 
 ## Protobuf
 
-The `grpc_lite` module exports the shared zig-protobuf runtime as `grpc.protobuf`. The
-build package exports `createProtocStep` and `protobuf_codegen`. Optional
-`grpc_lite_protobuf` adapters add typed APIs while the transport remains raw-byte based.
+The raw `grpc_lite` module has no zig-protobuf import. Package dependencies disable
+protobuf support by default, and an explicit `.protobuf = false` does not resolve or
+compile zig-protobuf for either the target or host. Repository builds enable protobuf
+support by default so their typed tests and code-generation steps remain available.
 
-Downstream dependencies always expose `grpc_lite` and `grpc_lite_protobuf_runtime`. Pass
-`.protobuf = true` to additionally expose `grpc_lite_protobuf`.
+Pass `.protobuf = true` to expose the separate `grpc_lite_protobuf_runtime` and
+`grpc_lite_protobuf` modules. The build package's `createProtocStep` and
+`protobuf_codegen` exports are also opt-in code-generation APIs: using them resolves
+zig-protobuf. `createProtocStep` returns an optional step so callers can use
+`orelse return` with Zig's lazy dependency fetch. The typed adapter continues to operate
+over the raw-byte transport.
 
 Generated service VTables can be registered without manual method paths:
 
