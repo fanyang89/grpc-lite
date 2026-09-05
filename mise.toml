@@ -20,8 +20,16 @@ description = "Build grpc-lite with ReleaseSafe optimization"
 run = "zig build -Doptimize=ReleaseSafe"
 
 [tasks.transpile-c]
-description = "Regenerate C sources for CMake consumers"
+description = "Generate local C sources for CMake consumers"
 run = "tools/transpile_c.sh"
+
+[tasks.package-transpiled-c]
+description = "Create the generated-only C release bundle"
+run = "tools/package_transpiled_c.sh ${GRPC_LITE_TRANSPILED_C_DIST_DIR:-dist}"
+
+[tasks.check-transpiled-c]
+description = "Verify generated C bundle reproducibility"
+run = ".mise/tasks/check-transpiled-c"
 
 [tasks.test]
 description = "Run all tests"
@@ -72,8 +80,13 @@ description = "Generate, build, and run the C++ package consumer"
 run = "tests/consumer/run_cpp.sh"
 
 [tasks.test-consumer-cmake-c]
-description = "Build and run CMake FetchContent C consumers"
-run = "tests/consumer/run_cmake_c.sh"
+description = "Build the generated C bundle without Zig or network access"
+depends = ["check-transpiled-c"]
+run = '''bash -c '
+archives=(.zig-cache/transpiled-c-dist/*.tar.gz)
+test "${#archives[@]}" -eq 1
+tests/consumer/run_cmake_c.sh "${archives[0]}" "${archives[0]}.sha256"
+' '''
 
 [tasks.gen-proto]
 description = "Generate Zig protobuf sources"

@@ -37,6 +37,8 @@ mise run test-consumer
 mise run test-consumer-cmake-c
 mise run test-consumer-cpp
 mise run transpile-c
+mise run package-transpiled-c
+mise run check-transpiled-c
 mise run prepare-network-deps
 mise run prepare-tls-deps
 mise run prepare-gperftools
@@ -64,11 +66,22 @@ The authoritative compatibility matrix lives in
 ## Transpiled C Sources
 
 `mise run transpile-c` emits the runtime and C++ protoc plugin through Zig's C backend,
-vendors the matching `zig.h`, and applies the GNU assembler compatibility transform. The
-result under `transpiled/` is committed so CMake source consumers do not need Zig.
+vendors the matching `zig.h`, writes a manifest, and applies deterministic compatibility
+transforms. The ignored `transpiled/` directory is for local use and is never committed.
 
-CI compiles both generated C translation units with the system compiler. Regenerate and
-commit them whenever their Zig implementation, dependencies, or Zig version changes.
+`mise run check-transpiled-c` generates and packages twice with independent caches,
+compares the resulting archives byte for byte, verifies the SHA-256 sidecar, and tests
+that neither tracked files nor `git archive` contain `transpiled/`. The generated-only
+release asset is named `grpc-lite-transpiled-c-<version>-linux-x86_64.tar.gz` and contains
+only the manifest, two C translation units, and `zig.h`.
+
+CI consumes the exact archive in a separate environment where Zig is absent and the
+network is disabled. Git checkouts and GitHub automatic “Source code” archives do not
+support no-Zig CMake by themselves: consumers must extract the same-version asset and
+pass `GRPC_LITE_TRANSPILED_C_DIR`. The asset is insecure Linux x86_64 only and includes
+no nghttp2 or c-ares sources. Fully offline builds must stage those dependencies as
+hashed `file://` archives and set `GRPC_LITE_NO_NETWORK=ON`. A colocated SHA-256 sidecar
+detects corruption but is not, by itself, publisher authentication.
 
 ## Coverage
 

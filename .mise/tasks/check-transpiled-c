@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#MISE description="Build and verify the reproducible generated C bundle"
+set -euo pipefail
+
+project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/grpc-lite-check-transpiled-c.XXXXXX")
+output_dir=${GRPC_LITE_TRANSPILED_C_DIST_DIR:-"$project_root/.zig-cache/transpiled-c-dist"}
+cleanup() {
+    local status=$?
+    rm -rf "$work_dir"
+    return "$status"
+}
+trap cleanup EXIT
+
+if [[ -n "$(git -C "$project_root" ls-files transpiled)" ]]; then
+    printf '%s\n' 'Generated C must not be tracked under transpiled/' >&2
+    exit 1
+fi
+if git -C "$project_root" archive HEAD | tar -tf - | grep -q '^transpiled/'; then
+    printf '%s\n' 'git archive unexpectedly contains transpiled/' >&2
+    exit 1
+fi
+
+for run in 1 2; do
+    GRPC_LITE_ZIG_CACHE_DIR="$work_dir/cache-$run" \
+        "$project_root/tools/package_transpiled_c.sh" "$work_dir/dist-$run"
+done
+
+archive_1=("$work_dir/dist-1/"*.tar.gz)
+archive_2=("$work_dir/dist-2/"*.tar.gz)
+if [[ ${#archive_1[@]} -ne 1 || ${#archive_2[@]} -ne 1 ]]; then
+    printf '%s\n' 'Packaging did not produce exactly one archive per run' >&2
+    exit 1
+fi
+cmp "${archive_1[0]}" "${archive_2[0]}"
+cmp "${archive_1[0]}.sha256" "${archive_2[0]}.sha256"
+(
+    cd "$(dirname "${archive_1[0]}")"
+    sha256sum --check "$(basename "${archive_1[0]}").sha256"
+)
+
+rm -rf "$output_dir"
+mkdir -p "$output_dir"
+cp "${archive_1[0]}" "${archive_1[0]}.sha256" "$output_dir/"
+printf 'Reproducible transpiled C bundle: %s\n' "$output_dir/$(basename "${archive_1[0]}")"
