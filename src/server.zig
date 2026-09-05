@@ -1564,6 +1564,19 @@ const Connection = struct {
         }
     }
 
+    fn flushIdleGoAway(self: *Connection) !bool {
+        try self.flush();
+        if (c.nghttp2_session_want_write(self.session) != 0) return false;
+        if (comptime build_options.tls) {
+            if (self.tls_session) |tls_session| {
+                return self.tls_plaintext == null and
+                    !tls_session.hasPendingWrite() and
+                    tls_session.ciphertext().len == 0;
+            }
+        }
+        return true;
+    }
+
     fn finishTlsWrite(self: *Connection, result: tls_record.Result) !bool {
         switch (result) {
             .bytes => |count| {
@@ -3676,11 +3689,14 @@ fn expireDeadlines(server: *Impl, now: u64) void {
                             connection.closeOnLoop(&server.loop);
                             continue;
                         };
-                        connection.flush() catch {
-                            connection.closeOnLoop(&server.loop);
+                        const goaway_fully_queued = connection.flushIdleGoAway() catch {
+                            connection.close();
                             continue;
                         };
-                        connection.closeGracefully(&server.loop);
+                        if (goaway_fully_queued)
+                            connection.closeGracefully(&server.loop)
+                        else
+                            connection.close();
                     },
                 }
             },
@@ -5194,10 +5210,38 @@ test "server resource fragmented valid cleartext preface survives into idle" {
     try std.testing.expectEqual(@as(usize, 1), server.coordinator.admitted_connections.load(.acquire));
 }
 
+test "server resource idle GOAWAY hard-closes a saturated cleartext output queue" {
+    var server = try Server.init(std.testing.allocator, .{
+        .write_high_watermark_bytes = 16,
+        .write_low_watermark_bytes = 8,
+    });
+    defer server.deinit();
+    server.impl.state = .running;
+    defer server.impl.state = .initialized;
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer deinitTestConnection(&connection);
+
+    var output: [*c]const u8 = null;
+    while (c.nghttp2_session_mem_send2(connection.session, &output) > 0) {}
+    connection.queued_write_bytes = server.impl.write_high_watermark_bytes;
+    defer connection.queued_write_bytes = 0;
+    const expires_at = server.impl.clock.now();
+    try setConnectionDeadline(&connection, .idle, expires_at);
+
+    expireDeadlines(server.impl, expires_at);
+
+    try std.testing.expect(connection.closing);
+    try std.testing.expectEqual(@as(?ConnectionDeadline, null), connection.connection_deadline);
+    try std.testing.expect(c.nghttp2_session_want_write(connection.session) != 0);
+}
+
 test "server resource PING traffic does not refresh idle expiry" {
     var server = try Server.init(std.testing.allocator, .{
         .cleartext_preface_timeout_ns = std.time.ns_per_s,
         .connection_idle_timeout_ns = 30 * std.time.ns_per_ms,
+        .write_high_watermark_bytes = 16,
+        .write_low_watermark_bytes = 8,
     });
     defer server.deinit();
     try server.start();

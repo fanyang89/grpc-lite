@@ -6856,6 +6856,8 @@ test "TLS channel replaces a server-idle connection for a later RPC" {
     var handler = Handler{};
     var test_server = try server.Server.init(std.testing.allocator, .{
         .connection_idle_timeout_ns = 20 * std.time.ns_per_ms,
+        .write_high_watermark_bytes = 16,
+        .write_low_watermark_bytes = 8,
         .tls = .{
             .certificate_chain_pem = certificate,
             .private_key_pem = private_key,
