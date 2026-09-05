@@ -73,47 +73,59 @@ Idle retirement sends `GOAWAY(NO_ERROR)` before graceful closure.
 
 ## CMake Source Build
 
-The source build compiles checked-in C translations and does not require Zig. It currently
-supports insecure Linux x86_64 and produces static C transport targets:
+Git checkouts and GitHub automatic “Source code” archives intentionally contain no
+generated C. A no-Zig CMake build pairs the source at a tag with that release's matching
+`grpc-lite-transpiled-c-<version>-linux-x86_64.tar.gz` asset. Verify its sidecar from the
+folder containing both files, extract it, and pass the extracted root explicitly:
+
+```bash
+sha256sum --check grpc-lite-transpiled-c-0.4.0-linux-x86_64.tar.gz.sha256
+tar -xzf grpc-lite-transpiled-c-0.4.0-linux-x86_64.tar.gz
+cmake -S grpc-lite -B build \
+  -DGRPC_LITE_TRANSPILED_C_DIR="$PWD/grpc-lite-transpiled-c-0.4.0-linux-x86_64"
+```
+
+The generated-only asset targets insecure Linux x86_64. It contains only its manifest,
+two generated C translation units, and the matching `zig.h`; it does not contain project
+sources or third-party dependencies. `sha256sum --check` provides integrity/error
+detection, but a checksum colocated with an asset is not publisher authentication.
+
+After setting `GRPC_LITE_TRANSPILED_C_DIR`, add the source directory and link its targets:
 
 ```cmake
 add_subdirectory(third_party/grpc-lite)
-
 target_link_libraries(c_app PRIVATE grpc_lite::c)
 target_link_libraries(cpp_app PRIVATE grpc_lite::grpcpp)
 ```
 
-Typed C++ source builds opt into the official Protobuf integration explicitly:
-
-```cmake
-find_package(Protobuf REQUIRED)
-set(GRPC_LITE_ENABLE_PROTOBUF ON)
-add_subdirectory(third_party/grpc-lite)
-
-target_link_libraries(typed_cpp_app PRIVATE grpc_lite::grpcpp_protobuf)
-```
-
-`grpc_lite::grpcpp_protobuf_lite` is also defined when the Protobuf package exports
-`protobuf::libprotobuf-lite`. The top-level application must select a single compatible
-Protobuf dependency graph; grpc-lite never downloads a second copy.
+Typed C++ source builds additionally call `find_package(Protobuf REQUIRED)` and set
+`GRPC_LITE_ENABLE_PROTOBUF=ON` before `add_subdirectory`, then link
+`grpc_lite::grpcpp_protobuf`. `grpc_lite::grpcpp_protobuf_lite` is defined when the
+Protobuf package exports `protobuf::libprotobuf-lite`. The application must select one
+compatible Protobuf dependency graph.
 
 `grpc_lite::c` and `grpc_lite::c_static` both refer to the source-built static transport.
 An installed package exposes the versioned shared transport through `grpc_lite::c` and
 the static archive through `grpc_lite::c_static`.
 
-nghttp2 uses the nested submodule when available and otherwise uses its pinned archive.
-c-ares uses its pinned archive. Dependency mirrors can override either source; hashes are
-optional for custom URLs and use CMake's `ALGO=value` format:
+The generated bundle does not make dependency resolution offline. For a fully offline
+configuration, stage nghttp2 and c-ares archives separately, hash them, and enable the
+network guard:
 
 ```bash
-cmake -S . -B build \
-  -DGRPC_LITE_NGHTTP2_URL=https://mirror.example/nghttp2.tar.gz \
+cmake -S grpc-lite -B build \
+  -DGRPC_LITE_TRANSPILED_C_DIR="$PWD/grpc-lite-transpiled-c-0.4.0-linux-x86_64" \
+  -DGRPC_LITE_NO_NETWORK=ON \
+  -DGRPC_LITE_NGHTTP2_URL="file://$PWD/deps/nghttp2.tar.gz" \
   -DGRPC_LITE_NGHTTP2_URL_HASH=SHA256=... \
-  -DGRPC_LITE_CARES_URL=https://mirror.example/c-ares.tar.gz \
+  -DGRPC_LITE_CARES_URL="file://$PWD/deps/c-ares.tar.gz" \
   -DGRPC_LITE_CARES_URL_HASH=SHA256=...
 ```
 
-Maintainers run `mise run transpile-c` after changing the Zig runtime or C++ generator.
+Without `GRPC_LITE_NO_NETWORK`, nghttp2 may use the nested source directory and both
+dependencies otherwise use their pinned archives. Maintainers use `mise run transpile-c`
+for an ignored local bundle directory and `mise run package-transpiled-c` for an asset;
+generated output is never committed.
 
 ## Low-Level C++ API
 

@@ -8,13 +8,17 @@ cd "$project_root"
 zig fmt --check build.zig src examples tests benchmarks
 actionlint
 
+.mise/tasks/check-transpiled-c
+archives=(.zig-cache/transpiled-c-dist/*.tar.gz)
+test "${#archives[@]}" -eq 1
+tests/consumer/run_cmake_c.sh "${archives[0]}" "${archives[0]}.sha256"
+
 zig build
 zig build -Doptimize=ReleaseSafe
 zig build test --summary all
 zig build test -Doptimize=ReleaseSafe --summary all
 
 tests/consumer/run_raw.sh
-tests/consumer/run_cmake_c.sh
 tests/consumer/run_cpp.sh
 
 TSAN_OPTIONS=halt_on_error=1:exitcode=66 \

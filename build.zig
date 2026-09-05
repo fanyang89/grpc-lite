@@ -29,11 +29,9 @@ pub fn build(b: *std.Build) void {
         query.ofmt = .c;
         break :blk b.resolveTargetQuery(query);
     } else requested_target;
-    const host_target = if (transpile_c) blk: {
-        var query = std.Target.Query.fromTarget(&b.graph.host.result);
-        query.ofmt = .c;
-        break :blk b.resolveTargetQuery(query);
-    } else b.graph.host;
+    // Published C output must use one explicit target for both the runtime and
+    // the protoc plugin rather than inheriting properties from the runner.
+    const host_target = if (transpile_c) target else b.graph.host;
     const optimize = b.standardOptimizeOption(.{});
     const sanitizers: Sanitizers = .{
         .thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer"),

@@ -19,7 +19,7 @@ wire bytes, explicit allocators, deterministic teardown, and bounded backpressur
 | Unary and full-duplex streaming | Persistent multiplexed channels | Raw Zig and stable C APIs |
 | Cleartext HTTP/2 and optional TLS | IPv4 DNS through c-ares | Typed zig-protobuf adapters |
 | Deadlines and cancellation | GOAWAY replacement and reconnect | Focused grpcpp-shaped C++ facade |
-| ASCII and binary metadata | Graceful server drain | CMake source builds without Zig |
+| ASCII and binary metadata | Graceful server drain | CMake builds from release-generated C without Zig |
 | Per-message identity or gzip | Multi-reactor Linux servers | Generated C++ service glue |
 
 ## Quick Start
@@ -53,27 +53,23 @@ defer result.deinit();
 
 ### C and C++
 
-Source consumers can build the checked-in C translation directly. Zig is not required:
+Git checkouts and GitHub's automatic “Source code” archives intentionally omit generated
+C. To build with CMake without Zig, download the same-version
+`grpc-lite-transpiled-c-0.4.0-linux-x86_64.tar.gz` release asset and its checksum, verify
+and extract it, then configure the source tree with
+`-DGRPC_LITE_TRANSPILED_C_DIR=<extracted-root>`.
 
-```cmake
-include(FetchContent)
-FetchContent_Declare(
-  grpc_lite
-  GIT_REPOSITORY https://github.com/fanyang89/grpc-lite.git
-  GIT_TAG v0.4.0)
-FetchContent_MakeAvailable(grpc_lite)
-
-target_link_libraries(c_app PRIVATE grpc_lite::c)
-target_link_libraries(cpp_app PRIVATE grpc_lite::grpcpp)
-```
+The generated-only asset supports insecure Linux x86_64 and contains no third-party
+dependencies. A fully offline configure must also provide hashed local `file://` archives
+for nghttp2 and c-ares and set `GRPC_LITE_NO_NETWORK=ON`. `sha256sum --check` detects
+corruption, but a checksum hosted beside an asset is not by itself publisher
+authentication.
 
 Typed generated C++ services keep the official Protobuf runtime as an explicit external
 dependency; the raw transport and grpcpp-shaped facade do not require Protobuf or
-Abseil. See [the C and C++ API guide](docs/c-cpp-api.md) for the opt-in CMake component
-and code-generation workflow.
-
-The source CMake build currently targets insecure Linux x86_64. The native Zig build
-supports Linux x86_64 and arm64, with TLS available through an optional mbedTLS build.
+Abseil. See [the C and C++ API guide](docs/c-cpp-api.md) for extraction, offline CMake,
+and code-generation details. The native Zig build supports Linux x86_64 and arm64, with
+TLS available through an optional mbedTLS build.
 
 ## Compatibility
 
