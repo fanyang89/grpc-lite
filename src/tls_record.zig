@@ -5,6 +5,20 @@ const c = @import("mbedtls_c.zig").api;
 const queue_capacity = 64 * 1024;
 const personalization = "grpc-lite";
 const h2_protocols = [_:null]?[*:0]const u8{ "h2", null };
+// HTTP/2 permits TLS 1.2 ECDHE AEAD suites and all TLS 1.3 suites below.
+// Keeping an explicit list prevents mbedTLS defaults from enabling RFC 7540 Appendix A suites.
+const http2_ciphersuites = [_]c_int{
+    c.MBEDTLS_TLS1_3_AES_128_GCM_SHA256,
+    c.MBEDTLS_TLS1_3_AES_256_GCM_SHA384,
+    c.MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256,
+    c.MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    c.MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    c.MBEDTLS_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    c.MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    c.MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+    c.MBEDTLS_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    0,
+};
 var psa_state: std.atomic.Value(u8) = .init(0);
 
 pub const Config = struct {
@@ -95,6 +109,7 @@ pub const Config = struct {
             c.MBEDTLS_SSL_PRESET_DEFAULT,
         ) != 0) return error.TlsConfigurationFailed;
         c.mbedtls_ssl_conf_min_tls_version(&self.ssl, c.MBEDTLS_SSL_VERSION_TLS1_2);
+        c.mbedtls_ssl_conf_ciphersuites(&self.ssl, &http2_ciphersuites);
         c.mbedtls_ssl_conf_rng(&self.ssl, c.mbedtls_ctr_drbg_random, &self.drbg);
         if (c.mbedtls_ssl_conf_alpn_protocols(&self.ssl, @ptrCast(@constCast(&h2_protocols))) != 0)
             return error.TlsConfigurationFailed;

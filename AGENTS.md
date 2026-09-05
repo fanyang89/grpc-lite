@@ -114,8 +114,9 @@ The v2 target requires `empty_unary`, `large_unary`,
 `server_streaming`, `ping_pong`, and `empty_stream`. Also run `rpc_soak`, `channel_soak`,
 the public HTTP/2 framing suite, and the negative HTTP/2 client cases.
 
-TLS cases not yet wired into the official harness are reported separately from the
-required insecure profile. Cases requiring auth, service config, ORCA, or xDS are skipped
+The official framing harness requires the TLS application-protocol, minimum-version, and
+bad-cipher-suite cases in addition to the insecure framing profile. Cases requiring auth,
+service config, ORCA, or xDS are skipped
 with the scope-table reason. grpc-core `bad_client` tests use private C APIs and are not
 part of this profile; use the public HTTP/2 interop tools instead.
 

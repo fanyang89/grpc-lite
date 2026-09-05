@@ -11,56 +11,62 @@ REQUIRED_PASSES = {
     "TestSoonShortPreface",
     "TestSoonUnknownFrameType",
     "TestSoonAllSettingsFramesAcked",
-}
-UPSTREAM_HARNESS_LIMITATIONS = {
-    "TestSoonSmallMaxFrameSize",
-}
-EXPECTED_SKIPS = {
     "TestSoonTLSApplicationProtocol",
     "TestSoonTLSMaxVersion",
     "TestSoonTLSBadCipherSuites",
 }
+UPSTREAM_HARNESS_LIMITATIONS = {
+    "TestSoonSmallMaxFrameSize",
+}
 
 
-def load_report(path: Path) -> dict:
-    for line in reversed(path.read_text(encoding="utf-8").splitlines()):
-        if line.startswith('{"cases":'):
-            return json.loads(line)
-    raise ValueError("HTTP/2 report JSON was not found")
-
-
-def validate(report: dict) -> list[str]:
-    entries = report.get("cases")
-    if not isinstance(entries, list):
-        return ["HTTP/2 report does not contain a cases list"]
-
-    cases = {entry.get("name"): entry for entry in entries}
-    expected = REQUIRED_PASSES | UPSTREAM_HARNESS_LIMITATIONS | EXPECTED_SKIPS
-    errors = [
-        f"missing expected case: {name}" for name in sorted(expected - cases.keys())
+def load_reports(path: Path) -> list[dict]:
+    reports = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith('{"cases":')
     ]
+    if not reports:
+        raise ValueError("HTTP/2 report JSON was not found")
+    return reports
 
-    for name in sorted(REQUIRED_PASSES & cases.keys()):
-        case = cases[name]
-        if not case.get("passed") or case.get("skipped"):
+
+def validate(reports: list[dict]) -> list[str]:
+    entries_by_name: dict[str, list[dict]] = {}
+    errors: list[str] = []
+    for report in reports:
+        entries = report.get("cases")
+        if not isinstance(entries, list):
+            errors.append("HTTP/2 report does not contain a cases list")
+            continue
+        for entry in entries:
+            entries_by_name.setdefault(entry.get("name"), []).append(entry)
+
+    expected = REQUIRED_PASSES | UPSTREAM_HARNESS_LIMITATIONS
+    errors.extend(
+        f"missing expected case: {name}"
+        for name in sorted(expected - entries_by_name.keys())
+    )
+
+    for name in sorted(REQUIRED_PASSES & entries_by_name.keys()):
+        active = [entry for entry in entries_by_name[name] if not entry.get("skipped")]
+        if len(active) != 1:
+            errors.append(f"required framing case did not run exactly once: {name}")
+        elif not active[0].get("passed"):
             errors.append(f"required framing case did not pass: {name}")
 
-    for name in sorted(UPSTREAM_HARNESS_LIMITATIONS & cases.keys()):
-        case = cases[name]
-        if case.get("skipped"):
-            errors.append(
-                f"upstream harness limitation was unexpectedly skipped: {name}"
-            )
-        if case.get("passed"):
+    for name in sorted(UPSTREAM_HARNESS_LIMITATIONS & entries_by_name.keys()):
+        active = [entry for entry in entries_by_name[name] if not entry.get("skipped")]
+        if len(active) != 1:
+            errors.append(f"upstream harness limitation did not run exactly once: {name}")
+        elif active[0].get("passed"):
             errors.append(f"upstream harness limitation unexpectedly passed: {name}")
 
-    for name in sorted(EXPECTED_SKIPS & cases.keys()):
-        if not cases[name].get("skipped"):
-            errors.append(f"out-of-scope TLS case was not skipped: {name}")
-
-    for name in sorted(cases.keys() - expected):
-        case = cases[name]
-        if not case.get("passed") or case.get("skipped"):
+    for name in sorted(entries_by_name.keys() - expected):
+        active = [entry for entry in entries_by_name[name] if not entry.get("skipped")]
+        if len(active) != 1:
+            errors.append(f"new framing case did not run exactly once: {name}")
+        elif not active[0].get("passed"):
             errors.append(f"new framing case is not passing: {name}")
 
     return errors
@@ -72,12 +78,12 @@ def main() -> int:
         return 2
 
     try:
-        report = load_report(Path(sys.argv[1]))
+        reports = load_reports(Path(sys.argv[1]))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(error, file=sys.stderr)
         return 1
 
-    errors = validate(report)
+    errors = validate(reports)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
@@ -85,7 +91,7 @@ def main() -> int:
 
     limitations = sorted(UPSTREAM_HARNESS_LIMITATIONS)
     print(
-        "HTTP/2 framing report validated; upstream harness limitations: "
+        "HTTP/2 framing and TLS reports validated; upstream harness limitations: "
         + ", ".join(limitations)
     )
     return 0
