@@ -53,6 +53,23 @@ run_isolated() {
     fi
     grep -q 'requires nghttp2' "$work_dir/negative-network.log"
 
+    mkdir -p "$package_source/third_party/nghttp2"
+    : >"$package_source/third_party/nghttp2/CMakeLists.txt"
+    if cmake -S "$package_source" -B "$work_dir/negative-remote-override" \
+        -G Ninja -DGRPC_LITE_NO_NETWORK=ON \
+        -DGRPC_LITE_TRANSPILED_C_DIR="$bundle_dir" \
+        -DGRPC_LITE_NGHTTP2_URL=https://example.invalid/nghttp2.tar.gz \
+        -DGRPC_LITE_CARES_URL="file://$cares_archive" \
+        -DGRPC_LITE_CARES_URL_HASH=SHA256=c222b6d681096f9444d2c4863d2c1174019e27cacca0a4a5c114d36dd7d7bf78 \
+        >"$work_dir/negative-remote-override.log" 2>&1; then
+        printf '%s\n' 'CMake unexpectedly preferred a remote nghttp2 URL in NO_NETWORK mode' >&2
+        exit 1
+    fi
+    grep -q 'configured URL is' "$work_dir/negative-remote-override.log"
+    grep -q 'https://example.invalid/nghttp2.tar.gz' \
+        "$work_dir/negative-remote-override.log"
+    rm -rf "$package_source/third_party/nghttp2"
+
     cmake -S "$consumer_source" -B "$work_dir/build" \
         "${common[@]}" \
         -DGRPC_LITE_SOURCE_DIR="$package_source" \

@@ -25,7 +25,7 @@ run = "tools/transpile_c.sh"
 
 [tasks.package-transpiled-c]
 description = "Create the generated-only C release bundle"
-run = "tools/package_transpiled_c.sh ${GRPC_LITE_TRANSPILED_C_DIST_DIR:-dist}"
+run = "tools/package_transpiled_c.sh ${GRPC_LITE_TRANSPILED_C_DIST_DIR:-.zig-cache/transpiled-c-dist}"
 
 [tasks.check-transpiled-c]
 description = "Verify generated C bundle reproducibility"

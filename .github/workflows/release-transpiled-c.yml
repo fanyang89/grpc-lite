@@ -20,10 +20,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Checkout exact tag
+      - name: Checkout event commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Validate tag
@@ -73,10 +73,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - name: Checkout exact tag
+      - name: Checkout event commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Verify no-Zig container host
@@ -122,7 +122,34 @@ jobs:
           set -euo pipefail
           marker='<!-- grpc-lite-transpiled-c-workflow-owned -->'
           tag=$GITHUB_REF_NAME
+          archives=(bundle-dist/*.tar.gz)
+          test "${#archives[@]}" -eq 1
+          archive=${archives[0]}
+          root=$(basename "$archive" .tar.gz)
+          manifest_commit=$(tar -xOf "$archive" "$root/manifest.json" | jq -r .source_commit)
+          test "$manifest_commit" = "$GITHUB_SHA"
+          (cd bundle-dist && sha256sum --check "$(basename "$archive").sha256")
+
+          require_current_tag() {
+            local object_json object_type object_sha
+            object_json=$(gh api "repos/$GH_REPO/git/ref/tags/$tag")
+            object_type=$(jq -r .object.type <<<"$object_json")
+            object_sha=$(jq -r .object.sha <<<"$object_json")
+            while [[ "$object_type" == tag ]]; do
+              object_json=$(gh api "repos/$GH_REPO/git/tags/$object_sha")
+              object_type=$(jq -r .object.type <<<"$object_json")
+              object_sha=$(jq -r .object.sha <<<"$object_json")
+            done
+            if [[ "$object_type" != commit || "$object_sha" != "$manifest_commit" ]]; then
+              printf 'Tag %s now resolves to %s %s; expected commit %s\n' \
+                "$tag" "$object_type" "$object_sha" "$manifest_commit" >&2
+              return 1
+            fi
+          }
+
+          require_current_tag
           if ! release_json=$(gh release view "$tag" --json isDraft,body 2>/dev/null); then
+            require_current_tag
             gh release create "$tag" --verify-tag --draft --title "$tag" \
               --notes "$marker
           Generated-only C bundle for insecure Linux x86_64."
@@ -139,6 +166,7 @@ jobs:
               gh release download "$tag" --pattern "$name" --dir remote-assets
               cmp "$local_asset" "remote-assets/$name"
             else
+              require_current_tag
               gh release upload "$tag" "$local_asset"
               gh release download "$tag" --pattern "$name" --dir remote-assets
               cmp "$local_asset" "remote-assets/$name"
@@ -146,5 +174,6 @@ jobs:
           done
 
           if [[ "$is_draft" == true ]]; then
+            require_current_tag
             gh release edit "$tag" --draft=false
           fi

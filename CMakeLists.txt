@@ -87,14 +87,18 @@ function(_grpc_lite_require_local_archive dependency url hash)
 endfunction()
 
 if(GRPC_LITE_NO_NETWORK)
-  if(NOT TARGET nghttp2 AND
-      NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nghttp2/CMakeLists.txt")
+  if(GRPC_LITE_NGHTTP2_URL)
     _grpc_lite_require_local_archive(
       "nghttp2" "${GRPC_LITE_NGHTTP2_URL}" "${GRPC_LITE_NGHTTP2_URL_HASH}")
+  elseif(NOT TARGET nghttp2 AND
+      NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nghttp2/CMakeLists.txt")
+    _grpc_lite_require_local_archive("nghttp2" "" "")
   endif()
-  if(NOT TARGET c-ares::cares)
+  if(GRPC_LITE_CARES_URL)
     _grpc_lite_require_local_archive(
       "c-ares" "${GRPC_LITE_CARES_URL}" "${GRPC_LITE_CARES_URL_HASH}")
+  elseif(NOT TARGET c-ares::cares)
+    _grpc_lite_require_local_archive("c-ares" "" "")
   endif()
 endif()
 

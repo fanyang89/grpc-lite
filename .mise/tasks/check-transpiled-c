@@ -21,25 +21,30 @@ if git -C "$project_root" archive HEAD | tar -tf - | grep -q '^transpiled/'; the
     exit 1
 fi
 
-for run in 1 2; do
-    GRPC_LITE_ZIG_CACHE_DIR="$work_dir/cache-$run" \
-        "$project_root/tools/package_transpiled_c.sh" "$work_dir/dist-$run"
-done
-
-archive_1=("$work_dir/dist-1/"*.tar.gz)
-archive_2=("$work_dir/dist-2/"*.tar.gz)
-if [[ ${#archive_1[@]} -ne 1 || ${#archive_2[@]} -ne 1 ]]; then
-    printf '%s\n' 'Packaging did not produce exactly one archive per run' >&2
-    exit 1
-fi
-cmp "${archive_1[0]}" "${archive_2[0]}"
-cmp "${archive_1[0]}.sha256" "${archive_2[0]}.sha256"
-(
-    cd "$(dirname "${archive_1[0]}")"
-    sha256sum --check "$(basename "${archive_1[0]}").sha256"
-)
-
 rm -rf "$output_dir"
 mkdir -p "$output_dir"
-cp "${archive_1[0]}" "${archive_1[0]}.sha256" "$output_dir/"
-printf 'Reproducible transpiled C bundle: %s\n' "$output_dir/$(basename "${archive_1[0]}")"
+GRPC_LITE_ZIG_CACHE_DIR="$work_dir/cache-1" \
+    "$project_root/tools/package_transpiled_c.sh" "$output_dir"
+archive_1=("$output_dir/"*.tar.gz)
+if [[ ${#archive_1[@]} -ne 1 ]]; then
+    printf '%s\n' 'Packaging did not produce exactly one archive on the first run' >&2
+    exit 1
+fi
+cp "${archive_1[0]}" "$work_dir/first.tar.gz"
+cp "${archive_1[0]}.sha256" "$work_dir/first.tar.gz.sha256"
+
+GRPC_LITE_ZIG_CACHE_DIR="$work_dir/cache-2" \
+    "$project_root/tools/package_transpiled_c.sh" "$output_dir"
+archive_2=("$output_dir/"*.tar.gz)
+if [[ ${#archive_2[@]} -ne 1 ]]; then
+    printf '%s\n' 'Packaging did not produce exactly one archive on the second run' >&2
+    exit 1
+fi
+cmp "$work_dir/first.tar.gz" "${archive_2[0]}"
+cmp "$work_dir/first.tar.gz.sha256" "${archive_2[0]}.sha256"
+(
+    cd "$output_dir"
+    sha256sum --check "$(basename "${archive_2[0]}").sha256"
+)
+
+printf 'Reproducible transpiled C bundle: %s\n' "${archive_2[0]}"
