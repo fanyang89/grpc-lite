@@ -29,6 +29,7 @@ struct ChannelOptions {
   std::uint32_t multiplier_millis = 1600;
   std::uint32_t jitter_percent = 20;
   Logger logger;
+  std::uint64_t max_response_header_list_size = UINT64_C(65536);
 };
 
 class ClientStream;
@@ -70,6 +71,8 @@ class Channel {
     c_options.multiplier_millis = options.multiplier_millis;
     c_options.jitter_percent = options.jitter_percent;
     c_options.logger = logger == nullptr ? nullptr : &c_logger;
+    c_options.max_response_header_list_size =
+        options.max_response_header_list_size;
 
     grpc_lite_channel* channel = nullptr;
     const Error error(grpc_lite_channel_create_managed(

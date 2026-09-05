@@ -80,6 +80,7 @@ pub const ReconnectOptions = struct {
 const ChannelOptions = struct {
     user_agent: []const u8 = version.user_agent,
     initial_stream_window_size: u32 = 64 * 1024,
+    max_response_header_list_size: u32 = 64 * 1024,
     write_high_watermark_bytes: usize = 1024 * 1024,
     write_low_watermark_bytes: usize = 512 * 1024,
     runtime: ?*Runtime = null,
@@ -191,6 +192,9 @@ pub const Channel = struct {
             if (tls_options.handshake_timeout_ns == 0) return error.InvalidTlsHandshakeTimeout;
         }
         if (options.reconnect) |reconnect| try validateReconnectOptions(reconnect);
+        if (options.max_response_header_list_size == 0) {
+            return error.InvalidMaxResponseHeaderListSize;
+        }
         try validateTransportOptions(
             options.initial_stream_window_size,
             options.write_high_watermark_bytes,
@@ -220,6 +224,7 @@ pub const Channel = struct {
             .authority = undefined,
             .user_agent = undefined,
             .initial_stream_window_size = options.initial_stream_window_size,
+            .max_response_header_list_size = options.max_response_header_list_size,
             .write_high_watermark_bytes = options.write_high_watermark_bytes,
             .write_low_watermark_bytes = options.write_low_watermark_bytes,
             .tls_config = null,
@@ -482,6 +487,7 @@ const Impl = struct {
     authority: []u8,
     user_agent: []u8,
     initial_stream_window_size: u32,
+    max_response_header_list_size: u32,
     write_high_watermark_bytes: usize,
     write_low_watermark_bytes: usize,
     tls_config: ?*tls_record.Config = null,
@@ -647,6 +653,9 @@ const ClientStreamState = struct {
     response_compression: Compression = .identity,
     response_encoding_invalid: bool = false,
     response_metadata_invalid: bool = false,
+    response_header_list_size: usize = 0,
+    retained_response_metadata_size: usize = 0,
+    response_headers_too_large: bool = false,
     saw_response_headers: bool = false,
     headers_called: bool = false,
     remote_end_seen: bool = false,
@@ -919,6 +928,10 @@ const Operation = struct {
     response_metadata_invalid: bool = false,
     response_body: std.ArrayList(u8) = .empty,
     response_too_large: bool = false,
+    response_header_list_size: usize = 0,
+    retained_response_metadata_size: usize = 0,
+    response_headers_too_large: bool = false,
+    response_header_reset_submitted: bool = false,
     saw_response_headers: bool = false,
     http_status: ?u16 = null,
     content_type_grpc: bool = false,
@@ -1005,6 +1018,14 @@ const Operation = struct {
         if (self.response_message_owned) self.impl.allocator.free(self.response_message);
         self.response_message = owned;
         self.response_message_owned = true;
+        self.response_code = code;
+        self.outcome_set = true;
+    }
+
+    fn setStaticOutcome(self: *Operation, code: status.Code, text: []const u8) void {
+        if (self.outcome_set) return;
+        std.debug.assert(!self.response_message_owned);
+        self.response_message = @constCast(text);
         self.response_code = code;
         self.outcome_set = true;
     }
@@ -1572,14 +1593,21 @@ fn initializeSession(impl: *Impl) !void {
     c.nghttp2_option_set_no_auto_window_update(options, 1);
     c.nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, onBeginHeaders);
     c.nghttp2_session_callbacks_set_on_header_callback(callbacks, onHeader);
+    c.nghttp2_session_callbacks_set_on_invalid_header_callback(callbacks, onInvalidHeader);
     c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, onDataChunk);
     c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, onFrameReceived);
     c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, onStreamClose);
     if (c.nghttp2_session_client_new2(&impl.session, callbacks, impl, options) != 0) return error.OutOfMemory;
-    const settings = [_]c.nghttp2_settings_entry{.{
-        .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
-        .value = impl.initial_stream_window_size,
-    }};
+    const settings = [_]c.nghttp2_settings_entry{
+        .{
+            .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+            .value = impl.initial_stream_window_size,
+        },
+        .{
+            .settings_id = c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,
+            .value = impl.max_response_header_list_size,
+        },
+    };
     if (c.nghttp2_submit_settings(impl.session, c.NGHTTP2_FLAG_NONE, &settings, settings.len) != 0) {
         return error.NativeFailure;
     }
@@ -2563,6 +2591,82 @@ fn onBeginHeaders(_: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_fram
     return 0;
 }
 
+const response_headers_too_large_message = "received metadata size exceeds hard limit";
+
+fn accountResponseHeaderField(total: *usize, name_length: usize, value_length: usize, limit: u32) bool {
+    const field_size = std.math.add(usize, name_length, value_length) catch return false;
+    const charged_size = std.math.add(usize, field_size, 32) catch return false;
+    const maximum: usize = limit;
+    if (charged_size > maximum or total.* > maximum - charged_size) return false;
+    total.* += charged_size;
+    return true;
+}
+
+fn rejectOperationResponseHeaders(session: ?*c.nghttp2_session, operation: *Operation) c_int {
+    operation.response_headers_too_large = true;
+    operation.resetHeaderBlock(.none);
+    operation.setStaticOutcome(.resource_exhausted, response_headers_too_large_message);
+    if (!operation.response_header_reset_submitted) {
+        if (c.nghttp2_submit_rst_stream(
+            session,
+            c.NGHTTP2_FLAG_NONE,
+            operation.stream_id,
+            c.NGHTTP2_CANCEL,
+        ) != 0) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        operation.response_header_reset_submitted = true;
+    }
+    return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+}
+
+fn rejectClientStreamResponseHeaders(client_stream: *ClientStreamState) c_int {
+    client_stream.response_headers_too_large = true;
+    client_stream.resetHeaderBlock(.none);
+
+    // Serialize with application cancellation so the first local condition wins even
+    // when its wake has not reached the transport loop yet.
+    client_stream.mutex.lockUncancelable(syncIo());
+    if (client_stream.forced_status == null) {
+        client_stream.forced_status = if (client_stream.cancel_requested and !client_stream.app_released)
+            .init(.cancelled, "stream cancelled")
+        else
+            .init(.resource_exhausted, response_headers_too_large_message);
+    }
+    client_stream.mutex.unlock(syncIo());
+
+    if (!failClientStreamOnLoop(
+        client_stream,
+        .init(.resource_exhausted, response_headers_too_large_message),
+    )) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+}
+
+fn accountResponseHeader(
+    session: ?*c.nghttp2_session,
+    impl: *Impl,
+    stream_id: i32,
+    name_length: usize,
+    value_length: usize,
+) ?c_int {
+    if (impl.operations.get(stream_id)) |operation| {
+        if (operation.response_headers_too_large) return 0;
+        if (!accountResponseHeaderField(
+            &operation.response_header_list_size,
+            name_length,
+            value_length,
+            impl.max_response_header_list_size,
+        )) return rejectOperationResponseHeaders(session, operation);
+    } else if (impl.streams.get(stream_id)) |client_stream| {
+        if (client_stream.response_headers_too_large) return 0;
+        if (!accountResponseHeaderField(
+            &client_stream.response_header_list_size,
+            name_length,
+            value_length,
+            impl.max_response_header_list_size,
+        )) return rejectClientStreamResponseHeaders(client_stream);
+    }
+    return null;
+}
+
 fn onHeader(
     session: ?*c.nghttp2_session,
     received_frame: ?*const c.nghttp2_frame,
@@ -2574,8 +2678,10 @@ fn onHeader(
     user_data: ?*anyopaque,
 ) callconv(.c) c_int {
     const stream_id = received_frame.?.*.hd.stream_id;
-    _ = session;
     const impl: *Impl = @ptrCast(@alignCast(user_data.?));
+    if (accountResponseHeader(session, impl, stream_id, name_length, value_length)) |result| {
+        return result;
+    }
     const name = name_pointer[0..name_length];
     const value = value_pointer[0..value_length];
     if (impl.operations.get(stream_id)) |operation| {
@@ -2594,7 +2700,10 @@ fn onHeader(
                 return 0;
             };
         } else {
-            processResponseMetadata(operation, name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            processResponseMetadata(operation, name, value) catch |err| switch (err) {
+                error.ResponseHeadersTooLarge => return rejectOperationResponseHeaders(session, operation),
+                else => return c.NGHTTP2_ERR_CALLBACK_FAILURE,
+            };
         }
     } else if (impl.streams.get(stream_id)) |client_stream| {
         if (std.mem.eql(u8, name, ":status")) {
@@ -2613,10 +2722,28 @@ fn onHeader(
             };
             client_stream.decoder.compression = client_stream.response_compression;
         } else {
-            processClientResponseMetadata(client_stream, name, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            processClientResponseMetadata(client_stream, name, value) catch |err| switch (err) {
+                error.ResponseHeadersTooLarge => return rejectClientStreamResponseHeaders(client_stream),
+                else => return c.NGHTTP2_ERR_CALLBACK_FAILURE,
+            };
         }
     }
     return 0;
+}
+
+fn onInvalidHeader(
+    session: ?*c.nghttp2_session,
+    received_frame: ?*const c.nghttp2_frame,
+    _: [*c]const u8,
+    name_length: usize,
+    _: [*c]const u8,
+    value_length: usize,
+    _: u8,
+    user_data: ?*anyopaque,
+) callconv(.c) c_int {
+    const stream_id = received_frame.?.*.hd.stream_id;
+    const impl: *Impl = @ptrCast(@alignCast(user_data.?));
+    return accountResponseHeader(session, impl, stream_id, name_length, value_length) orelse 0;
 }
 
 fn onDataChunk(
@@ -2629,6 +2756,12 @@ fn onDataChunk(
 ) callconv(.c) c_int {
     const impl: *Impl = @ptrCast(@alignCast(user_data.?));
     if (impl.operations.get(stream_id)) |operation| {
+        if (operation.response_headers_too_large) {
+            if (c.nghttp2_session_consume_connection(session, data_length) != 0) {
+                return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
+            return 0;
+        }
         const limit = wireMessageLimit(operation.max_response_size);
         if (data_length > limit -| operation.response_body.items.len) {
             operation.response_too_large = true;
@@ -2641,6 +2774,12 @@ fn onDataChunk(
             return c.NGHTTP2_ERR_CALLBACK_FAILURE;
         }
     } else if (impl.streams.get(stream_id)) |client_stream| {
+        if (client_stream.response_headers_too_large) {
+            if (c.nghttp2_session_consume_connection(session, data_length) != 0) {
+                return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
+            return 0;
+        }
         const decoder_limit = client_stream.limits.max_inbound_buffer_size -| client_stream.inbound_buffered;
         client_stream.decoder.feedBounded(data_pointer[0..data_length], decoder_limit) catch |err| {
             const failure: status.Status = switch (err) {
@@ -3538,8 +3677,59 @@ fn isMalformedResponseMetadataName(name: []const u8) bool {
     return !metadata.isValidKey(name);
 }
 
-fn processResponseMetadata(operation: *Operation, name: []const u8, value: []const u8) error{OutOfMemory}!void {
+fn retainedMetadataFieldSize(name: []const u8, value: []const u8) !usize {
+    if (!metadata.isBinaryKey(name)) {
+        if (!metadata.isValidAsciiValue(value)) return 0;
+        const field_size = try std.math.add(usize, name.len, value.len);
+        return std.math.add(usize, field_size, 32);
+    }
+
+    var total: usize = 0;
+    var values = std.mem.splitScalar(u8, value, ',');
+    while (values.next()) |encoded| {
+        const decoder = if (std.mem.endsWith(u8, encoded, "="))
+            std.base64.standard.Decoder
+        else
+            std.base64.standard_no_pad.Decoder;
+        const decoded_length = try decoder.calcSizeForSlice(encoded);
+        const entry_size = try std.math.add(usize, name.len, decoded_length);
+        const charged_size = try std.math.add(usize, entry_size, 32);
+        total = try std.math.add(usize, total, charged_size);
+    }
+    return total;
+}
+
+fn preflightRetainedMetadata(
+    total: *usize,
+    name: []const u8,
+    value: []const u8,
+    limit: u32,
+) !void {
+    const charged_size = retainedMetadataFieldSize(name, value) catch |err| switch (err) {
+        error.Overflow => return error.ResponseHeadersTooLarge,
+        else => return err,
+    };
+    const maximum: usize = limit;
+    if (charged_size > maximum or total.* > maximum - charged_size) {
+        return error.ResponseHeadersTooLarge;
+    }
+    total.* += charged_size;
+}
+
+fn processResponseMetadata(operation: *Operation, name: []const u8, value: []const u8) !void {
     if (isResponseMetadata(name)) {
+        preflightRetainedMetadata(
+            &operation.retained_response_metadata_size,
+            name,
+            value,
+            operation.impl.max_response_header_list_size,
+        ) catch |err| switch (err) {
+            error.ResponseHeadersTooLarge => return error.ResponseHeadersTooLarge,
+            else => {
+                operation.response_metadata_invalid = true;
+                return;
+            },
+        };
         _ = operation.block_metadata.appendDecoded(name, value) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
@@ -3556,8 +3746,20 @@ fn processClientResponseMetadata(
     client_stream: *ClientStreamState,
     name: []const u8,
     value: []const u8,
-) error{OutOfMemory}!void {
+) !void {
     if (isResponseMetadata(name)) {
+        preflightRetainedMetadata(
+            &client_stream.retained_response_metadata_size,
+            name,
+            value,
+            client_stream.impl.?.max_response_header_list_size,
+        ) catch |err| switch (err) {
+            error.ResponseHeadersTooLarge => return error.ResponseHeadersTooLarge,
+            else => {
+                client_stream.response_metadata_invalid = true;
+                return;
+            },
+        };
         _ = client_stream.block_metadata.appendDecoded(name, value) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
@@ -3707,6 +3909,7 @@ fn initTestImpl(impl: *Impl, serialized_allocator: *SerializedAllocator, host: [
         .authority = &.{},
         .user_agent = &.{},
         .initial_stream_window_size = 64 * 1024,
+        .max_response_header_list_size = 64 * 1024,
         .write_high_watermark_bytes = 1024 * 1024,
         .write_low_watermark_bytes = 512 * 1024,
         .reconnect_options = null,
@@ -3715,6 +3918,14 @@ fn initTestImpl(impl: *Impl, serialized_allocator: *SerializedAllocator, host: [
         .logger = .{},
     };
     impl.allocator = serialized_allocator.allocator();
+}
+
+test "channel rejects a zero response header list size" {
+    try std.testing.expectError(error.InvalidMaxResponseHeaderListSize, Channel.init(
+        std.testing.allocator,
+        "invalid",
+        .{ .max_response_header_list_size = 0 },
+    ));
 }
 
 test "client stream open validates its synchronous inputs" {
@@ -4980,6 +5191,715 @@ test "serialized allocator forwards every vtable operation" {
     try std.testing.expectEqual(@as(usize, 44), probe.ret_addr);
 }
 
+test "response header accounting is exact cumulative and overflow safe" {
+    var total: usize = 0;
+    try std.testing.expect(accountResponseHeaderField(&total, 20, 48, 100));
+    try std.testing.expectEqual(@as(usize, 100), total);
+    try std.testing.expect(!accountResponseHeaderField(&total, 0, 0, 100));
+    try std.testing.expectEqual(@as(usize, 100), total);
+
+    total = 0;
+    try std.testing.expect(accountResponseHeaderField(&total, 1, 1, 100));
+    try std.testing.expect(accountResponseHeaderField(&total, 1, 33, 100));
+    try std.testing.expectEqual(@as(usize, 100), total);
+    try std.testing.expect(!accountResponseHeaderField(
+        &total,
+        std.math.maxInt(usize),
+        1,
+        std.math.maxInt(u32),
+    ));
+}
+
+test "response header block reset preserves RPC accounting" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    const operation = try Operation.init(&impl, "/test.Metadata/Reset", "", .{});
+    defer operation.deinit();
+
+    operation.response_header_list_size = 91;
+    operation.retained_response_metadata_size = 47;
+    operation.resetHeaderBlock(.response);
+    operation.resetHeaderBlock(.trailers);
+    try std.testing.expectEqual(@as(usize, 91), operation.response_header_list_size);
+    try std.testing.expectEqual(@as(usize, 47), operation.retained_response_metadata_size);
+}
+
+test "unary response header quota crossing records allocation-free local outcome" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.max_response_header_list_size = 64;
+    defer impl.operations.deinit(impl.allocator);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+
+    const operation = try Operation.init(&impl, "/test.Metadata/UnaryLimit", "", .{});
+    defer operation.deinit();
+    try submitOperation(&impl, operation);
+    operation.resetHeaderBlock(.response);
+    try operation.block_metadata.append("x-before", "discarded");
+    var native_frame: c.nghttp2_frame = undefined;
+    native_frame.hd.stream_id = operation.stream_id;
+    const encoded_unicode_message = "%E2%98%83" ** 4;
+    try std.testing.expectEqual(
+        @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
+        onHeader(
+            impl.session,
+            &native_frame,
+            "grpc-message".ptr,
+            "grpc-message".len,
+            encoded_unicode_message.ptr,
+            encoded_unicode_message.len,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expect(operation.response_headers_too_large);
+    try std.testing.expect(operation.response_header_reset_submitted);
+    try std.testing.expect(operation.outcome_set);
+    try std.testing.expectEqual(status.Code.resource_exhausted, operation.response_code);
+    try std.testing.expectEqualStrings(response_headers_too_large_message, operation.response_message);
+    try std.testing.expect(!operation.response_message_owned);
+    try std.testing.expectEqual(HeaderKind.none, operation.block_kind);
+    try std.testing.expectEqual(@as(usize, 0), operation.block_metadata.items().len);
+    try std.testing.expect(operation.block_grpc_message == null);
+
+    const rejected_size = operation.response_header_list_size;
+    for ([_][2][]const u8{
+        .{ "x-after", "hidden" },
+        .{ "grpc-status", "0" },
+    }) |header| {
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            onHeader(
+                impl.session,
+                &native_frame,
+                header[0].ptr,
+                header[0].len,
+                header[1].ptr,
+                header[1].len,
+                0,
+                &impl,
+            ),
+        );
+        try std.testing.expectEqual(rejected_size, operation.response_header_list_size);
+        try std.testing.expectEqual(@as(usize, 0), operation.block_metadata.items().len);
+        try std.testing.expect(operation.block_grpc_status == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), operation.initial_metadata.items().len);
+    try std.testing.expectEqual(@as(usize, 0), operation.trailing_metadata.items().len);
+    _ = impl.operations.remove(operation.stream_id);
+}
+
+test "invalid response headers share the aggregate quota" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.max_response_header_list_size = 64;
+    defer impl.operations.deinit(impl.allocator);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+
+    const operation = try Operation.init(&impl, "/test.Metadata/InvalidLimit", "", .{});
+    defer operation.deinit();
+    try submitOperation(&impl, operation);
+    operation.resetHeaderBlock(.response);
+    var native_frame: c.nghttp2_frame = undefined;
+    native_frame.hd.stream_id = operation.stream_id;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        onInvalidHeader(
+            impl.session,
+            &native_frame,
+            "x!invalid".ptr,
+            "x!invalid".len,
+            "value".ptr,
+            "value".len,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, "x!invalid".len + "value".len + 32), operation.response_header_list_size);
+    try std.testing.expectEqual(
+        @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
+        onInvalidHeader(
+            impl.session,
+            &native_frame,
+            "x".ptr,
+            1,
+            "".ptr,
+            0,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expect(operation.response_headers_too_large);
+    try std.testing.expectEqual(status.Code.resource_exhausted, operation.response_code);
+    _ = impl.operations.remove(operation.stream_id);
+}
+
+test "streaming response header quota terminalizes once and closes sends" {
+    const TerminalState = struct {
+        count: usize = 0,
+        code: status.Code = .unknown,
+
+        fn onMessage(
+            _: ?*anyopaque,
+            _: stream.ClientStream,
+            _: []const u8,
+            _: Compression,
+        ) stream.ReceiveAction {
+            return .continue_receiving;
+        }
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            _: stream.ClientStream,
+            final_status: status.Status,
+            _: *const metadata.Metadata,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.count += 1;
+            self.code = final_status.code;
+        }
+    };
+
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.max_response_header_list_size = 64;
+    defer impl.stream_states.deinit(impl.allocator);
+    defer impl.streams.deinit(impl.allocator);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+    var terminal_state = TerminalState{};
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Metadata/StreamingLimit",
+        .{},
+        .{
+            .context = &terminal_state,
+            .on_message = TerminalState.onMessage,
+            .on_terminal = TerminalState.onTerminal,
+        },
+    );
+    try impl.stream_states.put(impl.allocator, client_stream, {});
+    try submitClientStream(&impl, client_stream);
+    client_stream.resetHeaderBlock(.response);
+    var native_frame: c.nghttp2_frame = undefined;
+    native_frame.hd.stream_id = client_stream.stream_id;
+    const large_value = "x" ** 33;
+    try std.testing.expectEqual(
+        @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
+        onHeader(
+            impl.session,
+            &native_frame,
+            "grpc-message".ptr,
+            "grpc-message".len,
+            large_value.ptr,
+            large_value.len,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expect(client_stream.response_headers_too_large);
+    try std.testing.expect(client_stream.rst_submitted);
+    try std.testing.expectEqual(status.Code.resource_exhausted, client_stream.forced_status.?.code);
+    try std.testing.expect(!client_stream.headers_called);
+    try std.testing.expect(!client_stream.remote_end_seen);
+
+    const rejected_size = client_stream.response_header_list_size;
+    for ([_][2][]const u8{
+        .{ "x-after", "hidden" },
+        .{ "grpc-status", "0" },
+    }) |header| {
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            onHeader(
+                impl.session,
+                &native_frame,
+                header[0].ptr,
+                header[0].len,
+                header[1].ptr,
+                header[1].len,
+                0,
+                &impl,
+            ),
+        );
+        try std.testing.expectEqual(rejected_size, client_stream.response_header_list_size);
+        try std.testing.expectEqual(@as(usize, 0), client_stream.block_metadata.items().len);
+        try std.testing.expect(client_stream.block_grpc_status == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), client_stream.initial_metadata.items().len);
+    try std.testing.expectEqual(@as(usize, 0), client_stream.trailing_metadata.items().len);
+
+    const stream_id = client_stream.stream_id;
+    _ = onStreamClose(impl.session, stream_id, c.NGHTTP2_CANCEL, &impl);
+    try std.testing.expectEqual(@as(usize, 1), terminal_state.count);
+    try std.testing.expectEqual(status.Code.resource_exhausted, terminal_state.code);
+    var handle = client_stream.handle();
+    try std.testing.expectError(error.StreamClosed, handle.send("late", .{}));
+    try std.testing.expectError(error.StreamClosed, handle.closeSend());
+    handle.deinit();
+}
+
+test "streaming oversized trailers preserve accepted initial metadata" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.max_response_header_list_size = 160;
+    defer impl.stream_states.deinit(impl.allocator);
+    defer impl.streams.deinit(impl.allocator);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Metadata/StreamingTrailersLimit",
+        .{},
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    try impl.stream_states.put(impl.allocator, client_stream, {});
+    try submitClientStream(&impl, client_stream);
+    var native_frame: c.nghttp2_frame = undefined;
+    native_frame.hd.stream_id = client_stream.stream_id;
+
+    client_stream.resetHeaderBlock(.response);
+    for ([_][2][]const u8{
+        .{ ":status", "200" },
+        .{ "content-type", "application/grpc" },
+        .{ "x-a", "v" },
+    }) |header| {
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            onHeader(
+                impl.session,
+                &native_frame,
+                header[0].ptr,
+                header[0].len,
+                header[1].ptr,
+                header[1].len,
+                0,
+                &impl,
+            ),
+        );
+    }
+    try std.testing.expect(try finishClientHeaderBlock(client_stream, false));
+    try std.testing.expectEqualStrings("v", client_stream.initial_metadata.getFirst("x-a").?);
+    const encoded = try frame.encode(impl.allocator, "before");
+    defer impl.allocator.free(encoded);
+    try client_stream.decoder.feed(encoded);
+    try decodeAvailableMessages(client_stream);
+    try std.testing.expectEqual("before".len, received);
+
+    client_stream.resetHeaderBlock(.trailers);
+    try std.testing.expectEqual(
+        @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
+        onHeader(
+            impl.session,
+            &native_frame,
+            "grpc-status".ptr,
+            "grpc-status".len,
+            "0".ptr,
+            1,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expectEqual(status.Code.resource_exhausted, client_stream.forced_status.?.code);
+    try std.testing.expectEqualStrings("v", client_stream.initial_metadata.getFirst("x-a").?);
+    try std.testing.expectEqual(@as(usize, 0), client_stream.trailing_metadata.items().len);
+    try std.testing.expectEqual(HeaderKind.none, client_stream.block_kind);
+
+    const stream_id = client_stream.stream_id;
+    _ = onStreamClose(impl.session, stream_id, c.NGHTTP2_CANCEL, &impl);
+    var handle = client_stream.handle();
+    handle.deinit();
+}
+
+test "pending streaming cancellation wins over response header quota" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.max_response_header_list_size = 64;
+    impl.stream_wake_notify_pending = true;
+    defer impl.stream_states.deinit(impl.allocator);
+    defer impl.streams.deinit(impl.allocator);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Metadata/CancelBeforeLimit",
+        .{},
+        .{
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    try impl.stream_states.put(impl.allocator, client_stream, {});
+    try submitClientStream(&impl, client_stream);
+    client_stream.resetHeaderBlock(.response);
+
+    var handle = client_stream.handle();
+    handle.cancel();
+    try std.testing.expect(client_stream.cancel_requested);
+    try std.testing.expect(client_stream.wake_queued);
+
+    var native_frame: c.nghttp2_frame = undefined;
+    native_frame.hd.stream_id = client_stream.stream_id;
+    const large_value = "x" ** 33;
+    try std.testing.expectEqual(
+        @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
+        onHeader(
+            impl.session,
+            &native_frame,
+            "grpc-message".ptr,
+            "grpc-message".len,
+            large_value.ptr,
+            large_value.len,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expect(client_stream.response_headers_too_large);
+    try std.testing.expect(client_stream.rst_submitted);
+    try std.testing.expectEqual(status.Code.cancelled, client_stream.forced_status.?.code);
+
+    _ = onStreamClose(impl.session, client_stream.stream_id, c.NGHTTP2_CANCEL, &impl);
+    handle.deinit();
+}
+
+test "retained response metadata accounting bounds binary comma amplification" {
+    try std.testing.expectEqual(
+        @as(usize, "x-ascii".len + "value".len + 32),
+        try retainedMetadataFieldSize("x-ascii", "value"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2 * ("x-bin".len + 1 + 32)),
+        try retainedMetadataFieldSize("x-bin", "YQ==,Yg"),
+    );
+
+    var total: usize = 0;
+    const one_entry = "very-long-binary-metadata-key-bin".len + 32;
+    try preflightRetainedMetadata(
+        &total,
+        "very-long-binary-metadata-key-bin",
+        ",,,",
+        @intCast(4 * one_entry),
+    );
+    try std.testing.expectEqual(4 * one_entry, total);
+    try std.testing.expectError(error.ResponseHeadersTooLarge, preflightRetainedMetadata(
+        &total,
+        "very-long-binary-metadata-key-bin",
+        "",
+        @intCast(4 * one_entry),
+    ));
+}
+
+fn transferNghttp2Sessions(source: ?*c.nghttp2_session, destination: ?*c.nghttp2_session) !usize {
+    var transferred: usize = 0;
+    while (true) {
+        var data: [*c]const u8 = null;
+        const length = c.nghttp2_session_mem_send2(source, &data);
+        if (length < 0) return error.NativeFailure;
+        if (length == 0) return transferred;
+        const consumed = c.nghttp2_session_mem_recv2(destination, data, @intCast(length));
+        if (consumed != length) return error.Http2ConnectionFailed;
+        transferred += @intCast(length);
+    }
+}
+
+fn transferClientPrefaceWithUnboundedPeerSetting(
+    source: ?*c.nghttp2_session,
+    destination: ?*c.nghttp2_session,
+) !void {
+    var data: [*c]const u8 = null;
+    const preface_length = c.nghttp2_session_mem_send2(source, &data);
+    if (preface_length <= 0 or
+        c.nghttp2_session_mem_recv2(destination, data, @intCast(preface_length)) != preface_length)
+    {
+        return error.Http2ConnectionFailed;
+    }
+    const settings_length = c.nghttp2_session_mem_send2(source, &data);
+    if (settings_length < 9) return error.Http2ConnectionFailed;
+    const settings = try std.testing.allocator.dupe(u8, data[0..@intCast(settings_length)]);
+    defer std.testing.allocator.free(settings);
+    var offset: usize = 9;
+    while (offset + 6 <= settings.len) : (offset += 6) {
+        const id = (@as(u16, settings[offset]) << 8) | settings[offset + 1];
+        if (id != c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE) continue;
+        @memset(settings[offset + 2 .. offset + 6], 0xff);
+    }
+    if (c.nghttp2_session_mem_recv2(destination, settings.ptr, settings.len) != settings.len) {
+        return error.Http2ConnectionFailed;
+    }
+    _ = try transferNghttp2Sessions(source, destination);
+}
+
+test "raw nghttp2 peer covers response header boundaries isolation and HPACK reuse" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.max_response_header_list_size = 300;
+    defer impl.operations.deinit(impl.allocator);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+
+    const PeerState = struct {
+        closes: usize = 0,
+
+        fn onStreamClose(
+            _: ?*c.nghttp2_session,
+            _: i32,
+            _: u32,
+            user_data: ?*anyopaque,
+        ) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            self.closes += 1;
+            return 0;
+        }
+    };
+    var peer_state = PeerState{};
+    var callbacks: ?*c.nghttp2_session_callbacks = null;
+    try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_session_callbacks_new(&callbacks));
+    defer c.nghttp2_session_callbacks_del(callbacks);
+    c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, PeerState.onStreamClose);
+    var peer_options: ?*c.nghttp2_option = null;
+    try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_option_new(&peer_options));
+    defer c.nghttp2_option_del(peer_options);
+    c.nghttp2_option_set_no_http_messaging(peer_options, 1);
+    var peer: ?*c.nghttp2_session = null;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.nghttp2_session_server_new2(&peer, callbacks, &peer_state, peer_options),
+    );
+    defer c.nghttp2_session_del(peer);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.nghttp2_submit_settings(peer, c.NGHTTP2_FLAG_NONE, null, 0),
+    );
+
+    const exact = try Operation.init(&impl, "/test.Metadata/ExactBoundary", "", .{});
+    try submitOperation(&impl, exact);
+    const over = try Operation.init(&impl, "/test.Metadata/OverBoundary", "", .{});
+    try submitOperation(&impl, over);
+    try transferClientPrefaceWithUnboundedPeerSetting(impl.session, peer);
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        c.nghttp2_session_get_remote_settings(peer, c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE),
+    );
+    try std.testing.expectEqual(@as(usize, 0), peer_state.closes);
+
+    // These trailers-only responses total exactly 300 and 301 charged bytes.
+    const exact_boundary_value = "b" ** 112;
+    const over_boundary_value = "b" ** 113;
+    const exact_headers = [_]c.nghttp2_nv{
+        nativeHeader(":status", "200"),
+        nativeHeader("content-type", "application/grpc"),
+        nativeHeader("x-boundary", exact_boundary_value),
+        nativeHeader("grpc-status", "5"),
+    };
+    const over_headers = [_]c.nghttp2_nv{
+        nativeHeader(":status", "200"),
+        nativeHeader("content-type", "application/grpc"),
+        nativeHeader("x-boundary", over_boundary_value),
+        nativeHeader("grpc-status", "5"),
+    };
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.nghttp2_submit_headers(
+            peer,
+            c.NGHTTP2_FLAG_END_STREAM,
+            over.stream_id,
+            null,
+            &over_headers,
+            over_headers.len,
+            null,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.nghttp2_submit_headers(
+            peer,
+            c.NGHTTP2_FLAG_END_STREAM,
+            exact.stream_id,
+            null,
+            &exact_headers,
+            exact_headers.len,
+            null,
+        ),
+    );
+    _ = try transferNghttp2Sessions(peer, impl.session);
+    _ = try transferNghttp2Sessions(impl.session, peer);
+    try std.testing.expect(over.done);
+    try std.testing.expect(over.response_headers_too_large);
+    try std.testing.expectEqual(status.Code.resource_exhausted, over.response_code);
+    try std.testing.expect(exact.done);
+    try std.testing.expectEqual(@as(usize, 300), exact.response_header_list_size);
+    try std.testing.expectEqual(status.Code.not_found, exact.response_code);
+    try std.testing.expectEqualStrings(
+        exact_boundary_value,
+        exact.trailing_metadata.getFirst("x-boundary").?,
+    );
+    try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+    over.deinit();
+    exact.deinit();
+
+    const rejected = try Operation.init(&impl, "/test.Metadata/Rejected", "", .{});
+    try submitOperation(&impl, rejected);
+    _ = try transferNghttp2Sessions(impl.session, peer);
+
+    // The preceding fields total 266 bytes. The large field is completed in a
+    // CONTINUATION callback and crosses the configured 300-byte limit there.
+    const large_value = "x" ** (20 * 1024);
+    const rejected_headers = [_]c.nghttp2_nv{
+        nativeHeader(":status", "200"),
+        nativeHeader("content-type", "application/grpc"),
+        // Repeated values compress to indexed fields but each decoded field is charged.
+        nativeHeader("x-repeat", "v"),
+        nativeHeader("x-repeat", "v"),
+        nativeHeader("x-repeat", "v"),
+        nativeHeader("x-repeat", "v"),
+        nativeHeader("x-large", large_value),
+        // This insertion follows the rejected field. A later stream references it.
+        nativeHeader("x-dynamic", "shared"),
+        nativeHeader("grpc-status", "8"),
+    };
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.nghttp2_submit_headers(
+            peer,
+            c.NGHTTP2_FLAG_END_STREAM,
+            rejected.stream_id,
+            null,
+            &rejected_headers,
+            rejected_headers.len,
+            null,
+        ),
+    );
+    _ = try transferNghttp2Sessions(peer, impl.session);
+    _ = try transferNghttp2Sessions(impl.session, peer);
+    try std.testing.expect(rejected.done);
+    try std.testing.expect(rejected.response_headers_too_large);
+    try std.testing.expectEqual(status.Code.resource_exhausted, rejected.response_code);
+    try std.testing.expectEqualStrings(response_headers_too_large_message, rejected.response_message);
+    try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+    rejected.deinit();
+
+    const accepted = try Operation.init(&impl, "/test.Metadata/Accepted", "", .{});
+    try submitOperation(&impl, accepted);
+    _ = try transferNghttp2Sessions(impl.session, peer);
+    const accepted_headers = [_]c.nghttp2_nv{
+        nativeHeader(":status", "200"),
+        nativeHeader("content-type", "application/grpc"),
+        nativeHeader("x-dynamic", "shared"),
+        nativeHeader("grpc-status", "5"),
+    };
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.nghttp2_submit_headers(
+            peer,
+            c.NGHTTP2_FLAG_END_STREAM,
+            accepted.stream_id,
+            null,
+            &accepted_headers,
+            accepted_headers.len,
+            null,
+        ),
+    );
+    _ = try transferNghttp2Sessions(peer, impl.session);
+    _ = try transferNghttp2Sessions(impl.session, peer);
+    try std.testing.expect(accepted.done);
+    try std.testing.expectEqual(status.Code.not_found, accepted.response_code);
+    try std.testing.expectEqualStrings("shared", accepted.trailing_metadata.getFirst("x-dynamic").?);
+    try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+    accepted.deinit();
+}
+
+test "client session advertises the default and reconnect response header list size" {
+    const Reader = struct {
+        fn advertised(session: ?*c.nghttp2_session) !u32 {
+            var data: [*c]const u8 = null;
+            const preface_length = c.nghttp2_session_mem_send2(session, &data);
+            try std.testing.expect(preface_length > 0);
+            try std.testing.expectEqualStrings(
+                "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+                data[0..@intCast(preface_length)],
+            );
+            const settings_length = c.nghttp2_session_mem_send2(session, &data);
+            try std.testing.expect(settings_length >= 9 + 12);
+            const settings = data[0..@intCast(settings_length)];
+            try std.testing.expectEqual(@as(u8, c.NGHTTP2_SETTINGS), settings[3]);
+            try std.testing.expectEqual(@as(u8, 0), settings[9]);
+            try std.testing.expectEqual(@as(u8, c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE), settings[10]);
+            try std.testing.expectEqual(@as(u8, 0), settings[15]);
+            try std.testing.expectEqual(@as(u8, c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE), settings[16]);
+            return (@as(u32, settings[17]) << 24) |
+                (@as(u32, settings[18]) << 16) |
+                (@as(u32, settings[19]) << 8) |
+                settings[20];
+        }
+    };
+
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+    try std.testing.expectEqual(@as(u32, 64 * 1024), try Reader.advertised(impl.session));
+
+    c.nghttp2_session_del(impl.session);
+    impl.session = null;
+    impl.max_response_header_list_size = 123;
+    try initializeSession(&impl);
+    try std.testing.expectEqual(@as(u32, 123), try Reader.advertised(impl.session));
+
+    c.nghttp2_session_del(impl.session);
+    impl.session = null;
+    try initializeSession(&impl);
+    try std.testing.expectEqual(@as(u32, 123), try Reader.advertised(impl.session));
+
+    defer impl.operations.deinit(impl.allocator);
+    const operation = try Operation.init(&impl, "/test.Metadata/ReconnectedLimit", "", .{});
+    defer operation.deinit();
+    try submitOperation(&impl, operation);
+    operation.resetHeaderBlock(.response);
+    var native_frame: c.nghttp2_frame = undefined;
+    native_frame.hd.stream_id = operation.stream_id;
+    const oversized_value = "x" ** 91;
+    try std.testing.expectEqual(
+        @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
+        onHeader(
+            impl.session,
+            &native_frame,
+            "x".ptr,
+            1,
+            oversized_value.ptr,
+            oversized_value.len,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expect(operation.response_headers_too_large);
+    try std.testing.expectEqual(status.Code.resource_exhausted, operation.response_code);
+    _ = impl.operations.remove(operation.stream_id);
+}
+
 test "target parsing" {
     const target = try parseTarget("127.0.0.1:50051");
     try std.testing.expectEqualStrings("127.0.0.1", target.host);
@@ -5246,6 +6166,116 @@ test "malformed response metadata fails one call and preserves the channel" {
     try std.testing.expectEqualStrings("reused", reused.payload);
     try std.testing.expectEqual(@as(usize, 5), handler.calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
+}
+
+test "oversized response metadata is block atomic and preserves channel reuse" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const large_value = "x" ** 2048;
+
+    const Handler = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn handle(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            context: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            _ = self.calls.fetchAdd(1, .monotonic);
+            if (std.mem.eql(u8, request, "large-initial")) {
+                try context.addInitialMetadata("x-large", large_value);
+            } else if (std.mem.eql(u8, request, "large-trailers")) {
+                try context.addInitialMetadata("x-accepted", "yes");
+                try context.addTrailingMetadata("x-large", large_value);
+            }
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const AsyncState = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        valid: std.atomic.Value(bool) = .init(false),
+
+        fn onComplete(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.valid.store(
+                result.status.code == .resource_exhausted and
+                    std.mem.eql(u8, result.status.message, response_headers_too_large_message) and
+                    result.payload.len == 0 and
+                    result.initial_metadata.items().len == 0 and
+                    result.trailing_metadata.items().len == 0,
+                .release,
+            );
+            self.done.store(true, .release);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Metadata/ResponseLimit",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .max_response_header_list_size = 1024,
+    });
+    defer channel.deinit();
+
+    var initial = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Metadata/ResponseLimit",
+        "large-initial",
+        .{},
+    );
+    defer initial.deinit();
+    try std.testing.expectEqual(status.Code.resource_exhausted, initial.status.code);
+    try std.testing.expectEqualStrings(response_headers_too_large_message, initial.status.message);
+    try std.testing.expectEqual(@as(usize, 0), initial.payload.len);
+    try std.testing.expectEqual(@as(usize, 0), initial.initial_metadata.items().len);
+    try std.testing.expectEqual(@as(usize, 0), initial.trailing_metadata.items().len);
+
+    var trailers = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Metadata/ResponseLimit",
+        "large-trailers",
+        .{},
+    );
+    defer trailers.deinit();
+    try std.testing.expectEqual(status.Code.resource_exhausted, trailers.status.code);
+    try std.testing.expectEqual(@as(usize, 0), trailers.payload.len);
+    try std.testing.expectEqualStrings("yes", trailers.initial_metadata.getFirst("x-accepted").?);
+    try std.testing.expectEqual(@as(usize, 0), trailers.trailing_metadata.items().len);
+
+    var async_state = AsyncState{};
+    try channel.callUnaryAsync(
+        "/test.Metadata/ResponseLimit",
+        "large-initial",
+        .{},
+        .{ .context = &async_state, .on_complete = AsyncState.onComplete },
+    );
+    const async_deadline = nowNs() +| 5 * std.time.ns_per_s;
+    while (!async_state.done.load(.acquire)) {
+        if (nowNs() >= async_deadline) return error.AsyncTimeout;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(async_state.valid.load(.acquire));
+
+    var reused = try channel.callUnary(
+        std.testing.allocator,
+        "/test.Metadata/ResponseLimit",
+        "reused",
+        .{},
+    );
+    defer reused.deinit();
+    try std.testing.expect(reused.status.isOk());
+    try std.testing.expectEqualStrings("reused", reused.payload);
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 4), handler.calls.load(.acquire));
 }
 
 test "channel and server exchange gzip-compressed unary messages" {
