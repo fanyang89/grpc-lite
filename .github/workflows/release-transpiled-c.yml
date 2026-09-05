@@ -13,8 +13,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  full-validation:
+    name: Full validation for tag SHA
+    uses: ./.github/workflows/ci.yml
+    with:
+      validation-ref: ${{ github.sha }}
+    permissions:
+      contents: read
+
   package:
     name: Validate and package generated C
+    needs: full-validation
     permissions:
       contents: read
     runs-on: ubuntu-24.04
