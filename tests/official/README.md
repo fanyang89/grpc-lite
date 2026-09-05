@@ -36,13 +36,14 @@ The HTTP/2 framing tool deliberately treats every `TestSoon*` failure as non-fat
 `run_http2.sh` runs its cleartext framing and TLS profile modes, then validates six
 required framing passes and three required TLS passes. The framing module remains pinned at
 `github.com/grpc/grpc/tools/http2_interop@v0.0.0-20260718051024-8542e01ff47e`, from grpc
-commit `8542e01ff47eb07247ff6cfbd545f3b6f4e9b5d3`. The harness copies that module into
-`.zig-cache` and applies two narrow patches: `http2_interop_go1.26.patch` accepts current
-Go TLS error text and bounds the bad-cipher probe to TLS 1.2 because Go's `CipherSuites`
-setting does not control TLS 1.3, while `http2_interop_goaway.patch` adds the missing
-`GoAwayFrame` parser dispatch, accepts parsed GOAWAY for existing negative framing checks,
-and requires it for `TestSoonSmallMaxFrameSize`. The repository raw server test
-independently verifies that an invalid `SETTINGS_MAX_FRAME_SIZE` receives GOAWAY with
+commit `8542e01ff47eb07247ff6cfbd545f3b6f4e9b5d3`. The harness downloads the selected
+module, verifies its path, version, checksum, source directory, and expected files, then
+copies it into `.zig-cache` and applies two narrow patches: `http2_interop_go1.26.patch`
+accepts current Go TLS error text and bounds the bad-cipher probe to TLS 1.2 because Go's
+`CipherSuites` setting does not control TLS 1.3, while `http2_interop_goaway.patch` adds
+the missing `GoAwayFrame` parser dispatch, accepts parsed GOAWAY for existing negative
+framing checks, and requires it for `TestSoonSmallMaxFrameSize`. The repository raw server
+test independently verifies that an invalid `SETTINGS_MAX_FRAME_SIZE` receives GOAWAY with
 `NGHTTP2_PROTOCOL_ERROR`. The complete upstream report is stored in
 `.zig-cache/official/http2-framing.log`.
 
