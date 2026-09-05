@@ -22,7 +22,8 @@ mise run interop-http2-edge
 | dedicated grpc-go client to grpc-lite and generated C++ servers | `half_duplex` | Pass; responses begin after the client half-closes |
 | grpc-go client to grpc-lite server | `cancel_after_begin`, `cancel_after_first_response`, `timeout_on_sleeping_server` | Pass |
 | grpc-lite client to grpc-go server | `cancel_after_begin`, `cancel_after_first_response`, `timeout_on_sleeping_server` | Pass |
-| grpc-lite compression integration | `client_compressed_unary`, `server_compressed_unary` | Pass; grpc-go v1.82.1 does not expose these cases through its interop client |
+| dedicated grpc-go gzip client to grpc-lite server | `identity_unary`, `gzip_request`, `gzip_response`, `identity_expectation_error`, `gzip_expectation_error`, `unsupported_request_encoding` | Pass; verifies identity/gzip request and response negotiation plus mismatch and unsupported-encoding statuses |
+| grpc-lite client to dedicated grpc-go gzip server | `client_compressed_unary`, `server_compressed_unary` | Pass; verifies identity/gzip request and response negotiation plus the request-compression mismatch status |
 | grpc-go TLS client to grpc-lite TLS server | `empty_unary`, `large_unary`, `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
 | grpc-lite TLS client to grpc-go TLS server | `empty_unary`, `large_unary`, `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream` | Pass |
 | gRPC HTTP/2 framing | `TestSoonClientShortSettings`, `TestSoonShortPreface`, `TestSoonUnknownFrameType`, `TestSoonClientPrefaceWithStreamId`, `TestSoonAllSettingsFramesAcked` | Pass |
