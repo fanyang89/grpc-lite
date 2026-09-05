@@ -25,13 +25,35 @@ if [[ "$actual_zig" != "$required_zig" ]]; then
     exit 1
 fi
 
+for command_name in python3 taskset; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf 'Required command not found: %s\n' "$command_name" >&2
+        exit 1
+    fi
+done
+selected_cpu=$(python3 - <<'PY'
+import os
+import sys
+
+try:
+    allowed_cpus = os.sched_getaffinity(0)
+except (AttributeError, OSError) as error:
+    print(f"Could not query CPU affinity: {error}", file=sys.stderr)
+    raise SystemExit(1)
+if not allowed_cpus:
+    print("Could not select a CPU: affinity set is empty", file=sys.stderr)
+    raise SystemExit(1)
+print(min(allowed_cpus))
+PY
+)
+
 cache_dir=${GRPC_LITE_ZIG_CACHE_DIR:-"$project_root/.zig-cache/transpile-c"}
 global_cache_dir=${GRPC_LITE_ZIG_GLOBAL_CACHE_DIR:-"$project_root/.zig-cache/transpile-c-global"}
 rm -rf "$output_dir" "$cache_dir"
 mkdir -p "$output_dir" "$cache_dir" "$global_cache_dir"
 (
     cd "$project_root"
-    zig build transpile-c \
+    taskset -c "$selected_cpu" zig build transpile-c -j1 \
         -Dtarget=x86_64-linux-gnu \
         -Dtranspile-c=true \
         -Dprotobuf=false \
