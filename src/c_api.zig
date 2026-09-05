@@ -1,5 +1,4 @@
 const std = @import("std");
-const build_options = @import("grpc_lite_options");
 const call = @import("call.zig");
 const channel = @import("channel.zig");
 const Compression = @import("compression.zig").Compression;
@@ -199,7 +198,7 @@ pub fn grpc_lite_library_version() callconv(.c) [*:0]const u8 {
 }
 
 pub fn grpc_lite_features() callconv(.c) u64 {
-    var features = Feature.raw_unary |
+    return Feature.raw_unary |
         Feature.streaming |
         Feature.gzip |
         Feature.dns |
@@ -208,8 +207,6 @@ pub fn grpc_lite_features() callconv(.c) u64 {
         Feature.c_server |
         Feature.managed_channel |
         Feature.logging_callback;
-    if (build_options.tls) features |= Feature.tls;
-    return features;
 }
 
 pub fn grpc_lite_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
@@ -1188,12 +1185,13 @@ fn view(value: []const u8) BytesView {
     };
 }
 
-test "C ABI reports version and build features" {
+test "C ABI reports version and usable features" {
     try std.testing.expectEqual((@as(u32, abi_major) << 16) | abi_minor, grpc_lite_abi_version());
     try std.testing.expectEqualStrings(version.string, std.mem.span(grpc_lite_library_version()));
     try std.testing.expect(grpc_lite_features() & Feature.streaming != 0);
     try std.testing.expect(grpc_lite_features() & Feature.managed_channel != 0);
     try std.testing.expect(grpc_lite_features() & Feature.logging_callback != 0);
+    try std.testing.expectEqual(@as(u64, 0), grpc_lite_features() & Feature.tls);
     try std.testing.expectEqualStrings(
         "invalid argument",
         std.mem.span(grpc_lite_error_string(@intFromEnum(Error.invalid_argument))),

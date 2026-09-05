@@ -34,6 +34,7 @@ typedef uint64_t grpc_lite_feature_bits;
 #define GRPC_LITE_FEATURE_STREAMING (UINT64_C(1) << 1)
 #define GRPC_LITE_FEATURE_GZIP (UINT64_C(1) << 2)
 #define GRPC_LITE_FEATURE_DNS (UINT64_C(1) << 3)
+/* Reserved for source compatibility; the C API currently exposes insecure transport. */
 #define GRPC_LITE_FEATURE_TLS (UINT64_C(1) << 4)
 #define GRPC_LITE_FEATURE_GRACEFUL_SERVER_DRAIN (UINT64_C(1) << 5)
 #define GRPC_LITE_FEATURE_C_STREAMING (UINT64_C(1) << 6)
@@ -91,6 +92,7 @@ typedef struct grpc_lite_metadata_entry_view {
 uint32_t grpc_lite_abi_version(void);
 /* Returned strings are immutable library-owned storage and must not be freed. */
 const char *grpc_lite_library_version(void);
+/* Reports capabilities usable through this C API, not all compiled transport features. */
 grpc_lite_feature_bits grpc_lite_features(void);
 const char *grpc_lite_error_string(grpc_lite_error error_code);
 
