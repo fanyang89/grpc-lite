@@ -56,6 +56,21 @@ Channel and Server options accept an optional `grpc_lite_logger` for connection 
 GOAWAY, startup, and drain events. The logger configuration is borrowed during handle
 creation; its user data must outlive the owning handle.
 
+`grpc_lite_server_options` and `grpc_lite::ServerOptions` expose finite server admission
+bounds: `max_connections = 1024` across all reactors,
+`max_concurrent_streams_per_connection = 100`,
+`cleartext_preface_timeout_ns = 10000000000`, and
+`connection_idle_timeout_ns = 300000000000`. Every value must be nonzero. The preface
+limit is an absolute cleartext deadline through the initial non-ACK SETTINGS; input does
+not refresh it. Idle means no active inbound RPC streams, so transport traffic does not
+refresh the deadline and any active unary or streaming RPC is exempt.
+
+C callers must initialize `struct_size`. Callers using an older size receive the finite
+resource defaults for missing fields; each appended field is read only when its own end
+offset is present. Excess streams are reset with `REFUSED_STREAM` before SETTINGS is
+acknowledged; exceeding an acknowledged stream limit causes `GOAWAY(PROTOCOL_ERROR)`.
+Idle retirement sends `GOAWAY(NO_ERROR)` before graceful closure.
+
 ## CMake Source Build
 
 The source build compiles checked-in C translations and does not require Zig. It currently

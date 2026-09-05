@@ -129,6 +129,25 @@ listeners, HTTP/2 sessions, connection state, deadline heaps, and write pools. L
 share the IPv4 port with `SO_REUSEPORT`; each connection and all its streams remain on one
 reactor. Multi-core scaling therefore needs multiple client connections or Channels.
 
+Server transport admission is finite by default:
+
+- `max_connections = 1024` caps admitted connections across all reactors. Initializing,
+  draining, and asynchronously closing connections continue to occupy a slot until final
+  destruction.
+- `max_concurrent_streams_per_connection = 100` is advertised exactly as HTTP/2
+  `SETTINGS_MAX_CONCURRENT_STREAMS`. Before the peer acknowledges the setting, excess
+  streams are reset with `REFUSED_STREAM`; exceeding the acknowledged limit is an HTTP/2
+  protocol error and causes GOAWAY.
+- `cleartext_preface_timeout_ns = 10s` is an absolute deadline through receipt of the
+  complete client preface and initial non-ACK SETTINGS. Partial or trickled input does not
+  refresh it.
+- `connection_idle_timeout_ns = 5m` bounds a continuous interval with no active inbound
+  RPC streams. PING, SETTINGS, reads, and writes do not refresh it. Any active unary or
+  streaming RPC disarms idle expiry; after the final stream closes a fresh interval starts.
+  Idle retirement sends `GOAWAY(NO_ERROR)` and closes gracefully.
+
+All four values must be nonzero; there is no unlimited or disabled sentinel.
+
 Each reactor uses a local allocator for connection and stream state. Page refills, large
 allocations, coordinator state, `std.Io.Threaded`, TLS configuration, and cross-thread
 stream commands use a serialized allocator backed by the allocator passed to

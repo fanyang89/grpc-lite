@@ -222,6 +222,10 @@ pub const Options = struct {
     write_low_watermark_bytes: usize = 512 * 1024,
     tls: ?TlsOptions = null,
     logger: event_logger.Logger = .{},
+    max_connections: usize = 1024,
+    max_concurrent_streams_per_connection: u32 = 100,
+    cleartext_preface_timeout_ns: u64 = 10 * std.time.ns_per_s,
+    connection_idle_timeout_ns: u64 = 5 * 60 * std.time.ns_per_s,
 };
 
 pub const LocalAddress = struct {
@@ -235,6 +239,10 @@ pub const Server = struct {
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !Server {
         if (options.reactor_count == 0) return error.InvalidReactorCount;
+        if (options.max_connections == 0) return error.InvalidMaxConnections;
+        if (options.max_concurrent_streams_per_connection == 0) return error.InvalidMaxConcurrentStreams;
+        if (options.cleartext_preface_timeout_ns == 0) return error.InvalidCleartextPrefaceTimeout;
+        if (options.connection_idle_timeout_ns == 0) return error.InvalidConnectionIdleTimeout;
         if (options.tls != null and !build_options.tls) return error.TlsUnavailable;
         if (options.tls) |tls_options| {
             if (tls_options.handshake_timeout_ns == 0) return error.InvalidTlsHandshakeTimeout;
@@ -254,20 +262,21 @@ pub const Server = struct {
         serialized_allocator.* = .init(allocator);
         const reactors = try allocator.alloc(*Impl, options.reactor_count);
         errdefer allocator.free(reactors);
-
-        var initialized: usize = 0;
-        errdefer for (reactors[0..initialized]) |reactor| destroyImpl(reactor);
-        while (initialized < reactors.len) : (initialized += 1) {
-            reactors[initialized] = try initImpl(serialized_allocator.allocator(), options);
-        }
-
         const coordinator = try allocator.create(Coordinator);
         errdefer allocator.destroy(coordinator);
         coordinator.* = .{
             .backing_allocator = allocator,
             .serialized_allocator = serialized_allocator,
             .reactors = reactors,
+            .max_connections = options.max_connections,
         };
+
+        var initialized: usize = 0;
+        errdefer for (reactors[0..initialized]) |reactor| destroyImpl(reactor);
+        while (initialized < reactors.len) : (initialized += 1) {
+            reactors[initialized] = try initImpl(serialized_allocator.allocator(), coordinator, options);
+        }
+
         return .{ .impl = reactors[0], .coordinator = coordinator };
     }
 
@@ -401,6 +410,7 @@ pub const Server = struct {
         const launched_count = coordinator.launched_count;
         coordinator.unlock();
         for (coordinator.reactors[0..launched_count]) |reactor| waitForReactor(reactor);
+        std.debug.assert(coordinator.admitted_connections.load(.acquire) == 0);
         coordinator.lock();
         const log_stopped = coordinator.state != .initialized and coordinator.state != .stopped;
         if (log_stopped) coordinator.state = .stopped;
@@ -551,6 +561,8 @@ const Coordinator = struct {
     drain_timeout_ns: u64 = 0,
     launched_count: usize = 0,
     start_in_progress: bool = false,
+    max_connections: usize,
+    admitted_connections: std.atomic.Value(usize) = .init(0),
 
     fn io(_: *Coordinator) std.Io {
         return syncIo();
@@ -562,6 +574,26 @@ const Coordinator = struct {
 
     fn unlock(self: *Coordinator) void {
         self.mutex.unlock(self.io());
+    }
+
+    fn tryClaimConnection(self: *Coordinator) bool {
+        var current = self.admitted_connections.load(.acquire);
+        while (current < self.max_connections) {
+            if (self.admitted_connections.cmpxchgWeak(
+                current,
+                current + 1,
+                .acq_rel,
+                .acquire,
+            )) |actual| {
+                current = actual;
+            } else return true;
+        }
+        return false;
+    }
+
+    fn releaseConnection(self: *Coordinator) void {
+        const previous = self.admitted_connections.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0 and previous <= self.max_connections);
     }
 };
 
@@ -581,6 +613,7 @@ const StartupError = error{
 const Impl = struct {
     // Shared storage may be touched by application and reactor threads.
     shared_allocator: std.mem.Allocator,
+    coordinator: *Coordinator,
     // Transport state uses this only on the owner reactor, or before start/after join.
     local_allocator_state: ReactorLocalAllocator,
     host: [:0]u8,
@@ -591,6 +624,9 @@ const Impl = struct {
     initial_stream_window_size: u32,
     write_high_watermark_bytes: usize,
     write_low_watermark_bytes: usize,
+    max_concurrent_streams_per_connection: u32,
+    cleartext_preface_timeout_ns: u64,
+    connection_idle_timeout_ns: u64,
     logger: event_logger.Logger,
     handlers: std.StringHashMapUnmanaged(service.UnaryHandler) = .empty,
     stream_handlers: std.StringHashMapUnmanaged(raw_stream.ServerHandler) = .empty,
@@ -727,7 +763,7 @@ const Impl = struct {
     }
 };
 
-fn initImpl(shared_allocator: std.mem.Allocator, options: Options) !*Impl {
+fn initImpl(shared_allocator: std.mem.Allocator, coordinator: *Coordinator, options: Options) !*Impl {
     const impl = try shared_allocator.create(Impl);
     errdefer shared_allocator.destroy(impl);
     const host = try shared_allocator.dupeZ(u8, options.host);
@@ -736,6 +772,7 @@ fn initImpl(shared_allocator: std.mem.Allocator, options: Options) !*Impl {
     errdefer io_threaded.deinit();
     impl.* = .{
         .shared_allocator = shared_allocator,
+        .coordinator = coordinator,
         .local_allocator_state = .init(shared_allocator),
         .host = host,
         .configured_port = options.port,
@@ -745,6 +782,9 @@ fn initImpl(shared_allocator: std.mem.Allocator, options: Options) !*Impl {
         .initial_stream_window_size = options.initial_stream_window_size,
         .write_high_watermark_bytes = options.write_high_watermark_bytes,
         .write_low_watermark_bytes = options.write_low_watermark_bytes,
+        .max_concurrent_streams_per_connection = options.max_concurrent_streams_per_connection,
+        .cleartext_preface_timeout_ns = options.cleartext_preface_timeout_ns,
+        .connection_idle_timeout_ns = options.connection_idle_timeout_ns,
         .logger = options.logger,
         .io_threaded = io_threaded,
         .tls_config = null,
@@ -1383,8 +1423,20 @@ fn streamResumeReceive(context: *anyopaque) !void {
     });
 }
 
+const ConnectionDeadlineKind = enum {
+    tls_handshake,
+    cleartext_preface,
+    idle,
+};
+
+const ConnectionDeadline = struct {
+    kind: ConnectionDeadlineKind,
+    expires_at_ns: u64,
+};
+
 const Connection = struct {
     server: *Impl,
+    owns_admission: bool = false,
     tcp: xev.TCP = undefined,
     session: ?*c.nghttp2_session = null,
     streams: std.AutoHashMapUnmanaged(i32, *Stream) = .empty,
@@ -1412,7 +1464,7 @@ const Connection = struct {
     plaintext_buffer: [16 * 1024]u8 = undefined,
     tls_session: ?*tls_record.Session = null,
     tls_handshaking: bool = false,
-    tls_handshake_deadline_ns: ?u64 = null,
+    connection_deadline: ?ConnectionDeadline = null,
     deadline_heap_index: ?usize = null,
     tls_handshake_needs_write: bool = false,
     tls_plaintext: ?[]u8 = null,
@@ -1440,10 +1492,16 @@ const Connection = struct {
         c.nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, onFrameSent);
         c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, onStreamClose);
         if (c.nghttp2_session_server_new2(&self.session, callbacks, self, options) != 0) return error.OutOfMemory;
-        const settings = [_]c.nghttp2_settings_entry{.{
-            .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
-            .value = self.server.initial_stream_window_size,
-        }};
+        const settings = [_]c.nghttp2_settings_entry{
+            .{
+                .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+                .value = self.server.initial_stream_window_size,
+            },
+            .{
+                .settings_id = c.NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
+                .value = self.server.max_concurrent_streams_per_connection,
+            },
+        };
         if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, &settings, settings.len) != 0) {
             return error.NativeFailure;
         }
@@ -1573,6 +1631,7 @@ const Connection = struct {
                 .complete => {
                     self.tls_handshaking = false;
                     clearConnectionDeadline(self);
+                    try armIdleDeadline(self);
                     try self.flush();
                     try self.receiveTlsPlaintext();
                     return;
@@ -1769,11 +1828,18 @@ const Connection = struct {
         std.debug.assert(self.pending_writes == 0);
         std.debug.assert(self.write_queue.head == null);
         drainWriteRequestPool(self);
+        var removed = false;
         for (server.connections.items, 0..) |item, index| {
             if (item == self) {
                 _ = server.connections.swapRemove(index);
+                removed = true;
                 break;
             }
+        }
+        std.debug.assert(removed);
+        if (self.owns_admission) {
+            self.owns_admission = false;
+            server.coordinator.releaseConnection();
         }
         server.localAllocator().destroy(self);
         finishDrainIfIdle(server);
@@ -1923,17 +1989,33 @@ fn removeStreamDeadline(stream: *Stream) void {
     if (deadlineHeapRemove(server, .{ .stream = stream })) scheduleDeadlineTimer(server);
 }
 
-fn setConnectionDeadline(connection: *Connection, expires_at_ns: u64) !void {
+fn setConnectionDeadline(connection: *Connection, kind: ConnectionDeadlineKind, expires_at_ns: u64) !void {
     try deadlineHeapInsertOrUpdate(connection.server, .{ .connection = connection }, expires_at_ns);
-    connection.tls_handshake_deadline_ns = expires_at_ns;
+    connection.connection_deadline = .{ .kind = kind, .expires_at_ns = expires_at_ns };
     scheduleDeadlineTimer(connection.server);
 }
 
 fn clearConnectionDeadline(connection: *Connection) void {
     const server = connection.server;
     const removed = deadlineHeapRemove(server, .{ .connection = connection });
-    connection.tls_handshake_deadline_ns = null;
+    connection.connection_deadline = null;
     if (removed) scheduleDeadlineTimer(server);
+}
+
+fn serverAcceptsIdleDeadline(server: *Impl) bool {
+    server.lock();
+    defer server.unlock();
+    return server.state == .running and server.shutdown_request == .none;
+}
+
+fn armIdleDeadline(connection: *Connection) !void {
+    if (connection.closing or connection.draining or connection.streams.count() != 0 or
+        !serverAcceptsIdleDeadline(connection.server)) return;
+    try setConnectionDeadline(
+        connection,
+        .idle,
+        connection.server.clock.now() +| connection.server.connection_idle_timeout_ns,
+    );
 }
 
 const WriteRequest = struct {
@@ -2136,23 +2218,31 @@ fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev
         closeListener(server_ptr);
         return .disarm;
     }
+    if (!server_ptr.coordinator.tryClaimConnection()) {
+        closeFd(tcp.fd);
+        return rearmListener(server_ptr);
+    }
     socket_options.enableTcpNoDelay(tcp.fd) catch {
+        server_ptr.coordinator.releaseConnection();
         closeFd(tcp.fd);
         return rearmListener(server_ptr);
     };
     if (comptime builtin.is_test) _ = server_ptr.accepted_connections.fetchAdd(1, .monotonic);
 
     const connection = server_ptr.localAllocator().create(Connection) catch {
+        server_ptr.coordinator.releaseConnection();
         closeFd(tcp.fd);
         return rearmListener(server_ptr);
     };
     connection.* = .{ .server = server_ptr, .tcp = tcp };
     server_ptr.connections.append(server_ptr.localAllocator(), connection) catch {
+        server_ptr.coordinator.releaseConnection();
         closeFd(tcp.fd);
         drainWriteRequestPool(connection);
         server_ptr.localAllocator().destroy(connection);
         return rearmListener(server_ptr);
     };
+    connection.owns_admission = true;
     connection.initializeSession() catch {
         connection.closeOnLoop(loop);
         return rearmListener(server_ptr);
@@ -2166,12 +2256,23 @@ fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev
             connection.tls_handshaking = true;
             setConnectionDeadline(
                 connection,
+                .tls_handshake,
                 server_ptr.clock.now() +| server_ptr.tls_handshake_timeout_ns,
             ) catch {
                 connection.closeOnLoop(loop);
                 return rearmListener(server_ptr);
             };
         }
+    }
+    if (!connection.tls_handshaking) {
+        setConnectionDeadline(
+            connection,
+            .cleartext_preface,
+            server_ptr.clock.now() +| server_ptr.cleartext_preface_timeout_ns,
+        ) catch {
+            connection.closeOnLoop(loop);
+            return rearmListener(server_ptr);
+        };
     }
     connection.startRead(loop) catch connection.closeOnLoop(loop);
     if (connection.tls_handshaking) {
@@ -2708,6 +2809,11 @@ fn cancelStreaming(target: *Stream, reason: raw_stream.ServerTerminalReason) voi
 }
 
 fn beginDrain(server: *Impl) void {
+    for (server.connections.items) |connection| {
+        if (connection.connection_deadline) |value| {
+            if (value.kind != .tls_handshake) clearConnectionDeadline(connection);
+        }
+    }
     if (!server.drain_started) {
         server.drain_started = true;
         closeListener(server);
@@ -2828,13 +2934,24 @@ fn maybeStopLoop(server: *Impl) void {
     if (stopping and server.listener_closed and server.connections.items.len == 0) server.loop.stop();
 }
 
+fn refuseStream(session: ?*c.nghttp2_session, stream_id: i32) c_int {
+    if (c.nghttp2_submit_rst_stream(
+        session,
+        c.NGHTTP2_FLAG_NONE,
+        stream_id,
+        c.NGHTTP2_REFUSED_STREAM,
+    ) != 0) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+}
+
 fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
     const native_frame = received_frame.?;
     if (native_frame.*.hd.type != c.NGHTTP2_HEADERS or native_frame.*.headers.cat != c.NGHTTP2_HCAT_REQUEST) return 0;
     const connection: *Connection = @ptrCast(@alignCast(user_data.?));
-    if (connection.draining) {
-        _ = c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, native_frame.*.hd.stream_id, c.NGHTTP2_REFUSED_STREAM);
-        return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    if (connection.draining or
+        connection.streams.count() >= connection.server.max_concurrent_streams_per_connection)
+    {
+        return refuseStream(session, native_frame.*.hd.stream_id);
     }
     const local_allocator = connection.allocator();
     const stream = local_allocator.create(Stream) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -2844,6 +2961,9 @@ fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp
         local_allocator.destroy(stream);
         return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     };
+    if (connection.connection_deadline) |value| {
+        if (value.kind == .idle) clearConnectionDeadline(connection);
+    }
     connection.highest_accepted_stream_id = @max(connection.highest_accepted_stream_id, stream.id);
     return 0;
 }
@@ -2964,6 +3084,19 @@ fn onDataChunk(
 fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
     const native_frame = received_frame.?;
     const connection: *Connection = @ptrCast(@alignCast(user_data.?));
+    if (native_frame.*.hd.stream_id == 0) {
+        if (native_frame.*.hd.type == c.NGHTTP2_SETTINGS and
+            native_frame.*.hd.flags & c.NGHTTP2_FLAG_ACK == 0)
+        {
+            if (connection.connection_deadline) |value| {
+                if (value.kind == .cleartext_preface) {
+                    clearConnectionDeadline(connection);
+                    armIdleDeadline(connection) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                }
+            }
+        }
+        return 0;
+    }
     const stream = connection.streams.get(native_frame.*.hd.stream_id) orelse return 0;
     if (native_frame.*.hd.type == c.NGHTTP2_HEADERS and stream.request_metadata_invalid and !stream.responded) {
         stream.responded = true;
@@ -3448,7 +3581,11 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, stream_error: u32, user
         }
         _ = retireStream(entry.value);
     }
-    if (connection.draining) finishDrainIfIdle(connection.server);
+    if (connection.draining) {
+        finishDrainIfIdle(connection.server);
+    } else if (connection.streams.count() == 0) {
+        armIdleDeadline(connection) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     return 0;
 }
 
@@ -3516,10 +3653,36 @@ fn expireDeadlines(server: *Impl, now: u64) void {
         const entry = deadlineHeapPop(server).?;
         switch (entry.target) {
             .connection => |connection| {
-                if (connection.tls_handshake_deadline_ns != entry.expires_at_ns) continue;
-                connection.tls_handshake_deadline_ns = null;
-                if (connection.closing or connection.session == null or !connection.tls_handshaking) continue;
-                connection.closeOnLoop(&server.loop);
+                const value = connection.connection_deadline orelse continue;
+                if (value.expires_at_ns != entry.expires_at_ns) continue;
+                connection.connection_deadline = null;
+                if (connection.closing or connection.session == null) continue;
+                server.lock();
+                const shutting_down = server.state != .running or server.shutdown_request != .none;
+                server.unlock();
+                if (shutting_down) continue;
+                switch (value.kind) {
+                    .tls_handshake => {
+                        if (connection.tls_handshaking) connection.closeOnLoop(&server.loop);
+                    },
+                    .cleartext_preface => connection.closeOnLoop(&server.loop),
+                    .idle => {
+                        if (connection.streams.count() != 0 or connection.draining) continue;
+                        connection.draining = true;
+                        connection.submitGoAway(
+                            connection.highest_accepted_stream_id,
+                            c.NGHTTP2_NO_ERROR,
+                        ) catch {
+                            connection.closeOnLoop(&server.loop);
+                            continue;
+                        };
+                        connection.flush() catch {
+                            connection.closeOnLoop(&server.loop);
+                            continue;
+                        };
+                        connection.closeGracefully(&server.loop);
+                    },
+                }
             },
             .stream => |stream| {
                 const value = stream.deadline orelse continue;
@@ -4584,7 +4747,7 @@ test "server deadline heap removes destroyed targets" {
     stream.deinit();
     try std.testing.expectEqual(@as(usize, 0), server.impl.deadline_heap.items.len);
 
-    try setConnectionDeadline(&connection, server.impl.clock.now() +| std.time.ns_per_s);
+    try setConnectionDeadline(&connection, .tls_handshake, server.impl.clock.now() +| std.time.ns_per_s);
     connection.close();
     try std.testing.expectEqual(@as(usize, 0), server.impl.deadline_heap.items.len);
 }
@@ -4714,6 +4877,433 @@ test "server streaming outbound cancellation frees only pending messages" {
     try std.testing.expectEqual(@as(usize, 0), streaming.outbound_head);
     try std.testing.expectEqual(@as(usize, 0), streaming.outbound.items.len);
     try std.testing.expectEqual(capacity, streaming.outbound.capacity);
+}
+
+fn expectInitialMaxConcurrentStreams(options: Options, expected: u32) !void {
+    var server = try Server.init(std.testing.allocator, options);
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer deinitTestConnection(&connection);
+
+    var data: [*c]const u8 = null;
+    const length = c.nghttp2_session_mem_send2(connection.session, &data);
+    try std.testing.expect(length >= 9);
+    const bytes = data[0..@intCast(length)];
+    try std.testing.expectEqual(@as(u8, c.NGHTTP2_SETTINGS), bytes[3]);
+    const payload_length = (@as(usize, bytes[0]) << 16) |
+        (@as(usize, bytes[1]) << 8) |
+        bytes[2];
+    try std.testing.expectEqual(@as(usize, 9) + payload_length, bytes.len);
+    var offset: usize = 9;
+    var found = false;
+    while (offset + 6 <= bytes.len) : (offset += 6) {
+        const settings_id = (@as(u16, bytes[offset]) << 8) | bytes[offset + 1];
+        if (settings_id != c.NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS) continue;
+        const value = (@as(u32, bytes[offset + 2]) << 24) |
+            (@as(u32, bytes[offset + 3]) << 16) |
+            (@as(u32, bytes[offset + 4]) << 8) |
+            bytes[offset + 5];
+        try std.testing.expectEqual(expected, value);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "server resource options are finite and reject zero" {
+    const defaults: Options = .{};
+    try std.testing.expectEqual(@as(usize, 1024), defaults.max_connections);
+    try std.testing.expectEqual(@as(u32, 100), defaults.max_concurrent_streams_per_connection);
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), defaults.cleartext_preface_timeout_ns);
+    try std.testing.expectEqual(@as(u64, 5 * 60 * std.time.ns_per_s), defaults.connection_idle_timeout_ns);
+
+    try std.testing.expectError(error.InvalidMaxConnections, Server.init(std.testing.allocator, .{ .max_connections = 0 }));
+    try std.testing.expectError(error.InvalidMaxConcurrentStreams, Server.init(std.testing.allocator, .{ .max_concurrent_streams_per_connection = 0 }));
+    try std.testing.expectError(error.InvalidCleartextPrefaceTimeout, Server.init(std.testing.allocator, .{ .cleartext_preface_timeout_ns = 0 }));
+    try std.testing.expectError(error.InvalidConnectionIdleTimeout, Server.init(std.testing.allocator, .{ .connection_idle_timeout_ns = 0 }));
+}
+
+test "server resource SETTINGS advertises exact concurrent stream limit" {
+    try expectInitialMaxConcurrentStreams(.{}, 100);
+    try expectInitialMaxConcurrentStreams(.{ .max_concurrent_streams_per_connection = 7 }, 7);
+}
+
+test "server resource stream admission remains bounded before SETTINGS acknowledgement" {
+    var server = try Server.init(std.testing.allocator, .{ .max_concurrent_streams_per_connection = 2 });
+    defer server.deinit();
+    server.impl.state = .running;
+    defer server.impl.state = .initialized;
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer {
+        clearConnectionDeadline(&connection);
+        deinitTestConnection(&connection);
+    }
+    try setConnectionDeadline(&connection, .cleartext_preface, server.impl.clock.now() +| std.time.ns_per_s);
+
+    try feedTestRequest(&connection, .{ .stream_id = 1, .end_stream = false });
+    try feedTestRequest(&connection, .{ .stream_id = 3, .include_preface = false, .end_stream = false });
+    try std.testing.expectEqual(@as(usize, 2), connection.streams.count());
+    try feedTestRequest(&connection, .{ .stream_id = 5, .include_preface = false, .end_stream = false });
+    try std.testing.expectEqual(@as(usize, 2), connection.streams.count());
+    try std.testing.expectEqual(@as(i32, 3), connection.highest_accepted_stream_id);
+    var output: [*c]const u8 = null;
+    var saw_refused_stream = false;
+    while (true) {
+        const length = c.nghttp2_session_mem_send2(connection.session, &output);
+        try std.testing.expect(length >= 0);
+        if (length == 0) break;
+        const bytes = output[0..@intCast(length)];
+        if (bytes.len >= 13 and bytes[3] == c.NGHTTP2_RST_STREAM and bytes[8] == 5) {
+            const code = (@as(u32, bytes[9]) << 24) |
+                (@as(u32, bytes[10]) << 16) |
+                (@as(u32, bytes[11]) << 8) |
+                bytes[12];
+            if (code == c.NGHTTP2_REFUSED_STREAM) saw_refused_stream = true;
+        }
+    }
+    try std.testing.expect(saw_refused_stream);
+
+    const reset = [_]u8{ 0, 0, 4, c.NGHTTP2_RST_STREAM, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
+    const consumed = c.nghttp2_session_mem_recv2(connection.session, &reset, reset.len);
+    try std.testing.expectEqual(@as(c.nghttp2_ssize, reset.len), consumed);
+    try std.testing.expectEqual(@as(usize, 1), connection.streams.count());
+    try feedTestRequest(&connection, .{ .stream_id = 7, .include_preface = false, .end_stream = false });
+    try std.testing.expectEqual(@as(usize, 2), connection.streams.count());
+    try std.testing.expectEqual(@as(i32, 7), connection.highest_accepted_stream_id);
+}
+
+test "server resource acknowledged stream excess emits protocol error GOAWAY" {
+    var server = try Server.init(std.testing.allocator, .{ .max_concurrent_streams_per_connection = 2 });
+    defer server.deinit();
+    server.impl.state = .running;
+    defer server.impl.state = .initialized;
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer {
+        clearConnectionDeadline(&connection);
+        deinitTestConnection(&connection);
+    }
+    var output: [*c]const u8 = null;
+    try std.testing.expect(c.nghttp2_session_mem_send2(connection.session, &output) > 0);
+    try setConnectionDeadline(&connection, .cleartext_preface, server.impl.clock.now() +| std.time.ns_per_s);
+    const preface_and_ack = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{
+        0, 0, 0, c.NGHTTP2_SETTINGS, 0,                  0, 0, 0, 0,
+        0, 0, 0, c.NGHTTP2_SETTINGS, c.NGHTTP2_FLAG_ACK, 0, 0, 0, 0,
+    };
+    const preface_consumed = c.nghttp2_session_mem_recv2(connection.session, preface_and_ack[0..].ptr, preface_and_ack.len);
+    try std.testing.expectEqual(@as(c.nghttp2_ssize, preface_and_ack.len), preface_consumed);
+    try feedTestRequest(&connection, .{ .stream_id = 1, .include_preface = false, .end_stream = false });
+    try feedTestRequest(&connection, .{ .stream_id = 3, .include_preface = false, .end_stream = false });
+
+    var header_block: std.ArrayList(u8) = .empty;
+    defer header_block.deinit(std.testing.allocator);
+    try header_block.appendSlice(std.testing.allocator, &.{ 0x83, 0x86, 0x04, 0x10 });
+    try header_block.appendSlice(std.testing.allocator, "/test.Echo/Unary");
+    try header_block.appendSlice(std.testing.allocator, &.{ 0x01, 0x09 });
+    try header_block.appendSlice(std.testing.allocator, "localhost");
+    try appendTestHeader(&header_block, "content-type", "application/grpc");
+    var excess: std.ArrayList(u8) = .empty;
+    defer excess.deinit(std.testing.allocator);
+    try excess.appendSlice(std.testing.allocator, &.{
+        @intCast(header_block.items.len >> 16),
+        @intCast(header_block.items.len >> 8),
+        @intCast(header_block.items.len),
+        c.NGHTTP2_HEADERS,
+        c.NGHTTP2_FLAG_END_HEADERS,
+        0,
+        0,
+        0,
+        5,
+    });
+    try excess.appendSlice(std.testing.allocator, header_block.items);
+    _ = c.nghttp2_session_mem_recv2(connection.session, excess.items.ptr, excess.items.len);
+    try std.testing.expectEqual(@as(usize, 2), connection.streams.count());
+
+    var saw_protocol_error = false;
+    while (true) {
+        const length = c.nghttp2_session_mem_send2(connection.session, &output);
+        try std.testing.expect(length >= 0);
+        if (length == 0) break;
+        const bytes = output[0..@intCast(length)];
+        if (bytes.len >= 17 and bytes[3] == c.NGHTTP2_GOAWAY) {
+            const code = (@as(u32, bytes[13]) << 24) |
+                (@as(u32, bytes[14]) << 16) |
+                (@as(u32, bytes[15]) << 8) |
+                bytes[16];
+            if (code == c.NGHTTP2_PROTOCOL_ERROR) saw_protocol_error = true;
+        }
+    }
+    try std.testing.expect(saw_protocol_error);
+}
+
+test "server resource cleartext SETTINGS transitions one tagged deadline to idle" {
+    var server = try Server.init(std.testing.allocator, .{ .connection_idle_timeout_ns = 17 });
+    defer server.deinit();
+    server.impl.state = .running;
+    defer server.impl.state = .initialized;
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer {
+        clearConnectionDeadline(&connection);
+        deinitTestConnection(&connection);
+    }
+    try setConnectionDeadline(&connection, .cleartext_preface, server.impl.clock.now() +| std.time.ns_per_s);
+    const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{ 0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0 };
+    for (preface[0 .. preface.len - 1]) |byte| {
+        const consumed = c.nghttp2_session_mem_recv2(connection.session, &byte, 1);
+        try std.testing.expectEqual(@as(c.nghttp2_ssize, 1), consumed);
+        try std.testing.expectEqual(ConnectionDeadlineKind.cleartext_preface, connection.connection_deadline.?.kind);
+    }
+    const final = preface[preface.len - 1];
+    const consumed = c.nghttp2_session_mem_recv2(connection.session, &final, 1);
+    try std.testing.expectEqual(@as(c.nghttp2_ssize, 1), consumed);
+    try std.testing.expectEqual(ConnectionDeadlineKind.idle, connection.connection_deadline.?.kind);
+    try std.testing.expectEqual(@as(usize, 1), server.impl.deadline_heap.items.len);
+}
+
+fn waitForAdmittedConnections(coordinator: *Coordinator, expected: usize) !void {
+    for (0..1000) |_| {
+        if (coordinator.admitted_connections.load(.acquire) == expected) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.TestTimeout;
+}
+
+fn writeTestStream(stream: anytype, io: std.Io, bytes: []const u8) !void {
+    var buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &buffer);
+    writer.interface.writeAll(bytes) catch |err| return writer.err orelse err;
+    writer.interface.flush() catch |err| return writer.err orelse err;
+}
+
+fn readSocketToEof(fd: std.posix.fd_t) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(std.testing.allocator);
+    var buffer: [512]u8 = undefined;
+    for (0..100) |_| {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&poll_fds, 10) == 0) continue;
+        const length = try std.posix.read(fd, &buffer);
+        if (length == 0) return output.toOwnedSlice(std.testing.allocator);
+        try output.appendSlice(std.testing.allocator, buffer[0..length]);
+    }
+    return error.TestTimeout;
+}
+
+fn waitForSocketEof(fd: std.posix.fd_t) !void {
+    const output = try readSocketToEof(fd);
+    std.testing.allocator.free(output);
+}
+
+test "server resource aggregate connection admission spans reactors" {
+    var server = try Server.init(std.testing.allocator, .{
+        .reactor_count = 2,
+        .max_connections = 1,
+        .cleartext_preface_timeout_ns = std.time.ns_per_s,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const local_address = try server.localAddress();
+    const address = try std.Io.net.IpAddress.parseIp4(local_address.host, local_address.port);
+    var io_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+    const first = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+    try waitForAdmittedConnections(server.coordinator, 1);
+    try writeTestStream(first, io, "P");
+
+    const excess_one = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+    const excess_two = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake);
+    try std.testing.expectEqual(@as(usize, 1), server.coordinator.admitted_connections.load(.acquire));
+    excess_one.close(io);
+    excess_two.close(io);
+
+    first.close(io);
+    try waitForAdmittedConnections(server.coordinator, 0);
+    const replacement = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+    defer replacement.close(io);
+    try waitForAdmittedConnections(server.coordinator, 1);
+}
+
+test "server resource silent and incomplete cleartext prefaces expire" {
+    var server = try Server.init(std.testing.allocator, .{
+        .cleartext_preface_timeout_ns = 20 * std.time.ns_per_ms,
+        .connection_idle_timeout_ns = std.time.ns_per_s,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const local_address = try server.localAddress();
+    const address = try std.Io.net.IpAddress.parseIp4(local_address.host, local_address.port);
+    var io_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+    const cases = [_][]const u8{
+        "",
+        "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{ 0, 0, 0, c.NGHTTP2_SETTINGS },
+    };
+    for (cases) |input| {
+        const stream = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+        defer stream.close(io);
+        if (input.len != 0) try writeTestStream(stream, io, input);
+        try waitForSocketEof(stream.socket.handle);
+    }
+
+    const slow = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+    defer slow.close(io);
+    const magic = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    for (magic[0 .. magic.len - 1]) |byte| {
+        writeTestStream(slow, io, &.{byte}) catch break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    }
+    try waitForSocketEof(slow.socket.handle);
+}
+
+test "server resource fragmented valid cleartext preface survives into idle" {
+    var server = try Server.init(std.testing.allocator, .{
+        .cleartext_preface_timeout_ns = 40 * std.time.ns_per_ms,
+        .connection_idle_timeout_ns = std.time.ns_per_s,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const local_address = try server.localAddress();
+    const address = try std.Io.net.IpAddress.parseIp4(local_address.host, local_address.port);
+    var io_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+    const stream = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+    defer stream.close(io);
+    const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{ 0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0 };
+    var offset: usize = 0;
+    while (offset < preface.len) {
+        const end = @min(offset + 7, preface.len);
+        try writeTestStream(stream, io, preface[offset..end]);
+        offset = end;
+    }
+    try waitForAdmittedConnections(server.coordinator, 1);
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(80), .awake);
+    try std.testing.expectEqual(@as(usize, 1), server.coordinator.admitted_connections.load(.acquire));
+}
+
+test "server resource PING traffic does not refresh idle expiry" {
+    var server = try Server.init(std.testing.allocator, .{
+        .cleartext_preface_timeout_ns = std.time.ns_per_s,
+        .connection_idle_timeout_ns = 30 * std.time.ns_per_ms,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const local_address = try server.localAddress();
+    const address = try std.Io.net.IpAddress.parseIp4(local_address.host, local_address.port);
+    var io_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+    const stream = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+    defer stream.close(io);
+    const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{ 0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0 };
+    try writeTestStream(stream, io, preface);
+    const ping = [_]u8{
+        0, 0, 8, c.NGHTTP2_PING, 0, 0, 0, 0, 0,
+        1, 2, 3, 4,              5, 6, 7, 8,
+    };
+    for (0..4) |_| {
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
+        try writeTestStream(stream, io, &ping);
+    }
+    const output = try readSocketToEof(stream.socket.handle);
+    defer std.testing.allocator.free(output);
+    var offset: usize = 0;
+    var saw_no_error_goaway = false;
+    while (offset + 9 <= output.len) {
+        const payload_length = (@as(usize, output[offset]) << 16) |
+            (@as(usize, output[offset + 1]) << 8) |
+            output[offset + 2];
+        const end = offset + 9 + payload_length;
+        try std.testing.expect(end <= output.len);
+        if (output[offset + 3] == c.NGHTTP2_GOAWAY and payload_length >= 8) {
+            const code = (@as(u32, output[offset + 13]) << 24) |
+                (@as(u32, output[offset + 14]) << 16) |
+                (@as(u32, output[offset + 15]) << 8) |
+                output[offset + 16];
+            if (code == c.NGHTTP2_NO_ERROR) saw_no_error_goaway = true;
+        }
+        offset = end;
+    }
+    try std.testing.expectEqual(output.len, offset);
+    try std.testing.expect(saw_no_error_goaway);
+}
+
+test "server resource active stream is idle-exempt until final close" {
+    var server = try Server.init(std.testing.allocator, .{
+        .cleartext_preface_timeout_ns = std.time.ns_per_s,
+        .connection_idle_timeout_ns = 20 * std.time.ns_per_ms,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const local_address = try server.localAddress();
+    const address = try std.Io.net.IpAddress.parseIp4(local_address.host, local_address.port);
+    var io_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+    const stream = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+    defer stream.close(io);
+    const header_block = [_]u8{
+        0x83, 0x86, 0x04, 0x10,
+    } ++ "/test.Echo/Unary" ++ [_]u8{
+        0x01, 0x09,
+    } ++ "localhost" ++ [_]u8{
+        0x0f, 0x10, 0x10,
+    } ++ "application/grpc";
+    const request = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{
+        0,                                0,                               0,                          c.NGHTTP2_SETTINGS, 0,                          0, 0, 0, 0,
+        @intCast(header_block.len >> 16), @intCast(header_block.len >> 8), @intCast(header_block.len), c.NGHTTP2_HEADERS,  c.NGHTTP2_FLAG_END_HEADERS, 0, 0, 0, 1,
+    } ++ header_block;
+    try writeTestStream(stream, io, request);
+    try waitForAdmittedConnections(server.coordinator, 1);
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(60), .awake);
+    try std.testing.expectEqual(@as(usize, 1), server.coordinator.admitted_connections.load(.acquire));
+
+    const reset = [_]u8{ 0, 0, 4, c.NGHTTP2_RST_STREAM, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
+    try writeTestStream(stream, io, &reset);
+    try waitForSocketEof(stream.socket.handle);
+}
+
+test "server resource shutdown releases preface admission and deadlines" {
+    for ([_]bool{ false, true }) |graceful| {
+        var server = try Server.init(std.testing.allocator, .{
+            .max_connections = 1,
+            .cleartext_preface_timeout_ns = std.time.ns_per_s,
+        });
+        defer server.deinit();
+        try server.start();
+        const local_address = try server.localAddress();
+        const address = try std.Io.net.IpAddress.parseIp4(local_address.host, local_address.port);
+        var io_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+        defer io_threaded.deinit();
+        const io = io_threaded.io();
+        const stream = try address.connect(io, .{ .mode = .stream, .timeout = .none });
+        defer stream.close(io);
+        try waitForAdmittedConnections(server.coordinator, 1);
+        if (graceful)
+            server.shutdownGracefully(std.time.ns_per_s)
+        else
+            server.shutdown();
+        server.wait();
+        try std.testing.expectEqual(@as(usize, 0), server.coordinator.admitted_connections.load(.acquire));
+        for (server.coordinator.reactors) |reactor| {
+            try std.testing.expectEqual(@as(usize, 0), reactor.deadline_heap.items.len);
+        }
+    }
 }
 
 test "malformed HTTP/2 settings close the connection promptly" {

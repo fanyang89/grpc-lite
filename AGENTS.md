@@ -76,6 +76,7 @@ authoritative: change it before implementing a feature with a different decision
 | Per-message compression | Selected | Only `identity` and `gzip` |
 | GOAWAY connection replacement | Selected | New calls use a new connection; no RPC retry |
 | Graceful server drain | Selected | Stop admission, send GOAWAY, wait with timeout |
+| Server resource limits | Selected | Aggregate connection cap, per-connection stream cap, absolute cleartext preface timeout, and idle timeout only while no inbound RPC streams are active |
 | TLS and ALPN | Selected | Optional mbedTLS; TLS 1.2+, mandatory `h2`, explicit PEM credentials |
 | mTLS | Out of scope | Client certificates and server-side client verification are not required |
 | DNS | Selected | c-ares on Linux io_uring; client IPv4 hostnames only |

@@ -14,7 +14,7 @@ const Status = @import("status.zig").Status;
 const version = @import("version.zig");
 
 pub const abi_major: u16 = 1;
-pub const abi_minor: u16 = 5;
+pub const abi_minor: u16 = 6;
 
 pub const Error = enum(i32) {
     ok = 0,
@@ -115,6 +115,10 @@ pub const ServerOptions = extern struct {
     max_inbound_buffer_size: u64 = 8 * 1024 * 1024,
     max_outbound_buffer_size: u64 = 8 * 1024 * 1024,
     logger: ?*const Logger = null,
+    max_connections: u64 = 1024,
+    cleartext_preface_timeout_ns: u64 = 10 * std.time.ns_per_s,
+    connection_idle_timeout_ns: u64 = 5 * 60 * std.time.ns_per_s,
+    max_concurrent_streams_per_connection: u32 = 100,
 };
 
 pub const ServerMethodOptions = extern struct {
@@ -166,6 +170,11 @@ const ServerCallStorage = struct {
 const client_stream_options_v1_size = @offsetOf(ClientStreamOptions, "max_outbound_buffer_size") + @sizeOf(u64);
 const client_stream_callbacks_v1_size = @offsetOf(ClientStreamCallbacks, "on_terminal") + @sizeOf(?*const fn (?*anyopaque, *ClientStreamHandle, i32, BytesView, *const MetadataViewHandle) callconv(.c) void);
 const server_options_v1_size = @offsetOf(ServerOptions, "max_outbound_buffer_size") + @sizeOf(u64);
+const server_options_logger_size = @offsetOf(ServerOptions, "logger") + @sizeOf(?*const Logger);
+const server_options_max_connections_size = @offsetOf(ServerOptions, "max_connections") + @sizeOf(u64);
+const server_options_preface_timeout_size = @offsetOf(ServerOptions, "cleartext_preface_timeout_ns") + @sizeOf(u64);
+const server_options_idle_timeout_size = @offsetOf(ServerOptions, "connection_idle_timeout_ns") + @sizeOf(u64);
+const server_options_max_streams_size = @offsetOf(ServerOptions, "max_concurrent_streams_per_connection") + @sizeOf(u32);
 const server_method_options_v1_size = @offsetOf(ServerMethodOptions, "explicit_initial_metadata") + @sizeOf(u32);
 const server_method_callbacks_v1_size = @offsetOf(ServerMethodCallbacks, "on_terminal") + @sizeOf(?*const fn (?*anyopaque, usize, u32) callconv(.c) void);
 const channel_options_v1_size = @offsetOf(ChannelOptions, "jitter_percent") + @sizeOf(u32);
@@ -870,6 +879,10 @@ fn mapServerError(err: anyerror) Error {
         => .invalid_state,
         error.InvalidMethodPath,
         error.InvalidReactorCount,
+        error.InvalidMaxConnections,
+        error.InvalidMaxConcurrentStreams,
+        error.InvalidCleartextPrefaceTimeout,
+        error.InvalidConnectionIdleTimeout,
         error.InvalidMaxMessageSize,
         error.InvalidInboundBufferSize,
         error.InvalidOutboundBufferSize,
@@ -1093,7 +1106,7 @@ fn parseServerOptions(pointer: ?*const ServerOptions) ?@import("server.zig").Opt
         value.max_inbound_buffer_size > std.math.maxInt(usize) or
         value.max_outbound_buffer_size > std.math.maxInt(usize)) return null;
     const host = bytes(value.host) orelse return null;
-    return .{
+    var parsed: @import("server.zig").Options = .{
         .host = host,
         .port = @intCast(value.port),
         .reactor_count = value.reactor_count,
@@ -1103,11 +1116,28 @@ fn parseServerOptions(pointer: ?*const ServerOptions) ?@import("server.zig").Opt
             .max_inbound_buffer_size = @intCast(value.max_inbound_buffer_size),
             .max_outbound_buffer_size = @intCast(value.max_outbound_buffer_size),
         },
-        .logger = if (value.struct_size >= @sizeOf(ServerOptions))
+        .logger = if (value.struct_size >= server_options_logger_size)
             parseLogger(value.logger) orelse return null
         else
             .{},
     };
+    if (value.struct_size >= server_options_max_connections_size) {
+        if (value.max_connections == 0 or value.max_connections > std.math.maxInt(usize)) return null;
+        parsed.max_connections = @intCast(value.max_connections);
+    }
+    if (value.struct_size >= server_options_preface_timeout_size) {
+        if (value.cleartext_preface_timeout_ns == 0) return null;
+        parsed.cleartext_preface_timeout_ns = value.cleartext_preface_timeout_ns;
+    }
+    if (value.struct_size >= server_options_idle_timeout_size) {
+        if (value.connection_idle_timeout_ns == 0) return null;
+        parsed.connection_idle_timeout_ns = value.connection_idle_timeout_ns;
+    }
+    if (value.struct_size >= server_options_max_streams_size) {
+        if (value.max_concurrent_streams_per_connection == 0) return null;
+        parsed.max_concurrent_streams_per_connection = value.max_concurrent_streams_per_connection;
+    }
+    return parsed;
 }
 
 fn parseLogger(pointer: ?*const Logger) ?event_logger.Logger {
@@ -1208,6 +1238,63 @@ test "C logger validates layout and channel option compatibility" {
     server_options.struct_size = @sizeOf(ServerOptions);
     logger.struct_size = @sizeOf(Logger) - 1;
     try std.testing.expectEqual(null, parseServerOptions(&server_options));
+}
+
+test "C server options preserve legacy layouts and bound appended reads" {
+    const Callback = struct {
+        fn log(_: ?*anyopaque, _: u32, _: BytesView) callconv(.c) void {}
+    };
+    const logger: Logger = .{ .log = Callback.log };
+    var options: ServerOptions = .{
+        .logger = &logger,
+        .max_connections = 17,
+        .cleartext_preface_timeout_ns = 23,
+        .connection_idle_timeout_ns = 29,
+        .max_concurrent_streams_per_connection = 31,
+    };
+
+    options.struct_size = server_options_v1_size;
+    var parsed = parseServerOptions(&options).?;
+    try std.testing.expect(parsed.logger.callback == null);
+    try std.testing.expectEqual(@as(usize, 1024), parsed.max_connections);
+    try std.testing.expectEqual(@as(u32, 100), parsed.max_concurrent_streams_per_connection);
+
+    options.struct_size = server_options_logger_size;
+    parsed = parseServerOptions(&options).?;
+    try std.testing.expect(parsed.logger.callback != null);
+    try std.testing.expectEqual(@as(usize, 1024), parsed.max_connections);
+
+    options.struct_size = server_options_max_connections_size;
+    parsed = parseServerOptions(&options).?;
+    try std.testing.expectEqual(@as(usize, 17), parsed.max_connections);
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), parsed.cleartext_preface_timeout_ns);
+
+    options.struct_size = server_options_preface_timeout_size;
+    parsed = parseServerOptions(&options).?;
+    try std.testing.expectEqual(@as(u64, 23), parsed.cleartext_preface_timeout_ns);
+    try std.testing.expectEqual(@as(u64, 5 * 60 * std.time.ns_per_s), parsed.connection_idle_timeout_ns);
+
+    options.struct_size = server_options_idle_timeout_size;
+    parsed = parseServerOptions(&options).?;
+    try std.testing.expectEqual(@as(u64, 29), parsed.connection_idle_timeout_ns);
+    try std.testing.expectEqual(@as(u32, 100), parsed.max_concurrent_streams_per_connection);
+
+    options.struct_size = server_options_max_streams_size;
+    parsed = parseServerOptions(&options).?;
+    try std.testing.expectEqual(@as(u32, 31), parsed.max_concurrent_streams_per_connection);
+
+    const invalid = [_]ServerOptions{
+        .{ .max_connections = 0 },
+        .{ .cleartext_preface_timeout_ns = 0 },
+        .{ .connection_idle_timeout_ns = 0 },
+        .{ .max_concurrent_streams_per_connection = 0 },
+    };
+    for (&invalid) |*value| try std.testing.expectEqual(null, parseServerOptions(value));
+
+    if (comptime @sizeOf(usize) < @sizeOf(u64)) {
+        var overflow: ServerOptions = .{ .max_connections = std.math.maxInt(u64) };
+        try std.testing.expectEqual(null, parseServerOptions(&overflow));
+    }
 }
 
 test "C server reports ordered lifecycle logs" {
