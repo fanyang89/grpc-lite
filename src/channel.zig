@@ -6835,6 +6835,59 @@ test "channel and server exchange a unary call over TLS" {
     try std.testing.expectEqualStrings("secure", result.payload);
 }
 
+test "TLS channel replaces a server-idle connection for a later RPC" {
+    if (!build_options.tls) return error.SkipZigTest;
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const certificate = @embedFile("testdata/localhost-cert.pem");
+    const private_key = @embedFile("testdata/localhost-key.pem");
+
+    const Handler = struct {
+        fn handle(
+            _: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{
+        .connection_idle_timeout_ns = 20 * std.time.ns_per_ms,
+        .tls = .{
+            .certificate_chain_pem = certificate,
+            .private_key_pem = private_key,
+        },
+    });
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Tls/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var runtime = try Runtime.init();
+    defer runtime.deinit();
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .runtime = &runtime,
+        .tls = .{ .ca_certificates_pem = certificate },
+    });
+    defer channel.deinit();
+
+    var first = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "first", .{});
+    defer first.deinit();
+    try std.testing.expect(first.status.isOk());
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake);
+    var second = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "second", .{});
+    defer second.deinit();
+    try std.testing.expect(second.status.isOk());
+    try std.testing.expectEqualStrings("second", second.payload);
+}
+
 test "TLS channel initialization times out against a silent peer" {
     if (!build_options.tls) return error.SkipZigTest;
     const certificate = @embedFile("testdata/localhost-cert.pem");

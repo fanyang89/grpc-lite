@@ -82,6 +82,10 @@ int main(void) {
   assert(stream_options.struct_size == sizeof(stream_options));
   assert(callbacks.struct_size == sizeof(callbacks));
   assert(server_options.struct_size == sizeof(server_options));
+  assert(server_options.max_connections == UINT64_C(1024));
+  assert(server_options.max_concurrent_streams_per_connection == 100);
+  assert(server_options.cleartext_preface_timeout_ns == UINT64_C(10000000000));
+  assert(server_options.connection_idle_timeout_ns == UINT64_C(300000000000));
   assert(method_options.struct_size == sizeof(method_options));
   assert(method_callbacks.struct_size == sizeof(method_callbacks));
   assert(options.max_response_size == UINT64_C(4194304));

@@ -31,6 +31,10 @@ struct ServerOptions {
   std::uint64_t max_inbound_buffer_size = UINT64_C(8388608);
   std::uint64_t max_outbound_buffer_size = UINT64_C(8388608);
   Logger logger;
+  std::uint64_t max_connections = UINT64_C(1024);
+  std::uint64_t cleartext_preface_timeout_ns = UINT64_C(10000000000);
+  std::uint64_t connection_idle_timeout_ns = UINT64_C(300000000000);
+  std::uint32_t max_concurrent_streams_per_connection = 100;
 };
 
 struct ServerMethodOptions {
@@ -201,6 +205,12 @@ class Server {
     c_options.max_inbound_buffer_size = options.max_inbound_buffer_size;
     c_options.max_outbound_buffer_size = options.max_outbound_buffer_size;
     c_options.logger = logger == nullptr ? nullptr : &c_logger;
+    c_options.max_connections = options.max_connections;
+    c_options.cleartext_preface_timeout_ns =
+        options.cleartext_preface_timeout_ns;
+    c_options.connection_idle_timeout_ns = options.connection_idle_timeout_ns;
+    c_options.max_concurrent_streams_per_connection =
+        options.max_concurrent_streams_per_connection;
 
     grpc_lite_server* server = nullptr;
     const Error error(grpc_lite_server_create(&c_options, &server));

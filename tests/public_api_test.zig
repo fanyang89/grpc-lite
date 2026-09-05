@@ -42,4 +42,10 @@ test "stable public API compiles for downstream consumers" {
     _ = try std.SemanticVersion.parse(grpc.version);
     const channel_options: grpc.ChannelOptions = .{};
     try std.testing.expectEqualStrings("grpc-lite/" ++ grpc.version, channel_options.user_agent);
+
+    const server_options: grpc.ServerOptions = .{};
+    try std.testing.expectEqual(@as(usize, 1024), server_options.max_connections);
+    try std.testing.expectEqual(@as(u32, 100), server_options.max_concurrent_streams_per_connection);
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), server_options.cleartext_preface_timeout_ns);
+    try std.testing.expectEqual(@as(u64, 5 * 60 * std.time.ns_per_s), server_options.connection_idle_timeout_ns);
 }

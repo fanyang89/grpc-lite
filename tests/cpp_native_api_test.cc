@@ -112,6 +112,12 @@ void TestRoundTrip() {
   std::atomic<int> log_count{0};
   Server server;
   grpc_lite::ServerOptions server_options;
+  assert(server_options.max_connections == UINT64_C(1024));
+  assert(server_options.max_concurrent_streams_per_connection == 100);
+  assert(server_options.cleartext_preface_timeout_ns == UINT64_C(10000000000));
+  assert(server_options.connection_idle_timeout_ns == UINT64_C(300000000000));
+  server_options.max_connections = UINT64_C(2048);
+  server_options.max_concurrent_streams_per_connection = 128;
   server_options.logger = [&log_count](grpc_lite::LogLevel,
                                         std::string_view) {
     log_count.fetch_add(1, std::memory_order_relaxed);

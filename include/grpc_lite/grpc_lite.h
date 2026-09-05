@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define GRPC_LITE_ABI_MAJOR 1u
-#define GRPC_LITE_ABI_MINOR 5u
+#define GRPC_LITE_ABI_MINOR 6u
 #define GRPC_LITE_ABI_VERSION \
   ((GRPC_LITE_ABI_MAJOR << 16) | GRPC_LITE_ABI_MINOR)
 
@@ -289,12 +289,22 @@ typedef struct grpc_lite_server_options {
   uint64_t max_inbound_buffer_size;
   uint64_t max_outbound_buffer_size;
   const grpc_lite_logger *logger;
+  /* Aggregate across every reactor owned by this server. */
+  uint64_t max_connections;
+  /* Absolute cleartext deadline through the initial non-ACK SETTINGS. */
+  uint64_t cleartext_preface_timeout_ns;
+  /* Maximum continuous interval with no active inbound RPC streams. */
+  uint64_t connection_idle_timeout_ns;
+  /* Simultaneous inbound HTTP/2 request streams on one connection. */
+  uint32_t max_concurrent_streams_per_connection;
 } grpc_lite_server_options;
 
+/* Resource limits and timeouts are finite and must all be nonzero. */
 #define GRPC_LITE_SERVER_OPTIONS_INIT \
   { sizeof(grpc_lite_server_options), \
     { (const uint8_t *)"127.0.0.1", sizeof("127.0.0.1") - 1 }, 0, 1, \
-    UINT64_C(4194304), UINT64_C(8388608), UINT64_C(8388608), NULL }
+    UINT64_C(4194304), UINT64_C(8388608), UINT64_C(8388608), NULL, \
+    UINT64_C(1024), UINT64_C(10000000000), UINT64_C(300000000000), 100 }
 
 typedef struct grpc_lite_server_method_options {
   size_t struct_size;
