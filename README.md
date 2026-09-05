@@ -17,7 +17,7 @@ wire bytes, explicit allocators, deterministic teardown, and bounded backpressur
 | Transport | Runtime | Integration |
 | --- | --- | --- |
 | Unary and full-duplex streaming | Persistent multiplexed channels | Raw Zig and stable C APIs |
-| Cleartext HTTP/2 and optional TLS | IPv4 DNS through c-ares | Typed zig-protobuf adapters |
+| Cleartext HTTP/2 and optional native Zig TLS | IPv4 DNS through c-ares | Typed zig-protobuf adapters |
 | Deadlines and cancellation | GOAWAY replacement and reconnect | Focused grpcpp-shaped C++ facade |
 | ASCII and binary metadata | Graceful server drain | CMake builds from release-generated C without Zig |
 | Per-message identity or gzip | Multi-reactor Linux servers | Generated C++ service glue |
@@ -60,10 +60,12 @@ and extract it, then configure the source tree with
 `-DGRPC_LITE_TRANSPILED_C_DIR=<extracted-root>`.
 
 The generated-only asset supports insecure Linux x86_64 and contains no third-party
-dependencies. A fully offline configure must also provide hashed local `file://` archives
-for nghttp2 and c-ares and set `GRPC_LITE_NO_NETWORK=ON`. `sha256sum --check` detects
-corruption, but a checksum hosted beside an asset is not by itself publisher
-authentication.
+dependencies. TLS is out of scope for this transpiled-C release bundle until separately
+selected; the CMake source build rejects `GRPC_LITE_ENABLE_TLS=ON`. This bundle decision
+does not affect optional TLS in the native Zig build. A fully offline configure must also
+provide hashed local `file://` archives for nghttp2 and c-ares and set
+`GRPC_LITE_NO_NETWORK=ON`. `sha256sum --check` detects corruption, but a checksum hosted
+beside an asset is not by itself publisher authentication.
 
 Typed generated C++ services keep the official Protobuf runtime as an explicit external
 dependency; the raw transport and grpcpp-shaped facade do not require Protobuf or
@@ -82,7 +84,8 @@ official grpc-go peers and public HTTP/2 framing suites on x86_64 and arm64.
 | Raw unary and all streaming cardinalities | Supported |
 | Typed zig-protobuf unary and streaming | Supported |
 | Metadata, deadlines, gzip, GOAWAY, drain | Supported |
-| TLS 1.2+, ALPN `h2`, explicit PEM credentials | Optional |
+| Native Zig TLS 1.2+, ALPN `h2`, explicit PEM credentials | Optional |
+| Transpiled-C release bundle TLS | Out of scope |
 | grpcpp-shaped synchronous common API | Selected subset |
 | Official Protobuf C++ runtime | Optional external typed-code dependency |
 | General Abseil compatibility | Out of scope |

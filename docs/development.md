@@ -79,9 +79,12 @@ CI consumes the exact archive in a separate environment where Zig is absent and 
 network is disabled. Git checkouts and GitHub automatic “Source code” archives do not
 support no-Zig CMake by themselves: consumers must extract the same-version asset and
 pass `GRPC_LITE_TRANSPILED_C_DIR`. The asset is insecure Linux x86_64 only and includes
-no nghttp2 or c-ares sources. Fully offline builds must stage those dependencies as
-hashed `file://` archives and set `GRPC_LITE_NO_NETWORK=ON`. A colocated SHA-256 sidecar
-detects corruption but is not, by itself, publisher authentication.
+no nghttp2 or c-ares sources. TLS is out of scope for this transpiled-C release bundle
+until separately selected, so CMake rejects `GRPC_LITE_ENABLE_TLS=ON`. Native Zig TLS
+remains selected and is validated by the separate TLS tasks above. Fully offline builds
+must stage those dependencies as hashed `file://` archives and set
+`GRPC_LITE_NO_NETWORK=ON`. A colocated SHA-256 sidecar detects corruption but is not, by
+itself, publisher authentication.
 
 ## Coverage
 
