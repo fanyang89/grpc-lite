@@ -6,17 +6,15 @@ from pathlib import Path
 
 
 REQUIRED_PASSES = {
+    "TestSoonAllSettingsFramesAcked",
     "TestSoonClientPrefaceWithStreamId",
     "TestSoonClientShortSettings",
     "TestSoonShortPreface",
-    "TestSoonUnknownFrameType",
-    "TestSoonAllSettingsFramesAcked",
-    "TestSoonTLSApplicationProtocol",
-    "TestSoonTLSMaxVersion",
-    "TestSoonTLSBadCipherSuites",
-}
-UPSTREAM_HARNESS_LIMITATIONS = {
     "TestSoonSmallMaxFrameSize",
+    "TestSoonTLSApplicationProtocol",
+    "TestSoonTLSBadCipherSuites",
+    "TestSoonTLSMaxVersion",
+    "TestSoonUnknownFrameType",
 }
 
 
@@ -42,10 +40,9 @@ def validate(reports: list[dict]) -> list[str]:
         for entry in entries:
             entries_by_name.setdefault(entry.get("name"), []).append(entry)
 
-    expected = REQUIRED_PASSES | UPSTREAM_HARNESS_LIMITATIONS
     errors.extend(
         f"missing expected case: {name}"
-        for name in sorted(expected - entries_by_name.keys())
+        for name in sorted(REQUIRED_PASSES - entries_by_name.keys())
     )
 
     for name in sorted(REQUIRED_PASSES & entries_by_name.keys()):
@@ -55,14 +52,7 @@ def validate(reports: list[dict]) -> list[str]:
         elif not active[0].get("passed"):
             errors.append(f"required framing case did not pass: {name}")
 
-    for name in sorted(UPSTREAM_HARNESS_LIMITATIONS & entries_by_name.keys()):
-        active = [entry for entry in entries_by_name[name] if not entry.get("skipped")]
-        if len(active) != 1:
-            errors.append(f"upstream harness limitation did not run exactly once: {name}")
-        elif active[0].get("passed"):
-            errors.append(f"upstream harness limitation unexpectedly passed: {name}")
-
-    for name in sorted(entries_by_name.keys() - expected):
+    for name in sorted(entries_by_name.keys() - REQUIRED_PASSES):
         active = [entry for entry in entries_by_name[name] if not entry.get("skipped")]
         if len(active) != 1:
             errors.append(f"new framing case did not run exactly once: {name}")
@@ -89,11 +79,7 @@ def main() -> int:
             print(error, file=sys.stderr)
         return 1
 
-    limitations = sorted(UPSTREAM_HARNESS_LIMITATIONS)
-    print(
-        "HTTP/2 framing and TLS reports validated; upstream harness limitations: "
-        + ", ".join(limitations)
-    )
+    print("HTTP/2 framing and TLS reports validated; all required cases passed")
     return 0
 
 

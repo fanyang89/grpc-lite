@@ -66,6 +66,8 @@ cp -R "$module_dir" "$harness_dir"
 chmod -R u+w "$harness_dir"
 patch -d "$harness_dir" -p1 --fuzz=0 --forward --batch \
   <"$project_root/tests/official/http2_interop_go1.26.patch"
+patch -d "$harness_dir" -p1 --fuzz=0 --forward --batch \
+  <"$project_root/tests/official/http2_interop_goaway.patch"
 mkdir -p "$harness_dir/src/core/tsi/test_creds"
 cp "$certificate" "$harness_dir/src/core/tsi/test_creds/ca.pem"
 
