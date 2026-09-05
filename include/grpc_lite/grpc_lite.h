@@ -143,11 +143,13 @@ typedef struct grpc_lite_channel_options {
   uint32_t multiplier_millis;
   uint32_t jitter_percent;
   const grpc_lite_logger *logger;
+  /* Finite cumulative response metadata limit; valid range is 1..UINT32_MAX. */
+  uint64_t max_response_header_list_size;
 } grpc_lite_channel_options;
 
 #define GRPC_LITE_CHANNEL_OPTIONS_INIT \
   { sizeof(grpc_lite_channel_options), 0, UINT64_C(1000000000), \
-    UINT64_C(120000000000), 1600, 20, NULL }
+    UINT64_C(120000000000), 1600, 20, NULL, UINT64_C(65536) }
 
 /* Creates a connected insecure channel. Hostnames require a Runtime. */
 grpc_lite_error grpc_lite_channel_create(

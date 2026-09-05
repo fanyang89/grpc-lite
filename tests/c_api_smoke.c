@@ -94,6 +94,7 @@ int main(void) {
   assert(channel_options.max_backoff_ns == UINT64_C(120000000000));
   assert(channel_options.multiplier_millis == 1600);
   assert(channel_options.jitter_percent == 20);
+  assert(channel_options.max_response_header_list_size == UINT64_C(65536));
   assert(grpc_lite_unary_result_status_code(NULL) == 2);
 
   grpc_lite_metadata *metadata = NULL;

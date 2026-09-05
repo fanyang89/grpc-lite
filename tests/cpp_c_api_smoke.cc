@@ -28,6 +28,9 @@ static_assert(offsetof(grpc_lite_channel_options, multiplier_millis) ==
               offsetof(grpc_lite_channel_options, max_backoff_ns) + 8);
 static_assert(offsetof(grpc_lite_channel_options, jitter_percent) ==
               offsetof(grpc_lite_channel_options, multiplier_millis) + 4);
+static_assert(offsetof(grpc_lite_channel_options,
+                       max_response_header_list_size) ==
+              offsetof(grpc_lite_channel_options, logger) + sizeof(void *));
 
 int main() {
   grpc_lite_unary_options options = GRPC_LITE_UNARY_OPTIONS_INIT;
@@ -63,6 +66,7 @@ int main() {
   if ((grpc_lite_features() & GRPC_LITE_FEATURE_LOGGING_CALLBACK) == 0) return 6;
   assert(channel_options.initial_backoff_ns == UINT64_C(1000000000));
   assert(channel_options.max_backoff_ns == UINT64_C(120000000000));
+  assert(channel_options.max_response_header_list_size == UINT64_C(65536));
   grpc_lite_channel *channel = reinterpret_cast<grpc_lite_channel *>(1);
   const grpc_lite_bytes_view invalid_target = {
       reinterpret_cast<const std::uint8_t *>("invalid"), 7};

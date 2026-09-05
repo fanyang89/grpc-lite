@@ -72,6 +72,8 @@ void TestInvalidObjects() {
   auto logger_token = std::make_shared<int>(1);
   std::weak_ptr<int> weak = logger_token;
   grpc_lite::ChannelOptions options;
+  assert(options.max_response_header_list_size == UINT64_C(65536));
+  options.max_response_header_list_size = 4096;
   options.logger = [token = std::move(logger_token)](
                        grpc_lite::LogLevel, std::string_view) {};
   Channel channel;

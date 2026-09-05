@@ -71,6 +71,14 @@ offset is present. Excess streams are reset with `REFUSED_STREAM` before SETTING
 acknowledged; exceeding an acknowledged stream limit causes `GOAWAY(PROTOCOL_ERROR)`.
 Idle retirement sends `GOAWAY(NO_ERROR)` before graceful closure.
 
+`grpc_lite_channel_options.max_response_header_list_size` and the matching low-level C++
+option default to 65536 and accept values from 1 through `UINT32_MAX`. The HTTP/2 setting
+is advertised per header list, but local enforcement charges each decoded physical field
+as name bytes plus value bytes plus 32 and accumulates across all response header and
+trailer blocks in an RPC. Oversize blocks are withheld atomically and finish only that RPC
+with `RESOURCE_EXHAUSTED`; an accepted initial block survives oversized trailers and the
+connection remains reusable.
+
 ## CMake Source Build
 
 Git checkouts and GitHub automatic “Source code” archives intentionally contain no

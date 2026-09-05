@@ -83,6 +83,7 @@ pub const ChannelOptions = extern struct {
     multiplier_millis: u32 = 1600,
     jitter_percent: u32 = 20,
     logger: ?*const Logger = null,
+    max_response_header_list_size: u64 = 64 * 1024,
 };
 
 pub const ClientStreamOptions = extern struct {
@@ -178,12 +179,15 @@ const server_options_max_streams_size = @offsetOf(ServerOptions, "max_concurrent
 const server_method_options_v1_size = @offsetOf(ServerMethodOptions, "explicit_initial_metadata") + @sizeOf(u32);
 const server_method_callbacks_v1_size = @offsetOf(ServerMethodCallbacks, "on_terminal") + @sizeOf(?*const fn (?*anyopaque, usize, u32) callconv(.c) void);
 const channel_options_v1_size = @offsetOf(ChannelOptions, "jitter_percent") + @sizeOf(u32);
+const channel_options_v2_size = @offsetOf(ChannelOptions, "logger") + @sizeOf(?*const Logger);
+const channel_options_v3_size = @offsetOf(ChannelOptions, "max_response_header_list_size") + @sizeOf(u64);
 
 const allocator = std.heap.c_allocator;
 
 const ChannelCreateOptions = struct {
     reconnect: ?channel.ReconnectOptions = null,
     logger: event_logger.Logger = .{},
+    max_response_header_list_size: u32 = 64 * 1024,
 };
 
 pub fn grpc_lite_abi_version() callconv(.c) u32 {
@@ -355,9 +359,10 @@ fn createChannel(
         .runtime = if (runtime_handle) |handle| &runtimeStorage(handle).value else null,
         .reconnect = options.reconnect,
         .logger = options.logger,
+        .max_response_header_list_size = options.max_response_header_list_size,
     }) catch |err| return switch (err) {
         error.OutOfMemory => .out_of_memory,
-        error.InvalidTarget, error.InvalidReconnectOptions => .invalid_argument,
+        error.InvalidTarget, error.InvalidReconnectOptions, error.InvalidMaxResponseHeaderListSize => .invalid_argument,
         error.RuntimeRequired, error.RuntimeNotInitialized => .invalid_state,
         else => .unavailable,
     };
@@ -1048,6 +1053,11 @@ fn parseChannelOptions(pointer: ?*const ChannelOptions) ?ChannelCreateOptions {
         value.max_backoff_ns < value.initial_backoff_ns or
         value.multiplier_millis < 1000 or
         value.jitter_percent > 100) return null;
+    const max_response_header_list_size = if (value.struct_size >= channel_options_v3_size) blk: {
+        if (value.max_response_header_list_size == 0 or
+            value.max_response_header_list_size > std.math.maxInt(u32)) return null;
+        break :blk @as(u32, @intCast(value.max_response_header_list_size));
+    } else 64 * 1024;
     return .{
         .reconnect = .{
             .allow_initial_offline = value.allow_initial_offline == 1,
@@ -1056,10 +1066,11 @@ fn parseChannelOptions(pointer: ?*const ChannelOptions) ?ChannelCreateOptions {
             .multiplier_millis = value.multiplier_millis,
             .jitter_percent = @intCast(value.jitter_percent),
         },
-        .logger = if (value.struct_size >= @sizeOf(ChannelOptions))
+        .logger = if (value.struct_size >= channel_options_v2_size)
             parseLogger(value.logger) orelse return null
         else
             .{},
+        .max_response_header_list_size = max_response_header_list_size,
     };
 }
 
@@ -1195,6 +1206,10 @@ test "C ABI reports version and build features" {
 
 test "C managed channel options have stable layout and defaults" {
     const options: ChannelOptions = .{};
+    try std.testing.expectEqual(
+        @as(u32, 64 * 1024),
+        parseChannelOptions(null).?.max_response_header_list_size,
+    );
     try std.testing.expectEqual(@sizeOf(ChannelOptions), options.struct_size);
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(ChannelOptions, "struct_size"));
     try std.testing.expectEqual(@sizeOf(usize), @offsetOf(ChannelOptions, "allow_initial_offline"));
@@ -1208,6 +1223,11 @@ test "C managed channel options have stable layout and defaults" {
     try std.testing.expectEqual(@as(u32, 1600), options.multiplier_millis);
     try std.testing.expectEqual(@as(u32, 20), options.jitter_percent);
     try std.testing.expectEqual(null, options.logger);
+    try std.testing.expectEqual(
+        @offsetOf(ChannelOptions, "logger") + @sizeOf(?*const Logger),
+        @offsetOf(ChannelOptions, "max_response_header_list_size"),
+    );
+    try std.testing.expectEqual(@as(u64, 64 * 1024), options.max_response_header_list_size);
 }
 
 test "C logger validates layout and channel option compatibility" {
@@ -1219,18 +1239,36 @@ test "C logger validates layout and channel option compatibility" {
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(Logger, "struct_size"));
     try std.testing.expectEqual(@sizeOf(usize), @offsetOf(Logger, "user_data"));
 
-    var options: ChannelOptions = .{ .logger = &logger };
+    var options: ChannelOptions = .{ .logger = &logger, .max_response_header_list_size = 1234 };
     const parsed = parseChannelOptions(&options).?;
     try std.testing.expect(parsed.logger.callback != null);
+    try std.testing.expectEqual(@as(u32, 1234), parsed.max_response_header_list_size);
 
     options.struct_size = channel_options_v1_size;
-    try std.testing.expect(parseChannelOptions(&options).?.logger.callback == null);
+    const parsed_v1 = parseChannelOptions(&options).?;
+    try std.testing.expect(parsed_v1.logger.callback == null);
+    try std.testing.expectEqual(@as(u32, 64 * 1024), parsed_v1.max_response_header_list_size);
 
-    options.struct_size = @sizeOf(ChannelOptions);
+    options.struct_size = channel_options_v2_size;
+    const parsed_v2 = parseChannelOptions(&options).?;
+    try std.testing.expect(parsed_v2.logger.callback != null);
+    try std.testing.expectEqual(@as(u32, 64 * 1024), parsed_v2.max_response_header_list_size);
+
+    options.struct_size = channel_options_v3_size;
     logger.struct_size = @sizeOf(Logger) - 1;
     try std.testing.expectEqual(null, parseChannelOptions(&options));
 
     logger.struct_size = @sizeOf(Logger);
+    options.max_response_header_list_size = 0;
+    try std.testing.expectEqual(null, parseChannelOptions(&options));
+    options.max_response_header_list_size = @as(u64, std.math.maxInt(u32)) + 1;
+    try std.testing.expectEqual(null, parseChannelOptions(&options));
+    options.max_response_header_list_size = std.math.maxInt(u32);
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        parseChannelOptions(&options).?.max_response_header_list_size,
+    );
+
     var server_options: ServerOptions = .{ .logger = &logger };
     try std.testing.expect(parseServerOptions(&server_options).?.logger.callback != null);
     server_options.struct_size = server_options_v1_size;
@@ -1350,6 +1388,8 @@ test "C managed channel validates options and clears outputs" {
         .{ .initial_backoff_ns = 2, .max_backoff_ns = 1 },
         .{ .multiplier_millis = 999 },
         .{ .jitter_percent = 101 },
+        .{ .max_response_header_list_size = 0 },
+        .{ .max_response_header_list_size = @as(u64, std.math.maxInt(u32)) + 1 },
     };
     for (invalid_options) |invalid| {
         output = @ptrFromInt(1);

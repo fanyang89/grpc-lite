@@ -26,6 +26,13 @@ Reconnect backoff follows the gRPC defaults: one-second initial delay, 1.6 multi
 120-second cap, and 20 percent jitter. Success resets the backoff. Recovery never retries
 an RPC that may have reached the server; applications own RPC retry policy.
 
+`max_response_header_list_size` defaults to 65536 and must be nonzero. The advertised
+HTTP/2 setting applies per header list, while grpc-lite enforces the bound cumulatively
+across all initial headers and trailers for each RPC. Every decoded physical field costs
+its name bytes, value bytes, and 32 bytes. A rejected block is not disclosed; the RPC
+finishes with `RESOURCE_EXHAUSTED` and the connection remains reusable. Initial metadata
+accepted before oversized trailers remains available.
+
 `Channel.callUnary` supports concurrent callers. `Channel.shutdown` may run while calls
 are active; join caller threads before giving `Channel.deinit` exclusive access. The
 Channel serializes access to the allocator passed to `Channel.init`.
