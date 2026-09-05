@@ -2648,6 +2648,7 @@ fn accountResponseHeader(
     value_length: usize,
 ) ?c_int {
     if (impl.operations.get(stream_id)) |operation| {
+        if (operation.response_headers_too_large) return 0;
         if (!accountResponseHeaderField(
             &operation.response_header_list_size,
             name_length,
@@ -2655,6 +2656,7 @@ fn accountResponseHeader(
             impl.max_response_header_list_size,
         )) return rejectOperationResponseHeaders(session, operation);
     } else if (impl.streams.get(stream_id)) |client_stream| {
+        if (client_stream.response_headers_too_large) return 0;
         if (!accountResponseHeaderField(
             &client_stream.response_header_list_size,
             name_length,
@@ -5264,6 +5266,31 @@ test "unary response header quota crossing records allocation-free local outcome
     try std.testing.expectEqual(HeaderKind.none, operation.block_kind);
     try std.testing.expectEqual(@as(usize, 0), operation.block_metadata.items().len);
     try std.testing.expect(operation.block_grpc_message == null);
+
+    const rejected_size = operation.response_header_list_size;
+    for ([_][2][]const u8{
+        .{ "x-after", "hidden" },
+        .{ "grpc-status", "0" },
+    }) |header| {
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            onHeader(
+                impl.session,
+                &native_frame,
+                header[0].ptr,
+                header[0].len,
+                header[1].ptr,
+                header[1].len,
+                0,
+                &impl,
+            ),
+        );
+        try std.testing.expectEqual(rejected_size, operation.response_header_list_size);
+        try std.testing.expectEqual(@as(usize, 0), operation.block_metadata.items().len);
+        try std.testing.expect(operation.block_grpc_status == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), operation.initial_metadata.items().len);
+    try std.testing.expectEqual(@as(usize, 0), operation.trailing_metadata.items().len);
     _ = impl.operations.remove(operation.stream_id);
 }
 
@@ -5385,6 +5412,31 @@ test "streaming response header quota terminalizes once and closes sends" {
     try std.testing.expectEqual(status.Code.resource_exhausted, client_stream.forced_status.?.code);
     try std.testing.expect(!client_stream.headers_called);
     try std.testing.expect(!client_stream.remote_end_seen);
+
+    const rejected_size = client_stream.response_header_list_size;
+    for ([_][2][]const u8{
+        .{ "x-after", "hidden" },
+        .{ "grpc-status", "0" },
+    }) |header| {
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            onHeader(
+                impl.session,
+                &native_frame,
+                header[0].ptr,
+                header[0].len,
+                header[1].ptr,
+                header[1].len,
+                0,
+                &impl,
+            ),
+        );
+        try std.testing.expectEqual(rejected_size, client_stream.response_header_list_size);
+        try std.testing.expectEqual(@as(usize, 0), client_stream.block_metadata.items().len);
+        try std.testing.expect(client_stream.block_grpc_status == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), client_stream.initial_metadata.items().len);
+    try std.testing.expectEqual(@as(usize, 0), client_stream.trailing_metadata.items().len);
 
     const stream_id = client_stream.stream_id;
     _ = onStreamClose(impl.session, stream_id, c.NGHTTP2_CANCEL, &impl);
