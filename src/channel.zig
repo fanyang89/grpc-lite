@@ -2621,6 +2621,18 @@ fn rejectOperationResponseHeaders(session: ?*c.nghttp2_session, operation: *Oper
 fn rejectClientStreamResponseHeaders(client_stream: *ClientStreamState) c_int {
     client_stream.response_headers_too_large = true;
     client_stream.resetHeaderBlock(.none);
+
+    // Serialize with application cancellation so the first local condition wins even
+    // when its wake has not reached the transport loop yet.
+    client_stream.mutex.lockUncancelable(syncIo());
+    if (client_stream.forced_status == null) {
+        client_stream.forced_status = if (client_stream.cancel_requested and !client_stream.app_released)
+            .init(.cancelled, "stream cancelled")
+        else
+            .init(.resource_exhausted, response_headers_too_large_message);
+    }
+    client_stream.mutex.unlock(syncIo());
+
     if (!failClientStreamOnLoop(
         client_stream,
         .init(.resource_exhausted, response_headers_too_large_message),
@@ -5384,6 +5396,140 @@ test "streaming response header quota terminalizes once and closes sends" {
     handle.deinit();
 }
 
+test "streaming oversized trailers preserve accepted initial metadata" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.max_response_header_list_size = 160;
+    defer impl.stream_states.deinit(impl.allocator);
+    defer impl.streams.deinit(impl.allocator);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Metadata/StreamingTrailersLimit",
+        .{},
+        .{
+            .context = &received,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    try impl.stream_states.put(impl.allocator, client_stream, {});
+    try submitClientStream(&impl, client_stream);
+    var native_frame: c.nghttp2_frame = undefined;
+    native_frame.hd.stream_id = client_stream.stream_id;
+
+    client_stream.resetHeaderBlock(.response);
+    for ([_][2][]const u8{
+        .{ ":status", "200" },
+        .{ "content-type", "application/grpc" },
+        .{ "x-a", "v" },
+    }) |header| {
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            onHeader(
+                impl.session,
+                &native_frame,
+                header[0].ptr,
+                header[0].len,
+                header[1].ptr,
+                header[1].len,
+                0,
+                &impl,
+            ),
+        );
+    }
+    try std.testing.expect(try finishClientHeaderBlock(client_stream, false));
+    try std.testing.expectEqualStrings("v", client_stream.initial_metadata.getFirst("x-a").?);
+    const encoded = try frame.encode(impl.allocator, "before");
+    defer impl.allocator.free(encoded);
+    try client_stream.decoder.feed(encoded);
+    try decodeAvailableMessages(client_stream);
+    try std.testing.expectEqual("before".len, received);
+
+    client_stream.resetHeaderBlock(.trailers);
+    try std.testing.expectEqual(
+        @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
+        onHeader(
+            impl.session,
+            &native_frame,
+            "grpc-status".ptr,
+            "grpc-status".len,
+            "0".ptr,
+            1,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expectEqual(status.Code.resource_exhausted, client_stream.forced_status.?.code);
+    try std.testing.expectEqualStrings("v", client_stream.initial_metadata.getFirst("x-a").?);
+    try std.testing.expectEqual(@as(usize, 0), client_stream.trailing_metadata.items().len);
+    try std.testing.expectEqual(HeaderKind.none, client_stream.block_kind);
+
+    const stream_id = client_stream.stream_id;
+    _ = onStreamClose(impl.session, stream_id, c.NGHTTP2_CANCEL, &impl);
+    var handle = client_stream.handle();
+    handle.deinit();
+}
+
+test "pending streaming cancellation wins over response header quota" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.max_response_header_list_size = 64;
+    impl.stream_wake_notify_pending = true;
+    defer impl.stream_states.deinit(impl.allocator);
+    defer impl.streams.deinit(impl.allocator);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+
+    const client_stream = try ClientStreamState.init(
+        &impl,
+        "/test.Metadata/CancelBeforeLimit",
+        .{},
+        .{
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = StreamTestCallbacks.onTerminal,
+        },
+    );
+    try impl.stream_states.put(impl.allocator, client_stream, {});
+    try submitClientStream(&impl, client_stream);
+    client_stream.resetHeaderBlock(.response);
+
+    var handle = client_stream.handle();
+    handle.cancel();
+    try std.testing.expect(client_stream.cancel_requested);
+    try std.testing.expect(client_stream.wake_queued);
+
+    var native_frame: c.nghttp2_frame = undefined;
+    native_frame.hd.stream_id = client_stream.stream_id;
+    const large_value = "x" ** 33;
+    try std.testing.expectEqual(
+        @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
+        onHeader(
+            impl.session,
+            &native_frame,
+            "grpc-message".ptr,
+            "grpc-message".len,
+            large_value.ptr,
+            large_value.len,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expect(client_stream.response_headers_too_large);
+    try std.testing.expect(client_stream.rst_submitted);
+    try std.testing.expectEqual(status.Code.cancelled, client_stream.forced_status.?.code);
+
+    _ = onStreamClose(impl.session, client_stream.stream_id, c.NGHTTP2_CANCEL, &impl);
+    handle.deinit();
+}
+
 test "retained response metadata accounting bounds binary comma amplification" {
     try std.testing.expectEqual(
         @as(usize, "x-ascii".len + "value".len + 32),
@@ -5451,12 +5597,12 @@ fn transferClientPrefaceWithUnboundedPeerSetting(
     _ = try transferNghttp2Sessions(source, destination);
 }
 
-test "raw nghttp2 peer keeps HPACK synchronized after oversized response headers" {
+test "raw nghttp2 peer covers response header boundaries isolation and HPACK reuse" {
     var host = [_:0]u8{'x'};
     var serialized_allocator: SerializedAllocator = undefined;
     var impl: Impl = undefined;
     initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
-    impl.max_response_header_list_size = 256;
+    impl.max_response_header_list_size = 300;
     defer impl.operations.deinit(impl.allocator);
     try initializeSession(&impl);
     defer c.nghttp2_session_del(impl.session);
@@ -5495,8 +5641,10 @@ test "raw nghttp2 peer keeps HPACK synchronized after oversized response headers
         c.nghttp2_submit_settings(peer, c.NGHTTP2_FLAG_NONE, null, 0),
     );
 
-    const rejected = try Operation.init(&impl, "/test.Metadata/Rejected", "", .{});
-    try submitOperation(&impl, rejected);
+    const exact = try Operation.init(&impl, "/test.Metadata/ExactBoundary", "", .{});
+    try submitOperation(&impl, exact);
+    const over = try Operation.init(&impl, "/test.Metadata/OverBoundary", "", .{});
+    try submitOperation(&impl, over);
     try transferClientPrefaceWithUnboundedPeerSetting(impl.session, peer);
     try std.testing.expectEqual(
         std.math.maxInt(u32),
@@ -5504,7 +5652,67 @@ test "raw nghttp2 peer keeps HPACK synchronized after oversized response headers
     );
     try std.testing.expectEqual(@as(usize, 0), peer_state.closes);
 
-    // Huffman encoding remains larger than one frame, forcing CONTINUATION handling.
+    // These trailers-only responses total exactly 300 and 301 charged bytes.
+    const exact_boundary_value = "b" ** 112;
+    const over_boundary_value = "b" ** 113;
+    const exact_headers = [_]c.nghttp2_nv{
+        nativeHeader(":status", "200"),
+        nativeHeader("content-type", "application/grpc"),
+        nativeHeader("x-boundary", exact_boundary_value),
+        nativeHeader("grpc-status", "5"),
+    };
+    const over_headers = [_]c.nghttp2_nv{
+        nativeHeader(":status", "200"),
+        nativeHeader("content-type", "application/grpc"),
+        nativeHeader("x-boundary", over_boundary_value),
+        nativeHeader("grpc-status", "5"),
+    };
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.nghttp2_submit_headers(
+            peer,
+            c.NGHTTP2_FLAG_END_STREAM,
+            over.stream_id,
+            null,
+            &over_headers,
+            over_headers.len,
+            null,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.nghttp2_submit_headers(
+            peer,
+            c.NGHTTP2_FLAG_END_STREAM,
+            exact.stream_id,
+            null,
+            &exact_headers,
+            exact_headers.len,
+            null,
+        ),
+    );
+    _ = try transferNghttp2Sessions(peer, impl.session);
+    _ = try transferNghttp2Sessions(impl.session, peer);
+    try std.testing.expect(over.done);
+    try std.testing.expect(over.response_headers_too_large);
+    try std.testing.expectEqual(status.Code.resource_exhausted, over.response_code);
+    try std.testing.expect(exact.done);
+    try std.testing.expectEqual(@as(usize, 300), exact.response_header_list_size);
+    try std.testing.expectEqual(status.Code.not_found, exact.response_code);
+    try std.testing.expectEqualStrings(
+        exact_boundary_value,
+        exact.trailing_metadata.getFirst("x-boundary").?,
+    );
+    try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+    over.deinit();
+    exact.deinit();
+
+    const rejected = try Operation.init(&impl, "/test.Metadata/Rejected", "", .{});
+    try submitOperation(&impl, rejected);
+    _ = try transferNghttp2Sessions(impl.session, peer);
+
+    // The preceding fields total 266 bytes. The large field is completed in a
+    // CONTINUATION callback and crosses the configured 300-byte limit there.
     const large_value = "x" ** (20 * 1024);
     const rejected_headers = [_]c.nghttp2_nv{
         nativeHeader(":status", "200"),
@@ -5605,14 +5813,39 @@ test "client session advertises the default and reconnect response header list s
 
     c.nghttp2_session_del(impl.session);
     impl.session = null;
-    impl.max_response_header_list_size = 12345;
+    impl.max_response_header_list_size = 123;
     try initializeSession(&impl);
-    try std.testing.expectEqual(@as(u32, 12345), try Reader.advertised(impl.session));
+    try std.testing.expectEqual(@as(u32, 123), try Reader.advertised(impl.session));
 
     c.nghttp2_session_del(impl.session);
     impl.session = null;
     try initializeSession(&impl);
-    try std.testing.expectEqual(@as(u32, 12345), try Reader.advertised(impl.session));
+    try std.testing.expectEqual(@as(u32, 123), try Reader.advertised(impl.session));
+
+    defer impl.operations.deinit(impl.allocator);
+    const operation = try Operation.init(&impl, "/test.Metadata/ReconnectedLimit", "", .{});
+    defer operation.deinit();
+    try submitOperation(&impl, operation);
+    operation.resetHeaderBlock(.response);
+    var native_frame: c.nghttp2_frame = undefined;
+    native_frame.hd.stream_id = operation.stream_id;
+    const oversized_value = "x" ** 91;
+    try std.testing.expectEqual(
+        @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
+        onHeader(
+            impl.session,
+            &native_frame,
+            "x".ptr,
+            1,
+            oversized_value.ptr,
+            oversized_value.len,
+            0,
+            &impl,
+        ),
+    );
+    try std.testing.expect(operation.response_headers_too_large);
+    try std.testing.expectEqual(status.Code.resource_exhausted, operation.response_code);
+    _ = impl.operations.remove(operation.stream_id);
 }
 
 test "target parsing" {
