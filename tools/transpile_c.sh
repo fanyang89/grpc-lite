@@ -26,8 +26,9 @@ if [[ "$actual_zig" != "$required_zig" ]]; then
 fi
 
 cache_dir=${GRPC_LITE_ZIG_CACHE_DIR:-"$project_root/.zig-cache/transpile-c"}
+global_cache_dir=${GRPC_LITE_ZIG_GLOBAL_CACHE_DIR:-"$project_root/.zig-cache/transpile-c-global"}
 rm -rf "$output_dir" "$cache_dir"
-mkdir -p "$output_dir" "$cache_dir"
+mkdir -p "$output_dir" "$cache_dir" "$global_cache_dir"
 (
     cd "$project_root"
     zig build transpile-c \
@@ -37,6 +38,7 @@ mkdir -p "$output_dir" "$cache_dir"
         -Doptimize=ReleaseSafe \
         --seed 0 \
         --cache-dir "$cache_dir" \
+        --global-cache-dir "$global_cache_dir" \
         --prefix "$output_dir" \
         --summary all
 )

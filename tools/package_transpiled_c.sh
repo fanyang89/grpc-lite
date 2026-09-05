@@ -54,6 +54,7 @@ if [[ "$actual_zig" != "$required_zig" ]]; then
 fi
 
 GRPC_LITE_ZIG_CACHE_DIR=${GRPC_LITE_ZIG_CACHE_DIR:-"$work_dir/zig-cache"} \
+    GRPC_LITE_ZIG_GLOBAL_CACHE_DIR=${GRPC_LITE_ZIG_GLOBAL_CACHE_DIR:-"$work_dir/zig-global-cache"} \
     "$project_root/tools/transpile_c.sh" "$work_dir/generated"
 
 expected_files=$'include/zig.h\nmanifest.json\nsrc/grpc_lite.c\nsrc/protoc-gen-grpc_lite_cpp.c'
