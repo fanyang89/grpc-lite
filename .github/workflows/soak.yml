@@ -43,6 +43,13 @@ jobs:
         with:
           version: 2026.7.14
 
+      - name: Install Protobuf C++ tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev
+
       - name: Run official unary soak
         run: mise run interop-official
 
