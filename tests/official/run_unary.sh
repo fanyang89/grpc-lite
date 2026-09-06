@@ -35,6 +35,14 @@ compression_cases=(
   client_compressed_unary
   server_compressed_unary
 )
+grpc_go_gzip_cases=(
+  identity_unary
+  gzip_request
+  gzip_response
+  identity_expectation_error
+  gzip_expectation_error
+  unsupported_request_encoding
+)
 
 peer_pid=
 peer_log=
@@ -101,7 +109,9 @@ printf '%s\n' 'Building grpc-go v1.82.1 interop binaries...'
 (cd "$project_root/tests/official" && \
   go build -mod=readonly -o "$work_dir/grpc-go-interop-client" google.golang.org/grpc/interop/client && \
   go build -mod=readonly -o "$work_dir/grpc-go-interop-server" google.golang.org/grpc/interop/server && \
-  go build -mod=readonly -o "$work_dir/grpc-go-half-duplex-client" half_duplex_client.go)
+  go build -mod=readonly -o "$work_dir/grpc-go-half-duplex-client" half_duplex_client.go && \
+  go build -mod=readonly -o "$work_dir/grpc-go-gzip-client" ./gzip_client && \
+  go build -mod=readonly -o "$work_dir/grpc-go-gzip-server" ./gzip_server)
 
 printf '%s\n' 'Building generated C++ interop binaries...'
 rm -rf "$work_dir/cpp-proto-stage" "$work_dir/cpp-build"
@@ -148,6 +158,13 @@ for test_case in "${stream_lifecycle_cases[@]}"; do
     --server_port="$zig_server_port" \
     --test_case="$test_case" \
     --use_tls=false
+done
+for test_case in "${grpc_go_gzip_cases[@]}"; do
+  run_case 'grpc-go gzip client -> grpc-lite server' "$test_case" \
+    "$work_dir/grpc-go-gzip-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$zig_server_port" \
+    --test_case="$test_case"
 done
 for test_case in "${soak_cases[@]}"; do
   run_case 'grpc-go client -> grpc-lite server' "$test_case" \
@@ -231,27 +248,25 @@ for test_case in "${streaming_cases[@]}"; do
 done
 stop_peer
 
+peer_log="$work_dir/grpc-go-gzip-server.log"
+"$work_dir/grpc-go-gzip-server" --port="$go_server_port" >"$peer_log" 2>&1 &
+peer_pid=$!
+wait_for_peer "$go_server_port"
+for test_case in "${compression_cases[@]}"; do
+  run_case 'grpc-lite client -> grpc-go gzip server' "$test_case" \
+    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+    --server_host=127.0.0.1 \
+    --server_port="$go_server_port" \
+    --test_case="$test_case" \
+    --use_tls=false
+done
+stop_peer
+
 printf '%s\n' "All 10 bidirectional unary runs passed."
 printf '%s\n' "All 8 raw bidirectional streaming runs passed."
 printf '%s\n' "All 8 generated C++ streaming interop runs passed."
 printf '%s\n' "Both raw and generated C++ half-duplex server runs passed."
 printf '%s\n' "All 6 bidirectional streaming cancellation and deadline runs passed."
 printf '%s\n' "All 4 bidirectional soak runs passed: rpc_soak and channel_soak in each direction ($soak_iterations iteration(s) each)."
-
-printf '%s\n' 'grpc-go v1.82.1 does not expose the official compression cases; running grpc-lite compression integration separately.'
-peer_log="$work_dir/grpc-lite-compression-server.log"
-"$project_root/zig-out/bin/grpc-lite-interop-server" \
-  --port="$zig_server_port" --use_tls=false >"$peer_log" 2>&1 &
-peer_pid=$!
-wait_for_peer "$zig_server_port"
-for test_case in "${compression_cases[@]}"; do
-  run_case 'grpc-lite client -> grpc-lite server (compression integration)' "$test_case" \
-    "$project_root/zig-out/bin/grpc-lite-interop-client" \
-    --server_host=127.0.0.1 \
-    --server_port="$zig_server_port" \
-    --test_case="$test_case" \
-    --use_tls=false
-done
-stop_peer
-
-printf '%s\n' 'All 2 grpc-lite compression integration runs passed.'
+printf '%s\n' 'All 6 grpc-go client to grpc-lite gzip negotiation and error runs passed.'
+printf '%s\n' 'Both grpc-lite client to grpc-go gzip interop runs passed.'
