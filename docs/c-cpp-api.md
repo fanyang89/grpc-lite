@@ -34,6 +34,12 @@ outlive dependent handles. The API provides:
 - event-driven server registration and retained cross-thread calls
 - metadata, bounded backpressure, cancellation observation, and graceful drain
 
+`grpc_lite_features()` reports capabilities usable through the C ABI, rather than every
+transport capability compiled into the library. `GRPC_LITE_FEATURE_TLS` remains defined
+for source compatibility, but the returned mask leaves it clear because C Channel and
+Server options currently create only insecure transports. Building with `-Dtls=true`
+still enables TLS for the Zig API and does not change the C option struct layouts.
+
 C and C++ callback code runs synchronously on API caller or transport threads, may run
 concurrently, and must not block unless the specific synchronous facade contract permits
 it.
