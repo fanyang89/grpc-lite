@@ -297,6 +297,7 @@ jobs:
       - gperftools
       - package-consumer
       - sanitizer
+      - tls-test
       - interop
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -310,6 +311,7 @@ jobs:
           GPERFTOOLS_RESULT: ${{ needs.gperftools.result }}
           PACKAGE_CONSUMER_RESULT: ${{ needs.package-consumer.result }}
           SANITIZER_RESULT: ${{ needs.sanitizer.result }}
+          TLS_TEST_RESULT: ${{ needs.tls-test.result }}
           INTEROP_RESULT: ${{ needs.interop.result }}
         run: |
           test "$WORKFLOW_LINT_RESULT" = success
@@ -319,4 +321,5 @@ jobs:
           test "$GPERFTOOLS_RESULT" = success
           test "$PACKAGE_CONSUMER_RESULT" = success
           test "$SANITIZER_RESULT" = success
+          test "$TLS_TEST_RESULT" = success
           test "$INTEROP_RESULT" = success
