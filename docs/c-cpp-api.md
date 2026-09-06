@@ -99,10 +99,15 @@ cmake -S grpc-lite -B build \
   -DGRPC_LITE_TRANSPILED_C_DIR="$PWD/grpc-lite-transpiled-c-0.4.0-linux-x86_64"
 ```
 
-The generated-only asset targets insecure Linux x86_64. It contains only its manifest,
-two generated C translation units, and the matching `zig.h`; it does not contain project
-sources or third-party dependencies. `sha256sum --check` provides integrity/error
-detection, but a checksum colocated with an asset is not publisher authentication.
+The generated-only asset targets insecure Linux x86_64. TLS is out of scope for this
+transpiled-C release bundle until separately selected, and CMake rejects
+`GRPC_LITE_ENABLE_TLS=ON`. This does not change the optional mbedTLS support available to
+native Zig builds.
+
+The asset contains only its manifest, two generated C translation units, and the matching
+`zig.h`; it does not contain project sources or third-party dependencies.
+`sha256sum --check` provides integrity/error detection, but a checksum colocated with an
+asset is not publisher authentication.
 
 After setting `GRPC_LITE_TRANSPILED_C_DIR`, add the source directory and link its targets:
 

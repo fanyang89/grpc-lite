@@ -48,7 +48,8 @@ mise run gen-grpcpp
 - `libxev` owns socket and event-loop integration.
 - gRPC payloads remain raw protobuf wire bytes.
 - Generated protobuf sources live under `.zig-cache` and are not committed.
-- The transport target supports raw unary and full-duplex streaming over cleartext or TLS IPv4.
+- The native Zig transport supports raw unary and full-duplex streaming over cleartext or TLS IPv4.
+- The insecure Linux x86_64 transpiled-C release bundle supports cleartext transport only.
 - c-ares resolves client hostnames to IPv4 candidates on the libxev loop.
 
 Keep C types private to transport modules. Keep protobuf out of `src/root.zig` so the
@@ -77,7 +78,8 @@ authoritative: change it before implementing a feature with a different decision
 | GOAWAY connection replacement | Selected | New calls use a new connection; no RPC retry |
 | Graceful server drain | Selected | Stop admission, send GOAWAY, wait with timeout |
 | Server resource limits | Selected | Aggregate connection cap, per-connection stream cap, absolute cleartext preface timeout, and idle timeout only while no inbound RPC streams are active |
-| TLS and ALPN | Selected | Optional mbedTLS; TLS 1.2+, mandatory `h2`, explicit PEM credentials |
+| Native Zig TLS and ALPN | Selected | Optional mbedTLS; TLS 1.2+, mandatory `h2`, explicit PEM credentials |
+| Transpiled-C release bundle TLS | Out of scope | The insecure Linux x86_64 bundle remains cleartext-only until TLS is separately selected |
 | mTLS | Out of scope | Client certificates and server-side client verification are not required |
 | DNS | Selected | c-ares on Linux io_uring; client IPv4 hostnames only |
 | IPv6 | Out of scope | No AAAA, Happy Eyeballs, or IPv6 listeners |

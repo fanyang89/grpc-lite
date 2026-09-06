@@ -8,7 +8,7 @@ if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
   message(FATAL_ERROR "The grpc-lite transpiled C bundle supports x86_64 only")
 endif()
 
-option(GRPC_LITE_ENABLE_TLS "Enable TLS transport support through mbedTLS" OFF)
+option(GRPC_LITE_ENABLE_TLS "Request TLS (out of scope for the transpiled-C release bundle)" OFF)
 option(GRPC_LITE_ENABLE_PROTOBUF "Expose optional official Protobuf C++ integration targets" OFF)
 option(GRPC_LITE_NO_NETWORK "Reject dependency sources that could require network access" OFF)
 set(GRPC_LITE_TRANSPILED_C_DIR "" CACHE PATH
@@ -19,7 +19,8 @@ set(GRPC_LITE_CARES_URL "" CACHE STRING "Optional c-ares source tarball URL")
 set(GRPC_LITE_CARES_URL_HASH "" CACHE STRING "Optional c-ares tarball hash (ALGO=value)")
 
 if(GRPC_LITE_ENABLE_TLS)
-  message(FATAL_ERROR "TLS is not yet available in the transpiled C source build")
+  message(FATAL_ERROR
+    "TLS is out of scope for the insecure Linux x86_64 transpiled-C release bundle; configure with GRPC_LITE_ENABLE_TLS=OFF")
 endif()
 
 set(_grpc_lite_bundle_help
