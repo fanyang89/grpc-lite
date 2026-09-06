@@ -161,6 +161,9 @@ Compare only within one scenario: unary operations are complete RPCs while bidir
 operations are messages on persistent streams. `repeated` is intentionally compressible;
 `deterministic-random` is repeatable higher-entropy input.
 
+The [advisor performance stack triage](advisor-performance-stack-triage.md) records the
+landed optimization sequence and safe cleanup requirements for its historical worktrees.
+
 ## Dependencies
 
 - Latest stable Zig release through mise (minimum 0.16.0)
