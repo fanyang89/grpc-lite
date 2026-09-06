@@ -181,8 +181,9 @@ zig build -Dtls=true
 
 Downstream packages pass `.tls = true` to the grpc-lite dependency. Clients trust only
 the supplied PEM CA bundle; system roots are not searched. Hostname verification and SNI
-use the Channel target. TLS 1.2 or newer and ALPN `h2` are mandatory. The default handshake
-timeout is ten seconds.
+use the Channel target. TLS 1.2 or newer and ALPN `h2` are mandatory. TLS 1.2 is limited
+to ECDHE AEAD suites, while TLS 1.3 uses its AES-GCM and ChaCha20-Poly1305 suites, matching
+the HTTP/2 cipher profile. The default handshake timeout is ten seconds.
 
 ```zig
 var channel = try grpc.Channel.init(allocator, "api.example.com:443", .{
