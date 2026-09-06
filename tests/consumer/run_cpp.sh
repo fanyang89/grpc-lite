@@ -49,7 +49,7 @@ cp -R "$package_source/examples/cpp/." "$consumer_source/"
 
 (
     cd "$package_source"
-    zig build -Dprotobuf=false -Doptimize=ReleaseSafe --prefix "$stage"
+    zig build -Dprotobuf=true -Doptimize=ReleaseSafe --prefix "$stage"
     zig build -Dprotobuf=false -Doptimize=ReleaseSafe \
         install-cpp-e2e-server --prefix "$stage"
 )

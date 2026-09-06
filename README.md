@@ -32,9 +32,15 @@ Add grpc-lite to `build.zig.zon`, then import its public module:
 const grpc_lite = b.dependency("grpc_lite", .{
     .target = target,
     .optimize = optimize,
+    .protobuf = false,
 });
 exe.root_module.addImport("grpc_lite", grpc_lite.module("grpc_lite"));
 ```
+
+The raw module does not import zig-protobuf. Package consumers default to protobuf support
+being disabled; setting `.protobuf = false` explicitly guarantees that zig-protobuf and
+its host code-generation dependencies are not resolved. Set `.protobuf = true` only for
+the separate typed adapter and code-generation modules.
 
 ```zig
 const grpc = @import("grpc_lite");

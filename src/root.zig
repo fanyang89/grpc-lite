@@ -83,7 +83,6 @@ pub const server = @import("server.zig");
 pub const service = @import("service.zig");
 pub const status = @import("status.zig");
 pub const stream = @import("stream.zig");
-pub const protobuf = @import("protobuf");
 pub const xev = @import("xev");
 
 pub const CallOptions = call.Options;
@@ -151,7 +150,6 @@ test {
     _ = service;
     _ = status;
     _ = stream;
-    _ = protobuf;
     _ = xev;
     _ = version_info;
     if (build_options.tls) _ = @import("tls_record.zig");

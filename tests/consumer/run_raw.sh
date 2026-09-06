@@ -64,27 +64,6 @@ prefetch_zigfetch_url_package() {
         --output "$global_cache/p/$expected_hash.tar.gz" "$url"
 }
 
-prefetch_archive_package() {
-    local url=$1
-    local expected_hash=$2
-    local archive_name=$3
-    local dependency_archive="$work_dir/$archive_name"
-    local package_dir="$global_cache/p/$expected_hash"
-
-    curl --fail --location --silent --show-error --output "$dependency_archive" "$url"
-    mkdir -p "$package_dir"
-    unzip -q "$dependency_archive" -d "$package_dir"
-    local actual_hash
-    actual_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zig fetch "$package_dir")
-    if [[ "$actual_hash" != "$expected_hash" ]]; then
-        printf 'package hash mismatch for %s: expected %s, got %s\n' \
-            "$archive_name" "$expected_hash" "$actual_hash" >&2
-        exit 1
-    fi
-    tar --create --gzip --file "$global_cache/p/$expected_hash.tar.gz" \
-        --directory "$package_dir" .
-}
-
 prefetch_url_package \
     'https://codeload.github.com/mitchellh/libxev/tar.gz/b0650f082458226860ed7ab0fc7c9c73823c8950' \
     'libxev-0.0.0-86vtcxkOFACqPXUTAPuq5i0xpDYWU5G5RfrYQXxlUT26' \
@@ -106,17 +85,9 @@ prefetch_url_package \
     'nanozlog-0.1.0-5UtdH535AADW7HUBpfLboKJkdB1IVYaqz7YFQ2dHIcqL' \
     'nanozlog.tar.gz'
 prefetch_url_package \
-    'https://github.com/Arwalk/zig-protobuf/archive/b794f99323cead7f1794ae68554d0311cc309857.tar.gz' \
-    'protobuf-5.0.0-0e82ahZiKwC5Yrh4psANoUzrV_H4CQU1EsOIY9Zdyap_' \
-    'protobuf.tar.gz'
-prefetch_url_package \
     'https://github.com/rockorager/zeit/archive/b1c1c2fcbc71fd7799a316bbcf0ff88d06d80ccc.tar.gz' \
     'zeit-0.9.0-5I6bk2m9AgBSMH8-L6rYJkwuQAyhXplnfxnvTSGzVHUR' \
     'zeit.tar.gz'
-prefetch_archive_package \
-    'https://github.com/protocolbuffers/protobuf/releases/download/v32.1/protoc-32.1-linux-x86_64.zip' \
-    'N-V-__8AAGKbngAmNuaBMSXq_WgmQi6N8WVWVKp0moFSTvoJ' \
-    'protoc-linux-x86_64.zip'
 prefetch_url_package \
     'https://codeload.github.com/fanyang89/gperftools/tar.gz/1a01cd2cf8f7000845d343fa8e0bbac70378858b' \
     'N-V-__8AAGKVkABvsDVHhSU8seHKvtJ8Q23b9Y0OMiFVWt-y' \
@@ -165,9 +136,8 @@ ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig
     -Doptimize=ReleaseFast -Dgperftools=true --summary all
 "$consumer/zig-out/bin/grpc-lite-raw-consumer"
 
-protobuf_path="$consumer/zig-pkg/protobuf-5.0.0-0e82avKUKAAVwTWJzTIEZ14Fu0zC11_lElR8tE6H__y1"
-if [[ -e "$protobuf_path" || -L "$protobuf_path" ]]; then
-    printf '%s\n' 'raw consumer unexpectedly resolved zig-protobuf' >&2
+if find "$consumer/zig-pkg" -maxdepth 1 -name 'protobuf-*' -print -quit | grep -q .; then
+    printf '%s\n' 'raw -Dprotobuf=false consumer unexpectedly resolved zig-protobuf' >&2
     exit 1
 fi
 grpc_proto_path="$consumer/zig-pkg/N-V-__8AAMvUAgBnxziu_Kuqr4AuJ00Vke6R0R-Rc1A26DRX"
