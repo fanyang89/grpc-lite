@@ -57,15 +57,19 @@ mkdir -p "$work_dir"
 (cd "$project_root" && zig build -Dtls=true)
 
 # The pinned official module predates Go's current TLS error text and TLS 1.3
-# CipherSuites behavior. Apply a narrow compatibility patch in the build cache.
+# CipherSuites behavior. Resolve and validate it before applying narrow patches.
+http2_module=github.com/grpc/grpc/tools/http2_interop
 module_dir=$(cd "$project_root/tests/official" && \
-  go mod download -json github.com/grpc/grpc/tools/http2_interop | \
-  python3 -c 'import json, sys; print(json.load(sys.stdin)["Dir"])')
+  go mod download -json "$http2_module" | \
+  python3 "$project_root/tests/official/resolve_http2_module.py")
 rm -rf "$harness_dir"
-cp -R "$module_dir" "$harness_dir"
+mkdir -p "$harness_dir"
+cp -R "$module_dir"/. "$harness_dir"
 chmod -R u+w "$harness_dir"
 patch -d "$harness_dir" -p1 --fuzz=0 --forward --batch \
   <"$project_root/tests/official/http2_interop_go1.26.patch"
+patch -d "$harness_dir" -p1 --fuzz=0 --forward --batch \
+  <"$project_root/tests/official/http2_interop_goaway.patch"
 mkdir -p "$harness_dir/src/core/tsi/test_creds"
 cp "$certificate" "$harness_dir/src/core/tsi/test_creds/ca.pem"
 
