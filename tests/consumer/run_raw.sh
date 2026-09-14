@@ -76,12 +76,12 @@ prefetch_package \
     'https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz' \
     'N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp' \
     'cares.tar.gz'
-prefetch_zigfetch_url_package \
-    'https://cpucycles.cr.yp.to/libcpucycles-20260625.tar.gz' \
+prefetch_package \
+    'https://github.com/fanyang89/libcpucycles-mirror/releases/download/v20260625/libcpucycles-20260625.tar.gz' \
     'N-V-__8AAHSUBAA_Vn8NXM2L9F21QFvrTIxbH9yvxs5cO-lY' \
     'cpucycles.tar.gz'
 prefetch_url_package \
-    'https://github.com/wyzdwdz/nanozlog/archive/e693c11976d55ba0a5b8deeaaaf9f1c5cc30eba9.tar.gz' \
+    'https://codeload.github.com/wyzdwdz/nanozlog/tar.gz/e693c11976d55ba0a5b8deeaaaf9f1c5cc30eba9' \
     'nanozlog-0.1.0-5UtdH535AADW7HUBpfLboKJkdB1IVYaqz7YFQ2dHIcqL' \
     'nanozlog.tar.gz'
 prefetch_url_package \

@@ -17,11 +17,11 @@
             .hash = "N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp",
         },
         .cpucycles = .{
-            .url = "https://cpucycles.cr.yp.to/libcpucycles-20260625.tar.gz",
+            .url = "https://github.com/fanyang89/libcpucycles-mirror/releases/download/v20260625/libcpucycles-20260625.tar.gz",
             .hash = "N-V-__8AAHSUBAA_Vn8NXM2L9F21QFvrTIxbH9yvxs5cO-lY",
         },
         .nanozlog = .{
-            .url = "https://github.com/wyzdwdz/nanozlog/archive/e693c11976d55ba0a5b8deeaaaf9f1c5cc30eba9.tar.gz",
+            .url = "https://codeload.github.com/wyzdwdz/nanozlog/tar.gz/e693c11976d55ba0a5b8deeaaaf9f1c5cc30eba9",
             .hash = "nanozlog-0.1.0-5UtdH535AADW7HUBpfLboKJkdB1IVYaqz7YFQ2dHIcqL",
         },
         .mbedtls = .{
@@ -30,7 +30,7 @@
             .lazy = true,
         },
         .protobuf = .{
-            .url = "https://github.com/Arwalk/zig-protobuf/archive/b794f99323cead7f1794ae68554d0311cc309857.tar.gz",
+            .url = "https://codeload.github.com/Arwalk/zig-protobuf/tar.gz/b794f99323cead7f1794ae68554d0311cc309857",
             .hash = "protobuf-5.0.0-0e82ahZiKwC5Yrh4psANoUzrV_H4CQU1EsOIY9Zdyap_",
             .lazy = true,
         },

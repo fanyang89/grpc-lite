@@ -166,7 +166,7 @@ operations are messages on persistent streams. `repeated` is intentionally compr
 - Latest stable Zig release through mise (minimum 0.16.0)
 - nghttp2 1.69.0
 - c-ares 1.34.8
-- libcpucycles 20260625
+- libcpucycles 20260625 ([release mirror](https://github.com/fanyang89/libcpucycles-mirror/releases/tag/v20260625))
 - libxev b0650f0
 - zig-protobuf 5.0.0
 - nanozlog 0.1.0
@@ -174,3 +174,11 @@ operations are messages on persistent streams. `repeated` is intentionally compr
 - gperftools 2.18.1-based fork (optional)
 - CMake and Ninja for upstream C builds
 - mise for tool versions and project tasks
+
+The libcpucycles mirror serves the unchanged upstream archive. Its SHA-256 is
+`74a815bfb5ab645e5d07617125824c946ce5039db139e5233467d1ff33f69afa`, verified against
+`https://cpucycles.cr.yp.to/libcpucycles-20260625.tar.gz`. The Zig package hash stays
+`N-V-__8AAHSUBAA_Vn8NXM2L9F21QFvrTIxbH9yvxs5cO-lY`. Builds and the raw consumer
+fixture use the mirror so a build does not depend on the upstream site's availability.
+Nanozlog and zig-protobuf use GitHub codeload URLs without changing their pinned
+commits or package hashes. Protobuf remains optional for raw transport consumers.
