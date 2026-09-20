@@ -7872,6 +7872,42 @@ test "TLS channel replaces a server-idle connection for a later RPC" {
     const certificate = @embedFile("testdata/localhost-cert.pem");
     const private_key = @embedFile("testdata/localhost-key.pem");
 
+    const Diagnostics = struct {
+        mutex: std.Io.Mutex = .init,
+        started_ns: u64,
+        buffer: [16 * 1024]u8 = undefined,
+        len: usize = 0,
+        dropped: usize = 0,
+
+        fn log(context: ?*anyopaque, level: u32, log_message: event_logger.BytesView) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.mutex.lockUncancelable(syncIo());
+            defer self.mutex.unlock(syncIo());
+            const line = std.fmt.bufPrint(self.buffer[self.len..], "+{d}us level={d} {s}\n", .{
+                (nowNs() -| self.started_ns) / std.time.ns_per_us,
+                level,
+                if (log_message.data) |data| data[0..log_message.size] else "",
+            }) catch {
+                self.dropped += 1;
+                return;
+            };
+            self.len += line.len;
+        }
+
+        fn dump(self: *@This(), err: anyerror) void {
+            self.mutex.lockUncancelable(syncIo());
+            defer self.mutex.unlock(syncIo());
+            std.debug.print("TLS idle replacement failed: {s} (idle=20ms sleep=100ms high=16 low=8 dropped={d})\n{s}", .{
+                @errorName(err), self.dropped, self.buffer[0..self.len],
+            });
+        }
+    };
+    var diagnostics: Diagnostics = .{ .started_ns = nowNs() };
+    // Registered before transport teardown so callbacks cannot outlive the capture.
+    errdefer |err| diagnostics.dump(err);
+    const logger: event_logger.Logger = .{ .context = &diagnostics, .callback = Diagnostics.log };
+    logger.write(.debug, "test: initializing server", .{});
+
     const Handler = struct {
         fn handle(
             _: *@This(),
@@ -7885,6 +7921,7 @@ test "TLS channel replaces a server-idle connection for a later RPC" {
 
     var handler = Handler{};
     var test_server = try server.Server.init(std.testing.allocator, .{
+        .logger = logger,
         .connection_idle_timeout_ns = 20 * std.time.ns_per_ms,
         .write_high_watermark_bytes = 16,
         .write_low_watermark_bytes = 8,
@@ -7904,18 +7941,28 @@ test "TLS channel replaces a server-idle connection for a later RPC" {
     defer runtime.deinit();
     var target_buffer: [32]u8 = undefined;
     const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
+    logger.write(.debug, "test: initializing channel", .{});
     var channel = try Channel.init(std.testing.allocator, target, .{
         .runtime = &runtime,
+        .logger = logger,
         .tls = .{ .ca_certificates_pem = certificate },
     });
     defer channel.deinit();
 
+    logger.write(.debug, "test: first RPC start generation={d}", .{channel.impl.connection_generation.load(.monotonic)});
     var first = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "first", .{});
     defer first.deinit();
+    logger.write(.debug, "test: first RPC status={s} message={s} generation={d}", .{
+        @tagName(first.status.code), first.status.message, channel.impl.connection_generation.load(.monotonic),
+    });
     try std.testing.expect(first.status.isOk());
     try std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake);
+    logger.write(.debug, "test: second RPC start generation={d}", .{channel.impl.connection_generation.load(.monotonic)});
     var second = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "second", .{});
     defer second.deinit();
+    logger.write(.debug, "test: second RPC status={s} message={s} payload_len={d} generation={d}", .{
+        @tagName(second.status.code), second.status.message, second.payload.len, channel.impl.connection_generation.load(.monotonic),
+    });
     try std.testing.expect(second.status.isOk());
     try std.testing.expectEqualStrings("second", second.payload);
 }

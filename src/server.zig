@@ -3689,10 +3689,14 @@ fn expireDeadlines(server: *Impl, now: u64) void {
                             connection.closeOnLoop(&server.loop);
                             continue;
                         };
-                        const goaway_fully_queued = connection.flushIdleGoAway() catch {
+                        const goaway_fully_queued = connection.flushIdleGoAway() catch |err| {
+                            server.logger.write(.debug, "server idle GOAWAY flush failed error={s}", .{@errorName(err)});
                             connection.close();
                             continue;
                         };
+                        server.logger.write(.debug, "server idle close last_stream_id={d} goaway_fully_queued={} queued_write_bytes={d}", .{
+                            connection.highest_accepted_stream_id, goaway_fully_queued, connection.queued_write_bytes,
+                        });
                         if (goaway_fully_queued)
                             connection.closeGracefully(&server.loop)
                         else
