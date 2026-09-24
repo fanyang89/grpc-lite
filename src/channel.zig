@@ -7897,7 +7897,7 @@ test "TLS channel replaces a server-idle connection for a later RPC" {
         fn dump(self: *@This(), err: anyerror) void {
             self.mutex.lockUncancelable(syncIo());
             defer self.mutex.unlock(syncIo());
-            std.debug.print("TLS idle replacement failed: {s} (idle=20ms sleep=100ms high=16 low=8 dropped={d})\n{s}", .{
+            std.debug.print("TLS idle replacement failed: {s} (idle=1000ms replacement_wait=5000ms high=16 low=8 dropped={d})\n{s}", .{
                 @errorName(err), self.dropped, self.buffer[0..self.len],
             });
         }
@@ -7922,7 +7922,7 @@ test "TLS channel replaces a server-idle connection for a later RPC" {
     var handler = Handler{};
     var test_server = try server.Server.init(std.testing.allocator, .{
         .logger = logger,
-        .connection_idle_timeout_ns = 20 * std.time.ns_per_ms,
+        .connection_idle_timeout_ns = std.time.ns_per_s,
         .write_high_watermark_bytes = 16,
         .write_low_watermark_bytes = 8,
         .tls = .{
@@ -7949,14 +7949,26 @@ test "TLS channel replaces a server-idle connection for a later RPC" {
     });
     defer channel.deinit();
 
-    logger.write(.debug, "test: first RPC start generation={d}", .{channel.impl.connection_generation.load(.monotonic)});
+    const first_generation = channel.impl.connection_generation.load(.monotonic);
+    logger.write(.debug, "test: first RPC start generation={d}", .{first_generation});
     var first = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "first", .{});
     defer first.deinit();
     logger.write(.debug, "test: first RPC status={s} message={s} generation={d}", .{
         @tagName(first.status.code), first.status.message, channel.impl.connection_generation.load(.monotonic),
     });
     try std.testing.expect(first.status.isOk());
-    try std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake);
+    // A fixed sleep can span several idle replacements and race the next close.
+    // Generation advances before the TLS handshake, so also wait for admission.
+    const replacement_deadline = nowNs() +| 5 * std.time.ns_per_s;
+    while (true) {
+        channel.impl.mutex.lockUncancelable(syncIo());
+        const replacement_ready = channel.impl.connection_generation.load(.monotonic) > first_generation and
+            channel.impl.accepting_streams;
+        channel.impl.mutex.unlock(syncIo());
+        if (replacement_ready) break;
+        try std.testing.expect(nowNs() < replacement_deadline);
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
     logger.write(.debug, "test: second RPC start generation={d}", .{channel.impl.connection_generation.load(.monotonic)});
     var second = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "second", .{});
     defer second.deinit();
