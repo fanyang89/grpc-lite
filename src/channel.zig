@@ -826,14 +826,23 @@ fn clientStreamSend(context: *anyopaque, payload: []const u8, options: stream.Se
     if (options.compression != .identity and options.compression != client_stream.request_compression) {
         return error.CompressionNotConfigured;
     }
-    client_stream.mutex.lockUncancelable(syncIo());
-    if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or
-        client_stream.cancel_requested or client_stream.terminal)
     {
-        client_stream.mutex.unlock(syncIo());
-        return error.StreamClosed;
+        client_stream.mutex.lockUncancelable(syncIo());
+        defer client_stream.mutex.unlock(syncIo());
+        if (client_stream.impl == null or !client_stream.app_owned or client_stream.app_released or
+            client_stream.cancel_requested or client_stream.terminal) return error.StreamClosed;
+        if (!client_stream.send_open) return error.SendClosed;
+        // Identity wire size is known before copying. Keep the post-encode check
+        // below because concurrent senders can consume capacity while unlocked.
+        if (options.compression == .identity) {
+            const encoded_size = std.math.add(usize, payload.len, frame.header_size) catch return error.MessageTooLarge;
+            if (encoded_size > client_stream.limits.max_outbound_buffer_size) return error.OutboundBufferLimitExceeded;
+            if (encoded_size > client_stream.limits.max_outbound_buffer_size - client_stream.outbound_buffered) {
+                client_stream.backpressure_requested = true;
+                return error.WouldBlock;
+            }
+        }
     }
-    client_stream.mutex.unlock(syncIo());
 
     const encoded = try frame.encodeWithCompression(client_stream.allocator, payload, options.compression);
     var owned = true;
@@ -8308,4 +8317,59 @@ test "response status parsing rejects noncanonical decimal values for unary and 
             try std.testing.expectEqual(case.code, status.Code.fromInt(parsed));
         }
     }
+}
+
+test "client stream rejects full or half-closed sends before allocating" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(&impl, "/test.Stream/Duplex", .{
+        .send_compression = .gzip,
+        .limits = .{ .max_message_size = 16, .max_inbound_buffer_size = 21, .max_outbound_buffer_size = 21 },
+    }, .{
+        .context = &received,
+        .on_message = StreamTestCallbacks.onMessage,
+        .on_terminal = StreamTestCallbacks.onTerminal,
+    });
+    client_stream.loop_owned = false;
+    var handle = client_stream.handle();
+    defer handle.deinit();
+    try handle.send("payload", .{});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    serialized_allocator.backing = failing.allocator();
+    defer serialized_allocator.backing = std.testing.allocator;
+    try std.testing.expectError(error.WouldBlock, handle.send("12345678", .{}));
+    try std.testing.expect(client_stream.backpressure_requested);
+    try std.testing.expectEqual(@as(usize, 12), client_stream.outbound_buffered);
+    try std.testing.expectEqual(@as(usize, 1), client_stream.outbound.items.len);
+    try handle.closeSend();
+    try std.testing.expectError(error.SendClosed, handle.send("late", .{}));
+    try std.testing.expectError(error.SendClosed, handle.send("late", .{ .compression = .gzip }));
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "client stream admission uses compressed wire size for gzip" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(&impl, "/test.Stream/Duplex", .{
+        .send_compression = .gzip,
+        .limits = .{ .max_message_size = 1024, .max_inbound_buffer_size = 1029, .max_outbound_buffer_size = 1029 },
+    }, .{
+        .context = &received,
+        .on_message = StreamTestCallbacks.onMessage,
+        .on_terminal = StreamTestCallbacks.onTerminal,
+    });
+    client_stream.loop_owned = false;
+    var handle = client_stream.handle();
+    defer handle.deinit();
+    try handle.send(&@as([960]u8, @splat('x')), .{});
+    try std.testing.expectError(error.WouldBlock, handle.send(&@as([1024]u8, @splat('a')), .{}));
+    try handle.send(&@as([1024]u8, @splat('a')), .{ .compression = .gzip });
+    try std.testing.expectEqual(@as(usize, 2), client_stream.outbound.items.len);
+    try std.testing.expect(client_stream.outbound_buffered <= 1029);
 }
