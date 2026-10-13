@@ -24,16 +24,18 @@ pub fn decode(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
 
     var index: usize = 0;
     while (index < message.len) {
-        if (message[index] != '%') {
-            try output.append(allocator, message[index]);
-            index += 1;
-            continue;
+        if (message[index] == '%' and message.len - index >= 3) {
+            if (unhex(message[index + 1])) |high| {
+                if (unhex(message[index + 2])) |low| {
+                    try output.append(allocator, high << 4 | low);
+                    index += 3;
+                    continue;
+                }
+            }
         }
-        if (index + 2 >= message.len) return error.InvalidGrpcMessage;
-        const high = try unhex(message[index + 1]);
-        const low = try unhex(message[index + 2]);
-        try output.append(allocator, high << 4 | low);
-        index += 3;
+        // The gRPC protocol requires preserving malformed status messages.
+        try output.append(allocator, message[index]);
+        index += 1;
     }
     return output.toOwnedSlice(allocator);
 }
@@ -46,12 +48,12 @@ fn hex(value: u8) u8 {
     return if (value < 10) '0' + value else 'A' + value - 10;
 }
 
-fn unhex(value: u8) !u8 {
+fn unhex(value: u8) ?u8 {
     return switch (value) {
         '0'...'9' => value - '0',
         'a'...'f' => value - 'a' + 10,
         'A'...'F' => value - 'A' + 10,
-        else => error.InvalidGrpcMessage,
+        else => null,
     };
 }
 
@@ -63,4 +65,24 @@ test "grpc-message percent encoding round trips" {
     const decoded = try decode(std.testing.allocator, encoded);
     defer std.testing.allocator.free(decoded);
     try std.testing.expectEqualStrings("bad % value\n", decoded);
+}
+
+test "grpc-message decoding preserves malformed escapes and decodes valid portions" {
+    const cases = [_][2][]const u8{
+        .{ "", "" },
+        .{ "%", "%" },
+        .{ "%2", "%2" },
+        .{ "%GG", "%GG" },
+        .{ "%0g%g0", "%0g%g0" },
+        .{ "bad%20value%ZZ%21%", "bad value%ZZ!%" },
+        .{ "%%41", "%A" },
+        .{ "%25%32%30", "%20" },
+        .{ "%e4%B8%AD%E6%96%87", "中文" },
+        .{ "%00%ff", "\x00\xff" },
+    };
+    for (cases) |case| {
+        const decoded = try decode(std.testing.allocator, case[0]);
+        defer std.testing.allocator.free(decoded);
+        try std.testing.expectEqualStrings(case[1], decoded);
+    }
 }

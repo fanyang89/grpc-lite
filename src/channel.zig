@@ -8177,3 +8177,62 @@ test "channel and server exchange a bidirectional stream over TLS" {
     try std.testing.expect(state.succeeded.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), state.messages.load(.acquire));
 }
+
+test "unary preserves peer status with malformed grpc-message escapes" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+
+    const operation = try Operation.init(&impl, "/test.Echo/Unary", "", .{});
+    defer operation.deinit();
+    operation.saw_response_headers = true;
+    operation.http_status = 200;
+    operation.content_type_grpc = true;
+    operation.grpc_status = @intFromEnum(status.Code.not_found);
+    operation.grpc_message = try impl.allocator.dupe(u8, "missing%20item%ZZ%");
+    operation.finalize(c.NGHTTP2_NO_ERROR);
+    try std.testing.expect(operation.done);
+    try std.testing.expectEqual(status.Code.not_found, operation.response_code);
+    try std.testing.expectEqualStrings("missing item%ZZ%", operation.response_message);
+}
+
+test "streaming preserves peer status with malformed grpc-message escapes" {
+    const TerminalState = struct {
+        called: bool = false,
+        valid: bool = false,
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            _: stream.ClientStream,
+            final_status: status.Status,
+            _: *const metadata.Metadata,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.called = true;
+            self.valid = final_status.code == .not_found and
+                std.mem.eql(u8, final_status.message, "missing item%ZZ%");
+        }
+    };
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var terminal: TerminalState = .{};
+    const client_stream = try ClientStreamState.init(&impl, "/test.Stream/Duplex", .{}, .{
+        .context = &terminal,
+        .on_message = StreamTestCallbacks.onMessage,
+        .on_terminal = TerminalState.onTerminal,
+    });
+    client_stream.loop_owned = false;
+    var handle = client_stream.handle();
+    defer handle.deinit();
+    client_stream.saw_response_headers = true;
+    client_stream.http_status = 200;
+    client_stream.content_type_grpc = true;
+    client_stream.grpc_status = @intFromEnum(status.Code.not_found);
+    client_stream.grpc_message = try client_stream.allocator.dupe(u8, "missing%20item%ZZ%");
+    finalizeClientStream(client_stream);
+    try std.testing.expect(terminal.called);
+    try std.testing.expect(terminal.valid);
+}
