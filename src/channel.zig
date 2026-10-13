@@ -130,7 +130,53 @@ const UnaryAdmission = struct {
     }
 };
 
+pub const StreamAdmissionOptions = struct {
+    max_streams: usize = 1024,
+    max_buffer_bytes: usize = 1024 * 1024 * 1024,
+};
+
+pub const StreamAdmissionStats = struct {
+    retained_streams: usize = 0,
+    reserved_buffer_bytes: usize = 0,
+    rejected_streams: u64 = 0,
+};
+
+const StreamAdmission = struct {
+    limits: StreamAdmissionOptions = .{},
+    mutex: std.Io.Mutex = .init,
+    stats: StreamAdmissionStats = .{},
+
+    fn reserve(self: *StreamAdmission, bytes: usize) !void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        if (self.stats.retained_streams >= self.limits.max_streams or
+            bytes > self.limits.max_buffer_bytes - self.stats.reserved_buffer_bytes)
+        {
+            self.stats.rejected_streams +|= 1;
+            return error.StreamAdmissionRejected;
+        }
+        self.stats.retained_streams += 1;
+        self.stats.reserved_buffer_bytes += bytes;
+    }
+
+    fn release(self: *StreamAdmission, bytes: usize) void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        std.debug.assert(self.stats.retained_streams > 0);
+        std.debug.assert(self.stats.reserved_buffer_bytes >= bytes);
+        self.stats.retained_streams -= 1;
+        self.stats.reserved_buffer_bytes -= bytes;
+    }
+
+    fn snapshot(self: *StreamAdmission) StreamAdmissionStats {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        return self.stats;
+    }
+};
+
 const ChannelOptions = struct {
+    stream_admission: StreamAdmissionOptions = .{},
     unary_admission: UnaryAdmissionOptions = .{},
     user_agent: []const u8 = version.user_agent,
     initial_stream_window_size: u32 = 64 * 1024,
@@ -148,6 +194,7 @@ pub const Options = ChannelOptions;
 const AllocatorOperation = enum { alloc, resize, remap, free };
 
 const SerializedAllocator = struct {
+    stream_admission: StreamAdmission = .{},
     backing: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
     references: std.atomic.Value(usize) = .init(1),
@@ -245,7 +292,13 @@ pub const Channel = struct {
         return self.impl.unary_admission.snapshot();
     }
 
+    pub fn streamAdmissionStats(self: *Channel) StreamAdmissionStats {
+        return self.impl.serialized_allocator.stream_admission.snapshot();
+    }
+
     pub fn init(allocator: std.mem.Allocator, target: []const u8, options: ChannelOptions) !Channel {
+        if (options.stream_admission.max_streams == 0 or options.stream_admission.max_buffer_bytes == 0)
+            return error.InvalidStreamAdmissionLimits;
         if (options.unary_admission.max_calls == 0 or options.unary_admission.max_request_bytes == 0)
             return error.InvalidUnaryAdmissionLimits;
         if (options.tls != null and !build_options.tls) return error.TlsUnavailable;
@@ -273,6 +326,7 @@ pub const Channel = struct {
         const serialized_allocator = try allocator.create(SerializedAllocator);
         errdefer allocator.destroy(serialized_allocator);
         serialized_allocator.* = .init(allocator);
+        serialized_allocator.stream_admission.limits = options.stream_admission;
 
         impl.* = .{
             .unary_admission = .{ .limits = options.unary_admission },
@@ -682,6 +736,7 @@ const ClientStreamState = struct {
     impl: ?*Impl,
     allocator: std.mem.Allocator,
     allocator_owner: *SerializedAllocator,
+    admission_bytes: usize,
     path: []u8,
     request_metadata: metadata.Metadata,
     callbacks: stream.ClientCallbacks,
@@ -747,6 +802,10 @@ const ClientStreamState = struct {
         options: stream.Options,
         callbacks: stream.ClientCallbacks,
     ) !*ClientStreamState {
+        const admission_bytes = std.math.add(usize, options.limits.max_inbound_buffer_size, options.limits.max_outbound_buffer_size) catch
+            return error.InvalidStreamAdmissionLimits;
+        try impl.serialized_allocator.stream_admission.reserve(admission_bytes);
+        errdefer impl.serialized_allocator.stream_admission.release(admission_bytes);
         const self = try impl.allocator.create(ClientStreamState);
         errdefer impl.allocator.destroy(self);
         impl.serialized_allocator.retain();
@@ -757,6 +816,7 @@ const ClientStreamState = struct {
             .impl = impl,
             .allocator = impl.allocator,
             .allocator_owner = impl.serialized_allocator,
+            .admission_bytes = admission_bytes,
             .path = owned_path,
             .request_metadata = metadata.Metadata.init(impl.allocator),
             .callbacks = callbacks,
@@ -813,6 +873,7 @@ const ClientStreamState = struct {
         self.initial_metadata.deinit();
         self.trailing_metadata.deinit();
         self.block_metadata.deinit();
+        allocator_owner.stream_admission.release(self.admission_bytes);
         allocator.destroy(self);
         allocator_owner.release();
     }
@@ -4587,7 +4648,12 @@ test "client stream handle outlives channel teardown" {
         },
     );
 
+    const owner = channel.impl.serialized_allocator;
+    owner.retain();
+    defer owner.release();
+    try std.testing.expectEqual(@as(usize, 1), channel.streamAdmissionStats().retained_streams);
     channel.deinit();
+    try std.testing.expectEqual(@as(usize, 1), owner.stream_admission.snapshot().retained_streams);
     const client_state: *ClientStreamState = @ptrCast(@alignCast(client_stream.context));
     try std.testing.expect(client_state.impl == null);
     try std.testing.expectEqual(@as(usize, 1), terminal_state.terminals);
@@ -4596,6 +4662,8 @@ test "client stream handle outlives channel teardown" {
     try std.testing.expectError(error.StreamClosed, client_stream.resumeReceive());
     client_stream.cancel();
     client_stream.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owner.stream_admission.snapshot().retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), owner.stream_admission.snapshot().reserved_buffer_bytes);
 }
 
 test "client stream cancellation closes command surface" {
@@ -8579,4 +8647,113 @@ test "unary admission releases reservations on validation and enqueue rejection"
     try std.testing.expectEqual(@as(usize, 0), stats.retained_calls);
     try std.testing.expectEqual(@as(usize, 0), stats.retained_request_bytes);
     try std.testing.expectEqual(@as(u64, 0), stats.rejected_calls);
+}
+
+test "stream admission enforces count and capacity reservations" {
+    var budget: StreamAdmission = .{ .limits = .{ .max_streams = 2, .max_buffer_bytes = 10 } };
+    try budget.reserve(6);
+    try budget.reserve(4);
+    try std.testing.expectError(error.StreamAdmissionRejected, budget.reserve(0));
+    budget.release(4);
+    try std.testing.expectError(error.StreamAdmissionRejected, budget.reserve(5));
+    try budget.reserve(4);
+    budget.release(4);
+    budget.release(6);
+    const snapshot = budget.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.reserved_buffer_bytes);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.rejected_streams);
+}
+
+fn testStreamAdmissionAllocationFailures(allocator: std.mem.Allocator) !void {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    serialized_allocator.backing = allocator;
+    var received: usize = 0;
+    const client_stream = ClientStreamState.init(&impl, "/test.Stream/Duplex", .{
+        .metadata = &.{.{ .key = "x-key", .value = "value" }},
+    }, .{
+        .context = &received,
+        .on_message = StreamTestCallbacks.onMessage,
+        .on_terminal = StreamTestCallbacks.onTerminal,
+    }) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), serialized_allocator.stream_admission.snapshot().retained_streams);
+        try std.testing.expectEqual(@as(usize, 0), serialized_allocator.stream_admission.snapshot().reserved_buffer_bytes);
+        try std.testing.expectEqual(@as(usize, 1), serialized_allocator.references.load(.monotonic));
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), serialized_allocator.stream_admission.snapshot().reserved_buffer_bytes);
+    client_stream.destroyUnqueued();
+    try std.testing.expectEqual(@as(usize, 0), serialized_allocator.stream_admission.snapshot().retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), serialized_allocator.stream_admission.snapshot().reserved_buffer_bytes);
+}
+
+test "stream admission rolls back every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testStreamAdmissionAllocationFailures, .{});
+}
+
+test "stream admission rejects before allocation and releases failed opens" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    serialized_allocator.stream_admission.limits.max_buffer_bytes = 1;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    serialized_allocator.backing = failing.allocator();
+    var channel: Channel = .{ .impl = &impl };
+    var received: usize = 0;
+    const callbacks: stream.ClientCallbacks = .{
+        .context = &received,
+        .on_message = StreamTestCallbacks.onMessage,
+        .on_terminal = StreamTestCallbacks.onTerminal,
+    };
+    try std.testing.expectError(error.StreamAdmissionRejected, channel.openStream("/test.Stream/Duplex", .{}, callbacks));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 1), channel.streamAdmissionStats().rejected_streams);
+    serialized_allocator.backing = std.testing.allocator;
+    serialized_allocator.stream_admission.limits = .{};
+    try std.testing.expectError(error.InvalidMetadataKey, channel.openStream("/test.Stream/Duplex", .{
+        .metadata = &.{.{ .key = "grpc-invalid", .value = "value" }},
+    }, callbacks));
+    try std.testing.expectError(error.ChannelUnavailable, channel.openStream("/test.Stream/Duplex", .{}, callbacks));
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
+    try std.testing.expectError(error.InvalidStreamAdmissionLimits, channel.openStream("/test.Stream/Duplex", .{
+        .limits = .{ .max_outbound_buffer_size = std.math.maxInt(usize) },
+    }, callbacks));
+}
+
+test "channel rejects zero stream admission limits" {
+    for ([_]StreamAdmissionOptions{ .{ .max_streams = 0 }, .{ .max_buffer_bytes = 0 } }) |limits| {
+        try std.testing.expectError(error.InvalidStreamAdmissionLimits, Channel.init(
+            std.testing.allocator,
+            "invalid",
+            .{ .stream_admission = limits },
+        ));
+    }
+}
+
+test "stream admission is safe with concurrent reservations" {
+    const Worker = struct {
+        fn run(budget: *StreamAdmission) void {
+            for (0..1000) |_| {
+                budget.reserve(5) catch continue;
+                budget.release(5);
+            }
+        }
+    };
+    var budget: StreamAdmission = .{ .limits = .{ .max_streams = 2, .max_buffer_bytes = 10 } };
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{&budget});
+        started += 1;
+    }
+    for (threads) |thread| thread.join();
+    started = 0;
+    try std.testing.expectEqual(@as(usize, 0), budget.snapshot().retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), budget.snapshot().reserved_buffer_bytes);
 }

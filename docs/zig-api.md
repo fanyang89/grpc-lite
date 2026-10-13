@@ -59,8 +59,7 @@ thread-safe snapshot of `retained_calls`, `retained_request_bytes`, and the satu
 
 C/C++ channels use the same default limits and receive gRPC `RESOURCE_EXHAUSTED` on
 quota rejection. ABI 1.7 exposes configuration and snapshots through C and C++; see
-[Managed Channels](c-cpp-api.md#managed-channels). Aggregate streaming admission is
-not yet exposed.
+[Managed Channels](c-cpp-api.md#managed-channels). Streaming uses the separate capacity reservation described below.
 
 ## Unary Calls
 
@@ -98,6 +97,33 @@ without invoking it. There is no explicit unary cancellation API.
 The callback runs on the transport loop and must not block or call `Channel.deinit`.
 Payload, status, and metadata are borrowed until callback return. `Channel.deinit` waits
 for every accepted callback before releasing Channel storage.
+
+## Streaming Admission
+
+Each Channel has `stream_admission.max_streams = 1024` and
+`stream_admission.max_buffer_bytes = 1024 * 1024 * 1024`; both must be nonzero.
+Before allocating a stream, `openStream` reserves one slot and the sum of that
+stream's `max_inbound_buffer_size` and `max_outbound_buffer_size`. With the default
+8 MiB per direction, the 1 GiB budget admits at most 64 retained streams per Channel.
+Tune either the per-stream capacities or the Channel budget for higher concurrency.
+Reservation does not eagerly allocate the buffers.
+
+Exhaustion returns `error.StreamAdmissionRejected` without invoking callbacks.
+Failed construction or submission returns the reservation. Successful streams retain
+it until both transport ownership and the application handle are released, including
+terminal streams still held by the application. The accounting storage outlives the
+Channel when handles do; always deinitialize application-owned stream handles.
+
+`channel.streamAdmissionStats()` returns a thread-safe snapshot of `retained_streams`,
+`reserved_buffer_bytes`, and saturating `rejected_streams`. This is a conservative
+sum of configured capacities, not current queue occupancy or a total heap limit.
+Metadata, decoder/workspace overhead, temporary concurrent send allocations, and
+transport write buffers are not included. Unary admission remains independent.
+
+C/C++ currently inherit these defaults. A rejected open returns C `WOULD_BLOCK`
+(or `grpc_lite::ErrorCode::WouldBlock`); the grpcpp facade maps that failure to
+`RESOURCE_EXHAUSTED`. Streaming admission configuration and snapshots through C/C++
+are deferred; the native Zig API exposes both.
 
 ## Raw Streaming
 

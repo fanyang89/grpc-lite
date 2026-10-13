@@ -58,6 +58,8 @@ class FailingMessage {
 }  // namespace
 
 int main() {
+  assert(grpc::internal::ErrorStatus(grpc_lite::Error(grpc_lite::ErrorCode::WouldBlock))
+             .error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
   static_assert(std::is_same_v<decltype(grpc::Status::OK), const grpc::Status&>);
   static_assert(
       std::is_same_v<decltype(grpc::Status::CANCELLED), const grpc::Status&>);

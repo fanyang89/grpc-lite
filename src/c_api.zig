@@ -483,7 +483,10 @@ pub fn grpc_lite_channel_open_stream(
         .on_remote_end = clientStreamOnRemoteEnd,
         .on_writable = clientStreamOnWritable,
         .on_terminal = clientStreamOnTerminal,
-    }) catch |err| return mapStreamError(err);
+    }) catch |err| {
+        allocator.destroy(storage);
+        return mapStreamError(err);
+    };
     storage.ready.store(true, .release);
     output.* = clientStreamHandle(storage);
     return .ok;
@@ -1032,10 +1035,11 @@ fn metadataView(handle: *const MetadataViewHandle) *const metadata.Metadata {
 fn mapStreamError(err: anyerror) Error {
     return switch (err) {
         error.OutOfMemory => .out_of_memory,
-        error.WouldBlock => .would_block,
+        error.WouldBlock, error.StreamAdmissionRejected => .would_block,
         error.StreamClosed, error.SendClosed => .closed,
         error.ChannelUnavailable => .unavailable,
         error.MessageTooLarge, error.OutboundBufferLimitExceeded => .out_of_range,
+        error.InvalidStreamAdmissionLimits,
         error.InvalidMethodPath,
         error.InvalidMetadataKey,
         error.InvalidMetadataValue,
@@ -1911,4 +1915,9 @@ test "C unary admission snapshot validates outputs and preserves unknown tail" {
     extended.stats.retained_calls = 99;
     try std.testing.expectEqual(Error.invalid_argument, grpc_lite_channel_get_unary_admission_stats(null, &extended.stats));
     try std.testing.expectEqual(@as(u64, 99), extended.stats.retained_calls);
+}
+
+test "C stream admission errors map to retryable admission failure" {
+    try std.testing.expectEqual(Error.would_block, mapStreamError(error.StreamAdmissionRejected));
+    try std.testing.expectEqual(Error.invalid_argument, mapStreamError(error.InvalidStreamAdmissionLimits));
 }
