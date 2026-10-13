@@ -9,6 +9,13 @@ mise run interop-http2
 mise run interop-http2-edge
 ```
 
+The TLS harness defaults both peers to port zero, lets the kernel assign ports, and
+reads each actual port from that peer's startup log before probing readiness.
+`ZIG_TLS_SERVER_PORT` and `GO_TLS_SERVER_PORT` still override the defaults; an occupied
+explicit port fails rather than silently choosing another port. The harness runs
+`bash tests/official/run_tls_test.sh` to validate readiness-log parsing and failed-peer
+handling before starting interoperability cases.
+
 ## Current Matrix
 
 | Peer or suite | Cases | Result |
