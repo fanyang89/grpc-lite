@@ -77,6 +77,11 @@ void TestInvalidObjects() {
   options.logger = [token = std::move(logger_token)](
                        grpc_lite::LogLevel, std::string_view) {};
   Channel channel;
+  grpc_lite::StreamAdmissionStats stream_stats;
+  assert(channel.GetStreamAdmissionStats(&stream_stats).code() == grpc_lite::ErrorCode::InvalidArgument);
+  assert(channel.GetStreamAdmissionStats(nullptr).code() == grpc_lite::ErrorCode::InvalidArgument);
+  assert(options.max_streams == 1024);
+  assert(options.max_stream_buffer_bytes == UINT64_C(1073741824));
   grpc_lite::UnaryAdmissionStats stats;
   assert(channel.GetUnaryAdmissionStats(&stats).code() == grpc_lite::ErrorCode::InvalidArgument);
   assert(channel.GetUnaryAdmissionStats(nullptr).code() == grpc_lite::ErrorCode::InvalidArgument);
@@ -97,10 +102,21 @@ void TestInvalidObjects() {
   assert(Channel::CreateManaged(nullptr, "127.0.0.1:1", options, &channel).code() ==
          grpc_lite::ErrorCode::InvalidArgument);
   options.max_unary_request_bytes = 1;
+  options.max_streams = 0;
+  assert(Channel::CreateManaged(nullptr, "127.0.0.1:1", options, &channel).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  options.max_streams = 1;
+  options.max_stream_buffer_bytes = 0;
+  assert(Channel::CreateManaged(nullptr, "127.0.0.1:1", options, &channel).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  options.max_stream_buffer_bytes = 1;
   assert(Channel::CreateManaged(nullptr, "127.0.0.1:1", options, &channel).ok());
   assert(channel.GetUnaryAdmissionStats(&stats).ok());
   assert(stats.retained_calls == 0 && stats.retained_request_bytes == 0);
   assert(stats.rejected_calls == 0);
+  assert(channel.GetStreamAdmissionStats(&stream_stats).ok());
+  assert(stream_stats.retained_streams == 0 && stream_stats.reserved_buffer_bytes == 0);
+  assert(stream_stats.rejected_streams == 0);
   channel.Shutdown();
   channel.Wait();
 }

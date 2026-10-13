@@ -71,11 +71,22 @@ Initialize `grpc_lite_unary_admission_stats` with
 `grpc_lite_channel_get_unary_admission_stats`. C++ provides
 `Channel::GetUnaryAdmissionStats(UnaryAdmissionStats*)`. Snapshots report retained
 calls, retained request bytes, and a saturating quota-rejection count. They are
-thread-safe but must not race Channel destruction. These statistics exclude streaming. Streaming has a separate default admission
+thread-safe but must not race Channel destruction. These symbols require ABI 1.7
+or newer and exclude streaming.
+
+Streaming has a separate default admission
 budget of 1024 retained streams and 1 GiB of configured aggregate buffer capacity
 (64 streams at the default 8 MiB per direction). A rejected stream open returns
 `GRPC_LITE_ERROR_WOULD_BLOCK`; the grpcpp facade maps it to `RESOURCE_EXHAUSTED`.
-C/C++ configuration and snapshots for the streaming budget are not yet exposed. These new symbols require a runtime with ABI 1.7 or newer.
+ABI 1.8 appends `max_streams` and `max_stream_buffer_bytes` to Channel options;
+both must be nonzero and fit `size_t`. Old prefixes retain the defaults. Initialize
+`grpc_lite_stream_admission_stats` with `GRPC_LITE_STREAM_ADMISSION_STATS_INIT` and
+call `grpc_lite_channel_get_stream_admission_stats`; C++ exposes
+`Channel::GetStreamAdmissionStats(StreamAdmissionStats*)`. These new symbols require
+ABI 1.8 or newer. Snapshots report `retained_streams`, `reserved_buffer_bytes`, and
+saturating `rejected_streams`. Buffer bytes are reserved capacities, not current
+occupancy or total heap usage. Closed streams still held by the application retain
+their reservation until their handle and transport ownership are both released.
 
 Use `grpc_lite_channel_shutdown` to stop admission and active work, then
 `grpc_lite_channel_wait` before exclusive destruction when calls may be concurrent.

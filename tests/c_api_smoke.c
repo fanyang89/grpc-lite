@@ -127,6 +127,8 @@ int main(void) {
 
   if (grpc_lite_runtime_create(&runtime) != GRPC_LITE_OK) return 10;
   grpc_lite_runtime_destroy(runtime);
+  channel_options.max_streams = 1;
+  channel_options.max_stream_buffer_bytes = 1;
   channel_options.max_unary_calls = 1;
   channel_options.max_unary_request_bytes = 1;
   channel_options.allow_initial_offline = 1;
@@ -149,6 +151,17 @@ int main(void) {
   assert(grpc_lite_channel_get_unary_admission_stats(channel, &stats) == GRPC_LITE_OK);
   assert(stats.retained_calls == 0 && stats.retained_request_bytes == 0);
   assert(stats.rejected_calls == 1);
+  grpc_lite_stream_admission_stats stream_stats = GRPC_LITE_STREAM_ADMISSION_STATS_INIT;
+  assert(grpc_lite_channel_get_stream_admission_stats(channel, &stream_stats) == GRPC_LITE_OK);
+  assert(stream_stats.retained_streams == 0 && stream_stats.rejected_streams == 0);
+  grpc_lite_client_stream *rejected_stream = NULL;
+  assert(grpc_lite_channel_open_stream(
+      channel, bytes("/test.Stream/Duplex", sizeof("/test.Stream/Duplex") - 1),
+      NULL, &callbacks, &rejected_stream) == GRPC_LITE_ERROR_WOULD_BLOCK);
+  assert(rejected_stream == NULL);
+  assert(grpc_lite_channel_get_stream_admission_stats(channel, &stream_stats) == GRPC_LITE_OK);
+  assert(stream_stats.retained_streams == 0 && stream_stats.reserved_buffer_bytes == 0);
+  assert(stream_stats.rejected_streams == 1);
   grpc_lite_channel_shutdown(channel);
   grpc_lite_channel_wait(channel);
   grpc_lite_channel_destroy(channel);

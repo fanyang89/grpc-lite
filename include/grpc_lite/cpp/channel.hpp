@@ -32,12 +32,20 @@ struct ChannelOptions {
   std::uint64_t max_response_header_list_size = UINT64_C(65536);
   std::uint64_t max_unary_calls = 4096;
   std::uint64_t max_unary_request_bytes = UINT64_C(67108864);
+  std::uint64_t max_streams = 1024;
+  std::uint64_t max_stream_buffer_bytes = UINT64_C(1073741824);
 };
 
 struct UnaryAdmissionStats {
   std::uint64_t retained_calls = 0;
   std::uint64_t retained_request_bytes = 0;
   std::uint64_t rejected_calls = 0;
+};
+
+struct StreamAdmissionStats {
+  std::uint64_t retained_streams = 0;
+  std::uint64_t reserved_buffer_bytes = 0;
+  std::uint64_t rejected_streams = 0;
 };
 
 class ClientStream;
@@ -84,6 +92,8 @@ class Channel {
 
     c_options.max_unary_calls = options.max_unary_calls;
     c_options.max_unary_request_bytes = options.max_unary_request_bytes;
+    c_options.max_streams = options.max_streams;
+    c_options.max_stream_buffer_bytes = options.max_stream_buffer_bytes;
 
     grpc_lite_channel* channel = nullptr;
     const Error error(grpc_lite_channel_create_managed(
@@ -101,6 +111,16 @@ class Channel {
     const Error error(grpc_lite_channel_get_unary_admission_stats(channel_, &stats));
     if (!error.ok()) return error;
     *out = {stats.retained_calls, stats.retained_request_bytes, stats.rejected_calls};
+    return {};
+  }
+
+  Error GetStreamAdmissionStats(StreamAdmissionStats* out) const {
+    if (out == nullptr) return Error(ErrorCode::InvalidArgument);
+    *out = {};
+    grpc_lite_stream_admission_stats stats = GRPC_LITE_STREAM_ADMISSION_STATS_INIT;
+    const Error error(grpc_lite_channel_get_stream_admission_stats(channel_, &stats));
+    if (!error.ok()) return error;
+    *out = {stats.retained_streams, stats.reserved_buffer_bytes, stats.rejected_streams};
     return {};
   }
 

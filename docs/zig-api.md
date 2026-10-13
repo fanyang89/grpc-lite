@@ -120,10 +120,10 @@ sum of configured capacities, not current queue occupancy or a total heap limit.
 Metadata, decoder/workspace overhead, temporary concurrent send allocations, and
 transport write buffers are not included. Unary admission remains independent.
 
-C/C++ currently inherit these defaults. A rejected open returns C `WOULD_BLOCK`
+C/C++ share these defaults. A rejected open returns C `WOULD_BLOCK`
 (or `grpc_lite::ErrorCode::WouldBlock`); the grpcpp facade maps that failure to
-`RESOURCE_EXHAUSTED`. Streaming admission configuration and snapshots through C/C++
-are deferred; the native Zig API exposes both.
+`RESOURCE_EXHAUSTED`. ABI 1.8 exposes `max_streams`, `max_stream_buffer_bytes`, and
+stream admission snapshots through C/C++; see [Managed Channels](c-cpp-api.md#managed-channels).
 
 ## Raw Streaming
 
