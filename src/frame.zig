@@ -182,6 +182,9 @@ fn decompressGzip(
     payload: []const u8,
     max_message_size: usize,
 ) ![]u8 {
+    // RFC 1952 requires rejecting nonzero reserved FLG bits. Zig's inflater
+    // parses the flags but does not enforce this constraint.
+    if (payload.len < 10 or payload[3] & 0xe0 != 0) return error.MalformedCompressedMessage;
     var input: std.Io.Reader = .fixed(payload);
     const history = try allocator.alloc(u8, std.compress.flate.max_window_len);
     defer allocator.free(history);
@@ -463,4 +466,25 @@ test "gzip decoding rejects truncated footers even with a complete gRPC frame" {
             decodeUnaryWithCompression(std.testing.allocator, truncated, 1024, .gzip),
         );
     }
+}
+
+test "gzip decoding rejects reserved header flags" {
+    const encoded = try encodeWithCompression(std.testing.allocator, "payload", .gzip);
+    defer std.testing.allocator.free(encoded);
+    const flags_index = header_size + 3;
+    const original_flags = encoded[flags_index];
+    for ([_]u8{ 0x20, 0x40, 0x80, 0xe0 }) |reserved| {
+        encoded[flags_index] = original_flags | reserved;
+        if (decodeUnaryWithCompression(std.testing.allocator, encoded, 1024, .gzip)) |decoded| {
+            std.testing.allocator.free(decoded);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.MalformedCompressedMessage, err);
+        }
+    }
+    // FTEXT is advisory, not a reserved bit.
+    encoded[flags_index] = original_flags | 0x01;
+    const decoded = try decodeUnaryWithCompression(std.testing.allocator, encoded, 1024, .gzip);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("payload", decoded);
 }
