@@ -85,7 +85,53 @@ pub const ReconnectOptions = struct {
     jitter_percent: u8 = 20,
 };
 
+pub const UnaryAdmissionOptions = struct {
+    max_calls: usize = 4096,
+    max_request_bytes: usize = 64 * 1024 * 1024,
+};
+
+pub const UnaryAdmissionStats = struct {
+    retained_calls: usize = 0,
+    retained_request_bytes: usize = 0,
+    rejected_calls: u64 = 0,
+};
+
+const UnaryAdmission = struct {
+    limits: UnaryAdmissionOptions = .{},
+    mutex: std.Io.Mutex = .init,
+    stats: UnaryAdmissionStats = .{},
+
+    fn reserve(self: *UnaryAdmission, bytes: usize) !void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        if (self.stats.retained_calls >= self.limits.max_calls or
+            bytes > self.limits.max_request_bytes - self.stats.retained_request_bytes)
+        {
+            self.stats.rejected_calls +|= 1;
+            return error.UnaryAdmissionRejected;
+        }
+        self.stats.retained_calls += 1;
+        self.stats.retained_request_bytes += bytes;
+    }
+
+    fn release(self: *UnaryAdmission, bytes: usize) void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        std.debug.assert(self.stats.retained_calls > 0);
+        std.debug.assert(self.stats.retained_request_bytes >= bytes);
+        self.stats.retained_calls -= 1;
+        self.stats.retained_request_bytes -= bytes;
+    }
+
+    fn snapshot(self: *UnaryAdmission) UnaryAdmissionStats {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        return self.stats;
+    }
+};
+
 const ChannelOptions = struct {
+    unary_admission: UnaryAdmissionOptions = .{},
     user_agent: []const u8 = version.user_agent,
     initial_stream_window_size: u32 = 64 * 1024,
     max_response_header_list_size: u32 = 64 * 1024,
@@ -194,7 +240,14 @@ pub const Channel = struct {
 
     impl: *Impl,
 
+    /// Snapshot of retained unary operations, logical request bytes, and quota rejections.
+    pub fn unaryAdmissionStats(self: *Channel) UnaryAdmissionStats {
+        return self.impl.unary_admission.snapshot();
+    }
+
     pub fn init(allocator: std.mem.Allocator, target: []const u8, options: ChannelOptions) !Channel {
+        if (options.unary_admission.max_calls == 0 or options.unary_admission.max_request_bytes == 0)
+            return error.InvalidUnaryAdmissionLimits;
         if (options.tls != null and !build_options.tls) return error.TlsUnavailable;
         if (options.tls) |tls_options| {
             if (tls_options.handshake_timeout_ns == 0) return error.InvalidTlsHandshakeTimeout;
@@ -222,6 +275,7 @@ pub const Channel = struct {
         serialized_allocator.* = .init(allocator);
 
         impl.* = .{
+            .unary_admission = .{ .limits = options.unary_admission },
             .backing_allocator = allocator,
             .serialized_allocator = serialized_allocator,
             .allocator = undefined,
@@ -489,6 +543,7 @@ const TestObserver = if (builtin.is_test) struct {
 } else struct {};
 
 const Impl = struct {
+    unary_admission: UnaryAdmission = .{},
     backing_allocator: std.mem.Allocator,
     serialized_allocator: *SerializedAllocator,
     allocator: std.mem.Allocator,
@@ -921,6 +976,7 @@ const Operation = struct {
     impl: *Impl,
     path: []u8,
     request_frame: []u8,
+    admission_bytes: usize,
     request_offset: usize = 0,
     request_metadata: metadata.Metadata,
     request_compression: Compression,
@@ -966,6 +1022,14 @@ const Operation = struct {
     block_grpc_message: ?[]u8 = null,
 
     fn init(impl: *Impl, path: []const u8, payload: []const u8, options: call.Options) !*Operation {
+        var admission_bytes = std.math.add(usize, path.len, frame.header_size) catch return error.UnaryRequestSizeOverflow;
+        admission_bytes = std.math.add(usize, admission_bytes, payload.len) catch return error.UnaryRequestSizeOverflow;
+        for (options.metadata) |entry| {
+            admission_bytes = std.math.add(usize, admission_bytes, entry.key.len) catch return error.UnaryRequestSizeOverflow;
+            admission_bytes = std.math.add(usize, admission_bytes, entry.value.len) catch return error.UnaryRequestSizeOverflow;
+        }
+        try impl.unary_admission.reserve(admission_bytes);
+        errdefer impl.unary_admission.release(admission_bytes);
         const operation = try impl.allocator.create(Operation);
         errdefer impl.allocator.destroy(operation);
         const owned_path = try impl.allocator.dupe(u8, path);
@@ -981,6 +1045,7 @@ const Operation = struct {
             .impl = impl,
             .path = owned_path,
             .request_frame = request_frame,
+            .admission_bytes = admission_bytes,
             .request_metadata = metadata.Metadata.init(impl.allocator),
             .request_compression = options.request_compression,
             .max_response_size = options.max_response_size,
@@ -1030,6 +1095,7 @@ const Operation = struct {
         self.initial_metadata.deinit();
         self.trailing_metadata.deinit();
         self.block_metadata.deinit();
+        self.impl.unary_admission.release(self.admission_bytes);
         allocator.destroy(self);
     }
 
@@ -8372,4 +8438,145 @@ test "client stream admission uses compressed wire size for gzip" {
     try handle.send(&@as([1024]u8, @splat('a')), .{ .compression = .gzip });
     try std.testing.expectEqual(@as(usize, 2), client_stream.outbound.items.len);
     try std.testing.expect(client_stream.outbound_buffered <= 1029);
+}
+
+test "unary admission enforces exact count and byte boundaries and recovers" {
+    var admission: UnaryAdmission = .{ .limits = .{ .max_calls = 2, .max_request_bytes = 10 } };
+    try admission.reserve(6);
+    try admission.reserve(4);
+    try std.testing.expectError(error.UnaryAdmissionRejected, admission.reserve(0));
+    admission.release(4);
+    try std.testing.expectError(error.UnaryAdmissionRejected, admission.reserve(5));
+    try admission.reserve(4);
+    admission.release(4);
+    admission.release(6);
+    const stats = admission.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), stats.retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), stats.retained_request_bytes);
+    try std.testing.expectEqual(@as(u64, 2), stats.rejected_calls);
+}
+
+fn testUnaryAdmissionAllocationFailures(allocator: std.mem.Allocator) !void {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    serialized_allocator.backing = allocator;
+    const operation = Operation.init(&impl, "/test.Echo/Unary", "payload", .{
+        .metadata = &.{.{ .key = "x-key", .value = "value" }},
+        .request_compression = .gzip,
+    }) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), impl.unary_admission.snapshot().retained_calls);
+        try std.testing.expectEqual(@as(usize, 0), impl.unary_admission.snapshot().retained_request_bytes);
+        return err;
+    };
+    const stats = impl.unary_admission.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), stats.retained_calls);
+    try std.testing.expectEqual(@as(usize, "/test.Echo/Unary".len + 5 + "payload".len + "x-key".len + "value".len), stats.retained_request_bytes);
+    operation.deinit();
+    try std.testing.expectEqual(@as(usize, 0), impl.unary_admission.snapshot().retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), impl.unary_admission.snapshot().retained_request_bytes);
+}
+
+test "unary admission rolls back every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testUnaryAdmissionAllocationFailures, .{});
+}
+
+test "unary admission rejects before allocating and never calls a rejected async callback" {
+    const Callback = struct {
+        fn complete(context: ?*anyopaque, _: call.AsyncResult) void {
+            const called: *bool = @ptrCast(@alignCast(context.?));
+            called.* = true;
+        }
+    };
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.unary_admission.limits.max_request_bytes = 1;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    serialized_allocator.backing = failing.allocator();
+    var channel: Channel = .{ .impl = &impl };
+    var called = false;
+    try std.testing.expectError(error.UnaryAdmissionRejected, channel.callUnaryAsync(
+        "/test.Echo/Unary",
+        "payload",
+        .{},
+        .{ .context = &called, .on_complete = Callback.complete },
+    ));
+    try std.testing.expectError(error.UnaryAdmissionRejected, channel.callUnary(
+        std.testing.allocator,
+        "/test.Echo/Unary",
+        "payload",
+        .{},
+    ));
+    try std.testing.expect(!called);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 2), channel.unaryAdmissionStats().rejected_calls);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+}
+
+test "channel rejects zero unary admission limits" {
+    for ([_]UnaryAdmissionOptions{
+        .{ .max_calls = 0 },
+        .{ .max_request_bytes = 0 },
+    }) |limits| {
+        try std.testing.expectError(error.InvalidUnaryAdmissionLimits, Channel.init(
+            std.testing.allocator,
+            "invalid",
+            .{ .unary_admission = limits },
+        ));
+    }
+}
+
+test "unary admission remains bounded with concurrent callers" {
+    const Worker = struct {
+        fn run(admission: *UnaryAdmission) void {
+            for (0..1000) |_| {
+                admission.reserve(5) catch continue;
+                admission.release(5);
+            }
+        }
+    };
+    var admission: UnaryAdmission = .{ .limits = .{ .max_calls = 2, .max_request_bytes = 10 } };
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{&admission});
+        started += 1;
+    }
+    for (threads) |thread| thread.join();
+    started = 0;
+    try std.testing.expectEqual(@as(usize, 0), admission.snapshot().retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), admission.snapshot().retained_request_bytes);
+}
+
+test "unary admission releases reservations on validation and enqueue rejection" {
+    const Callback = struct {
+        fn complete(_: ?*anyopaque, _: call.AsyncResult) void {
+            @panic("rejected call must not invoke its callback");
+        }
+    };
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var channel: Channel = .{ .impl = &impl };
+    try std.testing.expectError(error.InvalidMetadataKey, channel.callUnaryAsync(
+        "/test.Echo/Unary",
+        "payload",
+        .{ .metadata = &.{.{ .key = "grpc-invalid", .value = "value" }} },
+        .{ .on_complete = Callback.complete },
+    ));
+    try std.testing.expectError(error.ChannelUnavailable, channel.callUnaryAsync(
+        "/test.Echo/Unary",
+        "payload",
+        .{},
+        .{ .on_complete = Callback.complete },
+    ));
+    const stats = channel.unaryAdmissionStats();
+    try std.testing.expectEqual(@as(usize, 0), stats.retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), stats.retained_request_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.rejected_calls);
 }

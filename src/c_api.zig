@@ -407,10 +407,20 @@ pub fn grpc_lite_channel_call_unary(
         method,
         request_bytes,
         options,
-    ) catch |err| return switch (err) {
-        error.OutOfMemory => .out_of_memory,
-        error.InvalidMethodPath, error.InvalidMaxResponseSize, error.InvalidMetadataKey, error.InvalidMetadataValue => .invalid_argument,
-        else => .internal,
+    ) catch |err| blk: {
+        if (err == error.UnaryAdmissionRejected) {
+            break :blk call.Result.init(allocator, .init(.resource_exhausted, "unary admission limit exceeded"), "") catch {
+                allocator.destroy(storage);
+                return .out_of_memory;
+            };
+        }
+        allocator.destroy(storage);
+        return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            error.UnaryRequestSizeOverflow => .out_of_range,
+            error.InvalidMethodPath, error.InvalidMaxResponseSize, error.InvalidMetadataKey, error.InvalidMetadataValue => .invalid_argument,
+            else => .internal,
+        };
     };
     output.* = @ptrCast(storage);
     return .ok;
@@ -1800,4 +1810,23 @@ test "C failed unary and stream creation release handle storage" {
     try std.testing.expectEqual(null, stream);
     try std.testing.expect(grpc_lite_channel_open_stream(handle, view("/test.Echo/Stream"), null, &callbacks, &stream) != .ok);
     try std.testing.expectEqual(null, stream);
+}
+
+test "C unary admission rejection is RESOURCE_EXHAUSTED without changing the ABI" {
+    var storage: ChannelStorage = .{ .value = try channel.Channel.init(std.testing.allocator, "127.0.0.1:1", .{
+        .reconnect = .{ .allow_initial_offline = true },
+        .unary_admission = .{ .max_request_bytes = 1 },
+    }) };
+    defer storage.value.deinit();
+    var result: ?*UnaryResultHandle = null;
+    try std.testing.expectEqual(Error.ok, grpc_lite_channel_call_unary(
+        @ptrCast(&storage),
+        view("/test.Echo/Unary"),
+        view("payload"),
+        null,
+        &result,
+    ));
+    defer grpc_lite_unary_result_destroy(result);
+    try std.testing.expectEqual(@as(i32, 8), grpc_lite_unary_result_status_code(result));
+    try std.testing.expectEqual(@as(usize, 0), grpc_lite_unary_result_payload(result).size);
 }

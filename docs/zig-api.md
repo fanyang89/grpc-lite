@@ -37,6 +37,30 @@ accepted before oversized trailers remains available.
 are active; join caller threads before giving `Channel.deinit` exclusive access. The
 Channel serializes access to the allocator passed to `Channel.init`.
 
+## Unary Admission
+
+Channels default to `unary_admission.max_calls = 4096` and
+`unary_admission.max_request_bytes = 64 * 1024 * 1024`. Both must be nonzero.
+Admission is reserved before copying or compressing a unary request and covers
+construction, pending, and in-flight operations until their storage is released.
+For async calls this includes the completion callback; for blocking calls it includes
+copying the result. A callback starting another call still occupies its original slot.
+
+The byte charge is the method path, five-byte frame header, uncompressed payload,
+and raw metadata key/value lengths. It is a logical request budget, **not** a total
+heap or wire-byte limit: response storage, compression workspace, allocator overhead,
+and streaming calls are excluded. Set both limits for the deployment's capacity.
+
+Both unary entry points return `error.UnaryAdmissionRejected` immediately on quota
+exhaustion; rejected async calls never invoke the completion callback. Allocation or
+validation failures roll back reservations. `channel.unaryAdmissionStats()` returns a
+thread-safe snapshot of `retained_calls`, `retained_request_bytes`, and the saturating
+`rejected_calls` quota counter. Release of operation storage makes quota reusable.
+
+C/C++ channels inherit the default limits and receive gRPC `RESOURCE_EXHAUSTED` on
+quota rejection. Configuring limits and reading snapshots through the C/C++ API, and
+aggregate streaming admission, are not yet exposed.
+
 ## Unary Calls
 
 ```zig
