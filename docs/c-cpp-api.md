@@ -55,6 +55,25 @@ the stream with `INTERNAL_ERROR`, or closes the connection if reset submission f
 reconnects with bounded exponential backoff without replaying submitted RPCs. Unsubmitted
 unary calls retain their original deadlines while waiting for a connection.
 
+ABI 1.7 appends `max_unary_calls` (default 4096) and `max_unary_request_bytes`
+(default 64 MiB) to `grpc_lite_channel_options`; the C++ `ChannelOptions` uses the
+same fields. Both limits must be nonzero and fit `size_t`. Older option prefixes
+retain the defaults for absent fields. Initialize options with
+`GRPC_LITE_CHANNEL_OPTIONS_INIT` and preserve `struct_size`.
+
+Unary quota rejection returns a result with gRPC `RESOURCE_EXHAUSTED`, not a C API
+error. The limits cover retained unary operations, including construction and result
+copying. Bytes charge the method path, five-byte frame header, uncompressed payload,
+and raw metadata keys/values, not total heap usage or response storage.
+
+Initialize `grpc_lite_unary_admission_stats` with
+`GRPC_LITE_UNARY_ADMISSION_STATS_INIT`, then call
+`grpc_lite_channel_get_unary_admission_stats`. C++ provides
+`Channel::GetUnaryAdmissionStats(UnaryAdmissionStats*)`. Snapshots report retained
+calls, retained request bytes, and a saturating quota-rejection count. They are
+thread-safe but must not race Channel destruction. Aggregate streaming admission
+is not included. These new symbols require a runtime with ABI 1.7 or newer.
+
 Use `grpc_lite_channel_shutdown` to stop admission and active work, then
 `grpc_lite_channel_wait` before exclusive destruction when calls may be concurrent.
 

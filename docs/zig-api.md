@@ -57,9 +57,10 @@ validation failures roll back reservations. `channel.unaryAdmissionStats()` retu
 thread-safe snapshot of `retained_calls`, `retained_request_bytes`, and the saturating
 `rejected_calls` quota counter. Release of operation storage makes quota reusable.
 
-C/C++ channels inherit the default limits and receive gRPC `RESOURCE_EXHAUSTED` on
-quota rejection. Configuring limits and reading snapshots through the C/C++ API, and
-aggregate streaming admission, are not yet exposed.
+C/C++ channels use the same default limits and receive gRPC `RESOURCE_EXHAUSTED` on
+quota rejection. ABI 1.7 exposes configuration and snapshots through C and C++; see
+[Managed Channels](c-cpp-api.md#managed-channels). Aggregate streaming admission is
+not yet exposed.
 
 ## Unary Calls
 

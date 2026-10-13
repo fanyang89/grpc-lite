@@ -13,7 +13,7 @@ const Status = @import("status.zig").Status;
 const version = @import("version.zig");
 
 pub const abi_major: u16 = 1;
-pub const abi_minor: u16 = 6;
+pub const abi_minor: u16 = 7;
 
 pub const Error = enum(i32) {
     ok = 0,
@@ -83,6 +83,15 @@ pub const ChannelOptions = extern struct {
     jitter_percent: u32 = 20,
     logger: ?*const Logger = null,
     max_response_header_list_size: u64 = 64 * 1024,
+    max_unary_calls: u64 = 4096,
+    max_unary_request_bytes: u64 = 64 * 1024 * 1024,
+};
+
+pub const UnaryAdmissionStats = extern struct {
+    struct_size: usize = @sizeOf(UnaryAdmissionStats),
+    retained_calls: u64 = 0,
+    retained_request_bytes: u64 = 0,
+    rejected_calls: u64 = 0,
 };
 
 pub const ClientStreamOptions = extern struct {
@@ -181,9 +190,13 @@ const channel_options_v1_size = @offsetOf(ChannelOptions, "jitter_percent") + @s
 const channel_options_v2_size = @offsetOf(ChannelOptions, "logger") + @sizeOf(?*const Logger);
 const channel_options_v3_size = @offsetOf(ChannelOptions, "max_response_header_list_size") + @sizeOf(u64);
 
+const channel_options_unary_calls_size = @offsetOf(ChannelOptions, "max_unary_calls") + @sizeOf(u64);
+const channel_options_unary_bytes_size = @offsetOf(ChannelOptions, "max_unary_request_bytes") + @sizeOf(u64);
+
 const allocator = if (@import("builtin").is_test) std.testing.allocator else std.heap.c_allocator;
 
 const ChannelCreateOptions = struct {
+    unary_admission: channel.UnaryAdmissionOptions = .{},
     reconnect: ?channel.ReconnectOptions = null,
     logger: event_logger.Logger = .{},
     max_response_header_list_size: u32 = 64 * 1024,
@@ -354,6 +367,7 @@ fn createChannel(
     // Error is a C status enum, not a Zig error union: errdefer would not run.
     defer if (output.* == null) allocator.destroy(storage);
     storage.value = channel.Channel.init(allocator, target_bytes, .{
+        .unary_admission = options.unary_admission,
         .runtime = if (runtime_handle) |handle| &runtimeStorage(handle).value else null,
         .reconnect = options.reconnect,
         .logger = options.logger,
@@ -365,6 +379,23 @@ fn createChannel(
         else => .unavailable,
     };
     output.* = @ptrCast(storage);
+    return .ok;
+}
+
+pub fn grpc_lite_channel_get_unary_admission_stats(
+    channel_handle: ?*ChannelHandle,
+    out_stats: ?*UnaryAdmissionStats,
+) callconv(.c) Error {
+    const output = out_stats orelse return .invalid_argument;
+    if (output.struct_size < @sizeOf(UnaryAdmissionStats)) return .invalid_argument;
+    output.retained_calls = 0;
+    output.retained_request_bytes = 0;
+    output.rejected_calls = 0;
+    const handle = channel_handle orelse return .invalid_argument;
+    const snapshot = channelStorage(handle).value.unaryAdmissionStats();
+    output.retained_calls = snapshot.retained_calls;
+    output.retained_request_bytes = snapshot.retained_request_bytes;
+    output.rejected_calls = snapshot.rejected_calls;
     return .ok;
 }
 
@@ -1067,7 +1098,17 @@ fn parseChannelOptions(pointer: ?*const ChannelOptions) ?ChannelCreateOptions {
             value.max_response_header_list_size > std.math.maxInt(u32)) return null;
         break :blk @as(u32, @intCast(value.max_response_header_list_size));
     } else 64 * 1024;
+    var admission: channel.UnaryAdmissionOptions = .{};
+    if (value.struct_size >= channel_options_unary_calls_size) {
+        if (value.max_unary_calls == 0 or value.max_unary_calls > std.math.maxInt(usize)) return null;
+        admission.max_calls = @intCast(value.max_unary_calls);
+    }
+    if (value.struct_size >= channel_options_unary_bytes_size) {
+        if (value.max_unary_request_bytes == 0 or value.max_unary_request_bytes > std.math.maxInt(usize)) return null;
+        admission.max_request_bytes = @intCast(value.max_unary_request_bytes);
+    }
     return .{
+        .unary_admission = admission,
         .reconnect = .{
             .allow_initial_offline = value.allow_initial_offline == 1,
             .initial_backoff_ns = value.initial_backoff_ns,
@@ -1829,4 +1870,45 @@ test "C unary admission rejection is RESOURCE_EXHAUSTED without changing the ABI
     defer grpc_lite_unary_result_destroy(result);
     try std.testing.expectEqual(@as(i32, 8), grpc_lite_unary_result_status_code(result));
     try std.testing.expectEqual(@as(usize, 0), grpc_lite_unary_result_payload(result).size);
+}
+
+test "C unary admission options preserve old prefixes and validate appended fields" {
+    var options: ChannelOptions = .{ .max_unary_calls = 7, .max_unary_request_bytes = 123 };
+    const parsed = parseChannelOptions(&options).?;
+    try std.testing.expectEqual(@as(usize, 7), parsed.unary_admission.max_calls);
+    try std.testing.expectEqual(@as(usize, 123), parsed.unary_admission.max_request_bytes);
+    var legacy: [channel_options_v3_size]u8 align(@alignOf(ChannelOptions)) = undefined;
+    options.struct_size = legacy.len;
+    @memcpy(&legacy, std.mem.asBytes(&options)[0..legacy.len]);
+    const old = parseChannelOptions(@ptrCast(&legacy)).?;
+    try std.testing.expectEqual(@as(usize, 4096), old.unary_admission.max_calls);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), old.unary_admission.max_request_bytes);
+    options.struct_size = channel_options_unary_calls_size;
+    options.max_unary_request_bytes = 0;
+    try std.testing.expectEqual(@as(usize, 7), parseChannelOptions(&options).?.unary_admission.max_calls);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), parseChannelOptions(&options).?.unary_admission.max_request_bytes);
+    options.struct_size = @sizeOf(ChannelOptions);
+    try std.testing.expectEqual(null, parseChannelOptions(&options));
+    options.max_unary_request_bytes = 1;
+    options.max_unary_calls = 0;
+    try std.testing.expectEqual(null, parseChannelOptions(&options));
+    options.max_unary_calls = 1;
+    try std.testing.expect(parseChannelOptions(&options) != null);
+}
+
+test "C unary admission snapshot validates outputs and preserves unknown tail" {
+    try std.testing.expectEqual(Error.invalid_argument, grpc_lite_channel_get_unary_admission_stats(null, null));
+    var extended: extern struct {
+        stats: UnaryAdmissionStats,
+        canary: u64,
+    } = .{ .stats = .{ .retained_calls = 99 }, .canary = 0xabcdef };
+    extended.stats.struct_size = @sizeOf(@TypeOf(extended));
+    try std.testing.expectEqual(Error.invalid_argument, grpc_lite_channel_get_unary_admission_stats(null, &extended.stats));
+    try std.testing.expectEqual(@as(u64, 0), extended.stats.retained_calls);
+    try std.testing.expectEqual(@as(u64, 0xabcdef), extended.canary);
+    try std.testing.expectEqual(@sizeOf(@TypeOf(extended)), extended.stats.struct_size);
+    extended.stats.struct_size = @sizeOf(UnaryAdmissionStats) - 1;
+    extended.stats.retained_calls = 99;
+    try std.testing.expectEqual(Error.invalid_argument, grpc_lite_channel_get_unary_admission_stats(null, &extended.stats));
+    try std.testing.expectEqual(@as(u64, 99), extended.stats.retained_calls);
 }

@@ -127,6 +127,8 @@ int main(void) {
 
   if (grpc_lite_runtime_create(&runtime) != GRPC_LITE_OK) return 10;
   grpc_lite_runtime_destroy(runtime);
+  channel_options.max_unary_calls = 1;
+  channel_options.max_unary_request_bytes = 1;
   channel_options.allow_initial_offline = 1;
   channel_options.initial_backoff_ns = UINT64_C(10000000000);
   channel_options.max_backoff_ns = UINT64_C(10000000000);
@@ -135,6 +137,18 @@ int main(void) {
           bytes("127.0.0.1:1", sizeof("127.0.0.1:1") - 1),
           &channel_options,
           &channel) != GRPC_LITE_OK) return 14;
+  grpc_lite_unary_admission_stats stats = GRPC_LITE_UNARY_ADMISSION_STATS_INIT;
+  assert(grpc_lite_channel_get_unary_admission_stats(channel, &stats) == GRPC_LITE_OK);
+  assert(stats.retained_calls == 0 && stats.rejected_calls == 0);
+  grpc_lite_unary_result *result = NULL;
+  assert(grpc_lite_channel_call_unary(
+      channel, bytes("/test.Echo/Unary", sizeof("/test.Echo/Unary") - 1),
+      bytes("payload", 7), NULL, &result) == GRPC_LITE_OK);
+  assert(grpc_lite_unary_result_status_code(result) == 8);
+  grpc_lite_unary_result_destroy(result);
+  assert(grpc_lite_channel_get_unary_admission_stats(channel, &stats) == GRPC_LITE_OK);
+  assert(stats.retained_calls == 0 && stats.retained_request_bytes == 0);
+  assert(stats.rejected_calls == 1);
   grpc_lite_channel_shutdown(channel);
   grpc_lite_channel_wait(channel);
   grpc_lite_channel_destroy(channel);

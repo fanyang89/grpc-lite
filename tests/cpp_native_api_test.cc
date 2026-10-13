@@ -77,11 +77,32 @@ void TestInvalidObjects() {
   options.logger = [token = std::move(logger_token)](
                        grpc_lite::LogLevel, std::string_view) {};
   Channel channel;
+  grpc_lite::UnaryAdmissionStats stats;
+  assert(channel.GetUnaryAdmissionStats(&stats).code() == grpc_lite::ErrorCode::InvalidArgument);
+  assert(channel.GetUnaryAdmissionStats(nullptr).code() == grpc_lite::ErrorCode::InvalidArgument);
+  assert(options.max_unary_calls == 4096);
+  assert(options.max_unary_request_bytes == UINT64_C(67108864));
   const grpc_lite::Error error =
       Channel::CreateManaged(nullptr, "invalid", std::move(options), &channel);
   assert(error.code() == grpc_lite::ErrorCode::InvalidArgument);
   options.logger = {};
   assert(weak.expired());
+  options = {};
+  options.allow_initial_offline = true;
+  options.max_unary_calls = 0;
+  assert(Channel::CreateManaged(nullptr, "127.0.0.1:1", options, &channel).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  options.max_unary_calls = 1;
+  options.max_unary_request_bytes = 0;
+  assert(Channel::CreateManaged(nullptr, "127.0.0.1:1", options, &channel).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  options.max_unary_request_bytes = 1;
+  assert(Channel::CreateManaged(nullptr, "127.0.0.1:1", options, &channel).ok());
+  assert(channel.GetUnaryAdmissionStats(&stats).ok());
+  assert(stats.retained_calls == 0 && stats.retained_request_bytes == 0);
+  assert(stats.rejected_calls == 0);
+  channel.Shutdown();
+  channel.Wait();
 }
 
 struct RoundTripState {
