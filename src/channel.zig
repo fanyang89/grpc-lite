@@ -66,7 +66,15 @@ threadlocal var receiving_http2_impl: ?*Impl = null;
 
 pub const TlsOptions = struct {
     ca_certificates_pem: []const u8,
+    /// Client certificate for mutual TLS, presented when the server requests one.
+    identity: ?TlsIdentity = null,
     handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
+};
+
+/// PEM certificate chain and unencrypted PEM private key; parsed during `Channel.init`.
+pub const TlsIdentity = struct {
+    certificate_chain_pem: []const u8,
+    private_key_pem: []const u8,
 };
 
 pub const ReconnectOptions = struct {
@@ -243,6 +251,10 @@ pub const Channel = struct {
                 impl.tls_config = try tls_record.Config.createClient(
                     impl.allocator,
                     tls_options.ca_certificates_pem,
+                    if (tls_options.identity) |identity| .{
+                        .certificate_chain_pem = identity.certificate_chain_pem,
+                        .private_key_pem = identity.private_key_pem,
+                    } else null,
                 );
             }
         }
@@ -7856,6 +7868,58 @@ test "channel and server exchange a unary call over TLS" {
     var channel = try Channel.init(std.testing.allocator, target, .{
         .runtime = &runtime,
         .tls = .{ .ca_certificates_pem = certificate },
+    });
+    defer channel.deinit();
+
+    var result = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "secure", .{});
+    defer result.deinit();
+    try std.testing.expect(result.status.isOk());
+    try std.testing.expectEqualStrings("secure", result.payload);
+}
+
+test "channel and server exchange a unary call over mutual TLS" {
+    if (!build_options.tls) return error.SkipZigTest;
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const certificate = @embedFile("testdata/localhost-cert.pem");
+    const private_key = @embedFile("testdata/localhost-key.pem");
+
+    const Handler = struct {
+        fn handle(
+            _: *@This(),
+            allocator: std.mem.Allocator,
+            _: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{
+        .tls = .{
+            .certificate_chain_pem = certificate,
+            .private_key_pem = private_key,
+            .client_ca_certificates_pem = @embedFile("testdata/mtls/ca.pem"),
+        },
+    });
+    defer test_server.deinit();
+    try test_server.registerUnary(
+        "/test.Tls/Unary",
+        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+    );
+    try test_server.start();
+
+    var runtime = try Runtime.init();
+    defer runtime.deinit();
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .runtime = &runtime,
+        .tls = .{ .ca_certificates_pem = certificate, .identity = .{
+            .certificate_chain_pem = @embedFile("testdata/mtls/client.pem"),
+            .private_key_pem = @embedFile("testdata/mtls/client-key.pem"),
+        } },
     });
     defer channel.deinit();
 

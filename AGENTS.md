@@ -81,7 +81,7 @@ authoritative: change it before implementing a feature with a different decision
 | Native Zig TLS and ALPN | Selected | Optional mbedTLS; TLS 1.2+, mandatory `h2`, explicit PEM credentials |
 | Transpiled-C release bundles | Selected | Target-specific insecure Linux x86_64 and ARM64 packages; native CI packaging and no-Zig consumers |
 | Transpiled-C release bundle TLS | Out of scope | The insecure Linux x86_64 and ARM64 bundles remain cleartext-only until TLS is separately selected |
-| mTLS | Out of scope | Client certificates and server-side client verification are not required |
+| mTLS | Selected | Native Zig TLS only: optional client PEM identity and server-required client verification with explicit trusted CAs; no identity authorization or dynamic rotation |
 | DNS | Selected | c-ares on Linux io_uring; client IPv4 hostnames only |
 | IPv6 | Out of scope | No AAAA, Happy Eyeballs, or IPv6 listeners |
 | Reflection and health services | Out of scope | Not part of the lite profile |
