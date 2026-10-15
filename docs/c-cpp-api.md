@@ -93,10 +93,10 @@ generated C. A no-Zig CMake build pairs the source at a tag with that release's 
 folder containing both files, extract it, and pass the extracted root explicitly:
 
 ```bash
-sha256sum --check grpc-lite-transpiled-c-0.4.0-linux-x86_64.tar.gz.sha256
-tar -xzf grpc-lite-transpiled-c-0.4.0-linux-x86_64.tar.gz
+sha256sum --check grpc-lite-transpiled-c-0.5.0-linux-x86_64.tar.gz.sha256
+tar -xzf grpc-lite-transpiled-c-0.5.0-linux-x86_64.tar.gz
 cmake -S grpc-lite -B build \
-  -DGRPC_LITE_TRANSPILED_C_DIR="$PWD/grpc-lite-transpiled-c-0.4.0-linux-x86_64"
+  -DGRPC_LITE_TRANSPILED_C_DIR="$PWD/grpc-lite-transpiled-c-0.5.0-linux-x86_64"
 ```
 
 Choose `linux-x86_64` or `linux-arm64` to match the consumer architecture; the examples
@@ -136,7 +136,7 @@ network guard:
 
 ```bash
 cmake -S grpc-lite -B build \
-  -DGRPC_LITE_TRANSPILED_C_DIR="$PWD/grpc-lite-transpiled-c-0.4.0-linux-x86_64" \
+  -DGRPC_LITE_TRANSPILED_C_DIR="$PWD/grpc-lite-transpiled-c-0.5.0-linux-x86_64" \
   -DGRPC_LITE_NO_NETWORK=ON \
   -DGRPC_LITE_NGHTTP2_URL="file://$PWD/deps/nghttp2.tar.gz" \
   -DGRPC_LITE_NGHTTP2_URL_HASH=SHA256=... \

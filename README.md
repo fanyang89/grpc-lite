@@ -61,7 +61,7 @@ defer result.deinit();
 
 Git checkouts and GitHub's automatic “Source code” archives intentionally omit generated
 C. To build with CMake without Zig, download the same-version
-`grpc-lite-transpiled-c-0.4.0-linux-x86_64.tar.gz` release asset and its checksum, verify
+`grpc-lite-transpiled-c-0.5.0-linux-x86_64.tar.gz` release asset and its checksum, verify
 and extract it, then configure the source tree with
 `-DGRPC_LITE_TRANSPILED_C_DIR=<extracted-root>`.
 
