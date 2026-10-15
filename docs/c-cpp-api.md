@@ -247,3 +247,20 @@ grpc-lite does not expose Abseil in its selected grpcpp-shaped API and does not 
 substitute `absl/*` headers. Abseil used internally by a chosen Protobuf release remains
 that package's transitive dependency. Applications that include Abseil directly must
 continue to provide it or migrate those call sites separately.
+
+## Sanitizing transpiled-C consumers
+
+The Zig C backend reconstructs imported C types (including opaque pointers and
+nghttp2 callback types). Clang's UBSan `function` check cannot match those
+reconstructed types to the original C declarations. For a sanitized CMake
+consumer, compile the C runtime and its C dependencies with
+`-fsanitize=address,undefined -fno-sanitize=function`; C++ consumer code can keep
+`-fsanitize=address,undefined` without that exclusion. Link with the sanitizer
+flags as well.
+
+Zig's thread startup installs its own alternate signal stack. Run ASan consumers
+with `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:use_sigaltstack=0` to avoid ASan
+trying to unmap that stack at pthread teardown. This disables ASan's alternate
+signal stack, not address or leak detection. Use `UBSAN_OPTIONS=halt_on_error=1`
+to fail on the remaining undefined-behavior checks. These settings are validation
+constraints, not a claim of full function-type sanitizer coverage.
