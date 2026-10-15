@@ -89,7 +89,7 @@ connection remains reusable.
 
 Git checkouts and GitHub automatic “Source code” archives intentionally contain no
 generated C. A no-Zig CMake build pairs the source at a tag with that release's matching
-`grpc-lite-transpiled-c-<version>-linux-x86_64.tar.gz` asset. Verify its sidecar from the
+`grpc-lite-transpiled-c-<version>-linux-<arch>.tar.gz` asset. Verify its sidecar from the
 folder containing both files, extract it, and pass the extracted root explicitly:
 
 ```bash
@@ -99,7 +99,10 @@ cmake -S grpc-lite -B build \
   -DGRPC_LITE_TRANSPILED_C_DIR="$PWD/grpc-lite-transpiled-c-0.4.0-linux-x86_64"
 ```
 
-The generated-only asset targets insecure Linux x86_64. TLS is out of scope for this
+Choose `linux-x86_64` or `linux-arm64` to match the consumer architecture; the examples
+above use x86_64. CMake rejects bundles generated for a different architecture.
+
+The generated-only asset targets insecure Linux x86_64 and ARM64. TLS is out of scope for this
 transpiled-C release bundle until separately selected, and CMake rejects
 `GRPC_LITE_ENABLE_TLS=ON`. This does not change the optional mbedTLS support available to
 native Zig builds.

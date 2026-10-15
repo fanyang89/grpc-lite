@@ -65,7 +65,9 @@ C. To build with CMake without Zig, download the same-version
 and extract it, then configure the source tree with
 `-DGRPC_LITE_TRANSPILED_C_DIR=<extracted-root>`.
 
-The generated-only asset supports insecure Linux x86_64 and contains no third-party
+Use the `linux-arm64` asset instead on Linux ARM64.
+
+The generated-only asset supports insecure Linux x86_64 and ARM64 and contains no third-party
 dependencies. TLS is out of scope for this transpiled-C release bundle until separately
 selected; the CMake source build rejects `GRPC_LITE_ENABLE_TLS=ON`. This bundle decision
 does not affect optional TLS in the native Zig build. A fully offline configure must also
