@@ -97,7 +97,8 @@ official grpc-go peers and public HTTP/2 framing suites on x86_64 and arm64.
 | grpcpp-shaped synchronous common API | Selected subset |
 | Official Protobuf C++ runtime | Optional external typed-code dependency |
 | General Abseil compatibility | Out of scope |
-| IPv6, mTLS, retries, reflection, xDS | Out of scope |
+| Native Zig mTLS client identities and required server-side client verification | Optional |
+| IPv6, retries, reflection, xDS | Out of scope |
 
 See [the official interoperability profile](tests/official/README.md) for current cases
 and results. grpc-lite does not provide grpc-core ABI compatibility or the full grpcpp

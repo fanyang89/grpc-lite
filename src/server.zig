@@ -208,6 +208,8 @@ const EncodedValueBuilder = StackFirstBuilder(metadata.OutboundValue, encoded_va
 pub const TlsOptions = struct {
     certificate_chain_pem: []const u8,
     private_key_pem: []const u8,
+    /// When set, require a valid client certificate signed by these PEM CAs.
+    client_ca_certificates_pem: ?[]const u8 = null,
     handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
 };
 
@@ -798,6 +800,7 @@ fn initImpl(shared_allocator: std.mem.Allocator, coordinator: *Coordinator, opti
                 shared_allocator,
                 tls_options.certificate_chain_pem,
                 tls_options.private_key_pem,
+                tls_options.client_ca_certificates_pem,
             );
         }
     }
