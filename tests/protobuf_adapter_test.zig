@@ -477,6 +477,8 @@ test "typed streaming client and server cover all cardinalities" {
         false,
     );
 
+    server.shutdown();
+    server.wait();
     try std.testing.expectEqual(@as(usize, 1), server_state.messages);
     try std.testing.expectEqual(@as(usize, 2), client_state.messages);
     try std.testing.expectEqual(@as(usize, 2), bidi_state.messages);
@@ -551,6 +553,8 @@ test "typed streaming server rejects malformed protobuf requests" {
     }
     try std.testing.expectEqual(grpc.StatusCode.invalid_argument, completion.status);
     try std.testing.expectEqual(@as(usize, 0), completion.messages);
+    server.shutdown();
+    server.wait();
     try std.testing.expectEqual(@as(usize, 0), server_state.messages);
 }
 

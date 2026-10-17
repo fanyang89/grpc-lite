@@ -6295,7 +6295,7 @@ test "channel and server exchange gzip-compressed unary messages" {
     const service = @import("service.zig");
 
     const Handler = struct {
-        saw_gzip_request: bool = false,
+        saw_gzip_request: std.atomic.Value(bool) = .init(false),
 
         fn handle(
             self: *@This(),
@@ -6303,7 +6303,7 @@ test "channel and server exchange gzip-compressed unary messages" {
             context: *service.ServerContext,
             request: []const u8,
         ) !service.UnaryResponse {
-            self.saw_gzip_request = context.request_compression == .gzip;
+            self.saw_gzip_request.store(context.request_compression == .gzip, .release);
             context.setResponseCompression(.gzip);
             return service.UnaryResponse.ok(allocator, request);
         }
@@ -6331,7 +6331,7 @@ test "channel and server exchange gzip-compressed unary messages" {
     );
     defer result.deinit();
     try std.testing.expect(result.status.isOk());
-    try std.testing.expect(handler.saw_gzip_request);
+    try std.testing.expect(handler.saw_gzip_request.load(.acquire));
     try std.testing.expectEqual(Compression.gzip, result.response_compression);
     try std.testing.expectEqualStrings("compressible compressible compressible", result.payload);
 
@@ -6383,21 +6383,24 @@ test "channel resolves an IPv4 hostname with c-ares" {
 }
 
 test "manual receive flow control preserves unary messages larger than the initial window" {
+    var allocator_state = @import("test_allocator.zig").init();
+    defer std.testing.expectEqual(@as(usize, 0), allocator_state.deinit()) catch @panic("test allocator leak");
+    const allocator = allocator_state.allocator();
     const server = @import("server.zig");
     const service = @import("service.zig");
     const Handler = struct {
         fn handle(
             _: *@This(),
-            allocator: std.mem.Allocator,
+            response_allocator: std.mem.Allocator,
             _: *service.ServerContext,
             request: []const u8,
         ) !service.UnaryResponse {
-            return service.UnaryResponse.ok(allocator, request);
+            return service.UnaryResponse.ok(response_allocator, request);
         }
     };
 
     var handler = Handler{};
-    var test_server = try server.Server.init(std.testing.allocator, .{});
+    var test_server = try server.Server.init(allocator, .{});
     defer test_server.deinit();
     try test_server.registerUnary(
         "/test.Flow/LargeUnary",
@@ -6407,14 +6410,14 @@ test "manual receive flow control preserves unary messages larger than the initi
 
     var target_buffer: [32]u8 = undefined;
     const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
-    var channel = try Channel.init(std.testing.allocator, target, .{});
+    var channel = try Channel.init(allocator, target, .{});
     defer channel.deinit();
-    const payload = try std.testing.allocator.alloc(u8, 128 * 1024);
-    defer std.testing.allocator.free(payload);
+    const payload = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(payload);
     for (payload, 0..) |*byte, index| byte.* = @truncate(index);
 
     var result = try channel.callUnary(
-        std.testing.allocator,
+        allocator,
         "/test.Flow/LargeUnary",
         payload,
         .{ .max_response_size = payload.len },
@@ -6582,9 +6585,9 @@ test "server drain timeout closes a transport-active stream" {
         .{ .max_response_size = 16 * 1024 * 1024 },
     );
     defer result.deinit();
+    test_server.wait();
     try std.testing.expect(handler.called);
     try std.testing.expectEqual(status.Code.unavailable, result.status.code);
-    test_server.wait();
 }
 
 test "immediate shutdown escalates an active graceful drain" {

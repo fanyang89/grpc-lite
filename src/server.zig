@@ -6448,6 +6448,8 @@ test "raw HTTP/2 bidi stream incrementally exchanges messages" {
     try std.testing.expect(!echoed_first.compressed);
     try std.testing.expectEqualStrings("two two two", echoed_second.payload);
     try std.testing.expect(echoed_second.compressed);
+    server.shutdown();
+    server.wait();
     try std.testing.expectEqual(@as(usize, 1), handler.starts);
     try std.testing.expectEqual(@as(usize, 2), handler.messages);
     try std.testing.expectEqual(@as(usize, 1), handler.remote_ends);
