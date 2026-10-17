@@ -1253,10 +1253,55 @@ fn serverCallSendInitialMetadata(
     try enqueueStreamCommandLocked(server, target, command);
 }
 
+// These checks require the server lock. Repeat them after encoding because
+// another thread may finish the call or consume queue capacity while unlocked.
+fn checkRetainedSendLocked(target: *Stream, options: raw_stream.SendOptions) !void {
+    if (!target.streaming_active or target.finish_queued or target.transport_closed) return error.CallClosed;
+    if (!target.response_headers_queued) return error.InitialMetadataRequired;
+    if (options.compression == .gzip and !target.accepts_response_gzip) return error.CompressionNotAccepted;
+    if (target.streaming.?.handler.initial_metadata_mode == .explicit and
+        options.compression == .gzip and target.response_compression != .gzip)
+    {
+        return error.ResponseCompressionNotEnabled;
+    }
+}
+
+fn checkBorrowedSendLocked(target: *Stream, options: raw_stream.SendOptions) !void {
+    if (!target.streaming_active or target.finish_queued) return error.StreamFinished;
+    if (target.streaming.?.handler.initial_metadata_mode == .explicit and !target.response_headers_queued) {
+        return error.InitialMetadataRequired;
+    }
+    if (target.streaming.?.handler.initial_metadata_mode == .explicit and
+        options.compression == .gzip and target.response_compression != .gzip)
+    {
+        return error.ResponseCompressionNotEnabled;
+    }
+}
+
+fn checkOutboundCapacityLocked(target: *Stream, encoded_size: usize) !void {
+    const outbound_limit = target.connection.server.stream_limits.max_outbound_buffer_size;
+    if (encoded_size > outbound_limit) return error.OutboundBufferLimitExceeded;
+    if (target.outbound_reserved_bytes > outbound_limit or encoded_size > outbound_limit - target.outbound_reserved_bytes) {
+        target.writable_requested = true;
+        return error.WouldBlock;
+    }
+}
+
 fn serverCallSend(context: *anyopaque, payload: []const u8, options: raw_stream.SendOptions) !void {
     const control: *ServerCallControl = @ptrCast(@alignCast(context));
     const server = control.server;
     if (payload.len > server.stream_limits.max_message_size) return error.MessageTooLarge;
+
+    {
+        server.lock();
+        defer server.unlock();
+        const target = control.target orelse return error.CallClosed;
+        try checkRetainedSendLocked(target, options);
+        if (options.compression == .identity) {
+            const encoded_size = std.math.add(usize, payload.len, frame.header_size) catch return error.MessageTooLarge;
+            try checkOutboundCapacityLocked(target, encoded_size);
+        }
+    }
 
     const encoded = try frame.encodeWithCompression(server.shared_allocator, payload, options.compression);
     var command = StreamCommand{ .target = undefined, .action = .{ .send = encoded } };
@@ -1267,20 +1312,8 @@ fn serverCallSend(context: *anyopaque, payload: []const u8, options: raw_stream.
     defer server.unlock();
     const target = control.target orelse return error.CallClosed;
     command.target = target;
-    if (!target.streaming_active or target.finish_queued or target.transport_closed) return error.CallClosed;
-    if (!target.response_headers_queued) return error.InitialMetadataRequired;
-    if (options.compression == .gzip and !target.accepts_response_gzip) return error.CompressionNotAccepted;
-    if (target.streaming.?.handler.initial_metadata_mode == .explicit and
-        options.compression == .gzip and target.response_compression != .gzip)
-    {
-        return error.ResponseCompressionNotEnabled;
-    }
-    const outbound_limit = server.stream_limits.max_outbound_buffer_size;
-    if (encoded.len > outbound_limit) return error.OutboundBufferLimitExceeded;
-    if (target.outbound_reserved_bytes > outbound_limit or encoded.len > outbound_limit - target.outbound_reserved_bytes) {
-        target.writable_requested = true;
-        return error.WouldBlock;
-    }
+    try checkRetainedSendLocked(target, options);
+    try checkOutboundCapacityLocked(target, encoded.len);
     target.outbound_reserved_bytes += encoded.len;
     errdefer target.outbound_reserved_bytes -= encoded.len;
     if (options.compression == .gzip) target.response_gzip_requested = true;
@@ -1350,6 +1383,16 @@ fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.Send
     if (payload.len > server.stream_limits.max_message_size) return error.MessageTooLarge;
     if (options.compression == .gzip and !target.accepts_response_gzip) return error.CompressionNotAccepted;
 
+    {
+        server.lock();
+        defer server.unlock();
+        try checkBorrowedSendLocked(target, options);
+        if (options.compression == .identity) {
+            const encoded_size = std.math.add(usize, payload.len, frame.header_size) catch return error.MessageTooLarge;
+            try checkOutboundCapacityLocked(target, encoded_size);
+        }
+    }
+
     const encoded = try frame.encodeWithCompression(server.shared_allocator, payload, options.compression);
     var command = StreamCommand{ .target = target, .action = .{ .send = encoded } };
     var command_owned = true;
@@ -1357,21 +1400,8 @@ fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.Send
 
     server.lock();
     defer server.unlock();
-    if (!target.streaming_active or target.finish_queued) return error.StreamFinished;
-    if (target.streaming.?.handler.initial_metadata_mode == .explicit and !target.response_headers_queued) {
-        return error.InitialMetadataRequired;
-    }
-    if (target.streaming.?.handler.initial_metadata_mode == .explicit and
-        options.compression == .gzip and target.response_compression != .gzip)
-    {
-        return error.ResponseCompressionNotEnabled;
-    }
-    const outbound_limit = server.stream_limits.max_outbound_buffer_size;
-    if (encoded.len > outbound_limit) return error.OutboundBufferLimitExceeded;
-    if (target.outbound_reserved_bytes > outbound_limit or encoded.len > outbound_limit - target.outbound_reserved_bytes) {
-        target.writable_requested = true;
-        return error.WouldBlock;
-    }
+    try checkBorrowedSendLocked(target, options);
+    try checkOutboundCapacityLocked(target, encoded.len);
     target.outbound_reserved_bytes += encoded.len;
     errdefer target.outbound_reserved_bytes -= encoded.len;
     if (options.compression == .gzip) target.response_gzip_requested = true;
@@ -4637,6 +4667,7 @@ test "shared stream command allocation failure does not use local storage" {
     var target = Stream.init(std.testing.allocator, &connection, 1);
     defer target.deinit();
     target.streaming_active = true;
+    target.streaming = testSendStreamingState();
 
     const original_backing = server.coordinator.serialized_allocator.backing;
     defer server.coordinator.serialized_allocator.backing = original_backing;
@@ -6912,4 +6943,53 @@ test "malformed request metadata rejects one stream and preserves the connection
     try std.testing.expectEqual(@as(usize, 1), handler.calls);
     try std.testing.expect(handler.metadata_matches);
     try std.testing.expect(!connection.closing);
+}
+
+fn testSendStreamingState() StreamingState {
+    const Handler = struct {
+        fn start(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+        fn message(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext, _: []const u8, _: Compression) !raw_stream.ReceiveAction {
+            return .continue_receiving;
+        }
+        fn end(_: ?*anyopaque, _: raw_stream.ServerStream, _: *service.ServerContext) !void {}
+    };
+    return .{
+        .handler = .{ .on_start = Handler.start, .on_message = Handler.message, .on_remote_end = Handler.end },
+        .decoder = frame.Decoder.init(std.testing.allocator, 1024),
+        .context = service.ServerContext.init(std.testing.allocator),
+    };
+}
+
+test "server streaming send rejects full and closed calls without allocation" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    var target = Stream.init(std.testing.allocator, &connection, 1);
+    defer target.deinit();
+    target.streaming = testSendStreamingState();
+    target.streaming_active = true;
+    target.response_headers_queued = true;
+    target.accepts_response_gzip = true;
+    var control: ServerCallControl = .{ .allocator = server.impl.shared_allocator, .server = server.impl, .target = &target };
+    target.outbound_reserved_bytes = server.impl.stream_limits.max_outbound_buffer_size;
+    const original_backing = server.coordinator.serialized_allocator.backing;
+    defer server.coordinator.serialized_allocator.backing = original_backing;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    server.coordinator.serialized_allocator.backing = failing.allocator();
+    try std.testing.expectError(error.WouldBlock, streamSend(&target, "payload", .{}));
+    try std.testing.expect(target.writable_requested);
+    target.writable_requested = false;
+    try std.testing.expectError(error.WouldBlock, serverCallSend(&control, "payload", .{}));
+    try std.testing.expect(target.writable_requested);
+    target.finish_queued = true;
+    for ([_]Compression{ .identity, .gzip }) |compression| {
+        try std.testing.expectError(error.StreamFinished, streamSend(&target, "payload", .{ .compression = compression }));
+        try std.testing.expectError(error.CallClosed, serverCallSend(&control, "payload", .{ .compression = compression }));
+    }
+    control.target = null;
+    try std.testing.expectError(error.CallClosed, serverCallSend(&control, "payload", .{}));
+    try std.testing.expectEqual(server.impl.stream_limits.max_outbound_buffer_size, target.outbound_reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 0), target.command_refs);
+    try std.testing.expectEqual(@as(usize, 0), server.impl.stream_commands.items.len);
+    try std.testing.expect(!failing.has_induced_failure);
 }
