@@ -182,6 +182,9 @@ fn decompressGzip(
     payload: []const u8,
     max_message_size: usize,
 ) ![]u8 {
+    // RFC 1952 requires rejecting nonzero reserved FLG bits. Zig's inflater
+    // parses the flags but does not enforce this constraint.
+    if (payload.len < 10 or payload[3] & 0xe0 != 0) return error.MalformedCompressedMessage;
     var input: std.Io.Reader = .fixed(payload);
     const history = try allocator.alloc(u8, std.compress.flate.max_window_len);
     defer allocator.free(history);
@@ -198,6 +201,13 @@ fn decompressGzip(
     errdefer allocator.free(decompressed);
     if (decompressed.len > max_message_size) return error.MessageTooLarge;
     if (input.seek != input.end) return error.MalformedCompressedMessage;
+    // Zig's decompressor reads the gzip footer but leaves validation to callers.
+    const footer = decompressor.container_metadata.gzip;
+    if (footer.count != @as(u32, @truncate(decompressed.len)) or
+        footer.crc != std.hash.Crc32.hash(decompressed))
+    {
+        return error.MalformedCompressedMessage;
+    }
     return decompressed;
 }
 
@@ -416,4 +426,65 @@ test "unary decoding rejects truncated and repeated messages" {
         error.ExpectedUnaryMessage,
         decodeUnary(std.testing.allocator, combined, 1024),
     );
+}
+
+test "gzip decoding rejects corrupted checksum and uncompressed size" {
+    for ([_][]const u8{ "", "payload with integrity" }) |payload| {
+        const encoded = try encodeWithCompression(std.testing.allocator, payload, .gzip);
+        defer std.testing.allocator.free(encoded);
+        for (encoded.len - 8..encoded.len) |index| {
+            encoded[index] ^= 1;
+            if (decodeUnaryWithCompression(std.testing.allocator, encoded, 1024, .gzip)) |decoded| {
+                std.testing.allocator.free(decoded);
+                return error.TestUnexpectedResult;
+            } else |err| {
+                try std.testing.expectEqual(error.MalformedCompressedMessage, err);
+            }
+            encoded[index] ^= 1;
+        }
+    }
+}
+
+test "gzip decoding accepts exact decompressed size limits including empty messages" {
+    for ([_][]const u8{ "", "123456789" }) |payload| {
+        const encoded = try encodeWithCompression(std.testing.allocator, payload, .gzip);
+        defer std.testing.allocator.free(encoded);
+        const decoded = try decodeUnaryWithCompression(std.testing.allocator, encoded, payload.len, .gzip);
+        defer std.testing.allocator.free(decoded);
+        try std.testing.expectEqualSlices(u8, payload, decoded);
+    }
+}
+
+test "gzip decoding rejects truncated footers even with a complete gRPC frame" {
+    const encoded = try encodeWithCompression(std.testing.allocator, "payload", .gzip);
+    defer std.testing.allocator.free(encoded);
+    for (1..9) |missing| {
+        const truncated = try encodePayload(std.testing.allocator, encoded[header_size .. encoded.len - missing], true);
+        defer std.testing.allocator.free(truncated);
+        try std.testing.expectError(
+            error.MalformedCompressedMessage,
+            decodeUnaryWithCompression(std.testing.allocator, truncated, 1024, .gzip),
+        );
+    }
+}
+
+test "gzip decoding rejects reserved header flags" {
+    const encoded = try encodeWithCompression(std.testing.allocator, "payload", .gzip);
+    defer std.testing.allocator.free(encoded);
+    const flags_index = header_size + 3;
+    const original_flags = encoded[flags_index];
+    for ([_]u8{ 0x20, 0x40, 0x80, 0xe0 }) |reserved| {
+        encoded[flags_index] = original_flags | reserved;
+        if (decodeUnaryWithCompression(std.testing.allocator, encoded, 1024, .gzip)) |decoded| {
+            std.testing.allocator.free(decoded);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.MalformedCompressedMessage, err);
+        }
+    }
+    // FTEXT is advisory, not a reserved bit.
+    encoded[flags_index] = original_flags | 0x01;
+    const decoded = try decodeUnaryWithCompression(std.testing.allocator, encoded, 1024, .gzip);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("payload", decoded);
 }

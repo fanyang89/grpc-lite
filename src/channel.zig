@@ -2679,6 +2679,16 @@ fn accountResponseHeader(
     return null;
 }
 
+fn parseGrpcStatus(value: []const u8) u32 {
+    const invalid = std.math.maxInt(u32);
+    // grpc-status is decimal digits without signs, separators, or leading zeros.
+    if (value.len == 0 or (value.len > 1 and value[0] == '0')) return invalid;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) return invalid;
+    }
+    return std.fmt.parseInt(u32, value, 10) catch invalid;
+}
+
 fn onHeader(
     session: ?*c.nghttp2_session,
     received_frame: ?*const c.nghttp2_frame,
@@ -2702,7 +2712,7 @@ fn onHeader(
         } else if (std.mem.eql(u8, name, "content-type")) {
             operation.content_type_grpc = std.mem.startsWith(u8, value, "application/grpc");
         } else if (std.mem.eql(u8, name, "grpc-status")) {
-            operation.block_grpc_status = std.fmt.parseInt(u32, value, 10) catch std.math.maxInt(u32);
+            operation.block_grpc_status = parseGrpcStatus(value);
         } else if (std.mem.eql(u8, name, "grpc-message")) {
             if (operation.block_grpc_message) |old| operation.impl.allocator.free(old);
             operation.block_grpc_message = operation.impl.allocator.dupe(u8, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -2723,7 +2733,7 @@ fn onHeader(
         } else if (std.mem.eql(u8, name, "content-type")) {
             client_stream.content_type_grpc = std.mem.startsWith(u8, value, "application/grpc");
         } else if (std.mem.eql(u8, name, "grpc-status")) {
-            client_stream.block_grpc_status = std.fmt.parseInt(u32, value, 10) catch std.math.maxInt(u32);
+            client_stream.block_grpc_status = parseGrpcStatus(value);
         } else if (std.mem.eql(u8, name, "grpc-message")) {
             if (client_stream.block_grpc_message) |old| client_stream.allocator.free(old);
             client_stream.block_grpc_message = client_stream.allocator.dupe(u8, value) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -8176,4 +8186,126 @@ test "channel and server exchange a bidirectional stream over TLS" {
     }
     try std.testing.expect(state.succeeded.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), state.messages.load(.acquire));
+}
+
+test "unary preserves peer status with malformed grpc-message escapes" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+
+    const operation = try Operation.init(&impl, "/test.Echo/Unary", "", .{});
+    defer operation.deinit();
+    operation.saw_response_headers = true;
+    operation.http_status = 200;
+    operation.content_type_grpc = true;
+    operation.grpc_status = @backingInt(status.Code.not_found);
+    operation.grpc_message = try impl.allocator.dupe(u8, "missing%20item%ZZ%");
+    operation.finalize(c.NGHTTP2_NO_ERROR);
+    try std.testing.expect(operation.done);
+    try std.testing.expectEqual(status.Code.not_found, operation.response_code);
+    try std.testing.expectEqualStrings("missing item%ZZ%", operation.response_message);
+}
+
+test "streaming preserves peer status with malformed grpc-message escapes" {
+    const TerminalState = struct {
+        called: bool = false,
+        valid: bool = false,
+
+        fn onTerminal(
+            context: ?*anyopaque,
+            _: stream.ClientStream,
+            final_status: status.Status,
+            _: *const metadata.Metadata,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.called = true;
+            self.valid = final_status.code == .not_found and
+                std.mem.eql(u8, final_status.message, "missing item%ZZ%");
+        }
+    };
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var terminal: TerminalState = .{};
+    const client_stream = try ClientStreamState.init(&impl, "/test.Stream/Duplex", .{}, .{
+        .context = &terminal,
+        .on_message = StreamTestCallbacks.onMessage,
+        .on_terminal = TerminalState.onTerminal,
+    });
+    client_stream.loop_owned = false;
+    var handle = client_stream.handle();
+    defer handle.deinit();
+    client_stream.saw_response_headers = true;
+    client_stream.http_status = 200;
+    client_stream.content_type_grpc = true;
+    client_stream.grpc_status = @backingInt(status.Code.not_found);
+    client_stream.grpc_message = try client_stream.allocator.dupe(u8, "missing%20item%ZZ%");
+    finalizeClientStream(client_stream);
+    try std.testing.expect(terminal.called);
+    try std.testing.expect(terminal.valid);
+}
+
+test "response status parsing rejects noncanonical decimal values for unary and streaming" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    defer impl.operations.deinit(impl.allocator);
+    defer impl.streams.deinit(impl.allocator);
+
+    const operation = try Operation.init(&impl, "/test.Echo/Unary", "", .{});
+    defer operation.deinit();
+    try impl.operations.put(impl.allocator, 1, operation);
+    var received: usize = 0;
+    const client_stream = try ClientStreamState.init(&impl, "/test.Stream/Duplex", .{}, .{
+        .context = &received,
+        .on_message = StreamTestCallbacks.onMessage,
+        .on_terminal = StreamTestCallbacks.onTerminal,
+    });
+    client_stream.loop_owned = false;
+    var handle = client_stream.handle();
+    defer handle.deinit();
+    try impl.streams.put(impl.allocator, 3, client_stream);
+
+    const cases = [_]struct { value: []const u8, code: status.Code }{
+        .{ .value = "0", .code = .ok },
+        .{ .value = "5", .code = .not_found },
+        .{ .value = "16", .code = .unauthenticated },
+        .{ .value = "17", .code = .unknown },
+        .{ .value = "4294967295", .code = .unknown },
+        .{ .value = "4294967296", .code = .unknown },
+        .{ .value = "", .code = .unknown },
+        .{ .value = "+0", .code = .unknown },
+        .{ .value = "-0", .code = .unknown },
+        .{ .value = "0_0", .code = .unknown },
+        .{ .value = "00", .code = .unknown },
+        .{ .value = "01", .code = .unknown },
+        .{ .value = " 0", .code = .unknown },
+        .{ .value = "0 ", .code = .unknown },
+        .{ .value = "0x0", .code = .unknown },
+        .{ .value = "0,0", .code = .unknown },
+    };
+    for (cases) |case| {
+        for ([_]i32{ 1, 3 }) |stream_id| {
+            var native_frame: c.nghttp2_frame = undefined;
+            native_frame.hd.stream_id = stream_id;
+            try std.testing.expectEqual(@as(c_int, 0), onHeader(
+                null,
+                &native_frame,
+                "grpc-status".ptr,
+                "grpc-status".len,
+                case.value.ptr,
+                case.value.len,
+                0,
+                &impl,
+            ));
+            const parsed = if (stream_id == 1)
+                operation.block_grpc_status.?
+            else
+                client_stream.block_grpc_status.?;
+            try std.testing.expectEqual(case.code, status.Code.fromInt(parsed));
+        }
+    }
 }
