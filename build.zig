@@ -40,6 +40,23 @@ pub fn build(b: *std.Build) void {
         else
             null,
     };
+    const enable_tls = b.option(bool, "tls", "Enable TLS transport support through mbedTLS") orelse false;
+    const enable_protobuf = b.option(
+        bool,
+        "protobuf",
+        "Enable protobuf runtimes, typed adapters, code generation, examples, and tests",
+    ) orelse (b.pkg_hash.len == 0);
+    const enable_gperftools = b.option(
+        bool,
+        "gperftools",
+        "Expose gperftools profiling APIs (enables tcmalloc by default)",
+    ) orelse false;
+    const enable_tcmalloc = b.option(
+        bool,
+        "tcmalloc",
+        "Replace the process C allocator with tcmalloc (defaults to gperftools)",
+    ) orelse enable_gperftools;
+    // Register all options before lazy dependencies can suspend configuration.
     const libxev_dependency = b.dependency("libxev", .{
         .target = target,
         .optimize = optimize,
@@ -51,12 +68,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const enable_tls = b.option(bool, "tls", "Enable TLS transport support through mbedTLS") orelse false;
-    const enable_protobuf = b.option(
-        bool,
-        "protobuf",
-        "Enable protobuf runtimes, typed adapters, code generation, examples, and tests",
-    ) orelse (b.pkg_hash.len == 0);
     const protobuf_dependency = if (enable_protobuf)
         b.lazyDependency("protobuf", .{
             .target = target,
@@ -71,16 +82,6 @@ pub fn build(b: *std.Build) void {
         }) orelse return
     else
         null;
-    const enable_gperftools = b.option(
-        bool,
-        "gperftools",
-        "Expose gperftools profiling APIs (enables tcmalloc by default)",
-    ) orelse false;
-    const enable_tcmalloc = b.option(
-        bool,
-        "tcmalloc",
-        "Replace the process C allocator with tcmalloc (defaults to gperftools)",
-    ) orelse enable_gperftools;
     const grpc_proto_dependency = if (enable_protobuf)
         b.lazyDependency("grpc_proto", .{}) orelse return
     else
