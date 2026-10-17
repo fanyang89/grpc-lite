@@ -24,6 +24,6 @@ test "generated service exposes package and method types" {
     try std.testing.expectEqualStrings("demo", EchoApi.package);
     try std.testing.expectEqualStrings("EchoService", EchoApi.service_name);
 
-    const echo_field = @typeInfo(EchoApi).@"struct".fields[0];
-    try std.testing.expectEqualStrings("Echo", echo_field.name);
+    const echo_field = std.meta.fieldNames(EchoApi)[0];
+    try std.testing.expectEqualStrings("Echo", echo_field);
 }

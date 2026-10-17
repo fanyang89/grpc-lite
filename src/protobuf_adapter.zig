@@ -515,11 +515,11 @@ pub fn ServiceRegistration(comptime Service: type) type {
         }
 
         pub fn register(self: *@This(), server: *grpc.Server) !void {
-            inline for (@typeInfo(Service).@"struct".fields) |field| {
-                if (methodKind(Service, field.name) == .unary) {
+            inline for (comptime std.meta.fieldNames(Service)) |field| {
+                if (methodKind(Service, field) == .unary) {
                     try server.registerUnary(
-                        methodPath(Service, field.name),
-                        handlerFor(field.name, self),
+                        methodPath(Service, field),
+                        handlerFor(field, self),
                     );
                 }
             }
@@ -597,7 +597,7 @@ pub fn methodPath(comptime Service: type, comptime method: []const u8) []const u
 /// Returns the generated protobuf request type for a service method.
 pub fn RequestType(comptime Service: type, comptime method: []const u8) type {
     const function = MethodFunction(Service, method);
-    const parameter = @typeInfo(function).@"fn".params[1].type.?;
+    const parameter = @typeInfo(function).@"fn".param_types[1].?;
     return if (@typeInfo(parameter) == .pointer)
         QueueElementType(parameter)
     else
@@ -608,7 +608,7 @@ pub fn RequestType(comptime Service: type, comptime method: []const u8) type {
 pub fn ResponseType(comptime Service: type, comptime method: []const u8) type {
     const function = MethodFunction(Service, method);
     const info = @typeInfo(function).@"fn";
-    if (info.params.len == 3) return QueueElementType(info.params[2].type.?);
+    if (info.param_types.len == 3) return QueueElementType(info.param_types[2].?);
     const return_type = @typeInfo(function).@"fn".return_type.?;
     return @typeInfo(return_type).error_union.payload;
 }
@@ -616,8 +616,8 @@ pub fn ResponseType(comptime Service: type, comptime method: []const u8) type {
 /// Returns the request/response streaming cardinality for a generated method.
 pub fn methodKind(comptime Service: type, comptime method: []const u8) MethodKind {
     const info = @typeInfo(MethodFunction(Service, method)).@"fn";
-    const streams_requests = @typeInfo(info.params[1].type.?) == .pointer;
-    const streams_responses = info.params.len == 3;
+    const streams_requests = @typeInfo(info.param_types[1].?) == .pointer;
+    const streams_responses = info.param_types.len == 3;
     if (streams_requests and streams_responses) return .bidirectional_streaming;
     if (streams_requests) return .client_streaming;
     if (streams_responses) return .server_streaming;
@@ -637,15 +637,15 @@ fn sendMessage(
 }
 
 fn UserDataType(comptime Service: type) type {
-    const fields = @typeInfo(Service).@"struct".fields;
-    const function = @typeInfo(fields[0].type).pointer.child;
-    const userdata_pointer = @typeInfo(function).@"fn".params[0].type.?;
+    const fields = std.meta.fieldNames(Service);
+    const function = @typeInfo(@FieldType(Service, fields[0])).pointer.child;
+    const userdata_pointer = @typeInfo(function).@"fn".param_types[0].?;
     return @typeInfo(userdata_pointer).pointer.child;
 }
 
 fn ErrorSetType(comptime Service: type) type {
-    const fields = @typeInfo(Service).@"struct".fields;
-    const function = @typeInfo(fields[0].type).pointer.child;
+    const fields = std.meta.fieldNames(Service);
+    const function = @typeInfo(@FieldType(Service, fields[0])).pointer.child;
     const return_type = @typeInfo(function).@"fn".return_type.?;
     return @typeInfo(return_type).error_union.error_set;
 }
@@ -659,16 +659,16 @@ fn validateService(comptime Service: type) void {
     if (!@hasDecl(Service, "package") or !@hasDecl(Service, "service_name")) {
         @compileError("expected a zig-protobuf generated service type");
     }
-    const fields = @typeInfo(Service).@"struct".fields;
+    const fields = std.meta.fieldNames(Service);
     if (fields.len == 0) @compileError("protobuf service has no methods");
 
     const userdata = UserDataType(Service);
     const errors = ErrorSetType(Service);
     inline for (fields) |field| {
-        validateMethod(Service, field.name);
-        const function = @typeInfo(field.type).pointer.child;
+        validateMethod(Service, field);
+        const function = @typeInfo(@FieldType(Service, field)).pointer.child;
         const info = @typeInfo(function).@"fn";
-        const field_userdata = @typeInfo(info.params[0].type.?).pointer.child;
+        const field_userdata = @typeInfo(info.param_types[0].?).pointer.child;
         const field_errors = @typeInfo(info.return_type.?).error_union.error_set;
         if (field_userdata != userdata or field_errors != errors) {
             @compileError("protobuf service methods must share userdata and error types");
@@ -683,17 +683,17 @@ fn validateMethod(comptime Service: type, comptime method: []const u8) void {
         @compileError("protobuf service field is not a function pointer: " ++ method);
     }
     const info = @typeInfo(@typeInfo(field_type).pointer.child).@"fn";
-    if (info.params.len != 2 and info.params.len != 3) {
+    if (info.param_types.len != 2 and info.param_types.len != 3) {
         @compileError("unsupported protobuf method signature: " ++ method);
     }
     if (@typeInfo(info.return_type.?) != .error_union) {
         @compileError("protobuf method must return an error union: " ++ method);
     }
-    const request_parameter = info.params[1].type.?;
+    const request_parameter = info.param_types[1].?;
     if (@typeInfo(request_parameter) == .pointer) _ = QueueElementType(request_parameter);
     const return_payload = @typeInfo(info.return_type.?).error_union.payload;
-    if (info.params.len == 3) {
-        _ = QueueElementType(info.params[2].type.?);
+    if (info.param_types.len == 3) {
+        _ = QueueElementType(info.param_types[2].?);
         if (return_payload != void) {
             @compileError("streaming-response protobuf method must return void: " ++ method);
         }
@@ -707,6 +707,6 @@ fn QueueElementType(comptime Pointer: type) type {
     const Queue = @typeInfo(Pointer).pointer.child;
     if (!@hasDecl(Queue, "putOne")) @compileError("expected a protobuf queue pointer");
     const put_info = @typeInfo(@TypeOf(Queue.putOne)).@"fn";
-    if (put_info.params.len != 3) @compileError("unsupported protobuf queue type");
-    return put_info.params[2].type.?;
+    if (put_info.param_types.len != 3) @compileError("unsupported protobuf queue type");
+    return put_info.param_types[2].?;
 }

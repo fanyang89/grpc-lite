@@ -8,7 +8,7 @@ const large_response_size = 314159;
 const max_rpc_timeout_ns = 60 * std.time.ns_per_s;
 const streaming_request_sizes = [_]usize{ 27182, 8, 1828, 45904 };
 const streaming_response_sizes = [_]usize{ 31415, 9, 2653, 58979 };
-const zero_streaming_body = [_]u8{0} ** streaming_request_sizes[streaming_request_sizes.len - 1];
+const zero_streaming_body = @as([streaming_request_sizes[streaming_request_sizes.len - 1]]u8, @splat(0));
 const special_status_message = "\t\ntest with whitespace\r\nand Unicode BMP \xE2\x98\xBA and non-BMP \xF0\x9F\x98\x88\t\n";
 
 const Config = struct {
@@ -834,7 +834,7 @@ fn expectLargeResponse(allocator: std.mem.Allocator, result: *const grpc.CallRes
 fn specialStatusMessage(allocator: std.mem.Allocator, channel: *grpc.Channel) !void {
     const request: testing.SimpleRequest = .{
         .response_status = .{
-            .code = @intFromEnum(grpc.StatusCode.unknown),
+            .code = @backingInt(grpc.StatusCode.unknown),
             .message = special_status_message,
         },
     };

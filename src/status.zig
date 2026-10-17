@@ -42,7 +42,7 @@ pub const Status = struct {
 test "status code mapping covers the gRPC range" {
     var value: u32 = 0;
     while (value <= 16) : (value += 1) {
-        try std.testing.expectEqual(value, @intFromEnum(Code.fromInt(value)));
+        try std.testing.expectEqual(value, @backingInt(Code.fromInt(value)));
     }
     try std.testing.expectEqual(Code.unknown, Code.fromInt(17));
     try std.testing.expect(Status.ok.isOk());

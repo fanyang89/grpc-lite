@@ -15,7 +15,7 @@ var stderr_writer: std.Io.File.Writer = undefined;
 const PrintLevel = enum { ERR, WARN, INFO, DEBUG, TRACE };
 
 var verbose_flag: std.atomic.Value(bool) = .init(false);
-var runtime_level: std.atomic.Value(u8) = .init(@intFromEnum(RuntimeLevel.info));
+var runtime_level: std.atomic.Value(u8) = .init(@backingInt(RuntimeLevel.info));
 
 fn printMeta(writer: *std.Io.Writer, meta: nanozlog.Meta) std.Io.Writer.Error!void {
     try writer.print(
@@ -29,7 +29,7 @@ fn printMeta(writer: *std.Io.Writer, meta: nanozlog.Meta) std.Io.Writer.Error!vo
             meta.second,
             meta.millisecond,
             meta.microsecond,
-            @tagName(@as(PrintLevel, @enumFromInt(@intFromEnum(meta.level)))),
+            @tagName(@as(PrintLevel, @fromBackingInt(@intCast(@backingInt(meta.level))))),
             meta.thread_id,
         },
     );
@@ -40,7 +40,7 @@ fn printMeta(writer: *std.Io.Writer, meta: nanozlog.Meta) std.Io.Writer.Error!vo
 
 pub fn initGlobal(allocator: std.mem.Allocator, io: std.Io, verbose: bool) !void {
     verbose_flag.store(verbose, .release);
-    runtime_level.store(@intFromEnum(if (verbose) RuntimeLevel.debug else RuntimeLevel.info), .release);
+    runtime_level.store(@backingInt(if (verbose) RuntimeLevel.debug else RuntimeLevel.info), .release);
     stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
     try nanozlog.initNanoZlog(allocator, io, &stderr_writer.interface, .{
         .is_localtime = true,
@@ -52,12 +52,12 @@ pub fn initGlobal(allocator: std.mem.Allocator, io: std.Io, verbose: bool) !void
 }
 
 pub fn setRuntimeLevel(level: RuntimeLevel) void {
-    runtime_level.store(@intFromEnum(level), .release);
+    runtime_level.store(@backingInt(level), .release);
     verbose_flag.store(level == .debug, .release);
 }
 
 pub fn getRuntimeLevel() RuntimeLevel {
-    return @enumFromInt(runtime_level.load(.acquire));
+    return @fromBackingInt(@intCast(runtime_level.load(.acquire)));
 }
 
 pub fn deinitGlobal(allocator: std.mem.Allocator) void {

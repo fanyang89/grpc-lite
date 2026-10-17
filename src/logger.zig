@@ -22,7 +22,7 @@ pub const Logger = struct {
         const callback = self.callback orelse return;
         var buffer: [1024]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, format, args) catch "grpc-lite log message truncated";
-        callback(self.context, @intFromEnum(level), .{ .data = message.ptr, .size = message.len });
+        callback(self.context, @backingInt(level), .{ .data = message.ptr, .size = message.len });
     }
 };
 
@@ -43,6 +43,6 @@ test "logger formats and forwards a borrowed message" {
     var capture: Capture = .{};
     const logger: Logger = .{ .context = &capture, .callback = Capture.log };
     logger.write(.warn, "connection {s}", .{"closed"});
-    try std.testing.expectEqual(@as(u32, @intFromEnum(Level.warn)), capture.level);
+    try std.testing.expectEqual(@as(u32, @backingInt(Level.warn)), capture.level);
     try std.testing.expectEqualStrings("connection closed", capture.message[0..capture.message_len]);
 }

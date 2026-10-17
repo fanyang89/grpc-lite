@@ -372,7 +372,7 @@ fn classify(result: c_int, has_bytes: bool) Result {
 }
 
 fn parseCertificate(allocator: std.mem.Allocator, certificate: *c.mbedtls_x509_crt, pem: []const u8) !void {
-    const pem_z = try allocator.dupeZ(u8, pem);
+    const pem_z = try allocator.dupeSentinel(u8, pem, 0);
     defer allocator.free(pem_z);
     if (c.mbedtls_x509_crt_parse(certificate, pem_z.ptr, pem_z.len + 1) != 0)
         return error.InvalidCertificate;
@@ -384,7 +384,7 @@ fn parsePrivateKey(
     pem: []const u8,
     drbg: *c.mbedtls_ctr_drbg_context,
 ) !void {
-    const pem_z = try allocator.dupeZ(u8, pem);
+    const pem_z = try allocator.dupeSentinel(u8, pem, 0);
     defer {
         @memset(pem_z, 0);
         allocator.free(pem_z);

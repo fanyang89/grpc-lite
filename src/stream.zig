@@ -342,7 +342,7 @@ pub const ServerStream = struct {
 };
 
 fn unsupportedServerCallId(context: *anyopaque) ServerCallId {
-    return @enumFromInt(@intFromPtr(context));
+    return @fromBackingInt(@intCast(@intFromPtr(context)));
 }
 
 fn unsupportedServerCallRetain(_: *anyopaque) !ServerCall {

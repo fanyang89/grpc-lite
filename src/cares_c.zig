@@ -1,4 +1,1 @@
-pub const api = @cImport({
-    @cDefine("CARES_STATICLIB", "1");
-    @cInclude("ares.h");
-});
+pub const api = @import("cares_bindings");

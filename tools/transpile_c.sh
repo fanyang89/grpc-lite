@@ -54,14 +54,12 @@ rm -rf "$output_dir" "$cache_dir"
 mkdir -p "$output_dir" "$cache_dir" "$global_cache_dir"
 (
     cd "$project_root"
-    taskset -c "$selected_cpu" zig build transpile-c -j1 \
+    ZIG_GLOBAL_CACHE_DIR="$global_cache_dir" taskset -c "$selected_cpu" zig build transpile-c -j1 \
         -Dtarget="$transpiled_c_target" \
         -Dtranspile-c=true \
         -Dprotobuf=true \
         -Doptimize=ReleaseSafe \
-        --seed 0 \
         --cache-dir "$cache_dir" \
-        --global-cache-dir "$global_cache_dir" \
         --prefix "$output_dir" \
         --summary all
 )
