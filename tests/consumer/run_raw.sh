@@ -10,22 +10,6 @@ consumer="$work_dir/consumer"
 global_cache="$work_dir/global-cache"
 mkdir -p "$consumer/src" "$global_cache/p"
 
-prefetch_package() {
-    local url=$1
-    local expected_hash=$2
-    local archive_name=$3
-    local dependency_archive="$work_dir/$archive_name"
-
-    curl --fail --location --silent --show-error --output "$dependency_archive" "$url"
-    local actual_hash
-    actual_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zig fetch "$dependency_archive")
-    if [[ "$actual_hash" != "$expected_hash" ]]; then
-        printf 'package hash mismatch for %s: expected %s, got %s\n' \
-            "$archive_name" "$expected_hash" "$actual_hash" >&2
-        exit 1
-    fi
-}
-
 prefetch_url_package() {
     local url=$1
     local expected_hash=$2
@@ -64,11 +48,11 @@ prefetch_zigfetch_url_package() {
         --output "$global_cache/p/$expected_hash.tar.gz" "$url"
 }
 
-prefetch_package \
+prefetch_url_package \
     'https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99' \
     'N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX' \
     'nghttp2.tar.gz'
-prefetch_package \
+prefetch_url_package \
     'https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz' \
     'N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp' \
     'cares.tar.gz'
