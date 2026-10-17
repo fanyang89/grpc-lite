@@ -8199,7 +8199,7 @@ test "unary preserves peer status with malformed grpc-message escapes" {
     operation.saw_response_headers = true;
     operation.http_status = 200;
     operation.content_type_grpc = true;
-    operation.grpc_status = @intFromEnum(status.Code.not_found);
+    operation.grpc_status = @backingInt(status.Code.not_found);
     operation.grpc_message = try impl.allocator.dupe(u8, "missing%20item%ZZ%");
     operation.finalize(c.NGHTTP2_NO_ERROR);
     try std.testing.expect(operation.done);
@@ -8240,7 +8240,7 @@ test "streaming preserves peer status with malformed grpc-message escapes" {
     client_stream.saw_response_headers = true;
     client_stream.http_status = 200;
     client_stream.content_type_grpc = true;
-    client_stream.grpc_status = @intFromEnum(status.Code.not_found);
+    client_stream.grpc_status = @backingInt(status.Code.not_found);
     client_stream.grpc_message = try client_stream.allocator.dupe(u8, "missing%20item%ZZ%");
     finalizeClientStream(client_stream);
     try std.testing.expect(terminal.called);
