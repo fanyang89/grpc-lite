@@ -2,10 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const options = @import("grpc_lite_options");
 
-const c = @cImport({
-    @cInclude("cpucycles.h");
-    @cInclude("stdio.h");
-});
+const c = @import("cpucycles_bindings");
 
 const Backend = enum(u8) {
     uninitialized,
@@ -30,8 +27,8 @@ const validation_interval_ns = 100 * std.time.ns_per_ms;
 const validation_tolerance_ns = 2 * std.time.ns_per_ms;
 const initial_sample_ns = 10 * std.time.ns_per_ms;
 
-var backend: std.atomic.Value(u8) = .init(@intFromEnum(Backend.uninitialized));
-var fallback_reason: std.atomic.Value(u8) = .init(@intFromEnum(FallbackReason.none));
+var backend: std.atomic.Value(u8) = .init(@backingInt(Backend.uninitialized));
+var fallback_reason: std.atomic.Value(u8) = .init(@backingInt(FallbackReason.none));
 var validation_lock: std.atomic.Value(bool) = .init(false);
 var next_validation_cycles: std.atomic.Value(u64) = .init(0);
 var calibration_sequence: std.atomic.Value(u32) = .init(0);
@@ -94,7 +91,7 @@ pub fn implementation() []const u8 {
 }
 
 pub fn fallbackReason() []const u8 {
-    return @tagName(@as(FallbackReason, @enumFromInt(fallback_reason.load(.acquire))));
+    return @tagName(@as(FallbackReason, @fromBackingInt(@intCast(fallback_reason.load(.acquire)))));
 }
 
 fn ensureInitialized(io: std.Io) void {
@@ -103,8 +100,8 @@ fn ensureInitialized(io: std.Io) void {
         .initializing => std.atomic.spinLoopHint(),
         .uninitialized => {
             if (backend.cmpxchgStrong(
-                @intFromEnum(Backend.uninitialized),
-                @intFromEnum(Backend.initializing),
+                @backingInt(Backend.uninitialized),
+                @backingInt(Backend.initializing),
                 .acq_rel,
                 .acquire,
             ) != null) continue;
@@ -135,7 +132,7 @@ fn initialize(io: std.Io) void {
     const interval_cycles = scaleNsToCycles(validation_interval_ns, frequency) orelse
         return fallBack(.conversion_overflow);
     next_validation_cycles.store(second.cycles +| interval_cycles, .release);
-    backend.store(@intFromEnum(Backend.cycles), .release);
+    backend.store(@backingInt(Backend.cycles), .release);
 }
 
 fn validateIfDue(io: std.Io, cycles: u64, predicted_ns: u64) void {
@@ -214,12 +211,12 @@ fn monotonicNow(io: std.Io) u64 {
 }
 
 fn loadBackend() Backend {
-    return @enumFromInt(backend.load(.acquire));
+    return @fromBackingInt(@intCast(backend.load(.acquire)));
 }
 
 fn fallBack(reason: FallbackReason) void {
-    fallback_reason.store(@intFromEnum(reason), .release);
-    backend.store(@intFromEnum(Backend.monotonic), .release);
+    fallback_reason.store(@backingInt(reason), .release);
+    backend.store(@backingInt(Backend.monotonic), .release);
 }
 
 fn implementationCanBeStable(name: []const u8) bool {

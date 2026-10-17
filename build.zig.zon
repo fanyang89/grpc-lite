@@ -1,13 +1,10 @@
 .{
     .name = .grpc_lite,
     .version = "0.4.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0xa8480adad018cc05,
     .dependencies = .{
-        .libxev = .{
-            .url = "https://codeload.github.com/mitchellh/libxev/tar.gz/b0650f082458226860ed7ab0fc7c9c73823c8950",
-            .hash = "libxev-0.0.0-86vtcxkOFACqPXUTAPuq5i0xpDYWU5G5RfrYQXxlUT26",
-        },
+        .libxev = .{ .path = "vendor/libxev" },
         .nghttp2 = .{
             .url = "https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99",
             .hash = "N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX",
@@ -21,8 +18,8 @@
             .hash = "N-V-__8AAHSUBAA_Vn8NXM2L9F21QFvrTIxbH9yvxs5cO-lY",
         },
         .nanozlog = .{
-            .url = "https://github.com/wyzdwdz/nanozlog/archive/e693c11976d55ba0a5b8deeaaaf9f1c5cc30eba9.tar.gz",
-            .hash = "nanozlog-0.1.0-5UtdH535AADW7HUBpfLboKJkdB1IVYaqz7YFQ2dHIcqL",
+            .url = "https://github.com/wyzdwdz/nanozlog/archive/a1ad3d52aec355c2dba7568fe18ec440937d4f81.tar.gz",
+            .hash = "nanozlog-0.1.0-5UtdH6f6AAACQMkivAT4xIQtfBDFG3JACCJRpnY5Up3P",
         },
         .mbedtls = .{
             .url = "https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/mbedtls-3.6.6",
@@ -30,8 +27,8 @@
             .lazy = true,
         },
         .protobuf = .{
-            .url = "https://github.com/Arwalk/zig-protobuf/archive/b794f99323cead7f1794ae68554d0311cc309857.tar.gz",
-            .hash = "protobuf-5.0.0-0e82ahZiKwC5Yrh4psANoUzrV_H4CQU1EsOIY9Zdyap_",
+            .url = "https://github.com/Arwalk/zig-protobuf/archive/e9e18c7664b8c950e5fc679259c968dd66ccc48b.tar.gz",
+            .hash = "protobuf-7.0.0-0e82aqFhNADVgEgPYPI7ddEg_dzhphBToYgkjQTrMKWv",
             .lazy = true,
         },
         .grpc_proto = .{
@@ -54,6 +51,7 @@
         "include",
         "src",
         "tools",
+        "vendor",
         "examples",
         "tests",
         "proto",

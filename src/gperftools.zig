@@ -8,11 +8,7 @@ comptime {
     _ = grpc_lite;
 }
 
-const c = @cImport({
-    @cInclude("gperftools/profiler.h");
-    @cInclude("gperftools/heap-profiler.h");
-    @cInclude("gperftools/malloc_extension_c.h");
-});
+const c = @import("gperftools_bindings");
 
 /// Uses tcmalloc when `has_tcmalloc` is true, otherwise the system C allocator.
 pub const allocator = std.heap.c_allocator;

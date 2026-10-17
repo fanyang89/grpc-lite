@@ -164,6 +164,12 @@ pub fn build(b: *std.Build) void {
         grpc_lite.addIncludePath(b.path("tools"));
         grpc_lite.addObjectFile(native.mbedtls_archive.?);
     }
+    addCBindings(b, grpc_lite, "nghttp2_bindings", "#define _FORTIFY_SOURCE 0\n#include <nghttp2/nghttp2.h>\n", target);
+    addCBindings(b, grpc_lite, "cares_bindings", "#define CARES_STATICLIB 1\n#include <ares.h>\n", target);
+    addCBindings(b, grpc_lite, "cpucycles_bindings", "#include <cpucycles.h>\n#include <stdio.h>\n", target);
+    if (enable_tls) addCBindings(b, grpc_lite, "mbedtls_bindings", "#define MBEDTLS_USER_CONFIG_FILE \"mbedtls_user_config.h\"\n" ++
+        "#include <psa/crypto.h>\n#include <mbedtls/ctr_drbg.h>\n#include <mbedtls/entropy.h>\n" ++
+        "#include <mbedtls/error.h>\n#include <mbedtls/pk.h>\n#include <mbedtls/ssl.h>\n#include <mbedtls/x509_crt.h>\n", target);
     grpc_lite.addImport("xev", xev);
     grpc_lite.addImport("nanozlog", nanozlog_dependency.module("nanozlog"));
     const test_step = b.step("test", "Run unit tests");
@@ -180,6 +186,7 @@ pub fn build(b: *std.Build) void {
         xev.omit_frame_pointer = false;
 
         grpc_lite_gperftools.?.addIncludePath(dependency.path("src"));
+        addCBindings(b, grpc_lite_gperftools.?, "gperftools_bindings", "#include <gperftools/profiler.h>\n#include <gperftools/heap-profiler.h>\n#include <gperftools/malloc_extension_c.h>\n", target);
         applySanitizers(grpc_lite_gperftools.?, sanitizers);
         grpc_lite_gperftools.?.omit_frame_pointer = false;
 
@@ -243,9 +250,8 @@ pub fn build(b: *std.Build) void {
             )
         else
             null;
-        const zig_header_path = b.pathJoin(&.{ b.graph.zig_lib_directory.path.?, "zig.h" });
         const install_zig_header = b.addInstallFileWithDir(
-            .{ .cwd_relative = zig_header_path },
+            std.Build.LazyPath.zig_lib.path(b, "zig.h"),
             .header,
             "zig.h",
         );
@@ -266,6 +272,10 @@ pub fn build(b: *std.Build) void {
     package_static_library.addFileArg(library.getEmittedBin());
     const packaged_static_library = package_static_library.addOutputFileArg("libgrpc_lite.a");
     package_static_library.addArg(b.graph.zig_exe);
+    package_static_library.addFileArg(native.nghttp2_archive);
+    package_static_library.addFileArg(native.cares_archive);
+    if (native.mbedtls_archive) |archive| package_static_library.addFileArg(archive);
+    if (native.gperftools_archive) |archive| package_static_library.addFileArg(archive);
     const install_library = b.addInstallFileWithDir(
         packaged_static_library,
         .lib,
@@ -649,7 +659,7 @@ fn addProtobufSupport(
         },
     );
     const generate_proto_step = b.step("gen-proto", "Generate Zig protobuf sources");
-    generate_proto_step.dependOn(&generate_proto.step);
+    generate_proto_step.dependOn(generate_proto.step);
 
     const generate_interop_proto = protobuf_build.RunProtocStep.create(
         protobuf_dependency.builder,
@@ -668,7 +678,7 @@ fn addProtobufSupport(
         "gen-interop-proto",
         "Generate official gRPC interop protobuf sources",
     );
-    generate_interop_proto_step.dependOn(&generate_interop_proto.step);
+    generate_interop_proto_step.dependOn(generate_interop_proto.step);
 
     const install_cpp_interop_protos = b.step(
         "install-cpp-interop-protos",
@@ -719,7 +729,7 @@ fn addProtobufSupport(
         .name = "protobuf-integration",
         .root_module = protobuf_test_module,
     });
-    protobuf_tests.step.dependOn(&generate_proto.step);
+    protobuf_tests.step.dependOn(generate_proto.step);
     const run_protobuf_tests = b.addRunArtifact(protobuf_tests);
 
     const protobuf_adapter_test_module = b.createModule(.{
@@ -737,7 +747,7 @@ fn addProtobufSupport(
         .name = "protobuf-adapter",
         .root_module = protobuf_adapter_test_module,
     });
-    protobuf_adapter_tests.step.dependOn(&generate_proto.step);
+    protobuf_adapter_tests.step.dependOn(generate_proto.step);
     const run_protobuf_adapter_tests = b.addRunArtifact(protobuf_adapter_tests);
 
     const official_proto_test_module = b.createModule(.{
@@ -751,7 +761,7 @@ fn addProtobufSupport(
         .name = "official-protobuf",
         .root_module = official_proto_test_module,
     });
-    official_proto_tests.step.dependOn(&generate_interop_proto.step);
+    official_proto_tests.step.dependOn(generate_interop_proto.step);
     const run_official_proto_tests = b.addRunArtifact(official_proto_tests);
 
     const interop_client_test_module = b.createModule(.{
@@ -768,7 +778,7 @@ fn addProtobufSupport(
         .name = "interop-client-parser",
         .root_module = interop_client_test_module,
     });
-    interop_client_tests.step.dependOn(&generate_interop_proto.step);
+    interop_client_tests.step.dependOn(generate_interop_proto.step);
     const run_interop_client_tests = b.addRunArtifact(interop_client_tests);
 
     const benchmark_server_test_module = b.createModule(.{
@@ -786,7 +796,7 @@ fn addProtobufSupport(
         .name = "benchmark-server-parser",
         .root_module = benchmark_server_test_module,
     });
-    benchmark_server_tests.step.dependOn(&generate_proto.step);
+    benchmark_server_tests.step.dependOn(generate_proto.step);
     const run_benchmark_server_tests = b.addRunArtifact(benchmark_server_tests);
 
     const benchmark_client_test_module = b.createModule(.{
@@ -804,7 +814,7 @@ fn addProtobufSupport(
         .name = "benchmark-client",
         .root_module = benchmark_client_test_module,
     });
-    benchmark_client_tests.step.dependOn(&generate_proto.step);
+    benchmark_client_tests.step.dependOn(generate_proto.step);
     const run_benchmark_client_tests = b.addRunArtifact(benchmark_client_tests);
 
     test_step.dependOn(&run_protobuf_tests.step);
@@ -817,11 +827,11 @@ fn addProtobufSupport(
     const echo_server = addExample(b, "grpc-lite-echo-server", "examples/echo_server.zig", grpc_lite);
     echo_server.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
     echo_server.root_module.addImport("demo_proto", demo_proto);
-    echo_server.step.dependOn(&generate_proto.step);
+    echo_server.step.dependOn(generate_proto.step);
     const echo_client = addExample(b, "grpc-lite-echo-client", "examples/echo_client.zig", grpc_lite);
     echo_client.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
     echo_client.root_module.addImport("demo_proto", demo_proto);
-    echo_client.step.dependOn(&generate_proto.step);
+    echo_client.step.dependOn(generate_proto.step);
     b.installArtifact(echo_server);
     b.installArtifact(echo_client);
 
@@ -832,7 +842,7 @@ fn addProtobufSupport(
         grpc_lite,
     );
     interop_server.root_module.addImport("grpc_testing", interop_proto);
-    interop_server.step.dependOn(&generate_interop_proto.step);
+    interop_server.step.dependOn(generate_interop_proto.step);
     const interop_client = addExample(
         b,
         "grpc-lite-interop-client",
@@ -840,7 +850,7 @@ fn addProtobufSupport(
         grpc_lite,
     );
     interop_client.root_module.addImport("grpc_testing", interop_proto);
-    interop_client.step.dependOn(&generate_interop_proto.step);
+    interop_client.step.dependOn(generate_interop_proto.step);
     b.installArtifact(interop_server);
     b.installArtifact(interop_client);
 
@@ -852,7 +862,7 @@ fn addProtobufSupport(
     );
     benchmark_server.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
     benchmark_server.root_module.addImport("demo_proto", demo_proto);
-    benchmark_server.step.dependOn(&generate_proto.step);
+    benchmark_server.step.dependOn(generate_proto.step);
     const benchmark_client = addExample(
         b,
         "grpc-lite-benchmark-client",
@@ -861,7 +871,7 @@ fn addProtobufSupport(
     );
     benchmark_client.root_module.addImport("grpc_lite_protobuf", grpc_lite_protobuf);
     benchmark_client.root_module.addImport("demo_proto", demo_proto);
-    benchmark_client.step.dependOn(&generate_proto.step);
+    benchmark_client.step.dependOn(generate_proto.step);
     b.installArtifact(benchmark_server);
     b.installArtifact(benchmark_client);
 }
@@ -944,9 +954,9 @@ fn addNativeDependencies(
     const cc = b.fmt("{s} cc -target {s}", .{ b.graph.zig_exe, target_triple });
     const cxx = b.fmt("{s} c++ -target {s}", .{ b.graph.zig_exe, target_triple });
     const cmake_build_type = switch (optimize) {
-        .Debug => "Debug",
-        .ReleaseSafe => "RelWithDebInfo",
-        .ReleaseFast, .ReleaseSmall => "Release",
+        .debug => "Debug",
+        .safe => "RelWithDebInfo",
+        .fast, .small => "Release",
     };
 
     const build_nghttp2 = addNativeBuild(
@@ -1088,7 +1098,7 @@ fn addCpuCycles(
     var declarations: []const u8 = "";
     var entries: []const u8 = "";
     for (options) |option| {
-        const symbol = b.dupe(option);
+        const symbol = b.allocator.dupe(u8, option) catch @panic("out of memory");
         std.mem.replaceScalar(u8, symbol, '-', '_');
         declarations = b.fmt(
             \\{s}extern long long cpucycles_ticks_{s}_setup(void);
@@ -1123,7 +1133,7 @@ fn addCpuCycles(
         .flags = &.{ "-std=gnu99", "-D_GNU_SOURCE=1", "-fwrapv", "-fvisibility=hidden" },
     });
     for (options) |option| {
-        const symbol = b.dupe(option);
+        const symbol = b.allocator.dupe(u8, option) catch @panic("out of memory");
         std.mem.replaceScalar(u8, symbol, '-', '_');
         module.addCSourceFile(.{
             .file = dependency.path(b.fmt("cpucycles/{s}.c", .{option})),
@@ -1138,4 +1148,16 @@ fn addCpuCycles(
             },
         });
     }
+}
+
+fn addCBindings(b: *std.Build, module: *std.Build.Module, name: []const u8, header: []const u8, target: std.Build.ResolvedTarget) void {
+    const files = b.addWriteFiles();
+    const input = files.add(b.fmt("{s}.h", .{name}), header);
+    const translate = b.addSystemCommand(&.{ b.graph.zig_exe, "translate-c", "-lc", "-target", target.result.zigTriple(b.allocator) catch @panic("OOM") });
+    for (module.include_dirs.items) |include| switch (include) {
+        .path, .path_system, .path_after => |path| translate.addPrefixedDirectoryArg("-I", path),
+        else => {},
+    };
+    translate.addFileArg(input);
+    module.addImport(name, b.createModule(.{ .root_source_file = translate.captureStdOut(.{ .basename = b.fmt("{s}.zig", .{name}) }), .target = target, .link_libc = true }));
 }

@@ -578,7 +578,7 @@ pub fn grpc_lite_server_destroy(server_handle: ?*ServerHandle) callconv(.c) void
 
 pub fn grpc_lite_server_stream_id(stream_handle: ?*const ServerStreamHandle) callconv(.c) usize {
     const handle = stream_handle orelse return 0;
-    return @intFromEnum(serverStreamStorage(handle).value.id());
+    return @backingInt(serverStreamStorage(handle).value.id());
 }
 
 pub fn grpc_lite_server_stream_retain(
@@ -619,7 +619,7 @@ pub fn grpc_lite_server_call_destroy(call_handle: ?*ServerCallHandle) callconv(.
 
 pub fn grpc_lite_server_call_id(call_handle: ?*const ServerCallHandle) callconv(.c) usize {
     const handle = call_handle orelse return 0;
-    return @intFromEnum(serverCallStorageConst(handle).value.id());
+    return @backingInt(serverCallStorageConst(handle).value.id());
 }
 
 pub fn grpc_lite_server_call_is_cancelled(call_handle: ?*const ServerCallHandle) callconv(.c) u32 {
@@ -693,7 +693,7 @@ pub fn grpc_lite_server_context_request_metadata(
 
 pub fn grpc_lite_server_context_request_compression(context_handle: ?*const ServerContextHandle) callconv(.c) u32 {
     const handle = context_handle orelse return 0;
-    return @intFromEnum(serverContext(handle).request_compression);
+    return @backingInt(serverContext(handle).request_compression);
 }
 
 pub fn grpc_lite_server_context_has_deadline(context_handle: ?*const ServerContextHandle) callconv(.c) u32 {
@@ -715,7 +715,7 @@ pub fn grpc_lite_unary_result_destroy(result_handle: ?*UnaryResultHandle) callco
 
 pub fn grpc_lite_unary_result_status_code(result_handle: ?*const UnaryResultHandle) callconv(.c) i32 {
     const handle = result_handle orelse return 2;
-    return @intFromEnum(unaryResultStorageConst(handle).value.status.code);
+    return @backingInt(unaryResultStorageConst(handle).value.status.code);
 }
 
 pub fn grpc_lite_unary_result_status_message(result_handle: ?*const UnaryResultHandle) callconv(.c) BytesView {
@@ -730,7 +730,7 @@ pub fn grpc_lite_unary_result_payload(result_handle: ?*const UnaryResultHandle) 
 
 pub fn grpc_lite_unary_result_response_compression(result_handle: ?*const UnaryResultHandle) callconv(.c) u32 {
     const handle = result_handle orelse return 0;
-    return @intFromEnum(unaryResultStorageConst(handle).value.response_compression);
+    return @backingInt(unaryResultStorageConst(handle).value.response_compression);
 }
 
 pub fn grpc_lite_unary_result_metadata_count(result_handle: ?*const UnaryResultHandle, trailing: u32) callconv(.c) usize {
@@ -777,7 +777,7 @@ fn serverMethodOnMessage(
         @ptrCast(&borrowed),
         serverContextHandle(server_context),
         view(payload),
-        @intFromEnum(compression),
+        @backingInt(compression),
     ) == 0) .continue_receiving else .pause;
 }
 
@@ -833,7 +833,7 @@ fn serverMethodOnTerminal(
 ) void {
     const method = serverMethodContext(context);
     const callback = method.callbacks.on_terminal orelse return;
-    callback(method.callbacks.user_data, @intFromEnum(call_id), @intFromEnum(reason));
+    callback(method.callbacks.user_data, @backingInt(call_id), @backingInt(reason));
 }
 
 fn serverMethodContext(context: ?*anyopaque) *ServerMethodStorage {
@@ -933,7 +933,7 @@ fn clientStreamOnMessage(
         storage.callbacks.user_data,
         clientStreamHandle(storage),
         view(payload),
-        @intFromEnum(compression),
+        @backingInt(compression),
     ) == 0) .continue_receiving else .pause;
 }
 
@@ -960,7 +960,7 @@ fn clientStreamOnTerminal(
     callback(
         storage.callbacks.user_data,
         clientStreamHandle(storage),
-        @intFromEnum(final_status.code),
+        @backingInt(final_status.code),
         view(final_status.message),
         metadataViewHandle(trailing_metadata),
     );
@@ -1196,7 +1196,7 @@ test "C ABI reports version and usable features" {
     try std.testing.expectEqual(@as(u64, 0), grpc_lite_features() & Feature.tls);
     try std.testing.expectEqualStrings(
         "invalid argument",
-        std.mem.span(grpc_lite_error_string(@intFromEnum(Error.invalid_argument))),
+        std.mem.span(grpc_lite_error_string(@backingInt(Error.invalid_argument))),
     );
     try std.testing.expectEqualStrings("unknown error", std.mem.span(grpc_lite_error_string(-1)));
     try std.testing.expectEqual(2 * @sizeOf(usize), @sizeOf(BytesView));
@@ -1427,7 +1427,7 @@ test "C managed channel may start before its endpoint" {
         fn log(context: ?*anyopaque, level: u32, message: BytesView) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(context.?));
             const text = bytes(message) orelse return;
-            if (level == @intFromEnum(event_logger.Level.debug) and
+            if (level == @backingInt(event_logger.Level.debug) and
                 std.mem.indexOf(u8, text, "channel reconnect scheduled") != null)
             {
                 self.saw_reconnect.store(true, .release);
@@ -1699,7 +1699,7 @@ test "C client stream completes an event-driven round trip" {
         ) callconv(.c) u32 {
             const self: *@This() = @ptrCast(@alignCast(user_data.?));
             self.message_seen.store(
-                compression == @intFromEnum(Compression.identity) and
+                compression == @backingInt(Compression.identity) and
                     std.mem.eql(u8, bytes(payload).?, "hello"),
                 .release,
             );

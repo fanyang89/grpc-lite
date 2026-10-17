@@ -86,16 +86,16 @@ const Phase = enum(u8) {
 
 const Timing = struct {
     io: std.Io,
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(Phase.setup)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(Phase.setup)),
     measure_start_ns: std.atomic.Value(u64) = .init(0),
     measure_end_ns: std.atomic.Value(u64) = .init(0),
 
     fn loadPhase(self: *const Timing) Phase {
-        return @enumFromInt(self.phase.load(.acquire));
+        return @fromBackingInt(@intCast(self.phase.load(.acquire)));
     }
 
     fn storePhase(self: *Timing, phase: Phase) void {
-        self.phase.store(@intFromEnum(phase), .release);
+        self.phase.store(@backingInt(phase), .release);
     }
 
     fn requestIsMeasured(self: *const Timing, now_ns: u64) bool {
@@ -1305,7 +1305,7 @@ test "reject malformed benchmark client options" {
 test "payload patterns are stable and distinct" {
     var repeated: [16]u8 = undefined;
     fillPayload(&repeated, .repeated);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 16), &repeated);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x5a)), &repeated);
 
     var first: [16]u8 = undefined;
     var second: [16]u8 = undefined;

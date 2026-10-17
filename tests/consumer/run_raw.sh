@@ -64,10 +64,6 @@ prefetch_zigfetch_url_package() {
         --output "$global_cache/p/$expected_hash.tar.gz" "$url"
 }
 
-prefetch_url_package \
-    'https://codeload.github.com/mitchellh/libxev/tar.gz/b0650f082458226860ed7ab0fc7c9c73823c8950' \
-    'libxev-0.0.0-86vtcxkOFACqPXUTAPuq5i0xpDYWU5G5RfrYQXxlUT26' \
-    'libxev.tar.gz'
 prefetch_package \
     'https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99' \
     'N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX' \
@@ -81,12 +77,12 @@ prefetch_zigfetch_url_package \
     'N-V-__8AAHSUBAA_Vn8NXM2L9F21QFvrTIxbH9yvxs5cO-lY' \
     'cpucycles.tar.gz'
 prefetch_url_package \
-    'https://github.com/wyzdwdz/nanozlog/archive/e693c11976d55ba0a5b8deeaaaf9f1c5cc30eba9.tar.gz' \
-    'nanozlog-0.1.0-5UtdH535AADW7HUBpfLboKJkdB1IVYaqz7YFQ2dHIcqL' \
+    'https://github.com/wyzdwdz/nanozlog/archive/a1ad3d52aec355c2dba7568fe18ec440937d4f81.tar.gz' \
+    'nanozlog-0.1.0-5UtdH6f6AAACQMkivAT4xIQtfBDFG3JACCJRpnY5Up3P' \
     'nanozlog.tar.gz'
 prefetch_url_package \
-    'https://github.com/rockorager/zeit/archive/b1c1c2fcbc71fd7799a316bbcf0ff88d06d80ccc.tar.gz' \
-    'zeit-0.9.0-5I6bk2m9AgBSMH8-L6rYJkwuQAyhXplnfxnvTSGzVHUR' \
+    'https://github.com/rockorager/zeit/archive/refs/tags/v0.10.0.tar.gz' \
+    'zeit-0.10.0-5I6bkxS-AgAaI3lI3RsXsWnPw7sMCqJKoFnSB8_QRAoo' \
     'zeit.tar.gz'
 prefetch_url_package \
     'https://codeload.github.com/fanyang89/gperftools/tar.gz/1a01cd2cf8f7000845d343fa8e0bbac70378858b' \
@@ -103,7 +99,7 @@ cat >"$consumer/build.zig.zon" <<EOF
 .{
     .name = .grpc_lite_raw_consumer,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x7b2e24f38b336dd0,
     .dependencies = .{
         .grpc_lite = .{

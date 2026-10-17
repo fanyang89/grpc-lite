@@ -262,7 +262,7 @@ pub const Channel = struct {
             if (impl.tls_config) |config| config.destroy();
         };
 
-        const host = try impl.allocator.dupeZ(u8, parsed.host);
+        const host = try impl.allocator.dupeSentinel(u8, parsed.host, 0);
         errdefer impl.allocator.free(host);
         const authority = try impl.allocator.dupe(u8, target);
         errdefer impl.allocator.free(authority);
@@ -4609,14 +4609,14 @@ test "initial grpc-status requires trailers-only END_STREAM" {
 
     client_stream.resetHeaderBlock(.response);
     try client_stream.block_metadata.append("x-invalid", "present");
-    client_stream.block_grpc_status = @intFromEnum(status.Code.ok);
+    client_stream.block_grpc_status = @backingInt(status.Code.ok);
     try std.testing.expect(!try finishClientHeaderBlock(client_stream, false));
     try std.testing.expectEqual(@as(usize, 0), client_stream.initial_metadata.items().len);
     try std.testing.expectEqual(@as(usize, 0), client_stream.trailing_metadata.items().len);
 
     client_stream.resetHeaderBlock(.response);
     try client_stream.block_metadata.append("x-trailers-only", "present");
-    client_stream.block_grpc_status = @intFromEnum(status.Code.ok);
+    client_stream.block_grpc_status = @backingInt(status.Code.ok);
     try std.testing.expect(try finishClientHeaderBlock(client_stream, true));
     try std.testing.expectEqualStrings(
         "present",
@@ -5255,7 +5255,7 @@ test "unary response header quota crossing records allocation-free local outcome
     try operation.block_metadata.append("x-before", "discarded");
     var native_frame: c.nghttp2_frame = undefined;
     native_frame.hd.stream_id = operation.stream_id;
-    const encoded_unicode_message = "%E2%98%83" ** 4;
+    const encoded_unicode_message = "%E2%98%83%E2%98%83%E2%98%83%E2%98%83";
     try std.testing.expectEqual(
         @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
         onHeader(
@@ -5405,7 +5405,7 @@ test "streaming response header quota terminalizes once and closes sends" {
     client_stream.resetHeaderBlock(.response);
     var native_frame: c.nghttp2_frame = undefined;
     native_frame.hd.stream_id = client_stream.stream_id;
-    const large_value = "x" ** 33;
+    const large_value = &@as([33]u8, @splat('x'));
     try std.testing.expectEqual(
         @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
         onHeader(
@@ -5572,7 +5572,7 @@ test "pending streaming cancellation wins over response header quota" {
 
     var native_frame: c.nghttp2_frame = undefined;
     native_frame.hd.stream_id = client_stream.stream_id;
-    const large_value = "x" ** 33;
+    const large_value = &@as([33]u8, @splat('x'));
     try std.testing.expectEqual(
         @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
         onHeader(
@@ -5717,8 +5717,8 @@ test "raw nghttp2 peer covers response header boundaries isolation and HPACK reu
     try std.testing.expectEqual(@as(usize, 0), peer_state.closes);
 
     // These trailers-only responses total exactly 300 and 301 charged bytes.
-    const exact_boundary_value = "b" ** 112;
-    const over_boundary_value = "b" ** 113;
+    const exact_boundary_value = &@as([112]u8, @splat('b'));
+    const over_boundary_value = &@as([113]u8, @splat('b'));
     const exact_headers = [_]c.nghttp2_nv{
         nativeHeader(":status", "200"),
         nativeHeader("content-type", "application/grpc"),
@@ -5777,7 +5777,7 @@ test "raw nghttp2 peer covers response header boundaries isolation and HPACK reu
 
     // The preceding fields total 266 bytes. The large field is completed in a
     // CONTINUATION callback and crosses the configured 300-byte limit there.
-    const large_value = "x" ** (20 * 1024);
+    const large_value = &@as([(20 * 1024)]u8, @splat('x'));
     const rejected_headers = [_]c.nghttp2_nv{
         nativeHeader(":status", "200"),
         nativeHeader("content-type", "application/grpc"),
@@ -5893,7 +5893,7 @@ test "client session advertises the default and reconnect response header list s
     operation.resetHeaderBlock(.response);
     var native_frame: c.nghttp2_frame = undefined;
     native_frame.hd.stream_id = operation.stream_id;
-    const oversized_value = "x" ** 91;
+    const oversized_value = &@as([91]u8, @splat('x'));
     try std.testing.expectEqual(
         @as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE),
         onHeader(
@@ -5975,12 +5975,12 @@ test "response headers with grpc-status are trailers-only metadata" {
 
     operation.resetHeaderBlock(.response);
     try operation.block_metadata.append("x-trailers-only", "present");
-    operation.block_grpc_status = @intFromEnum(status.Code.not_found);
+    operation.block_grpc_status = @backingInt(status.Code.not_found);
     try std.testing.expect(try operation.finishHeaderBlock(true));
 
     try std.testing.expectEqual(@as(usize, 0), operation.initial_metadata.items().len);
     try std.testing.expectEqualStrings("present", operation.trailing_metadata.getFirst("x-trailers-only").?);
-    try std.testing.expectEqual(@as(?u32, @intFromEnum(status.Code.not_found)), operation.grpc_status);
+    try std.testing.expectEqual(@as(?u32, @backingInt(status.Code.not_found)), operation.grpc_status);
 }
 
 test "channel connection refusal cleans up startup resources" {
@@ -6183,7 +6183,7 @@ test "malformed response metadata fails one call and preserves the channel" {
 test "oversized response metadata is block atomic and preserves channel reuse" {
     const server = @import("server.zig");
     const service = @import("service.zig");
-    const large_value = "x" ** 2048;
+    const large_value = &@as([2048]u8, @splat('x'));
 
     const Handler = struct {
         calls: std.atomic.Value(usize) = .init(0),
@@ -7968,7 +7968,7 @@ test "TLS channel replaces a server-idle connection for a later RPC" {
     };
     var diagnostics: Diagnostics = .{ .started_ns = nowNs() };
     // Registered before transport teardown so callbacks cannot outlive the capture.
-    errdefer |err| diagnostics.dump(err);
+    errdefer diagnostics.dump(error.TestFailed);
     const logger: event_logger.Logger = .{ .context = &diagnostics, .callback = Diagnostics.log };
     logger.write(.debug, "test: initializing server", .{});
 

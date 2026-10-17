@@ -768,7 +768,7 @@ const Impl = struct {
 fn initImpl(shared_allocator: std.mem.Allocator, coordinator: *Coordinator, options: Options) !*Impl {
     const impl = try shared_allocator.create(Impl);
     errdefer shared_allocator.destroy(impl);
-    const host = try shared_allocator.dupeZ(u8, options.host);
+    const host = try shared_allocator.dupeSentinel(u8, options.host, 0);
     errdefer shared_allocator.free(host);
     var io_threaded = std.Io.Threaded.init(shared_allocator, .{});
     errdefer io_threaded.deinit();
@@ -1158,7 +1158,7 @@ const Stream = struct {
 
 fn serverCallId(context: *anyopaque) raw_stream.ServerCallId {
     const control: *ServerCallControl = @ptrCast(@alignCast(context));
-    return @enumFromInt(@intFromPtr(control));
+    return @fromBackingInt(@intCast(@intFromPtr(control)));
 }
 
 fn serverCallIsCancelled(context: *anyopaque) bool {
@@ -1200,7 +1200,7 @@ fn serverCallRelease(context: *anyopaque) void {
 
 fn serverStreamCallId(context: *anyopaque) raw_stream.ServerCallId {
     const target: *Stream = @ptrCast(@alignCast(context));
-    const control = target.call_control orelse return @enumFromInt(@intFromPtr(target));
+    const control = target.call_control orelse return @fromBackingInt(@intCast(@intFromPtr(target)));
     return serverCallId(control);
 }
 
@@ -3564,7 +3564,7 @@ fn submitTrailers(session: *c.nghttp2_session, stream: *Stream) !void {
         }
     }
     var code_buffer: [3]u8 = undefined;
-    const code = try std.fmt.bufPrint(&code_buffer, "{d}", .{@intFromEnum(stream.response_code)});
+    const code = try std.fmt.bufPrint(&code_buffer, "{d}", .{@backingInt(stream.response_code)});
     try trailers.append(stream.allocator, nativeHeader("grpc-status", code));
     const encoded = try message.encode(stream.allocator, stream.response_message);
     defer stream.allocator.free(encoded);
@@ -6245,7 +6245,7 @@ test "raw HTTP/2 bidi stream incrementally exchanges messages" {
         writable_send_failed: bool = false,
         remote_ended: bool = false,
 
-        const large_response = "0123456789abcdef" ** 4;
+        const large_response = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         fn onStart(context: ?*anyopaque, _: raw_stream.ServerStream, server_context: *service.ServerContext) !void {
             const self: *@This() = @ptrCast(@alignCast(context.?));
@@ -6751,7 +6751,7 @@ test "malformed streaming input resets only its stream and connection remains re
     var capture = TestResponseCapture{};
     defer capture.deinit();
     try capture.decode(output.items);
-    try std.testing.expectEqual(@as(?u32, @intFromEnum(status.Code.invalid_argument)), capture.stream1_status);
+    try std.testing.expectEqual(@as(?u32, @backingInt(status.Code.invalid_argument)), capture.stream1_status);
     try std.testing.expect(capture.stream1_trailing_metadata_matches);
     try std.testing.expect(capture.stream1_reset);
     try std.testing.expectEqual(@as(?u32, 0), capture.stream3_status);
