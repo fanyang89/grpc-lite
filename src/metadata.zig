@@ -86,6 +86,14 @@ pub const Metadata = struct {
             try decoded_values.append(self.allocator, decoded);
         }
 
+        const original_len = self.entries.items.len;
+        errdefer {
+            for (self.entries.items[original_len..]) |entry| {
+                self.allocator.free(entry.key);
+                self.allocator.free(entry.value);
+            }
+            self.entries.shrinkRetainingCapacity(original_len);
+        }
         for (decoded_values.items) |decoded| try self.appendOwned(key, decoded);
         return .appended;
     }
@@ -287,4 +295,26 @@ test "invalid incoming ASCII metadata is discarded" {
     try std.testing.expectEqual(IncomingResult.discarded, try metadata.appendDecoded("x-control", "bad\tvalue"));
     try std.testing.expectEqual(IncomingResult.appended, try metadata.appendDecoded("x-visible", " ~"));
     try std.testing.expectEqual(@as(usize, 1), metadata.items().len);
+}
+
+fn testDecodedMetadataAtomicity(allocator: std.mem.Allocator) !void {
+    var metadata = Metadata.init(allocator);
+    defer metadata.deinit();
+    try metadata.append("x-existing", "keep");
+    _ = metadata.appendDecoded("trace-bin", "YQ==,Yg,Yw==") catch |err| {
+        try std.testing.expectEqual(@as(usize, 1), metadata.items().len);
+        try std.testing.expectEqualStrings("x-existing", metadata.items()[0].key);
+        try std.testing.expectEqualStrings("keep", metadata.items()[0].value);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 4), metadata.items().len);
+    try std.testing.expectEqualStrings("keep", metadata.items()[0].value);
+    for (metadata.items()[1..], [_][]const u8{ "a", "b", "c" }) |entry, expected| {
+        try std.testing.expectEqualStrings("trace-bin", entry.key);
+        try std.testing.expectEqualStrings(expected, entry.value);
+    }
+}
+
+test "comma-joined binary metadata is atomic at every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testDecodedMetadataAtomicity, .{});
 }
