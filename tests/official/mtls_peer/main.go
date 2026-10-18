@@ -51,6 +51,7 @@ func run() error {
 		s := grpc.NewServer(grpc.Creds(credentials.NewTLS(config)))
 		defer s.Stop()
 		pb.RegisterTestServiceServer(s, interop.NewTestServer())
+		fmt.Fprintf(os.Stderr, "mTLS interop server listening on %s\n", listener.Addr())
 		return s.Serve(listener)
 	}
 	conn, err := grpc.NewClient(*address, grpc.WithTransportCredentials(credentials.NewTLS(config)))
