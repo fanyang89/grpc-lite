@@ -46,7 +46,178 @@ static_assert(offsetof(grpc_lite_channel_options, max_stream_buffer_bytes) ==
 static_assert(std::is_standard_layout_v<grpc_lite_stream_admission_stats>);
 static_assert(offsetof(grpc_lite_stream_admission_stats, struct_size) == 0);
 
+static_assert(std::is_standard_layout_v<grpc_lite_channel_operational_stats>);
+static_assert(offsetof(grpc_lite_channel_operational_stats, struct_size) == 0);
+static_assert(sizeof(grpc_lite_channel_operational_stats) == 208);
+static_assert(alignof(grpc_lite_channel_operational_stats) ==
+              alignof(std::uint64_t));
+static_assert(std::is_standard_layout_v<grpc_lite_server_operational_stats>);
+static_assert(offsetof(grpc_lite_server_operational_stats, struct_size) == 0);
+static_assert(sizeof(grpc_lite_server_operational_stats) == 120);
+static_assert(alignof(grpc_lite_server_operational_stats) ==
+              alignof(std::uint64_t));
+
+#define CHECK_OPERATIONAL_FIELD(type, field, offset)                   \
+  static_assert(std::is_same_v<decltype(type::field), std::uint64_t>); \
+  static_assert(offsetof(type, field) == offset)
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        unary_retained_calls, 8);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        unary_retained_request_bytes, 16);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        unary_rejected_calls, 24);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        stream_retained_streams, 32);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        stream_reserved_buffer_bytes, 40);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        stream_rejected_streams, 48);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats, active_unary_calls,
+                        56);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats, active_streams,
+                        64);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats, active_connections,
+                        72);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        pending_unary_calls, 80);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        pending_unary_calls_high_water, 88);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        stream_inbound_bytes, 96);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        stream_inbound_bytes_high_water, 104);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        stream_outbound_bytes, 112);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        stream_outbound_bytes_high_water, 120);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats, socket_write_bytes,
+                        128);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        socket_write_bytes_high_water, 136);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats, terminal_ok, 144);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats, terminal_cancelled,
+                        152);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        terminal_deadline_exceeded, 160);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats, terminal_other,
+                        168);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats, reconnect_attempts,
+                        176);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        reconnect_successes, 184);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats, reconnect_goaway,
+                        192);
+CHECK_OPERATIONAL_FIELD(grpc_lite_channel_operational_stats,
+                        reconnect_transport_failure, 200);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        admitted_connections, 8);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats, active_rpcs, 16);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        rejected_connections, 24);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        pre_ack_rejected_streams, 32);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        streaming_outbound_reserved_bytes, 40);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        streaming_outbound_reserved_bytes_high_water_sum, 48);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        socket_queued_write_bytes, 56);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        socket_queued_write_bytes_high_water_sum, 64);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        close_peer_transport, 72);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        close_protocol_local, 80);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        close_preface_timeout, 88);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats, close_idle_timeout,
+                        96);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        close_graceful_drain, 104);
+CHECK_OPERATIONAL_FIELD(grpc_lite_server_operational_stats,
+                        close_forced_shutdown, 112);
+#undef CHECK_OPERATIONAL_FIELD
+
+void TestOperationalStats() {
+  grpc_lite_channel_operational_stats channel =
+      GRPC_LITE_CHANNEL_OPERATIONAL_STATS_INIT;
+  assert(channel.struct_size == sizeof(channel));
+  constexpr std::uint64_t grpc_lite_channel_operational_stats::*
+      fields_channel[] = {
+          &grpc_lite_channel_operational_stats::unary_retained_calls,
+          &grpc_lite_channel_operational_stats::unary_retained_request_bytes,
+          &grpc_lite_channel_operational_stats::unary_rejected_calls,
+          &grpc_lite_channel_operational_stats::stream_retained_streams,
+          &grpc_lite_channel_operational_stats::stream_reserved_buffer_bytes,
+          &grpc_lite_channel_operational_stats::stream_rejected_streams,
+          &grpc_lite_channel_operational_stats::active_unary_calls,
+          &grpc_lite_channel_operational_stats::active_streams,
+          &grpc_lite_channel_operational_stats::active_connections,
+          &grpc_lite_channel_operational_stats::pending_unary_calls,
+          &grpc_lite_channel_operational_stats::pending_unary_calls_high_water,
+          &grpc_lite_channel_operational_stats::stream_inbound_bytes,
+          &grpc_lite_channel_operational_stats::stream_inbound_bytes_high_water,
+          &grpc_lite_channel_operational_stats::stream_outbound_bytes,
+          &grpc_lite_channel_operational_stats::
+              stream_outbound_bytes_high_water,
+          &grpc_lite_channel_operational_stats::socket_write_bytes,
+          &grpc_lite_channel_operational_stats::socket_write_bytes_high_water,
+          &grpc_lite_channel_operational_stats::terminal_ok,
+          &grpc_lite_channel_operational_stats::terminal_cancelled,
+          &grpc_lite_channel_operational_stats::terminal_deadline_exceeded,
+          &grpc_lite_channel_operational_stats::terminal_other,
+          &grpc_lite_channel_operational_stats::reconnect_attempts,
+          &grpc_lite_channel_operational_stats::reconnect_successes,
+          &grpc_lite_channel_operational_stats::reconnect_goaway,
+          &grpc_lite_channel_operational_stats::reconnect_transport_failure,
+      };
+  for (auto field : fields_channel) {
+    assert(channel.*field == 0);
+    channel.*field = UINT64_MAX;
+  }
+  assert(grpc_lite_channel_get_operational_stats(nullptr, nullptr) ==
+         GRPC_LITE_ERROR_INVALID_ARGUMENT);
+  assert(grpc_lite_channel_get_operational_stats(nullptr, &channel) ==
+         GRPC_LITE_ERROR_INVALID_ARGUMENT);
+  assert(channel.struct_size == sizeof(channel));
+  for (auto field : fields_channel) assert(channel.*field == 0);
+  grpc_lite_server_operational_stats server =
+      GRPC_LITE_SERVER_OPERATIONAL_STATS_INIT;
+  assert(server.struct_size == sizeof(server));
+  constexpr std::uint64_t grpc_lite_server_operational_stats::*
+      fields_server[] = {
+          &grpc_lite_server_operational_stats::admitted_connections,
+          &grpc_lite_server_operational_stats::active_rpcs,
+          &grpc_lite_server_operational_stats::rejected_connections,
+          &grpc_lite_server_operational_stats::pre_ack_rejected_streams,
+          &grpc_lite_server_operational_stats::
+              streaming_outbound_reserved_bytes,
+          &grpc_lite_server_operational_stats::
+              streaming_outbound_reserved_bytes_high_water_sum,
+          &grpc_lite_server_operational_stats::socket_queued_write_bytes,
+          &grpc_lite_server_operational_stats::
+              socket_queued_write_bytes_high_water_sum,
+          &grpc_lite_server_operational_stats::close_peer_transport,
+          &grpc_lite_server_operational_stats::close_protocol_local,
+          &grpc_lite_server_operational_stats::close_preface_timeout,
+          &grpc_lite_server_operational_stats::close_idle_timeout,
+          &grpc_lite_server_operational_stats::close_graceful_drain,
+          &grpc_lite_server_operational_stats::close_forced_shutdown,
+      };
+  for (auto field : fields_server) {
+    assert(server.*field == 0);
+    server.*field = UINT64_MAX;
+  }
+  assert(grpc_lite_server_get_operational_stats(nullptr, nullptr) ==
+         GRPC_LITE_ERROR_INVALID_ARGUMENT);
+  assert(grpc_lite_server_get_operational_stats(nullptr, &server) ==
+         GRPC_LITE_ERROR_INVALID_ARGUMENT);
+  assert(server.struct_size == sizeof(server));
+  for (auto field : fields_server) assert(server.*field == 0);
+}
+
 int main() {
+  TestOperationalStats();
   grpc_lite_unary_options options = GRPC_LITE_UNARY_OPTIONS_INIT;
   grpc_lite_channel_options channel_options = GRPC_LITE_CHANNEL_OPTIONS_INIT;
   grpc_lite_logger logger = GRPC_LITE_LOGGER_INIT;

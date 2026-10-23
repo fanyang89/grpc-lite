@@ -32,7 +32,99 @@ static_assert(std::is_nothrow_move_constructible_v<Server>);
 static_assert(!std::is_copy_constructible_v<ServerCall>);
 static_assert(std::is_nothrow_move_constructible_v<ServerCall>);
 
+static_assert(std::is_standard_layout_v<grpc_lite::ChannelOperationalStats>);
+static_assert(std::is_trivially_copyable_v<grpc_lite::ChannelOperationalStats>);
+static_assert(sizeof(grpc_lite::ChannelOperationalStats) ==
+              25 * sizeof(std::uint64_t));
+static_assert(std::is_same_v<decltype(&Channel::GetOperationalStats),
+                             grpc_lite::Error (Channel::*)(
+                                 grpc_lite::ChannelOperationalStats*) const>);
+static_assert(std::is_standard_layout_v<grpc_lite::ServerOperationalStats>);
+static_assert(std::is_trivially_copyable_v<grpc_lite::ServerOperationalStats>);
+static_assert(sizeof(grpc_lite::ServerOperationalStats) ==
+              14 * sizeof(std::uint64_t));
+static_assert(std::is_same_v<decltype(&Server::GetOperationalStats),
+                             grpc_lite::Error (Server::*)(
+                                 grpc_lite::ServerOperationalStats*) const>);
+
 namespace {
+
+// Typed member pointers cover every payload field without padding comparisons.
+constexpr std::uint64_t grpc_lite::ChannelOperationalStats::*
+    kChannelOperationalFields[] = {
+        &grpc_lite::ChannelOperationalStats::unary_retained_calls,
+        &grpc_lite::ChannelOperationalStats::unary_retained_request_bytes,
+        &grpc_lite::ChannelOperationalStats::unary_rejected_calls,
+        &grpc_lite::ChannelOperationalStats::stream_retained_streams,
+        &grpc_lite::ChannelOperationalStats::stream_reserved_buffer_bytes,
+        &grpc_lite::ChannelOperationalStats::stream_rejected_streams,
+        &grpc_lite::ChannelOperationalStats::active_unary_calls,
+        &grpc_lite::ChannelOperationalStats::active_streams,
+        &grpc_lite::ChannelOperationalStats::active_connections,
+        &grpc_lite::ChannelOperationalStats::pending_unary_calls,
+        &grpc_lite::ChannelOperationalStats::pending_unary_calls_high_water,
+        &grpc_lite::ChannelOperationalStats::stream_inbound_bytes,
+        &grpc_lite::ChannelOperationalStats::stream_inbound_bytes_high_water,
+        &grpc_lite::ChannelOperationalStats::stream_outbound_bytes,
+        &grpc_lite::ChannelOperationalStats::stream_outbound_bytes_high_water,
+        &grpc_lite::ChannelOperationalStats::socket_write_bytes,
+        &grpc_lite::ChannelOperationalStats::socket_write_bytes_high_water,
+        &grpc_lite::ChannelOperationalStats::terminal_ok,
+        &grpc_lite::ChannelOperationalStats::terminal_cancelled,
+        &grpc_lite::ChannelOperationalStats::terminal_deadline_exceeded,
+        &grpc_lite::ChannelOperationalStats::terminal_other,
+        &grpc_lite::ChannelOperationalStats::reconnect_attempts,
+        &grpc_lite::ChannelOperationalStats::reconnect_successes,
+        &grpc_lite::ChannelOperationalStats::reconnect_goaway,
+        &grpc_lite::ChannelOperationalStats::reconnect_transport_failure,
+};
+
+void CheckEmptyChannelOperationalStats(const Channel& owner) {
+  grpc_lite::ChannelOperationalStats stats;
+  for (auto field : kChannelOperationalFields) {
+    assert(stats.*field == 0);
+    stats.*field = UINT64_MAX;
+  }
+  assert(owner.GetOperationalStats(nullptr).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  assert(owner.GetOperationalStats(&stats).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  for (auto field : kChannelOperationalFields) assert(stats.*field == 0);
+}
+
+// Typed member pointers cover every payload field without padding comparisons.
+constexpr std::uint64_t grpc_lite::ServerOperationalStats::*
+    kServerOperationalFields[] = {
+        &grpc_lite::ServerOperationalStats::admitted_connections,
+        &grpc_lite::ServerOperationalStats::active_rpcs,
+        &grpc_lite::ServerOperationalStats::rejected_connections,
+        &grpc_lite::ServerOperationalStats::pre_ack_rejected_streams,
+        &grpc_lite::ServerOperationalStats::streaming_outbound_reserved_bytes,
+        &grpc_lite::ServerOperationalStats::
+            streaming_outbound_reserved_bytes_high_water_sum,
+        &grpc_lite::ServerOperationalStats::socket_queued_write_bytes,
+        &grpc_lite::ServerOperationalStats::
+            socket_queued_write_bytes_high_water_sum,
+        &grpc_lite::ServerOperationalStats::close_peer_transport,
+        &grpc_lite::ServerOperationalStats::close_protocol_local,
+        &grpc_lite::ServerOperationalStats::close_preface_timeout,
+        &grpc_lite::ServerOperationalStats::close_idle_timeout,
+        &grpc_lite::ServerOperationalStats::close_graceful_drain,
+        &grpc_lite::ServerOperationalStats::close_forced_shutdown,
+};
+
+void CheckEmptyServerOperationalStats(const Server& owner) {
+  grpc_lite::ServerOperationalStats stats;
+  for (auto field : kServerOperationalFields) {
+    assert(stats.*field == 0);
+    stats.*field = UINT64_MAX;
+  }
+  assert(owner.GetOperationalStats(nullptr).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  assert(owner.GetOperationalStats(&stats).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  for (auto field : kServerOperationalFields) assert(stats.*field == 0);
+}
 
 void TestMetadata() {
   Metadata metadata;
@@ -176,6 +268,81 @@ void TestRejectedOpenCleanup() {
   }
 }
 
+void TestOperationalStats() {
+  Channel empty_channel;
+  Server empty_server;
+  CheckEmptyChannelOperationalStats(empty_channel);
+  CheckEmptyServerOperationalStats(empty_server);
+
+  Server server;
+  assert(Server::Create({}, &server).ok());
+  grpc_lite::ServerOperationalStats server_stats;
+  const Server& server_view = server;
+  assert(server_view.GetOperationalStats(&server_stats).ok());
+  for (auto field : kServerOperationalFields) assert(server_stats.*field == 0);
+  assert(server_view.GetOperationalStats(nullptr).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  Server moved_server(std::move(server));
+  CheckEmptyServerOperationalStats(server);
+  server = std::move(moved_server);
+  CheckEmptyServerOperationalStats(moved_server);
+  assert(server.Start().ok());
+  std::uint32_t port = 0;
+  assert(server.Port(&port).ok());
+
+  Channel channel;
+  assert(Channel::CreateManaged(nullptr, "127.0.0.1:" + std::to_string(port),
+                                {}, &channel)
+             .ok());
+  grpc_lite::ChannelOperationalStats channel_stats;
+  const Channel& channel_view = channel;
+  assert(channel_view.GetOperationalStats(&channel_stats).ok());
+  assert(channel_stats.active_connections == 1);
+  assert(channel_stats.active_unary_calls == 0);
+  assert(channel_stats.active_streams == 0);
+  assert(channel_view.GetOperationalStats(nullptr).code() ==
+         grpc_lite::ErrorCode::InvalidArgument);
+  Channel moved_channel(std::move(channel));
+  CheckEmptyChannelOperationalStats(channel);
+  channel = std::move(moved_channel);
+  CheckEmptyChannelOperationalStats(moved_channel);
+  assert(server_view.GetOperationalStats(&server_stats).ok());
+  // Independent live samples are not compared for equality.
+  assert(server_stats.active_rpcs == 0);
+
+  channel.Shutdown();
+  channel.Wait();
+  server.Shutdown();
+  server.Wait();
+  assert(channel_view.GetOperationalStats(&channel_stats).ok());
+  assert(channel_stats.active_connections == 0);
+  assert(channel_stats.socket_write_bytes == 0);
+  assert(server_view.GetOperationalStats(&server_stats).ok());
+  assert(server_stats.admitted_connections == 0);
+  assert(server_stats.active_rpcs == 0);
+  assert(server_stats.streaming_outbound_reserved_bytes == 0);
+  assert(server_stats.socket_queued_write_bytes == 0);
+
+  // Once both owners are joined and no stream handles exist, every field is
+  // stable. Copies own their values and remain valid after owner destruction.
+  const auto channel_copy = channel_stats;
+  const auto server_copy = server_stats;
+  assert(channel_view.GetOperationalStats(&channel_stats).ok());
+  assert(server_view.GetOperationalStats(&server_stats).ok());
+  for (auto field : kChannelOperationalFields)
+    assert(channel_stats.*field == channel_copy.*field);
+  for (auto field : kServerOperationalFields)
+    assert(server_stats.*field == server_copy.*field);
+  channel = {};
+  server = {};
+  CheckEmptyChannelOperationalStats(channel);
+  CheckEmptyServerOperationalStats(server);
+  for (auto field : kChannelOperationalFields)
+    assert(channel_stats.*field == channel_copy.*field);
+  for (auto field : kServerOperationalFields)
+    assert(server_stats.*field == server_copy.*field);
+}
+
 struct RoundTripState {
   std::mutex mutex;
   std::condition_variable completed;
@@ -294,6 +461,12 @@ void TestRoundTripRetainedStreamOwnership() {
                &runtime, "127.0.0.1:" + std::to_string(port),
                std::move(channel_options), &channel)
                .ok());
+    grpc_lite::ChannelOperationalStats live_channel_stats;
+    assert(channel.GetOperationalStats(&live_channel_stats).ok());
+    assert(live_channel_stats.active_connections == 1);
+    grpc_lite::ServerOperationalStats live_server_stats;
+    assert(server.GetOperationalStats(&live_server_stats).ok());
+    assert(live_server_stats.active_rpcs == 0);
     channel_options.logger = {};
     assert(!logger_weak.expired());
 
@@ -404,6 +577,45 @@ void TestRoundTripRetainedStreamOwnership() {
     assert(channel.GetStreamAdmissionStats(&stats).ok());
     assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == reserved_bytes);
     assert(stats.rejected_streams == 1);
+    grpc_lite::ChannelOperationalStats stopped;
+    assert(channel.GetOperationalStats(&stopped).ok());
+    // Joined Channel: the terminal stream still owns its admission reservation.
+    grpc_lite::UnaryAdmissionStats unary_admission;
+    grpc_lite::StreamAdmissionStats stream_admission;
+    assert(channel.GetUnaryAdmissionStats(&unary_admission).ok());
+    assert(channel.GetStreamAdmissionStats(&stream_admission).ok());
+    assert(stopped.unary_retained_calls == unary_admission.retained_calls);
+    assert(stopped.unary_retained_request_bytes ==
+           unary_admission.retained_request_bytes);
+    assert(stopped.unary_rejected_calls == unary_admission.rejected_calls);
+    assert(stopped.stream_retained_streams ==
+           stream_admission.retained_streams);
+    assert(stopped.stream_reserved_buffer_bytes ==
+           stream_admission.reserved_buffer_bytes);
+    assert(stopped.stream_rejected_streams ==
+           stream_admission.rejected_streams);
+    assert(stopped.stream_retained_streams == 1);
+    assert(stopped.stream_reserved_buffer_bytes ==
+           stream_options.max_inbound_buffer_size +
+               stream_options.max_outbound_buffer_size);
+    assert(stopped.active_unary_calls == 0);
+    assert(stopped.active_streams == 0);
+    assert(stopped.active_connections == 0);
+    assert(stopped.pending_unary_calls == 0);
+    assert(stopped.pending_unary_calls_high_water == 0);
+    assert(stopped.stream_inbound_bytes == 0);
+    assert(stopped.stream_outbound_bytes == 0);
+    assert(stopped.stream_outbound_bytes_high_water >= 18);
+    assert(stopped.socket_write_bytes == 0);
+    assert(stopped.socket_write_bytes_high_water > 0);
+    assert(stopped.terminal_ok == 2);
+    assert(stopped.terminal_cancelled == 0);
+    assert(stopped.terminal_deadline_exceeded == 0);
+    assert(stopped.terminal_other == 0);
+    assert(stopped.reconnect_attempts == 0);
+    assert(stopped.reconnect_successes == 0);
+    assert(stopped.reconnect_goaway == 0);
+    assert(stopped.reconnect_transport_failure == 0);
   }  // Destroy the actual Channel while survivor still owns its stream.
   assert(logger_weak.expired());
   assert(!callback_weak.expired());
@@ -418,6 +630,24 @@ void TestRoundTripRetainedStreamOwnership() {
 
   server.ShutdownGracefully(UINT64_C(1000000000));
   server.Wait();
+  grpc_lite::ServerOperationalStats stopped_server;
+  assert(server.GetOperationalStats(&stopped_server).ok());
+  assert(stopped_server.admitted_connections == 0);
+  assert(stopped_server.active_rpcs == 0);
+  assert(stopped_server.rejected_connections == 0);
+  assert(stopped_server.pre_ack_rejected_streams == 0);
+  assert(stopped_server.streaming_outbound_reserved_bytes == 0);
+  assert(stopped_server.streaming_outbound_reserved_bytes_high_water_sum >= 19);
+  assert(stopped_server.socket_queued_write_bytes == 0);
+  assert(stopped_server.socket_queued_write_bytes_high_water_sum > 0);
+  assert(stopped_server.close_protocol_local == 0);
+  assert(stopped_server.close_preface_timeout == 0);
+  assert(stopped_server.close_idle_timeout == 0);
+  // Peer close and graceful drain can race; only the disjoint total is fixed.
+  assert(stopped_server.close_peer_transport +
+             stopped_server.close_graceful_drain +
+             stopped_server.close_forced_shutdown ==
+         1);
   assert(state.client_ok);
   assert(state.server_context_ok);
   assert(state.server_terminal);
@@ -439,6 +669,7 @@ int main() {
   TestMetadata();
   TestInvalidObjects();
   TestRejectedOpenCleanup();
+  TestOperationalStats();
   TestRoundTripRetainedStreamOwnership();
   return 0;
 }
