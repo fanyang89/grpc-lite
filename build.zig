@@ -508,10 +508,10 @@ pub fn build(b: *std.Build) void {
 
     const run_streaming_lifecycle = b.addRunArtifact(streaming_lifecycle);
     if (b.args) |args| run_streaming_lifecycle.addArgs(args);
-    const run_streaming_lifecycle_step = b.step("run-streaming-lifecycle", "Run the raw streaming lifecycle example (normal or interrupt)");
+    const run_streaming_lifecycle_step = b.step("run-streaming-lifecycle", "Run the raw streaming lifecycle example (normal, interrupt, or pre_handler_failure)");
     run_streaming_lifecycle_step.dependOn(&run_streaming_lifecycle.step);
 
-    const streaming_lifecycle_test_step = b.step("test-streaming-lifecycle", "Smoke-test normal and interrupted streaming lifecycles");
+    const streaming_lifecycle_test_step = b.step("test-streaming-lifecycle", "Smoke-test normal, interrupted, and pre-handler failure lifecycles");
     // The shell harness executes the artifact itself, bypassing Zig's foreign
     // executable handling. Only attach it to the suite for a matching host triple.
     if (target.result.cpu.arch == b.graph.host.result.cpu.arch and

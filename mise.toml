@@ -36,7 +36,7 @@ description = "Run all tests"
 run = "zig build test --summary all"
 
 [tasks.test-streaming-lifecycle]
-description = "Smoke-test normal and interrupted raw streaming lifecycles"
+description = "Smoke-test normal, interrupted, and pre-handler failure lifecycles"
 run = "zig build test-streaming-lifecycle -Dprotobuf=false --summary all"
 
 [tasks.test-release-safe]

@@ -175,13 +175,14 @@ IPv4 loopback client and server in one process. It sends the protobuf wire bytes
 is needed. After the usual `mise install` and `mise run bootstrap` setup:
 
 ```bash
-# Recommended: both modes, each under an external shutdown watchdog.
+# Recommended: all three modes, each under an external shutdown watchdog.
 mise run test-streaming-lifecycle
 zig build test-streaming-lifecycle -Dprotobuf=false -Doptimize=ReleaseSafe --summary all
 
 # Individual modes (without the external watchdog).
 zig build run-streaming-lifecycle -Dprotobuf=false -- normal
 zig build run-streaming-lifecycle -Dprotobuf=false -- interrupt
+zig build run-streaming-lifecycle -Dprotobuf=false -- pre_handler_failure
 
 # Install the raw artifact, then smoke-test it directly.
 zig build -Dprotobuf=false
@@ -201,16 +202,19 @@ architecture, and ABI to match the build host; explicitly requesting the smoke
 step for another target fails rather than executing it. Cross-target installation
 remains available; the individual run step uses Zig's normal artifact runner.
 
-The intended ordering is:
+For `normal` and `interrupt`, the intended ordering is:
 
 1. Main queues one request and calls `closeSend`. This half-closes requests only;
    responses remain independent.
 2. The server's `on_remote_end` callback attempts two responses. The first fills
    the outbound queue; the second must return `WouldBlock`. The unsent index is
    retained and retried only from `on_writable`, without polling or sleeping.
-3. Events publish server readiness and receipt of both responses to main, while
-   final status remains pending. Main requests graceful drain with a 5-second
-   bound while the RPC is still active.
+3. Main first waits for client progress or terminal notification. An early terminal
+   is an error in these modes and enters cleanup without waiting on a server
+   event that might never be set. Otherwise, after both responses arrive, main
+   waits for the server readiness event before reading the retained `ServerCall`.
+   With final status still pending, it requests graceful drain with a 5-second
+   bound while the RPC is active.
 4. In `normal` mode, main finishes the retained `ServerCall` with OK. In
    `interrupt` mode, main explicitly cancels the client stream and requires
    client CANCELLED and server `peer_cancelled`. Drain stops admission and lets
@@ -224,6 +228,17 @@ The intended ordering is:
    one retained stream / 4103 reserved bytes before `ClientStream.deinit`, then
    zero afterward. Contexts, allocator, and `init.io` outlive loops and handles;
    error-path defers also join before releasing retained server state.
+
+The third mode, `pre_handler_failure`, deliberately calls an unregistered method.
+It uses the same client-first wait but expects exactly one UNIMPLEMENTED terminal
+and zero messages. It requests immediate Server shutdown instead of graceful
+drain, joins both loops, then verifies no handler started, no server-handler
+terminal callback ran, no `ServerCall` was retained, and the server readiness
+event remains unset. It also checks the same admission release boundary. Only
+this checked outcome emits `EXPECTED_FAILURE` and exits zero; it demonstrates
+early-failure cleanup, not backpressure or graceful-drain success. Unexpected
+statuses (including deadline expiry), abnormal failure in `normal`/`interrupt`,
+and watchdog termination remain failures.
 
 Callbacks run on transport loop threads and must not block. Here they only
 validate bounded data, issue transport commands, and signal events; only main
@@ -242,15 +257,6 @@ capacity. The source also sets one reactor, one connection, one concurrent RPC,
 header and unary-admission budgets, write watermarks, and preface/idle timeouts.
 These are explicit queue/admission limits, **not a total heap bound**; see
 [Resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence).
-
-This example and its integration are an **UNCOMPILED / UNRUN candidate**, not
-completion evidence for [#53](https://github.com/fanyang89/grpc-lite/issues/53).
-Independent review and scheduled compile, normal/interrupt smoke, repeated, and
-applicable sanitizer validation remain required. Corrected retained-handle runtime
-qualification for [#44](https://github.com/fanyang89/grpc-lite/issues/44) and
-repeated/TSan qualification for [#45](https://github.com/fanyang89/grpc-lite/issues/45)
-remain separate prerequisites; this smoke does not replace them or establish
-release readiness.
 
 ## Server
 
