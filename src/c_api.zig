@@ -13,7 +13,7 @@ const Status = @import("status.zig").Status;
 const version = @import("version.zig");
 
 pub const abi_major: u16 = 1;
-pub const abi_minor: u16 = 8;
+pub const abi_minor: u16 = 9;
 
 pub const Error = enum(i32) {
     ok = 0,
@@ -101,6 +101,53 @@ pub const StreamAdmissionStats = extern struct {
     retained_streams: u64 = 0,
     reserved_buffer_bytes: u64 = 0,
     rejected_streams: u64 = 0,
+};
+
+pub const ChannelOperationalStats = extern struct {
+    struct_size: usize = @sizeOf(ChannelOperationalStats),
+    unary_retained_calls: u64 = 0,
+    unary_retained_request_bytes: u64 = 0,
+    unary_rejected_calls: u64 = 0,
+    stream_retained_streams: u64 = 0,
+    stream_reserved_buffer_bytes: u64 = 0,
+    stream_rejected_streams: u64 = 0,
+    active_unary_calls: u64 = 0,
+    active_streams: u64 = 0,
+    active_connections: u64 = 0,
+    pending_unary_calls: u64 = 0,
+    pending_unary_calls_high_water: u64 = 0,
+    stream_inbound_bytes: u64 = 0,
+    stream_inbound_bytes_high_water: u64 = 0,
+    stream_outbound_bytes: u64 = 0,
+    stream_outbound_bytes_high_water: u64 = 0,
+    socket_write_bytes: u64 = 0,
+    socket_write_bytes_high_water: u64 = 0,
+    terminal_ok: u64 = 0,
+    terminal_cancelled: u64 = 0,
+    terminal_deadline_exceeded: u64 = 0,
+    terminal_other: u64 = 0,
+    reconnect_attempts: u64 = 0,
+    reconnect_successes: u64 = 0,
+    reconnect_goaway: u64 = 0,
+    reconnect_transport_failure: u64 = 0,
+};
+
+pub const ServerOperationalStats = extern struct {
+    struct_size: usize = @sizeOf(ServerOperationalStats),
+    admitted_connections: u64 = 0,
+    active_rpcs: u64 = 0,
+    rejected_connections: u64 = 0,
+    pre_ack_rejected_streams: u64 = 0,
+    streaming_outbound_reserved_bytes: u64 = 0,
+    streaming_outbound_reserved_bytes_high_water_sum: u64 = 0,
+    socket_queued_write_bytes: u64 = 0,
+    socket_queued_write_bytes_high_water_sum: u64 = 0,
+    close_peer_transport: u64 = 0,
+    close_protocol_local: u64 = 0,
+    close_preface_timeout: u64 = 0,
+    close_idle_timeout: u64 = 0,
+    close_graceful_drain: u64 = 0,
+    close_forced_shutdown: u64 = 0,
 };
 
 pub const ClientStreamOptions = extern struct {
@@ -440,6 +487,100 @@ pub fn grpc_lite_channel_get_stream_admission_stats(
     output.retained_streams = snapshot.retained_streams;
     output.reserved_buffer_bytes = snapshot.reserved_buffer_bytes;
     output.rejected_streams = snapshot.rejected_streams;
+    return .ok;
+}
+
+// Operational outputs accept only complete known metric prefixes, or a future
+// full-size extension. Never assign the whole extern struct: size and tail belong
+// to the caller, and the writable allocation may be only a supported prefix.
+fn validOperationalStatsSize(comptime T: type, size: usize) bool {
+    if (size >= @sizeOf(T)) return true;
+    inline for (@typeInfo(T).@"struct".field_names[1..]) |name| {
+        if (size == @offsetOf(T, name) + @sizeOf(u64)) return true;
+    }
+    return false;
+}
+
+fn writeOperationalStats(comptime T: type, output: *T, snapshot: T) void {
+    inline for (@typeInfo(T).@"struct".field_names[1..]) |name| {
+        if (output.struct_size >= @offsetOf(T, name) + @sizeOf(u64)) {
+            @field(output, name) = @field(snapshot, name);
+        }
+    }
+}
+
+fn channelOperationalStats(snapshot: channel.OperationalStats) ChannelOperationalStats {
+    return .{
+        .unary_retained_calls = snapshot.unary_admission.retained_calls,
+        .unary_retained_request_bytes = snapshot.unary_admission.retained_request_bytes,
+        .unary_rejected_calls = snapshot.unary_admission.rejected_calls,
+        .stream_retained_streams = snapshot.stream_admission.retained_streams,
+        .stream_reserved_buffer_bytes = snapshot.stream_admission.reserved_buffer_bytes,
+        .stream_rejected_streams = snapshot.stream_admission.rejected_streams,
+        .active_unary_calls = snapshot.active_unary_calls,
+        .active_streams = snapshot.active_streams,
+        .active_connections = snapshot.active_connections,
+        .pending_unary_calls = snapshot.pending_unary_calls,
+        .pending_unary_calls_high_water = snapshot.pending_unary_calls_high_water,
+        .stream_inbound_bytes = snapshot.stream_inbound_bytes,
+        .stream_inbound_bytes_high_water = snapshot.stream_inbound_bytes_high_water,
+        .stream_outbound_bytes = snapshot.stream_outbound_bytes,
+        .stream_outbound_bytes_high_water = snapshot.stream_outbound_bytes_high_water,
+        .socket_write_bytes = snapshot.socket_write_bytes,
+        .socket_write_bytes_high_water = snapshot.socket_write_bytes_high_water,
+        .terminal_ok = snapshot.terminal_ok,
+        .terminal_cancelled = snapshot.terminal_cancelled,
+        .terminal_deadline_exceeded = snapshot.terminal_deadline_exceeded,
+        .terminal_other = snapshot.terminal_other,
+        .reconnect_attempts = snapshot.reconnect_attempts,
+        .reconnect_successes = snapshot.reconnect_successes,
+        .reconnect_goaway = snapshot.reconnect_goaway,
+        .reconnect_transport_failure = snapshot.reconnect_transport_failure,
+    };
+}
+
+fn serverOperationalStats(snapshot: @import("server.zig").OperationalStats) ServerOperationalStats {
+    return .{
+        .admitted_connections = snapshot.admitted_connections,
+        .active_rpcs = snapshot.active_rpcs,
+        .rejected_connections = snapshot.rejected_connections,
+        .pre_ack_rejected_streams = snapshot.pre_ack_rejected_streams,
+        .streaming_outbound_reserved_bytes = snapshot.streaming_outbound_reserved_bytes,
+        .streaming_outbound_reserved_bytes_high_water_sum = snapshot.streaming_outbound_reserved_bytes_high_water_sum,
+        .socket_queued_write_bytes = snapshot.socket_queued_write_bytes,
+        .socket_queued_write_bytes_high_water_sum = snapshot.socket_queued_write_bytes_high_water_sum,
+        .close_peer_transport = snapshot.close_peer_transport,
+        .close_protocol_local = snapshot.close_protocol_local,
+        .close_preface_timeout = snapshot.close_preface_timeout,
+        .close_idle_timeout = snapshot.close_idle_timeout,
+        .close_graceful_drain = snapshot.close_graceful_drain,
+        .close_forced_shutdown = snapshot.close_forced_shutdown,
+    };
+}
+
+pub fn grpc_lite_channel_get_operational_stats(
+    channel_handle: ?*ChannelHandle,
+    out_stats: ?*ChannelOperationalStats,
+) callconv(.c) Error {
+    const output = out_stats orelse return .invalid_argument;
+    if (!validOperationalStatsSize(ChannelOperationalStats, output.struct_size)) return .invalid_argument;
+    writeOperationalStats(ChannelOperationalStats, output, .{});
+    const handle = channel_handle orelse return .invalid_argument;
+    const snapshot = channelStorage(handle).value.operationalStats();
+    writeOperationalStats(ChannelOperationalStats, output, channelOperationalStats(snapshot));
+    return .ok;
+}
+
+pub fn grpc_lite_server_get_operational_stats(
+    server_handle: ?*const ServerHandle,
+    out_stats: ?*ServerOperationalStats,
+) callconv(.c) Error {
+    const output = out_stats orelse return .invalid_argument;
+    if (!validOperationalStatsSize(ServerOperationalStats, output.struct_size)) return .invalid_argument;
+    writeOperationalStats(ServerOperationalStats, output, .{});
+    const handle = server_handle orelse return .invalid_argument;
+    const snapshot = serverStorageConst(handle).value.operationalStats();
+    writeOperationalStats(ServerOperationalStats, output, serverOperationalStats(snapshot));
     return .ok;
 }
 
@@ -2221,4 +2362,211 @@ test "C stream admission snapshots retain closed handles until release" {
     try std.testing.expectEqual(Error.ok, grpc_lite_channel_get_stream_admission_stats(handle, &snapshot));
     try std.testing.expectEqual(@as(u64, 0), snapshot.retained_streams);
     try std.testing.expectEqual(@as(u64, 0), snapshot.reserved_buffer_bytes);
+}
+
+test "C operational stats supported target layout" {
+    // These are the supported native/release-bundle layouts, not a 32-bit promise.
+    if (@import("builtin").cpu.arch != .x86_64 and @import("builtin").cpu.arch != .aarch64) return;
+    inline for (.{ ChannelOperationalStats, ServerOperationalStats }, .{ 208, 120 }) |T, size| {
+        try std.testing.expectEqual(@as(usize, size), @sizeOf(T));
+        try std.testing.expectEqual(@as(usize, 8), @alignOf(T));
+        try std.testing.expectEqual(@as(usize, 0), @offsetOf(T, "struct_size"));
+        inline for (@typeInfo(T).@"struct".field_names[1..], 1..) |name, index| {
+            try std.testing.expectEqual(@as(usize, index * 8), @offsetOf(T, name));
+        }
+    }
+}
+
+// Exercise every byte size, not just sizeof-1: all complete prefixes are legal,
+// interior field sizes are not. Sentinel bytes cover both omitted fields and a
+// future tail, including a future size not aligned to a metric boundary.
+fn expectOperationalOutputPrefixes(comptime T: type, comptime getter: anytype, handle: anytype, expected: T, success: bool) !void {
+    try std.testing.expectEqual(Error.invalid_argument, getter(handle, null));
+    var storage: [@sizeOf(T) + 16]u8 align(@alignOf(T)) = undefined;
+    const output: *T = @ptrCast(&storage);
+    for (0..@sizeOf(T) + 10) |size| {
+        @memset(&storage, 0xa5);
+        output.struct_size = size;
+        const before = storage;
+        var valid = size >= @sizeOf(T);
+        inline for (@typeInfo(T).@"struct".field_names[1..]) |name| {
+            if (size == @offsetOf(T, name) + @sizeOf(u64)) valid = true;
+        }
+        const result = getter(handle, output);
+        try std.testing.expectEqual(if (valid and success) Error.ok else Error.invalid_argument, result);
+        try std.testing.expectEqual(size, output.struct_size);
+        if (!valid) {
+            try std.testing.expectEqualSlices(u8, &before, &storage);
+            continue;
+        }
+        var wanted = before;
+        const expected_bytes = std.mem.asBytes(&expected);
+        inline for (@typeInfo(T).@"struct".field_names[1..]) |name| {
+            const offset = @offsetOf(T, name);
+            const end = offset + @sizeOf(u64);
+            if (size >= end) @memcpy(wanted[offset..end], expected_bytes[offset..end]);
+        }
+        try std.testing.expectEqualSlices(u8, &wanted, &storage);
+    }
+}
+
+test "C operational stats null owners preserve size and unsupported bytes" {
+    try expectOperationalOutputPrefixes(ChannelOperationalStats, grpc_lite_channel_get_operational_stats, @as(?*ChannelHandle, null), .{}, false);
+    try expectOperationalOutputPrefixes(ServerOperationalStats, grpc_lite_server_get_operational_stats, @as(?*const ServerHandle, null), .{}, false);
+}
+
+test "C operational stats map every frozen Zig field" {
+    const native_channel: channel.OperationalStats = .{
+        .active_unary_calls = 7,
+        .active_streams = 8,
+        .active_connections = 9,
+        .pending_unary_calls = 10,
+        .pending_unary_calls_high_water = 11,
+        .stream_inbound_bytes = 12,
+        .stream_inbound_bytes_high_water = 13,
+        .stream_outbound_bytes = 14,
+        .stream_outbound_bytes_high_water = 15,
+        .socket_write_bytes = 16,
+        .socket_write_bytes_high_water = 17,
+        .terminal_ok = 18,
+        .terminal_cancelled = 19,
+        .terminal_deadline_exceeded = 20,
+        .terminal_other = 21,
+        .reconnect_attempts = 22,
+        .reconnect_successes = 23,
+        .reconnect_goaway = 24,
+        .reconnect_transport_failure = 25,
+        .unary_admission = .{ .retained_calls = 1, .retained_request_bytes = 2, .rejected_calls = 3 },
+        .stream_admission = .{ .retained_streams = 4, .reserved_buffer_bytes = 5, .rejected_streams = 6 },
+    };
+    const mapped_channel = channelOperationalStats(native_channel);
+    try std.testing.expectEqual(@as(u64, 1), mapped_channel.unary_retained_calls);
+    try std.testing.expectEqual(@as(u64, 2), mapped_channel.unary_retained_request_bytes);
+    try std.testing.expectEqual(@as(u64, 3), mapped_channel.unary_rejected_calls);
+    try std.testing.expectEqual(@as(u64, 4), mapped_channel.stream_retained_streams);
+    try std.testing.expectEqual(@as(u64, 5), mapped_channel.stream_reserved_buffer_bytes);
+    try std.testing.expectEqual(@as(u64, 6), mapped_channel.stream_rejected_streams);
+    try std.testing.expectEqual(@as(u64, 7), mapped_channel.active_unary_calls);
+    try std.testing.expectEqual(@as(u64, 8), mapped_channel.active_streams);
+    try std.testing.expectEqual(@as(u64, 9), mapped_channel.active_connections);
+    try std.testing.expectEqual(@as(u64, 10), mapped_channel.pending_unary_calls);
+    try std.testing.expectEqual(@as(u64, 11), mapped_channel.pending_unary_calls_high_water);
+    try std.testing.expectEqual(@as(u64, 12), mapped_channel.stream_inbound_bytes);
+    try std.testing.expectEqual(@as(u64, 13), mapped_channel.stream_inbound_bytes_high_water);
+    try std.testing.expectEqual(@as(u64, 14), mapped_channel.stream_outbound_bytes);
+    try std.testing.expectEqual(@as(u64, 15), mapped_channel.stream_outbound_bytes_high_water);
+    try std.testing.expectEqual(@as(u64, 16), mapped_channel.socket_write_bytes);
+    try std.testing.expectEqual(@as(u64, 17), mapped_channel.socket_write_bytes_high_water);
+    try std.testing.expectEqual(@as(u64, 18), mapped_channel.terminal_ok);
+    try std.testing.expectEqual(@as(u64, 19), mapped_channel.terminal_cancelled);
+    try std.testing.expectEqual(@as(u64, 20), mapped_channel.terminal_deadline_exceeded);
+    try std.testing.expectEqual(@as(u64, 21), mapped_channel.terminal_other);
+    try std.testing.expectEqual(@as(u64, 22), mapped_channel.reconnect_attempts);
+    try std.testing.expectEqual(@as(u64, 23), mapped_channel.reconnect_successes);
+    try std.testing.expectEqual(@as(u64, 24), mapped_channel.reconnect_goaway);
+    try std.testing.expectEqual(@as(u64, 25), mapped_channel.reconnect_transport_failure);
+    const native_server: @import("server.zig").OperationalStats = .{
+        .admitted_connections = 1,
+        .active_rpcs = 2,
+        .rejected_connections = 3,
+        .pre_ack_rejected_streams = 4,
+        .streaming_outbound_reserved_bytes = 5,
+        .streaming_outbound_reserved_bytes_high_water_sum = 6,
+        .socket_queued_write_bytes = 7,
+        .socket_queued_write_bytes_high_water_sum = 8,
+        .close_peer_transport = 9,
+        .close_protocol_local = 10,
+        .close_preface_timeout = 11,
+        .close_idle_timeout = 12,
+        .close_graceful_drain = 13,
+        .close_forced_shutdown = 14,
+    };
+    const mapped_server = serverOperationalStats(native_server);
+    try std.testing.expectEqual(@as(u64, 1), mapped_server.admitted_connections);
+    try std.testing.expectEqual(@as(u64, 2), mapped_server.active_rpcs);
+    try std.testing.expectEqual(@as(u64, 3), mapped_server.rejected_connections);
+    try std.testing.expectEqual(@as(u64, 4), mapped_server.pre_ack_rejected_streams);
+    try std.testing.expectEqual(@as(u64, 5), mapped_server.streaming_outbound_reserved_bytes);
+    try std.testing.expectEqual(@as(u64, 6), mapped_server.streaming_outbound_reserved_bytes_high_water_sum);
+    try std.testing.expectEqual(@as(u64, 7), mapped_server.socket_queued_write_bytes);
+    try std.testing.expectEqual(@as(u64, 8), mapped_server.socket_queued_write_bytes_high_water_sum);
+    try std.testing.expectEqual(@as(u64, 9), mapped_server.close_peer_transport);
+    try std.testing.expectEqual(@as(u64, 10), mapped_server.close_protocol_local);
+    try std.testing.expectEqual(@as(u64, 11), mapped_server.close_preface_timeout);
+    try std.testing.expectEqual(@as(u64, 12), mapped_server.close_idle_timeout);
+    try std.testing.expectEqual(@as(u64, 13), mapped_server.close_graceful_drain);
+    try std.testing.expectEqual(@as(u64, 14), mapped_server.close_forced_shutdown);
+}
+
+test "C operational stats match quiescent live owners and support output prefixes" {
+    var server_handle: ?*ServerHandle = null;
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_create(null, &server_handle));
+    defer grpc_lite_server_destroy(server_handle);
+    var server_stats: ServerOperationalStats = .{};
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_get_operational_stats(server_handle, &server_stats));
+    try std.testing.expectEqualDeep(ServerOperationalStats{}, server_stats);
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_start(server_handle));
+    var port: u32 = 0;
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_port(server_handle, &port));
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{port});
+    var channel_handle: ?*ChannelHandle = null;
+    try std.testing.expectEqual(Error.ok, grpc_lite_channel_create(null, view(target), &channel_handle));
+    defer grpc_lite_channel_destroy(channel_handle);
+    var result: ?*UnaryResultHandle = null;
+    try std.testing.expectEqual(Error.ok, grpc_lite_channel_call_unary(channel_handle, view("/test.Missing/Unary"), view("payload"), null, &result));
+    grpc_lite_unary_result_destroy(result);
+    grpc_lite_channel_shutdown(channel_handle);
+    grpc_lite_channel_wait(channel_handle);
+    grpc_lite_server_shutdown(server_handle);
+    grpc_lite_server_wait(server_handle);
+    // All activity has stopped, but both owners remain alive: comparisons below
+    // do not assert equality between independently sampled concurrent moments.
+    const native_channel = channelStorage(channel_handle.?).value.operationalStats();
+    var channel_stats: ChannelOperationalStats = .{};
+    try std.testing.expectEqual(Error.ok, grpc_lite_channel_get_operational_stats(channel_handle, &channel_stats));
+    try std.testing.expectEqual(@as(u64, native_channel.unary_admission.retained_calls), channel_stats.unary_retained_calls);
+    try std.testing.expectEqual(@as(u64, native_channel.unary_admission.retained_request_bytes), channel_stats.unary_retained_request_bytes);
+    try std.testing.expectEqual(@as(u64, native_channel.unary_admission.rejected_calls), channel_stats.unary_rejected_calls);
+    try std.testing.expectEqual(@as(u64, native_channel.stream_admission.retained_streams), channel_stats.stream_retained_streams);
+    try std.testing.expectEqual(@as(u64, native_channel.stream_admission.reserved_buffer_bytes), channel_stats.stream_reserved_buffer_bytes);
+    try std.testing.expectEqual(@as(u64, native_channel.stream_admission.rejected_streams), channel_stats.stream_rejected_streams);
+    try std.testing.expectEqual(@as(u64, native_channel.active_unary_calls), channel_stats.active_unary_calls);
+    try std.testing.expectEqual(@as(u64, native_channel.active_streams), channel_stats.active_streams);
+    try std.testing.expectEqual(@as(u64, native_channel.active_connections), channel_stats.active_connections);
+    try std.testing.expectEqual(@as(u64, native_channel.pending_unary_calls), channel_stats.pending_unary_calls);
+    try std.testing.expectEqual(@as(u64, native_channel.pending_unary_calls_high_water), channel_stats.pending_unary_calls_high_water);
+    try std.testing.expectEqual(@as(u64, native_channel.stream_inbound_bytes), channel_stats.stream_inbound_bytes);
+    try std.testing.expectEqual(@as(u64, native_channel.stream_inbound_bytes_high_water), channel_stats.stream_inbound_bytes_high_water);
+    try std.testing.expectEqual(@as(u64, native_channel.stream_outbound_bytes), channel_stats.stream_outbound_bytes);
+    try std.testing.expectEqual(@as(u64, native_channel.stream_outbound_bytes_high_water), channel_stats.stream_outbound_bytes_high_water);
+    try std.testing.expectEqual(@as(u64, native_channel.socket_write_bytes), channel_stats.socket_write_bytes);
+    try std.testing.expectEqual(@as(u64, native_channel.socket_write_bytes_high_water), channel_stats.socket_write_bytes_high_water);
+    try std.testing.expectEqual(@as(u64, native_channel.terminal_ok), channel_stats.terminal_ok);
+    try std.testing.expectEqual(@as(u64, native_channel.terminal_cancelled), channel_stats.terminal_cancelled);
+    try std.testing.expectEqual(@as(u64, native_channel.terminal_deadline_exceeded), channel_stats.terminal_deadline_exceeded);
+    try std.testing.expectEqual(@as(u64, native_channel.terminal_other), channel_stats.terminal_other);
+    try std.testing.expectEqual(@as(u64, native_channel.reconnect_attempts), channel_stats.reconnect_attempts);
+    try std.testing.expectEqual(@as(u64, native_channel.reconnect_successes), channel_stats.reconnect_successes);
+    try std.testing.expectEqual(@as(u64, native_channel.reconnect_goaway), channel_stats.reconnect_goaway);
+    try std.testing.expectEqual(@as(u64, native_channel.reconnect_transport_failure), channel_stats.reconnect_transport_failure);
+    try std.testing.expectEqual(@as(u64, 1), channel_stats.terminal_other);
+    const native_server = serverStorage(server_handle.?).value.operationalStats();
+    try std.testing.expectEqual(Error.ok, grpc_lite_server_get_operational_stats(server_handle, &server_stats));
+    try std.testing.expectEqual(native_server.admitted_connections, server_stats.admitted_connections);
+    try std.testing.expectEqual(native_server.active_rpcs, server_stats.active_rpcs);
+    try std.testing.expectEqual(native_server.rejected_connections, server_stats.rejected_connections);
+    try std.testing.expectEqual(native_server.pre_ack_rejected_streams, server_stats.pre_ack_rejected_streams);
+    try std.testing.expectEqual(native_server.streaming_outbound_reserved_bytes, server_stats.streaming_outbound_reserved_bytes);
+    try std.testing.expectEqual(native_server.streaming_outbound_reserved_bytes_high_water_sum, server_stats.streaming_outbound_reserved_bytes_high_water_sum);
+    try std.testing.expectEqual(native_server.socket_queued_write_bytes, server_stats.socket_queued_write_bytes);
+    try std.testing.expectEqual(native_server.socket_queued_write_bytes_high_water_sum, server_stats.socket_queued_write_bytes_high_water_sum);
+    try std.testing.expectEqual(native_server.close_peer_transport, server_stats.close_peer_transport);
+    try std.testing.expectEqual(native_server.close_protocol_local, server_stats.close_protocol_local);
+    try std.testing.expectEqual(native_server.close_preface_timeout, server_stats.close_preface_timeout);
+    try std.testing.expectEqual(native_server.close_idle_timeout, server_stats.close_idle_timeout);
+    try std.testing.expectEqual(native_server.close_graceful_drain, server_stats.close_graceful_drain);
+    try std.testing.expectEqual(native_server.close_forced_shutdown, server_stats.close_forced_shutdown);
+    try expectOperationalOutputPrefixes(ChannelOperationalStats, grpc_lite_channel_get_operational_stats, channel_handle, channel_stats, true);
+    try expectOperationalOutputPrefixes(ServerOperationalStats, grpc_lite_server_get_operational_stats, server_handle, server_stats, true);
 }
