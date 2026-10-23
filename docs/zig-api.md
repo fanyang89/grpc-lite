@@ -39,6 +39,9 @@ Channel serializes access to the allocator passed to `Channel.init`.
 
 ## Unary Admission
 
+For allocator ownership, exclusions, lifecycle test coverage and measured baselines, see
+[Resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence).
+
 Channels default to `unary_admission.max_calls = 4096` and
 `unary_admission.max_request_bytes = 64 * 1024 * 1024`. Both must be nonzero.
 Admission is reserved before copying or compressing a unary request and covers
