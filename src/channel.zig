@@ -8695,11 +8695,17 @@ test "successful terminal client streams retain admission until release and outl
         try std.testing.expect(state.valid);
         try std.testing.expectEqual(@as(usize, 1), channel.streamAdmissionStats().retained_streams);
         try std.testing.expectEqual(reserved_bytes, channel.streamAdmissionStats().reserved_buffer_bytes);
-        try std.testing.expectError(error.StreamAdmissionRejected, channel.openStream(path, options, .{
+        if (channel.openStream(path, options, .{
             .context = &rejected_state,
             .on_message = ClientState.onMessage,
             .on_terminal = ClientState.onTerminal,
-        }));
+        })) |unexpected_stream| {
+            var owned_stream = unexpected_stream;
+            owned_stream.deinit();
+            return error.TestExpectedError;
+        } else |err| {
+            try std.testing.expectError(error.StreamAdmissionRejected, @as(anyerror!void, err));
+        }
         try std.testing.expectEqual(@as(u64, @intCast(index + 1)), channel.streamAdmissionStats().rejected_streams);
 
         if (index == 1) {
