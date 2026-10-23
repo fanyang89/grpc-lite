@@ -343,7 +343,7 @@ void TestRoundTripRetainedStreamOwnership() {
     // Rejected sends must not change admission or poison the following valid send.
     grpc_lite::StreamAdmissionStats before_send;
     assert(channel.GetStreamAdmissionStats(&before_send).ok());
-    assert(before_send.retained_streams == 1 && before_send.reserved_buffer_bytes == 8192);
+    assert(before_send.retained_streams == 1 && before_send.reserved_buffer_bytes == reserved_bytes);
     assert(before_send.rejected_streams == 0);
     assert(stream.Send(std::string(1025, 'x')).code() == grpc_lite::ErrorCode::OutOfRange);
     assert(stream.Send("x", grpc_lite::Compression::Gzip).code() ==
