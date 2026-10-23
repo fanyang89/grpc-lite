@@ -471,12 +471,8 @@ pub fn grpc_lite_channel_call_unary(
         options,
     ) catch |err| blk: {
         if (err == error.UnaryAdmissionRejected) {
-            break :blk call.Result.init(allocator, .init(.resource_exhausted, "unary admission limit exceeded"), "") catch {
-                allocator.destroy(storage);
-                return .out_of_memory;
-            };
+            break :blk call.Result.init(allocator, .init(.resource_exhausted, "unary admission limit exceeded"), "") catch return .out_of_memory;
         }
-        allocator.destroy(storage);
         return switch (err) {
             error.OutOfMemory => .out_of_memory,
             error.UnaryRequestSizeOverflow => .out_of_range,
@@ -514,10 +510,7 @@ pub fn grpc_lite_channel_open_stream(
         .on_remote_end = clientStreamOnRemoteEnd,
         .on_writable = clientStreamOnWritable,
         .on_terminal = clientStreamOnTerminal,
-    }) catch |err| {
-        allocator.destroy(storage);
-        return mapStreamError(err);
-    };
+    }) catch |err| return mapStreamError(err);
     storage.ready.store(true, .release);
     output.* = clientStreamHandle(storage);
     return .ok;
