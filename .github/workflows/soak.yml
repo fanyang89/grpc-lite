@@ -109,7 +109,10 @@ jobs:
         if: always()
         with:
           name: native-cleartext-streaming-soak-x64
-          path: .zig-cache/official/streaming-soak/*.log
+          path: |
+            .zig-cache/official/streaming-soak/*.log
+            .zig-cache/official/streaming-soak/resources*.json
+            .zig-cache/official/streaming-soak/resources.jsonl
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 14

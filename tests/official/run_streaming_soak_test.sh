@@ -54,6 +54,7 @@ fixture_root="$test_dir/project"
 mkdir -p "$fixture_root/tests/official"
 runner="$fixture_root/tests/official/run_streaming_soak.sh"
 cp "$project_root/tests/official/run_streaming_soak.sh" "$runner"
+cp "$resource_observer" "$fixture_root/tests/official/"
 fixture_logs="$fixture_root/.zig-cache/official/streaming-soak"
 for previous in absent success; do
   for assignment in "${invalid_configurations[@]}"; do
@@ -64,11 +65,16 @@ for previous in absent success; do
         printf 'PASS old success\nharness_exit=0\n' >"$fixture_logs/$log.log"
       done
     fi
+    mkdir -p "$fixture_logs"
+    printf '{"status":"observed"}\n' >"$fixture_logs/resources-summary.json"
+    printf 'old sample\n' >"$fixture_logs/resources.jsonl"
     status=0
     env "$assignment" bash "$runner" >"$test_dir/output.log" 2>&1 || status=$?
     [[ "$status" == 2 ]]
     grep -q 'must' "$fixture_logs/harness.log"
     grep -qx 'harness_exit=2' "$fixture_logs/harness.log"
+    [[ ! -s "$fixture_logs/resources.jsonl" ]]
+    python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["status"] == "failed" and r["harness_exit"] == 2' "$fixture_logs/resources-summary.json"
     if grep -qE 'PASS|harness_exit=0' "$fixture_logs/harness.log"; then
       printf 'stale success artifact for %s\n' "$assignment" >&2
       exit 1
