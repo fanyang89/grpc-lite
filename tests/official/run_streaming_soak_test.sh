@@ -94,9 +94,12 @@ for log in harness build server client; do
   grep -qx 'outer invocation marker' "$fixture_logs/$log.log"
 done
 grep -qx 'internal-seed=8' "$fixture_logs/harness.log"
-# A mise-like incompatible timeout shadows PATH. The real outer runner must
-# select system GNU timeout instead; stop its child before any build via a tiny
-# failing unit-test fixture, exercising the actual GNU options and exit status.
+# Save a compatible executable before shadowing PATH; it may be PATH-only.
+selected_timeout=$(select_gnu_timeout)
+system_timeout=$(PATH='' select_gnu_timeout 2>/dev/null) || system_timeout=
+# A mise-like incompatible timeout shadows PATH. Where system GNU is installed,
+# exercise its precedence and the actual GNU options with a tiny child fixture
+# that fails before builds. PATH-only hosts still run all fallback tests below.
 shadow_dir="$test_dir/shadow"
 mkdir -p "$shadow_dir"
 cat >"$shadow_dir/timeout" <<'EOF'
@@ -106,14 +109,15 @@ printf 'timeout (incompatible fixture)\n'
 exit 64
 EOF
 chmod +x "$shadow_dir/timeout"
-selected_timeout=$(PATH="$shadow_dir:$PATH" select_gnu_timeout)
-[[ "$selected_timeout" == /usr/bin/timeout || "$selected_timeout" == /bin/timeout ]]
-printf '#!/bin/bash\nexit 23\n' >"$fixture_root/tests/official/run_streaming_soak_test.sh"
-status=0
-PATH="$shadow_dir:$PATH" bash "$runner" >"$test_dir/output.log" 2>&1 || status=$?
-[[ "$status" == 23 && ! -e "$shadow_dir/timeout.called" ]]
-grep -qx "gnu_timeout=$selected_timeout" "$fixture_logs/harness.log"
-grep -qx 'harness_exit=23' "$fixture_logs/harness.log"
+if [[ -n "$system_timeout" ]]; then
+  [[ $(PATH="$shadow_dir:$PATH" select_gnu_timeout) == "$system_timeout" ]]
+  printf '#!/bin/bash\nexit 23\n' >"$fixture_root/tests/official/run_streaming_soak_test.sh"
+  status=0
+  PATH="$shadow_dir:$PATH" bash "$runner" >"$test_dir/output.log" 2>&1 || status=$?
+  [[ "$status" == 23 && ! -e "$shadow_dir/timeout.called" ]]
+  grep -qx "gnu_timeout=$system_timeout" "$fixture_logs/harness.log"
+  grep -qx 'harness_exit=23' "$fixture_logs/harness.log"
+fi
 
 # A verified PATH installation is supported when no system candidate exists.
 fallback_dir="$test_dir/fallback"
@@ -154,4 +158,16 @@ for previous in absent success; do
     [[ -f "$fixture_logs/$log.log" && ! -s "$fixture_logs/$log.log" ]]
   done
 done
+# Run this entire mandatory suite against an isolated PATH-only runner copy.
+# Its empty system-candidate list also prevents recursively repeating this case.
+if [[ -n "$system_timeout" ]]; then
+  path_only_root="$test_dir/path-only-project"
+  mkdir -p "$path_only_root/tests/official"
+  sed 's|^gnu_timeout_paths=(/usr/bin/timeout /bin/timeout)$|gnu_timeout_paths=()|' \
+    "$project_root/tests/official/run_streaming_soak.sh" >"$path_only_root/tests/official/run_streaming_soak.sh"
+  grep -qx 'gnu_timeout_paths=()' "$path_only_root/tests/official/run_streaming_soak.sh"
+  cp "$project_root/tests/official/run_streaming_soak_test.sh" "$path_only_root/tests/official/"
+  PATH="$fallback_dir:$PATH" bash "$path_only_root/tests/official/run_streaming_soak_test.sh"
+  printf '%s\n' 'PATH-only mandatory shell suite passed'
+fi
 printf '%s\n' 'streaming soak harness unit tests passed'
