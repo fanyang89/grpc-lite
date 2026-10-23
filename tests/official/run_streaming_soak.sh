@@ -17,6 +17,9 @@ configure() {
     printf 'duration/timeout must be positive decimal seconds (at most 5 digits); seed must have 1-9 digits\n' >&2
     return 2
   fi
+  # Go's uint flag uses base 0. Normalize only after the nine-digit bound above,
+  # so leading zeros stay decimal and conversion cannot overflow shell integers.
+  seed=$((10#$seed))
   if ((overall_timeout <= duration + 30)); then
     printf 'overall timeout must exceed duration + 30 seconds (allow build/startup/drain time)\n' >&2
     return 2
@@ -114,34 +117,38 @@ run_soak() {
 }
 
 main() {
-  configure
   if [[ ${1:-} == --run ]]; then
+    configure
     run_soak
     return
   fi
-  if (($# != 0)); then
-    printf 'configure via STREAMING_SOAK_* environment variables, not arguments\n' >&2
-    return 2
-  fi
   mkdir -p "$work_dir"
-  # Truncate previous logs before starting: timeout/startup failures must not
-  # upload stale success evidence. GNU timeout covers builds AND all children.
-  for log in build server client; do : >"$work_dir/$log.log"; done
+  # Only the outer invocation initializes artifacts, before even validating
+  # configuration: invalid inputs must not leave stale success evidence.
+  for log in harness build server client; do : >"$work_dir/$log.log"; done
   local status=0 interrupted=0 runner_pid
-  printf 'Streaming soak running; logs: %s (overall timeout %ss)\n' "$work_dir" "$overall_timeout"
-  timeout --signal=TERM --kill-after=5s "${overall_timeout}s" bash "${BASH_SOURCE[0]}" --run \
-    >"$work_dir/harness.log" 2>&1 &
-  runner_pid=$!
-  # Forward signals sent only to this wrapper PID to timeout's process group.
-  # timeout owns TERM->KILL escalation even when a build or peer does not exit.
-  trap 'interrupted=130; kill -TERM "$runner_pid" 2>/dev/null || true' INT
-  trap 'interrupted=143; kill -TERM "$runner_pid" 2>/dev/null || true' TERM
-  wait "$runner_pid" || status=$?
-  if ((interrupted != 0)); then
-    wait "$runner_pid" || true
-    status=$interrupted
+  configure >>"$work_dir/harness.log" 2>&1 || status=$?
+  if ((status == 0 && $# != 0)); then
+    printf 'configure via STREAMING_SOAK_* environment variables, not arguments\n' >>"$work_dir/harness.log"
+    status=2
   fi
-  trap - INT TERM
+  if ((status == 0)); then
+    printf 'Streaming soak running; logs: %s (overall timeout %ss)\n' "$work_dir" "$overall_timeout"
+    # GNU timeout covers builds AND all children; retain any validation output.
+    timeout --signal=TERM --kill-after=5s "${overall_timeout}s" bash "${BASH_SOURCE[0]}" --run \
+      >>"$work_dir/harness.log" 2>&1 &
+    runner_pid=$!
+    # Forward signals sent only to this wrapper PID to timeout's process group.
+    # timeout owns TERM->KILL escalation even when a build or peer does not exit.
+    trap 'interrupted=130; kill -TERM "$runner_pid" 2>/dev/null || true' INT
+    trap 'interrupted=143; kill -TERM "$runner_pid" 2>/dev/null || true' TERM
+    wait "$runner_pid" || status=$?
+    if ((interrupted != 0)); then
+      wait "$runner_pid" || true
+      status=$interrupted
+    fi
+    trap - INT TERM
+  fi
   cat "$work_dir/harness.log"
   printf 'harness_exit=%d\n' "$status" | tee -a "$work_dir/harness.log"
   return "$status"
