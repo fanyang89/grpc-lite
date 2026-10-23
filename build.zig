@@ -498,6 +498,35 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(grpcpp_generated_server_test).step);
     }
 
+    const streaming_lifecycle = addExample(
+        b,
+        "grpc-lite-streaming-lifecycle",
+        "examples/streaming_lifecycle.zig",
+        grpc_lite,
+    );
+    b.installArtifact(streaming_lifecycle);
+
+    const run_streaming_lifecycle = b.addRunArtifact(streaming_lifecycle);
+    if (b.args) |args| run_streaming_lifecycle.addArgs(args);
+    const run_streaming_lifecycle_step = b.step("run-streaming-lifecycle", "Run the raw streaming lifecycle example (normal or interrupt)");
+    run_streaming_lifecycle_step.dependOn(&run_streaming_lifecycle.step);
+
+    const streaming_lifecycle_test_step = b.step("test-streaming-lifecycle", "Smoke-test normal and interrupted streaming lifecycles");
+    // The shell harness executes the artifact itself, bypassing Zig's foreign
+    // executable handling. Only attach it to the suite for a matching host triple.
+    if (target.result.cpu.arch == b.graph.host.result.cpu.arch and
+        target.result.os.tag == b.graph.host.result.os.tag and
+        target.result.abi == b.graph.host.result.abi)
+    {
+        const streaming_lifecycle_smoke = b.addSystemCommand(&.{"bash"});
+        streaming_lifecycle_smoke.addFileArg(b.path("tests/run_streaming_lifecycle.sh"));
+        streaming_lifecycle_smoke.addArtifactArg(streaming_lifecycle);
+        streaming_lifecycle_test_step.dependOn(&streaming_lifecycle_smoke.step);
+        test_step.dependOn(&streaming_lifecycle_smoke.step);
+    } else {
+        streaming_lifecycle_test_step.dependOn(&b.addFail("test-streaming-lifecycle requires a matching host OS, architecture, and ABI").step);
+    }
+
     const cpp_e2e_server = addExample(
         b,
         "grpc-lite-cpp-e2e-server",

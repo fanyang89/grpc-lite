@@ -35,6 +35,10 @@ run = ".mise/tasks/check-transpiled-c"
 description = "Run all tests"
 run = "zig build test --summary all"
 
+[tasks.test-streaming-lifecycle]
+description = "Smoke-test normal and interrupted raw streaming lifecycles"
+run = "zig build test-streaming-lifecycle -Dprotobuf=false --summary all"
+
 [tasks.test-release-safe]
 description = "Run all tests with ReleaseSafe optimization"
 run = "zig build test -Doptimize=ReleaseSafe --summary all"

@@ -167,6 +167,91 @@ command, grpc-lite closes the connection to guarantee local cleanup.
 shared storage. Handlers that decide metadata outside `on_start` can use
 `receive_initially_paused = true` and `initial_metadata_mode = .explicit`.
 
+### Runnable bounded lifecycle example
+
+[`examples/streaming_lifecycle.zig`](../examples/streaming_lifecycle.zig) runs a raw
+IPv4 loopback client and server in one process. It sends the protobuf wire bytes
+`08 01` directly: no schema, generated code, protobuf runtime, or global `Runtime`
+is needed. After the usual `mise install` and `mise run bootstrap` setup:
+
+```bash
+# Recommended: both modes, each under an external shutdown watchdog.
+mise run test-streaming-lifecycle
+zig build test-streaming-lifecycle -Dprotobuf=false -Doptimize=ReleaseSafe --summary all
+
+# Individual modes (without the external watchdog).
+zig build run-streaming-lifecycle -Dprotobuf=false -- normal
+zig build run-streaming-lifecycle -Dprotobuf=false -- interrupt
+
+# Install the raw artifact, then smoke-test it directly.
+zig build -Dprotobuf=false
+bash tests/run_streaming_lifecycle.sh ./zig-out/bin/grpc-lite-streaming-lifecycle
+```
+
+Execution requires Linux with usable `io_uring` (including permission under any
+container/seccomp policy), IPv4 loopback sockets, Bash, and GNU coreutils
+`/usr/bin/timeout`. The [smoke script](../tests/run_streaming_lifecycle.sh) deliberately
+rejects a missing/non-GNU watchdog rather than using a possibly incompatible PATH
+command. Each mode has a 20-second timeout and a further 2-second kill grace. A
+watchdog expiry, nonzero exit, or missing/duplicate expected evidence line fails.
+The smoke step joins existing `zig build test` / `mise run check` coverage and
+inherits optimization and sanitizer settings through `addExample`. Since Bash
+executes the binary directly, automatic smoke coverage requires the target OS,
+architecture, and ABI to match the build host; explicitly requesting the smoke
+step for another target fails rather than executing it. Cross-target installation
+remains available; the individual run step uses Zig's normal artifact runner.
+
+The intended ordering is:
+
+1. Main queues one request and calls `closeSend`. This half-closes requests only;
+   responses remain independent.
+2. The server's `on_remote_end` callback attempts two responses. The first fills
+   the outbound queue; the second must return `WouldBlock`. The unsent index is
+   retained and retried only from `on_writable`, without polling or sleeping.
+3. Events publish server readiness and receipt of both responses to main, while
+   final status remains pending. Main requests graceful drain with a 5-second
+   bound while the RPC is still active.
+4. In `normal` mode, main finishes the retained `ServerCall` with OK. In
+   `interrupt` mode, main explicitly cancels the client stream and requires
+   client CANCELLED and server `peer_cancelled`. Drain stops admission and lets
+   the active RPC finish; forced drain expiry is not an accepted outcome here.
+   The 10-second RPC deadline is a failure bound, not the intended interruption.
+5. Main waits for terminal notification, joins the draining Server while keeping
+   the Channel alive to flush cancellation, then shuts down and joins the
+   Channel. Only after both joins does it validate callback counters, release the
+   owning `ClientStream` and retained `ServerCall`, and tear down Channel/Server.
+   Terminal notification alone does not release admission: the example checks
+   one retained stream / 4103 reserved bytes before `ClientStream.deinit`, then
+   zero afterward. Contexts, allocator, and `init.io` outlive loops and handles;
+   error-path defers also join before releasing retained server state.
+
+Callbacks run on transport loop threads and must not block. Here they only
+validate bounded data, issue transport commands, and signal events; only main
+waits or prints. Callback messages, metadata, and stream views are borrowed and
+must not be retained or deinitialized. Only an explicitly retained owning
+`ServerCall` crosses from the server callback to main; events publish it and
+loop joins protect final counter reads.
+
+Both endpoints advertise a **4096-byte initial stream window** and configure
+**4096-byte inbound capacity**. Inbound capacity must cover the advertised window;
+using 4096 with the default 65536-byte window would be invalid. The maximum
+payload is 2 bytes and outbound capacity is **7 bytes** (payload plus the
+five-byte gRPC frame header), deliberately fitting only one response. Client
+admission permits one retained stream with **4103 bytes** of configured buffer
+capacity. The source also sets one reactor, one connection, one concurrent RPC,
+header and unary-admission budgets, write watermarks, and preface/idle timeouts.
+These are explicit queue/admission limits, **not a total heap bound**; see
+[Resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence).
+
+This example and its integration are an **UNCOMPILED / UNRUN candidate**, not
+completion evidence for [#53](https://github.com/fanyang89/grpc-lite/issues/53).
+Independent review and scheduled compile, normal/interrupt smoke, repeated, and
+applicable sanitizer validation remain required. Corrected retained-handle runtime
+qualification for [#44](https://github.com/fanyang89/grpc-lite/issues/44) and
+repeated/TSan qualification for [#45](https://github.com/fanyang89/grpc-lite/issues/45)
+remain separate prerequisites; this smoke does not replace them or establish
+release readiness.
+
 ## Server
 
 ```zig
