@@ -283,6 +283,13 @@ const OperationalAccounting = struct {
         self.stats.active_connections = @intFromBool(active);
     }
 
+    fn retireForRecovery(self: *OperationalAccounting) void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        if (self.stats.active_connections != 0) self.stats.reconnect_transport_failure +|= 1;
+        self.stats.active_connections = 0;
+    }
+
     fn terminal(self: *OperationalAccounting, comptime active_field: []const u8, code: status.Code) void {
         self.mutex.lockUncancelable(syncIo());
         defer self.mutex.unlock(syncIo());
@@ -817,6 +824,8 @@ const Impl = struct {
     resolved_addresses: []std.Io.net.IpAddress = &.{},
     next_address: usize = 0,
     connection_generation: std.atomic.Value(usize) = .init(0),
+    // Loop-owned attempt classification must not depend on the wrapping I/O generation.
+    tcp_attempt: enum { none, initial, subsequent } = .none,
     stopping_on_loop: bool = false,
     connect_count: std.atomic.Value(usize) = .init(0),
     read_buffer: [16 * 1024]u8 = undefined,
@@ -851,6 +860,18 @@ const Impl = struct {
         self.serialized_allocator.operational.add("active_unary_calls", 1);
         self.serialized_allocator.operational.add("pending_unary_calls", 1);
         return true;
+    }
+
+    fn recordTcpConnectAttempt(self: *Impl) void {
+        self.tcp_attempt = if (self.tcp_attempt == .none) .initial else .subsequent;
+        if (self.tcp_attempt == .subsequent)
+            self.serialized_allocator.operational.increment("reconnect_attempts");
+    }
+
+    fn recordConnectionActivation(self: *Impl) void {
+        self.serialized_allocator.operational.setConnectionActive(true);
+        if (self.tcp_attempt == .subsequent)
+            self.serialized_allocator.operational.increment("reconnect_successes");
     }
 
     fn signalStartup(self: *Impl, succeeded: bool) void {
@@ -1858,8 +1879,7 @@ fn startConnection(impl: *Impl) !void {
         }
     }
     impl.connect_active = true;
-    if (impl.connection_generation.load(.monotonic) > 1)
-        impl.serialized_allocator.operational.increment("reconnect_attempts");
+    impl.recordTcpConnectAttempt();
     impl.tcp.connect(&impl.loop, &impl.connect_completion, address, Impl, impl, onConnect);
     observeTestIo(impl);
 }
@@ -1989,9 +2009,7 @@ fn activateConnection(impl: *Impl) !void {
     impl.mutex.lockUncancelable(syncIo());
     impl.accepting_streams = true;
     impl.mutex.unlock(syncIo());
-    impl.serialized_allocator.operational.setConnectionActive(true);
-    if (impl.connection_generation.load(.monotonic) > 1)
-        impl.serialized_allocator.operational.increment("reconnect_successes");
+    impl.recordConnectionActivation();
     impl.ever_active = true;
     impl.logger.write(.info, "channel connected target={s}", .{impl.authority});
     impl.reconnect_backoff_pending_reset = impl.reconnect_attempt != 0;
@@ -3431,9 +3449,7 @@ fn handleTransportFailure(impl: *Impl, reason: []const u8) void {
         return;
     }
 
-    if (impl.serialized_allocator.operational.snapshot().active_connections != 0)
-        impl.serialized_allocator.operational.increment("reconnect_transport_failure");
-    impl.serialized_allocator.operational.setConnectionActive(false);
+    impl.serialized_allocator.operational.retireForRecovery();
     impl.connection_state = .closing;
     impl.logger.write(.warn, "channel connection lost target={s} reason={s}", .{ impl.authority, reason });
     impl.reconnect_after_close = true;
@@ -3569,7 +3585,13 @@ fn failConnectionCandidate(impl: *Impl, reason: []const u8) void {
     } else {
         impl.reconnect_after_close = false;
     }
-    impl.serialized_allocator.operational.setConnectionActive(false);
+    // TLS can activate successfully and then fail its immediate plaintext read.
+    // Consume the active gauge once, shared with the ordinary failure path.
+    if (impl.reconnect_after_close) {
+        impl.serialized_allocator.operational.retireForRecovery();
+    } else {
+        impl.serialized_allocator.operational.setConnectionActive(false);
+    }
     impl.connection_state = .closing;
     impl.connected = false;
     if (impl.session) |session| {
@@ -10340,4 +10362,57 @@ test "operational counters saturate and high water survives exact gauge release"
     accounting.setSocketBytes(0);
     try std.testing.expectEqual(@as(u64, 0), accounting.snapshot().socket_write_bytes);
     try std.testing.expectEqual(@as(u64, std.math.maxInt(usize)), accounting.snapshot().socket_write_bytes_high_water);
+}
+
+test "operational reconnect classification survives transport generation rollover" {
+    var host = [_:0]u8{'x'};
+    var owner: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &owner, host[0..1 :0]);
+    impl.connection_generation.store(std.math.maxInt(usize) - 1, .monotonic);
+    const generations = [_]usize{ std.math.maxInt(usize), 0, 1, 2 };
+    for (generations, 0..) |generation, subsequent_attempts| {
+        // Exercise the accounting seams used at TCP submission and activation,
+        // independently of the transport's intentionally wrapping I/O generation.
+        _ = impl.connection_generation.fetchAdd(1, .monotonic);
+        impl.recordTcpConnectAttempt();
+        impl.recordConnectionActivation();
+        const stats = owner.operational.snapshot();
+        try std.testing.expectEqual(generation, impl.connection_generation.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, @intCast(subsequent_attempts)), stats.reconnect_attempts);
+        try std.testing.expectEqual(@as(u64, @intCast(subsequent_attempts)), stats.reconnect_successes);
+    }
+}
+
+test "operational recovery counts post-activation TLS receive failure once" {
+    var host = [_:0]u8{'x'};
+    var owner: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &owner, host[0..1 :0]);
+    impl.reconnect_options = .{ .allow_initial_offline = true };
+
+    // No usable transport yet: an initial handshake/candidate failure is excluded.
+    impl.connection_state = .handshaking;
+    failConnectionCandidate(&impl, "TLS handshake failed");
+    try std.testing.expectEqual(@as(u64, 0), owner.operational.snapshot().reconnect_transport_failure);
+
+    // driveTlsHandshake activates before receiveTlsPlaintext; its callers route
+    // an immediate read error to failConnectionCandidate, not handleTransportFailure.
+    impl.connection_state = .active;
+    impl.recordConnectionActivation();
+    failConnectionCandidate(&impl, "TLS handshake failed");
+    try std.testing.expectEqual(@as(u64, 1), owner.operational.snapshot().reconnect_transport_failure);
+    try std.testing.expectEqual(@as(u64, 0), owner.operational.snapshot().active_connections);
+    failConnectionCandidate(&impl, "duplicate candidate failure");
+    handleTransportFailure(&impl, "duplicate transport failure");
+    try std.testing.expectEqual(@as(u64, 1), owner.operational.snapshot().reconnect_transport_failure);
+
+    // Ordinary recovery uses the same consumed gauge, with no duplicate count
+    // if the candidate-failure path is reached afterwards.
+    impl.connection_state = .active;
+    impl.recordConnectionActivation();
+    handleTransportFailure(&impl, "connection failed");
+    failConnectionCandidate(&impl, "duplicate candidate failure");
+    try std.testing.expectEqual(@as(u64, 2), owner.operational.snapshot().reconnect_transport_failure);
+    try std.testing.expectEqual(@as(u64, 0), owner.operational.snapshot().active_connections);
 }
