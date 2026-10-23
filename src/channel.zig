@@ -7262,7 +7262,7 @@ test "streaming termination ordering with paused receive disconnect shutdown and
         defer channel.deinit();
         var client_stream = try channel.openStream("/test.Termination/PausedReceive", .{
             .timeout_ns = 10 * std.time.ns_per_s,
-            .limits = .{ .max_message_size = 16, .max_inbound_buffer_size = 64, .max_outbound_buffer_size = 21 },
+            .limits = .{ .max_message_size = 16, .max_inbound_buffer_size = 64 * 1024, .max_outbound_buffer_size = 21 },
         }, .{
             .context = &capture,
             .on_headers = Capture.onHeaders,
