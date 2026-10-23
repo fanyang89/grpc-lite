@@ -169,6 +169,157 @@ Compare only within one scenario: unary operations are complete RPCs while bidir
 operations are messages on persistent streams. `repeated` is intentionally compressible;
 `deterministic-random` is repeatable higher-entropy input.
 
+## Resource accounting and lifecycle evidence
+
+This inventory for [issue #43](https://github.com/fanyang89/grpc-lite/issues/43)
+was checked against `25643b1` (2026-10-23). It describes existing behavior, not new
+limits. API contracts remain in [Zig](zig-api.md#unary-admission) and
+[C/C++](c-cpp-api.md#managed-channels).
+
+### Accounting boundaries
+
+**Configured capacity** is permission to retain data, not preallocated memory.
+**Occupancy** is current logical queued data; draining a queue can retain its allocation.
+**RSS** includes resident allocator pages, stacks, code and library storage, not just live
+payloads. Neither admission snapshot bounds total heap use or RSS. Independent Channels
+have independent budgets; server connection/stream limits are not a global byte budget.
+
+| Budget (default) | Charge / release boundary | Owner and exclusions |
+| --- | --- | --- |
+| Unary: 4096 retained calls, 64 MiB logical requests per Channel | `Operation.init` reserves before allocation/encoding: path + 5-byte frame header + uncompressed payload + raw metadata keys/values. Construction/enqueue failure rolls back. `Operation.deinit` releases after async callback return or blocking result copy, not at HTTP/2 close. | Channel serialized allocator, budget in `Impl`. Excludes responses, encoded metadata expansion, compression scratch, structures and allocator overhead. A separately owned `CallResult` can remain after reservation release. |
+| Streaming: 1024 retained streams, 1 GiB configured capacities per Channel | `ClientStreamState.init` reserves one and inbound + outbound configured capacity before construction. Failed opens roll back; `destroy` releases only after both application and loop ownership end. Terminal status, half-close and Channel teardown alone do not release a held handle. Default 8 + 8 MiB permits 64 streams, not 1024. | Refcounted serialized allocator owns budget and survives Channel teardown; backing allocator must survive final handle destruction. Excludes metadata, decoder/container overhead, concurrent temporary encodings and transport writes. No eager buffer allocation. |
+| Per-stream message / inbound / outbound: 4 / 8 / 8 MiB, client and server | Message limit checks uncompressed size. Decoder limits unconsumed wire data; client paused inbound queue charges decoded payload + 5, with decoder feed reduced by queued bytes. Outbound charges encoded frames (gzip wire size), released as consumed/discarded. Server `outbound_reserved_bytes` also covers queued send commands. Outbound fullness returns retryable `WouldBlock`; receive pause defers stream credit, while inbound overflow fails the RPC with `RESOURCE_EXHAUSTED`. Client cancellation stops delivery, but an application-retained handle can keep queued frames, payloads and decoder storage until final destruction. Server cancellation discards outbound commands and queued frames. | Client serialized allocator; server reactor-local decoder and shared-allocator commands. Logical occupancy excludes ArrayList spare capacity, decoder/decompression temporaries and already-transferred transport writes. Buffers need not shrink on drain. |
+| Unary response / request: 4 MiB each | Client `max_response_size`, server `max_request_size`: decode limit plus separate `wireMessageLimit` guard (message + message/8 + 1024 + 5, saturating) for encoded body. Storage freed with operation/server stream; blocking result copy has independent lifetime. | Client operation/result allocator; server local allocator. Not aggregate response storage or a bound on handler-produced response memory. |
+| Client response headers: 64 KiB per RPC | Cumulative physical name + value + 32 across initial/trailing blocks; retained decoded metadata accounting also guards binary comma expansion. Rejected block not published; earlier accepted metadata survives. Counters live with RPC, not connection. | Client allocator. Excludes HPACK/session allocations; not a compressed-wire byte cap. |
+| Server request headers: fixed 64 KiB | `onHeader` sums physical name + value lengths, unlike the client's +32 accounting. Freed with server stream. | Reactor-local metadata; excludes field/container and decoded binary expansion overhead. Not configurable or an aggregate metadata quota. |
+| Server connections: 1024 across reactors | Coordinator CAS admission before connection construction; init failure releases; initializing, draining and async-closing connections retain slot through final destruction. | Shared coordinator, reactor-local connections. Kernel socket buffers, descriptors, TLS and HTTP/2 allocations are separate costs. |
+| Server concurrent streams: 100 per connection | `onBeginHeaders` checks stream map before allocation; `onStreamClose` removes admission. Before SETTINGS acknowledgement refuse excess; after acknowledgement nghttp2 emits protocol-error GOAWAY. | Reactor-local stream map. Retained `ServerCall` control and pending command refs can outlive transport stream admission; no aggregate retained-call quota. |
+| Cleartext preface 10s; idle 5m; TLS handshake 10s | Absolute preface deadline ends on initial non-ACK SETTINGS. Idle only while no inbound streams; PING does not refresh it. TLS uses separate handshake deadline. Expiry retires connection; slot remains through destruction. | Connection/reactor deadline state, not byte reservations. Active RPCs are idle-exempt; per-call deadlines/drain timeout bound different lifetimes. |
+| HTTP/2 initial stream window 64 KiB; socket write high/low 1 MiB / 512 KiB | Flow-control credit returns on consumption/resume. Flush pauses at high and resumes below low; can overshoot by one serialized chunk. 64 KiB cleartext batch target is aggregation, not an additional memory quota. | Channel/connection write buffers and reusable descriptor pools, separate from stream buffers. Excludes nghttp2 queues, TLS ciphertext and kernel send/receive buffers. |
+
+Sources: [Channel options, admission and allocator](../src/channel.zig#L88),
+[stream construction/destruction](../src/channel.zig#L799),
+[unary construction/destruction](../src/channel.zig#L1081),
+[buffer limits](../src/stream.zig#L15), [decoder](../src/frame.zig#L46),
+[server options](../src/server.zig#L216), [connection admission](../src/server.zig#L565),
+[server stream/header admission](../src/server.zig#L2993),
+[retirement and command refs](../src/server.zig#L2645),
+[client response-header accounting tests](../src/channel.zig#L5359).
+
+Ownership outside those budgets matters:
+
+- Server reactor-local small-allocation pages are cached until allocator teardown;
+  refills/large allocations and cross-thread commands use the serialized backing
+  allocator. `ServerContext` allocator is callback-local. `ServerCall` clones own shared
+  control, not the whole transport stream; release all clones **before Server deinit**.
+  See [local allocator](../src/server.zig#L24) and
+  [control release/retirement](../src/server.zig#L1195).
+- [C handles](../src/c_api.zig#L208) use `c_allocator` (testing allocator in Zig tests).
+  Unary result and stream wrapper storage are allocated before the transport call/open;
+  even quota rejection can allocate a wrapper/result. Destroy results, metadata and
+  stream handles explicitly. C++ RAII wraps these owners and adds `std::string`, metadata,
+  callback and protobuf copies outside transport accounting; application executors own
+  their workers/queues. See [C unary/open/destroy](../src/c_api.zig#L450),
+  [C++ client stream](../include/grpc_lite/cpp/client_stream.hpp) and
+  [executor lifetime](c-cpp-api.md#generated-services).
+- nghttp2, libxev, c-ares, TLS state, libc allocator caches, application-retained results,
+  thread stacks and OS socket buffers are not summed by admission snapshots. Allocation
+  release need not immediately reduce RSS; no process-wide heap ceiling is promised.
+
+### Existing coverage and concrete gaps
+
+Test names below are source search keys, not claims of exhaustive interleaving coverage.
+`mise run test` includes the Zig and C/C++ executables; sanitizers and interoperability
+are separate stages in `mise run check`.
+
+| Transition | Existing evidence | Still uncovered / follow-up |
+| --- | --- | --- |
+| Retained client handle → Channel gone → final destroy | [Channel](../src/channel.zig#L4608): `client stream handle outlives channel teardown` asserts one terminal, closed commands, retained count then zero after release. [C](../src/c_api.zig#L2000): `C stream admission snapshots retain closed handles until release` retains across shutdown/wait, checks rejection then zero. | #44: C destruction (not only shutdown) with surviving handle; successful terminal handle retaining quota and reopening after release; callback-owned release vs transport retirement. |
+| Retained server call → transport retirement → last clone | [Server](../src/server.zig#L4468): `retained server call observes cancellation after transport retirement`; `retained server call abort is allocation free and submits a reset`. [Typed client](../tests/protobuf_adapter_test.zig#L656) deinitializes from callback. | #44: multiple retained clones/commands under distinct terminal causes, final control release and callback suppression; keep Server alive throughout, do not invent post-Server lifetime. |
+| Reserve → reject / construct / enqueue | [Channel](../src/channel.zig#L8511): exact count/byte boundaries, reject-before-allocation/no rejected async callback, zero limits, validation/unavailable enqueue rollback; analogous stream tests at `stream admission enforces count and capacity reservations`. | #46: notify/submission failure after ownership transfer, not just unavailable enqueue; callback counts and reservation recovery at each failure stage. |
+| Allocation failure → rollback | [Channel](../src/channel.zig#L8530): `unary admission rolls back every allocation failure` (gzip + metadata construction), `stream admission rolls back every allocation failure` (state/path/metadata). [Server](../src/server.zig#L4661): shared-command allocation, partial init/registration, multi-reactor registration/start rollback. Header builders and write bookkeeping have failure tests in both modules. | #46: result-copy failure, HTTP/2 submit/reset failure, retained send/finish/metadata enqueue failure with queued work; C wrapper allocation and C++ conversion failures. Existing all-allocation checks cover their helper, not all transport or foreign allocations. |
+| C/C++ error surface and ownership | [C](../src/c_api.zig#L1869): failed creation clears handles; unary rejection is RESOURCE_EXHAUSTED; stats preserve unknown tails. [C smoke](../tests/c_api_smoke.c#L130), [C++ native](../tests/cpp_native_api_test.cc#L75): defaults, rejection, snapshots. | #44/#46: these smoke assertions do not prove wrapper lifetime under concurrent destruction or OOM at every conversion. Extend existing executables rather than duplicate ABI suites. |
+| Active call → shutdown / deadline / GOAWAY / disconnect | [Channel](../src/channel.zig#L6583): connection replacement, accepted RPC drain, drain timeout/escalation, active call/blocked write/reconnect shutdown. [Server](../src/server.zig#L5384): preface admission/deadline release. [grpcpp facade](../tests/grpcpp_streaming_facade_test.cc#L205): pre-cancel, active cancel, early Finish, deadline, abandoned reader. | #45: deterministically order cancel vs trailers/deadline/disconnect/GOAWAY/shutdown while send or receive is blocked; assert one terminal, no later callback, bounded wait and final reservation/command cleanup. Ordinary success tests are not a race matrix. |
+| Concurrent reserve/release and allocator use | [Channel](../src/channel.zig#L8600): four threads × 1000 budget attempts (unary and stream); serialized backing allocator and concurrent unary tests at [7408](../src/channel.zig#L7408). [Server](../src/server.zig#L5746): multi-reactor concurrent callbacks/allocations. | #45: reserve/open/send races against retirement with explicit barriers. Budget-only contention does not cover full open/destroy; TSAN passing does not establish all schedules. |
+| Streaming backpressure / sustained load | [Channel](../src/channel.zig#L8456): full/half-closed no-allocation sends and gzip wire-size admission; [Server](../src/server.zig#L4871): ordered queue reuse/cancel; [receive credit](../src/server.zig#L5933): paused stream isolation/resume; [typed](../tests/protobuf_adapter_test.zig#L405): all cardinalities. | #47: long-lived slow consumers, repeated pause/resume, large messages, sustained backpressure and recovery. [Scheduled soak](../.github/workflows/soak.yml) is unary only; benchmark bidi is throughput evidence, not soak. |
+| Resource reuse / process residency | [Server allocator test](../src/server.zig#L4353), write pools, and admission tests check local reuse/release. Baseline below samples process resources. | #48: time series through warmup, pressure, recovery and teardown, correlating reservation and actual queue occupancy; no existing benchmark occupancy export. No plateau established by these short runs. |
+
+Exclusive follow-up seams: #44 owns retained-handle/control tests and wrapper lifetime
+assertions; #45 owns deterministic terminal-event ordering using existing
+`TestObserver`, semaphores and raw nghttp2 peers; #46 owns allocation/construction/submit
+rollback helpers using `FailingAllocator`/`checkAllAllocationFailures`; #47 owns
+`tests/official` streaming soak plus the existing scheduled workflow; #48 owns benchmark
+measurement/evidence around existing binaries, `/proc` and optional gperftools. These are
+recommendations, not implementation authorization. #44–46 share `channel.zig` and
+`server.zig`: serialize edits to those files, partition by the named test families, and
+reuse one observer/failure seam rather than creating competing harnesses. #47 should not
+also edit benchmark measurement code; #48 should not add transport limits or public
+telemetry without a separate scope decision.
+
+### Bounded baseline (not a soak or heap bound)
+
+On 2026-10-23, Linux x86_64 `7.2.8-200.fc44`, glibc 2.43, Zig 0.17.0,
+source `25643b1`, native ReleaseFast, TLS/gperftools off, default allocators/options.
+One fresh server/client pair per row, loopback, one reactor, one Channel, four workers or
+persistent streams, identity compression, deterministic-random payloads. These runs were
+**not isolated**: no shared validation lock was held, and concurrent compilation from
+other worktrees may have overlapped. They are bounded observations, not a controlled
+performance comparison. For reproduction on a shared host, serialize the entire build,
+server/client and sampling lifecycle with the shared validation lock. Build first:
+
+```bash
+mise install
+mise run bootstrap
+mise exec -- zig build -Doptimize=ReleaseFast
+# Repeat with (scenario, payload, pipeline) from the table:
+mise run bench -- --scenario unary --transport raw --warmup 1s --duration 3s \
+  --streams 4 --channels 1 --reactors 1 --pipeline 1 --payload-bytes 128 \
+  --payload-pattern deterministic-random --compression identity
+```
+
+For resource sampling, launch the same `zig-out/bin/grpc-lite-benchmark-server` with
+`--host=127.0.0.1 --port=0 --reactors=1`, read its reported port, then launch the client
+with the above flags (`--server-reactors=1` rather than `--reactors=1`, plus host/port).
+Sample `/proc/$pid/status` (`VmRSS`, `Threads`) and count `/proc/$pid/fd` every 100 ms
+for each PID, starting at client launch; retain timestamps and exclude the first second
+for the ranges below. Each run captured 41 samples per process over roughly four
+seconds, including startup/warmup; client had a 20s external ceiling (not reached),
+then server was terminated as in the bench wrapper. This does **not** measure server
+graceful-teardown residency. Retain JSON stdout, stderr and raw samples outside git.
+
+| Scenario | Payload bytes / pipeline | Completed / errors | Client RSS KiB min–max | Server RSS KiB min–max | Client / server FDs; threads |
+| --- | --- | --- | --- | --- | --- |
+| unary | 128 / 1 | 712284 / 0 | 3416–14552 | 4264–4264 | 6 / 8; 2 / 2 |
+| bidi-ping-pong | 128 / 1 | 895828 / 0 | 3336–20836 | 4124–4124 | 6 / 8; 2 / 2 |
+| bidi-throughput | 65536 / 8 | 36716 / 0 | 4964–5840 | 5860–8276 | 6 / 8; 2 / 2 |
+
+Ranges are observations, not maxima between samples or performance guarantees. The
+client includes the benchmark's growing latency reservoir (limit 1,000,000 samples),
+so its RSS is not transport-only; no heap attribution was collected. The throughput run
+also reported 2.762s maximum eligible latency, so it should not be presented as a
+uniform-latency steady state. FD/thread samples were constant after warmup, but long-run
+plateau, overload/recovery, allocator live bytes, kernel memory, queue occupancy and
+admission snapshot time series are **unavailable** in this baseline. Four default bidi
+streams imply 64 MiB reserved capacity by configuration; that is a derivation, **not a
+sampled reservation** or measured occupancy/RSS.
+
+Validation before documentation edits: `mise install`, `mise run bootstrap`,
+`mise run test` (285/291 passed, 6 TLS-disabled skips), ReleaseFast build, all three
+baseline clients, and a complete `mise run check` passed. An initial check invocation
+exceeded the execution tool's 200s timeout; a 1200s retry completed with recorded exit 0,
+including sanitizers, TLS, consumers and interop. For the later check after documentation
+edits, the agent time limit interrupted exit-status capture. Its retained log subsequently
+advanced through sanitizers, TLS and interop, ending with all eight HTTP/2 edge-case
+passes, but there is **no captured exit status**; it is not an authoritative completed
+final-tree gate. No source/tests changed, and local
+Markdown links/anchors and `git diff --check` passed after recovery. No privilege changes
+were needed. These earlier checks also ran without the shared validation lock.
+Local raw evidence is retained at `/home/fanmi/tmp/grpc-lite-issue43-evidence/`
+(`test.log`, `check.log`, `check-retry.log`, `check-retry.exit`, `check-final.log`,
+`measure-summary.jsonl`, per-scenario JSON/samples/logs and `measure.py`); this path is
+run-local, not a portable artifact link. The table and commands above are the committed
+baseline; #48 needs isolated, longer, phase-separated measurement.
+
 ## Dependencies
 
 - Latest stable Zig release through mise (minimum 0.17.0)

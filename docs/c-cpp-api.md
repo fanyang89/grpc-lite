@@ -50,6 +50,9 @@ the stream with `INTERNAL_ERROR`, or closes the connection if reset submission f
 
 ## Managed Channels
 
+See [Resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence)
+for quota ownership, wrapper allocations, existing coverage gaps and bounded measurements.
+
 `grpc_lite_channel_create_managed` creates a durable Channel. Set
 `allow_initial_offline` to return before the first connection succeeds. A managed Channel
 reconnects with bounded exponential backoff without replaying submitted RPCs. Unsubmitted
