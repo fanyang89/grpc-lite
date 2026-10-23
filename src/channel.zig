@@ -8508,6 +8508,225 @@ test "client stream admission uses compressed wire size for gzip" {
     try std.testing.expect(client_stream.outbound_buffered <= 1029);
 }
 
+test "completed unary results release admission before result destruction and outlive channel" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const path = "/test.Retained/Unary";
+    const payload = "retained response";
+    const request_bytes = path.len + frame.header_size + payload.len;
+    const Handler = struct {
+        fn handle(
+            _: *@This(),
+            allocator: std.mem.Allocator,
+            context: *service.ServerContext,
+            request: []const u8,
+        ) !service.UnaryResponse {
+            try context.addInitialMetadata("x-initial", "retained");
+            try context.addTrailingMetadata("x-trailing", "retained");
+            return service.UnaryResponse.init(allocator, .init(.ok, "retained status"), request);
+        }
+    };
+    const Completion = struct {
+        channel: *Channel,
+        calls: std.atomic.Value(usize) = .init(0),
+        done: std.atomic.Value(bool) = .init(false),
+        valid: bool = false,
+
+        fn onComplete(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            const stats = self.channel.unaryAdmissionStats();
+            // The async operation still owns its reservation throughout this callback.
+            self.valid = result.status.isOk() and
+                std.mem.eql(u8, result.payload, payload) and
+                stats.retained_calls == 1 and stats.retained_request_bytes == request_bytes;
+            self.done.store(true, .release);
+        }
+    };
+
+    var handler = Handler{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary(path, service.UnaryHandler.bind(Handler, &handler, Handler.handle));
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .unary_admission = .{ .max_calls = 1, .max_request_bytes = request_bytes },
+    });
+    var channel_active = true;
+    defer if (channel_active) channel.deinit();
+
+    var first = try channel.callUnary(std.testing.allocator, path, payload, .{ .timeout_ns = 5 * std.time.ns_per_s });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+    // A second full-budget operation must fit while the first result remains owned.
+    var second = try channel.callUnary(std.testing.allocator, path, payload, .{ .timeout_ns = 5 * std.time.ns_per_s });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+
+    var completion = Completion{ .channel = &channel };
+    try channel.callUnaryAsync(path, payload, .{ .timeout_ns = 5 * std.time.ns_per_s }, .{
+        .context = &completion,
+        .on_complete = Completion.onComplete,
+    });
+    try std.testing.expect(waitForTestFlag(&completion.done, 5 * std.time.ns_per_s));
+    channel.shutdown();
+    channel.wait();
+    // Joining the loop proves callback return and operation destruction, not just notification.
+    try std.testing.expect(completion.valid);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+    try std.testing.expectEqual(@as(u64, 0), channel.unaryAdmissionStats().rejected_calls);
+    channel.deinit();
+    channel_active = false;
+
+    for ([_]*const call.Result{ &first, &second }) |result| {
+        try std.testing.expect(result.status.isOk());
+        try std.testing.expectEqualStrings("retained status", result.status.message);
+        try std.testing.expectEqualStrings(payload, result.payload);
+        try std.testing.expectEqualStrings("retained", result.initial_metadata.getFirst("x-initial").?);
+        try std.testing.expectEqualStrings("retained", result.trailing_metadata.getFirst("x-trailing").?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), completion.calls.load(.acquire));
+}
+
+test "successful terminal client streams retain admission until release and outlive channel" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const path = "/test.Retained/Stream";
+    const limits: stream.BufferLimits = .{
+        .max_message_size = 1024,
+        .max_inbound_buffer_size = 64 * 1024,
+        .max_outbound_buffer_size = 2 * 1024,
+    };
+    const reserved_bytes = limits.max_inbound_buffer_size + limits.max_outbound_buffer_size;
+    const ServerHandler = struct {
+        fn onStart(_: ?*anyopaque, _: stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onMessage(
+            _: ?*anyopaque,
+            server_stream: stream.ServerStream,
+            _: *service.ServerContext,
+            payload: []const u8,
+            _: Compression,
+        ) !stream.ReceiveAction {
+            try server_stream.send(payload, .{});
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, server_stream: stream.ServerStream, _: *service.ServerContext) !void {
+            try server_stream.finish(.ok);
+        }
+    };
+    const ClientState = struct {
+        messages: std.atomic.Value(usize) = .init(0),
+        terminals: std.atomic.Value(usize) = .init(0),
+        done: std.atomic.Value(bool) = .init(false),
+        valid: bool = true,
+
+        fn onMessage(context: ?*anyopaque, _: stream.ClientStream, payload: []const u8, _: Compression) stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = self.messages.fetchAdd(1, .monotonic);
+            self.valid = self.valid and !self.done.load(.acquire) and std.mem.eql(u8, payload, "retained");
+            return .continue_receiving;
+        }
+
+        fn onTerminal(context: ?*anyopaque, _: stream.ClientStream, final_status: status.Status, _: *const metadata.Metadata) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = self.terminals.fetchAdd(1, .monotonic);
+            self.valid = self.valid and final_status.isOk();
+            self.done.store(true, .release);
+        }
+
+        fn waitForRetirement(client_stream: stream.ClientStream) !void {
+            const state: *ClientStreamState = @ptrCast(@alignCast(client_stream.context));
+            const deadline = nowNs() +| 5 * std.time.ns_per_s;
+            while (true) {
+                // The application still owns the state; inspect loop retirement under its mutex.
+                state.mutex.lockUncancelable(syncIo());
+                const retired = !state.loop_owned and state.impl == null;
+                state.mutex.unlock(syncIo());
+                if (retired) return;
+                if (nowNs() >= deadline) return error.StreamRetirementTimeout;
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            }
+        }
+    };
+
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerStream(path, .{
+        .on_start = ServerHandler.onStart,
+        .on_message = ServerHandler.onMessage,
+        .on_remote_end = ServerHandler.onRemoteEnd,
+    });
+    try test_server.start();
+
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{
+        .stream_admission = .{ .max_streams = 1, .max_buffer_bytes = reserved_bytes },
+    });
+    var channel_active = true;
+    defer if (channel_active) channel.deinit();
+    const owner = channel.impl.serialized_allocator;
+    // As in the existing teardown test, retain only the allocator/budget observer, not Channel.
+    owner.retain();
+    defer owner.release();
+    var states = [_]ClientState{ .{}, .{} };
+    var rejected_state = ClientState{};
+    const options: stream.Options = .{ .limits = limits, .timeout_ns = 5 * std.time.ns_per_s };
+    for (&states, 0..) |*state, index| {
+        var client_stream = try channel.openStream(path, options, .{
+            .context = state,
+            .on_message = ClientState.onMessage,
+            .on_terminal = ClientState.onTerminal,
+        });
+        var stream_active = true;
+        defer if (stream_active) client_stream.deinit();
+        try client_stream.send("retained", .{});
+        try client_stream.closeSend();
+        try std.testing.expect(waitForTestFlag(&state.done, 5 * std.time.ns_per_s));
+        try ClientState.waitForRetirement(client_stream);
+        try std.testing.expect(state.valid);
+        try std.testing.expectEqual(@as(usize, 1), channel.streamAdmissionStats().retained_streams);
+        try std.testing.expectEqual(reserved_bytes, channel.streamAdmissionStats().reserved_buffer_bytes);
+        try std.testing.expectError(error.StreamAdmissionRejected, channel.openStream(path, options, .{
+            .context = &rejected_state,
+            .on_message = ClientState.onMessage,
+            .on_terminal = ClientState.onTerminal,
+        }));
+        try std.testing.expectEqual(@as(u64, @intCast(index + 1)), channel.streamAdmissionStats().rejected_streams);
+
+        if (index == 1) {
+            channel.deinit();
+            channel_active = false;
+            try std.testing.expectEqual(@as(usize, 1), owner.stream_admission.snapshot().retained_streams);
+            try std.testing.expectEqual(reserved_bytes, owner.stream_admission.snapshot().reserved_buffer_bytes);
+        }
+        try std.testing.expectError(error.StreamClosed, client_stream.send("late", .{}));
+        try std.testing.expectError(error.StreamClosed, client_stream.closeSend());
+        try std.testing.expectError(error.StreamClosed, client_stream.resumeReceive());
+        client_stream.cancel();
+        client_stream.deinit();
+        stream_active = false;
+        try std.testing.expectEqual(@as(usize, 0), owner.stream_admission.snapshot().retained_streams);
+        try std.testing.expectEqual(@as(usize, 0), owner.stream_admission.snapshot().reserved_buffer_bytes);
+        // The next iteration reopens at the exact count/capacity limit after release.
+    }
+    // Channel's joined loop can no longer invoke callbacks, including on a released handle.
+    for (&states) |*state| {
+        try std.testing.expectEqual(@as(usize, 1), state.messages.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), state.terminals.load(.acquire));
+    }
+    try std.testing.expectEqual(@as(usize, 0), rejected_state.messages.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), rejected_state.terminals.load(.acquire));
+}
+
 test "unary admission enforces exact count and byte boundaries and recovers" {
     var admission: UnaryAdmission = .{ .limits = .{ .max_calls = 2, .max_request_bytes = 10 } };
     try admission.reserve(6);
