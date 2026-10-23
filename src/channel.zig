@@ -175,6 +175,128 @@ const StreamAdmission = struct {
     }
 };
 
+/// Caller-owned, allocation-free per-Channel snapshot. All new fields use u64:
+/// gauges count current owners/bytes; counters count events since initialization.
+/// Counters saturate at maxInt(u64); high-water marks never decrease; no reset API.
+/// Gauges use checked arithmetic, not saturating subtraction. Admission snapshots
+/// retain their existing units and release boundaries and are sampled separately.
+///
+/// Safe concurrently with supported operations, shutdown and wait, NOT deinit.
+/// Query only a live Channel, including after wait; no borrowed mutable storage.
+/// Operational fields are sampled under one accounting mutex; admission samples
+/// are not one transaction with them. Snapshots never inspect transport maps.
+///
+/// Stream queue bytes include terminal/detached retained handles until destruction,
+/// so they can remain nonzero after wait. Accounting lives with the refcounted
+/// allocator, not the Channel pointer. These are logical queue charges, NOT heap
+/// allocation or RSS: exclude spare capacity, decoder/metadata/HPACK storage,
+/// compression scratch, TLS internals, kernel buffers and application copies.
+pub const OperationalStats = struct {
+    unary_admission: UnaryAdmissionStats = .{},
+    stream_admission: StreamAdmissionStats = .{},
+    /// Accepted enqueue/open through first terminal outcome, before callbacks.
+    active_unary_calls: u64 = 0,
+    active_streams: u64 = 0,
+    /// Usable transport, including GOAWAY draining; excludes dialing/backoff.
+    /// Replacement starts after old TCP close, so this gauge is at most one.
+    active_connections: u64 = 0,
+    /// Accepted unary work until submission starts or a pre-submit terminal.
+    pending_unary_calls: u64 = 0,
+    pending_unary_calls_high_water: u64 = 0,
+    /// Paused decoded messages: uncompressed payload plus five-byte frame charge.
+    stream_inbound_bytes: u64 = 0,
+    stream_inbound_bytes_high_water: u64 = 0,
+    /// Encoded whole frames, charged until fully consumed or destroyed.
+    stream_outbound_bytes: u64 = 0,
+    stream_outbound_bytes_high_water: u64 = 0,
+    /// Owned socket-write buffers until completion/discard; TLS ciphertext if enabled.
+    socket_write_bytes: u64 = 0,
+    socket_write_bytes_high_water: u64 = 0,
+    /// Mutually exclusive final status buckets for accepted unary and streaming RPCs.
+    terminal_ok: u64 = 0,
+    terminal_cancelled: u64 = 0,
+    terminal_deadline_exceeded: u64 = 0,
+    terminal_other: u64 = 0,
+    /// TCP connect submissions after the initial TCP attempt (includes candidates).
+    /// DNS-only failures and backoff scheduling are not attempts; no RPC replay.
+    reconnect_attempts: u64 = 0,
+    /// Activation of a transport from one of those later TCP attempts.
+    reconnect_successes: u64 = 0,
+    /// GOAWAY entering drain, and usable transport failures initiating recovery
+    /// when reconnect is enabled. A draining transport can contribute to both;
+    /// these are triggers, not an exhaustive or disjoint failed-dial taxonomy.
+    reconnect_goaway: u64 = 0,
+    reconnect_transport_failure: u64 = 0,
+};
+
+// Leaf lock: never acquire stream, Impl, admission or allocator locks while held.
+// The allocator owner survives detached stream buffers, so queue updates never
+// dereference a retired Impl. No allocation occurs under this mutex.
+const OperationalAccounting = struct {
+    mutex: std.Io.Mutex = .init,
+    stats: OperationalStats = .{},
+
+    fn snapshot(self: *OperationalAccounting) OperationalStats {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        return self.stats;
+    }
+
+    fn increment(self: *OperationalAccounting, comptime field: []const u8) void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        @field(self.stats, field) +|= 1;
+    }
+
+    fn add(self: *OperationalAccounting, comptime field: []const u8, amount: usize) void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        // Each aggregate is bounded by its existing checked admission reservation
+        // or socket-write ownership. Panic rather than silently corrupt a gauge.
+        @field(self.stats, field) = std.math.add(u64, @field(self.stats, field), @intCast(amount)) catch
+            @panic("operational gauge overflow");
+        if (@hasField(OperationalStats, field ++ "_high_water")) {
+            @field(self.stats, field ++ "_high_water") = @max(
+                @field(self.stats, field ++ "_high_water"),
+                @field(self.stats, field),
+            );
+        }
+    }
+
+    fn subtract(self: *OperationalAccounting, comptime field: []const u8, amount: usize) void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        @field(self.stats, field) = std.math.sub(u64, @field(self.stats, field), @intCast(amount)) catch
+            @panic("operational gauge underflow");
+    }
+
+    fn setSocketBytes(self: *OperationalAccounting, bytes: usize) void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        self.stats.socket_write_bytes = @intCast(bytes);
+        self.stats.socket_write_bytes_high_water = @max(self.stats.socket_write_bytes_high_water, self.stats.socket_write_bytes);
+    }
+
+    fn setConnectionActive(self: *OperationalAccounting, active: bool) void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        self.stats.active_connections = @intFromBool(active);
+    }
+
+    fn terminal(self: *OperationalAccounting, comptime active_field: []const u8, code: status.Code) void {
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
+        @field(self.stats, active_field) = std.math.sub(u64, @field(self.stats, active_field), 1) catch
+            @panic("operational active gauge underflow");
+        switch (code) {
+            .ok => self.stats.terminal_ok +|= 1,
+            .cancelled => self.stats.terminal_cancelled +|= 1,
+            .deadline_exceeded => self.stats.terminal_deadline_exceeded +|= 1,
+            else => self.stats.terminal_other +|= 1,
+        }
+    }
+};
+
 const ChannelOptions = struct {
     stream_admission: StreamAdmissionOptions = .{},
     unary_admission: UnaryAdmissionOptions = .{},
@@ -194,6 +316,7 @@ pub const Options = ChannelOptions;
 const AllocatorOperation = enum { alloc, resize, remap, free };
 
 const SerializedAllocator = struct {
+    operational: OperationalAccounting = .{},
     stream_admission: StreamAdmission = .{},
     backing: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
@@ -290,6 +413,14 @@ pub const Channel = struct {
     /// Snapshot of retained unary operations, logical request bytes, and quota rejections.
     pub fn unaryAdmissionStats(self: *Channel) UnaryAdmissionStats {
         return self.impl.unary_admission.snapshot();
+    }
+
+    /// O(1), allocation-free value; see OperationalStats for scope and lifetime.
+    pub fn operationalStats(self: *Channel) OperationalStats {
+        var result = self.impl.serialized_allocator.operational.snapshot();
+        result.unary_admission = self.unaryAdmissionStats();
+        result.stream_admission = self.streamAdmissionStats();
+        return result;
     }
 
     pub fn streamAdmissionStats(self: *Channel) StreamAdmissionStats {
@@ -509,6 +640,8 @@ pub const Channel = struct {
                 return error.ChannelUnavailable;
             };
         }
+        client_stream.operational_active = true;
+        self.impl.serialized_allocator.operational.add("active_streams", 1);
         return client_stream.handle();
     }
 
@@ -707,11 +840,16 @@ const Impl = struct {
         defer self.mutex.unlock(syncIo());
         if (self.state != .running) return false;
         try self.pending.append(self.allocator, operation);
-        if (receiving_http2_impl == self) return true;
-        if (self.notifyAdmission()) |_| {} else |_| {
-            _ = self.pending.pop();
-            return false;
+        if (receiving_http2_impl != self) {
+            if (self.notifyAdmission()) |_| {} else |_| {
+                _ = self.pending.pop();
+                return false;
+            }
         }
+        operation.operational_active = true;
+        operation.operational_pending = true;
+        self.serialized_allocator.operational.add("active_unary_calls", 1);
+        self.serialized_allocator.operational.add("pending_unary_calls", 1);
         return true;
     }
 
@@ -763,6 +901,7 @@ const ClientStreamState = struct {
     loop_owned: bool = true,
     app_released: bool = false,
     terminal: bool = false,
+    operational_active: bool = false,
     send_open: bool = true,
     cancel_requested: bool = false,
     resume_requested: bool = false,
@@ -872,6 +1011,8 @@ const ClientStreamState = struct {
         std.debug.assert(self.deadline_heap_index == null);
         const allocator = self.allocator;
         const allocator_owner = self.allocator_owner;
+        allocator_owner.operational.subtract("stream_outbound_bytes", self.outbound_buffered);
+        allocator_owner.operational.subtract("stream_inbound_bytes", self.inbound_buffered);
         allocator.free(self.path);
         self.request_metadata.deinit();
         for (self.outbound.items[self.outbound_head..]) |item| allocator.free(item.frame_bytes);
@@ -987,6 +1128,7 @@ fn clientStreamSend(context: *anyopaque, payload: []const u8, options: stream.Se
     }
     try client_stream.outbound.append(client_stream.allocator, .{ .frame_bytes = encoded });
     client_stream.outbound_buffered += encoded.len;
+    client_stream.allocator_owner.operational.add("stream_outbound_bytes", encoded.len);
     owned = false;
     wakeClientStreamLocked(client_stream);
 }
@@ -1065,6 +1207,8 @@ const Operation = struct {
     condition: std.Io.Condition = .init,
     done: bool = false,
     finished: bool = false,
+    operational_active: bool = false,
+    operational_pending: bool = false,
     owner: OperationOwner = .blocking,
     outcome_set: bool = false,
     deadline_expired: bool = false,
@@ -1189,9 +1333,20 @@ const Operation = struct {
         self.outcome_set = true;
     }
 
+    fn endOperationalPending(self: *Operation) void {
+        if (!self.operational_pending) return;
+        self.operational_pending = false;
+        self.impl.serialized_allocator.operational.subtract("pending_unary_calls", 1);
+    }
+
     fn finish(self: *Operation) void {
         std.debug.assert(!self.finished);
         self.finished = true;
+        self.endOperationalPending();
+        if (self.operational_active) {
+            self.operational_active = false;
+            self.impl.serialized_allocator.operational.terminal("active_unary_calls", self.response_code);
+        }
         switch (self.owner) {
             .blocking => {
                 self.mutex.lockUncancelable(syncIo());
@@ -1703,6 +1858,8 @@ fn startConnection(impl: *Impl) !void {
         }
     }
     impl.connect_active = true;
+    if (impl.connection_generation.load(.monotonic) > 1)
+        impl.serialized_allocator.operational.increment("reconnect_attempts");
     impl.tcp.connect(&impl.loop, &impl.connect_completion, address, Impl, impl, onConnect);
     observeTestIo(impl);
 }
@@ -1783,6 +1940,7 @@ fn onConnect(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, res
             if (impl.session) |session| c.nghttp2_session_del(session);
             impl.session = null;
             clearTlsConnection(impl);
+            impl.serialized_allocator.operational.setConnectionActive(false);
             impl.connection_state = .closing;
         }
         return .disarm;
@@ -1831,6 +1989,9 @@ fn activateConnection(impl: *Impl) !void {
     impl.mutex.lockUncancelable(syncIo());
     impl.accepting_streams = true;
     impl.mutex.unlock(syncIo());
+    impl.serialized_allocator.operational.setConnectionActive(true);
+    if (impl.connection_generation.load(.monotonic) > 1)
+        impl.serialized_allocator.operational.increment("reconnect_successes");
     impl.ever_active = true;
     impl.logger.write(.info, "channel connected target={s}", .{impl.authority});
     impl.reconnect_backoff_pending_reset = impl.reconnect_attempt != 0;
@@ -1918,6 +2079,7 @@ fn processPending(impl: *Impl) void {
                 deadline - current,
             ).len;
         }
+        operation.endOperationalPending();
         submitOperation(impl, operation) catch {
             removeOperationDeadline(impl, operation);
             operation.setOutcome(.unavailable, "request submission failed") catch {};
@@ -2124,6 +2286,7 @@ fn readClientStreamData(
     var notify_writable = false;
     if (item.offset == item.frame_bytes.len) {
         client_stream.outbound_buffered -= item.frame_bytes.len;
+        client_stream.allocator_owner.operational.subtract("stream_outbound_bytes", item.frame_bytes.len);
         client_stream.allocator.free(item.frame_bytes);
         client_stream.outbound_head += 1;
         if (client_stream.outbound_head == client_stream.outbound.items.len) {
@@ -2230,6 +2393,10 @@ fn terminalizeStream(client_stream: *ClientStreamState, final_status: status.Sta
         return;
     }
     client_stream.terminal = true;
+    if (client_stream.operational_active) {
+        client_stream.operational_active = false;
+        client_stream.allocator_owner.operational.terminal("active_streams", final_status.code);
+    }
     const notify = client_stream.app_owned and !client_stream.app_released;
     client_stream.mutex.unlock(syncIo());
     if (notify) {
@@ -2277,6 +2444,7 @@ fn queueInboundMessage(client_stream: *ClientStreamState, decoded: frame.Decoder
         .buffered_size = buffered_size,
     });
     client_stream.inbound_buffered += buffered_size;
+    client_stream.allocator_owner.operational.add("stream_inbound_bytes", buffered_size);
 }
 
 fn decodeAvailableMessages(client_stream: *ClientStreamState) !void {
@@ -2306,6 +2474,7 @@ fn deliverInboundMessages(client_stream: *ClientStreamState) !void {
         const item = client_stream.inbound.items[client_stream.inbound_head];
         client_stream.inbound_head += 1;
         client_stream.inbound_buffered -= item.buffered_size;
+        client_stream.allocator_owner.operational.subtract("stream_inbound_bytes", item.buffered_size);
         const action = invokeMessageCallback(
             client_stream,
             item.payload,
@@ -2536,6 +2705,7 @@ fn queueOwnedSocketWrite(impl: *Impl, bytes: []u8) !void {
         std.debug.assert(removed);
     }
     impl.queued_write_bytes = try addQueuedWriteBytes(impl.queued_write_bytes, bytes.len);
+    impl.serialized_allocator.operational.setSocketBytes(impl.queued_write_bytes);
     impl.tcp.queueWrite(
         &impl.loop,
         &impl.write_queue,
@@ -2695,6 +2865,7 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
     const removed = impl.writes.remove(write);
     std.debug.assert(removed);
     impl.queued_write_bytes = completeQueuedWrite(impl.queued_write_bytes, write.bytes.len);
+    impl.serialized_allocator.operational.setSocketBytes(impl.queued_write_bytes);
     // WriteQueue retries partial writes and calls back with the full buffer length.
     const completed: ?usize = result catch null;
     const write_succeeded = completed != null and completed.? == write.bytes.len;
@@ -2995,6 +3166,7 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
                 "channel received GOAWAY target={s} last_stream_id={d} error_code={d}",
                 .{ impl.authority, native_frame.*.goaway.last_stream_id, native_frame.*.goaway.error_code },
             );
+            impl.serialized_allocator.operational.increment("reconnect_goaway");
             impl.connection_state = .draining;
             impl.mutex.lockUncancelable(syncIo());
             impl.accepting_streams = false;
@@ -3228,6 +3400,7 @@ fn expireDeadlines(impl: *Impl, now: u64) !void {
 
 fn beginReconnect(impl: *Impl) void {
     if (impl.connection_state != .draining or impl.operations.count() != 0 or impl.streams.count() != 0) return;
+    impl.serialized_allocator.operational.setConnectionActive(false);
     impl.connection_state = .closing;
     impl.reconnect_after_close = false;
     impl.connected = false;
@@ -3258,6 +3431,9 @@ fn handleTransportFailure(impl: *Impl, reason: []const u8) void {
         return;
     }
 
+    if (impl.serialized_allocator.operational.snapshot().active_connections != 0)
+        impl.serialized_allocator.operational.increment("reconnect_transport_failure");
+    impl.serialized_allocator.operational.setConnectionActive(false);
     impl.connection_state = .closing;
     impl.logger.write(.warn, "channel connection lost target={s} reason={s}", .{ impl.authority, reason });
     impl.reconnect_after_close = true;
@@ -3393,6 +3569,7 @@ fn failConnectionCandidate(impl: *Impl, reason: []const u8) void {
     } else {
         impl.reconnect_after_close = false;
     }
+    impl.serialized_allocator.operational.setConnectionActive(false);
     impl.connection_state = .closing;
     impl.connected = false;
     if (impl.session) |session| {
@@ -3495,6 +3672,7 @@ fn onWriteCanceled(impl_: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: x
 fn beginStop(impl: *Impl, reason: []const u8) void {
     if (impl.stopping_on_loop) return;
     impl.stopping_on_loop = true;
+    impl.serialized_allocator.operational.setConnectionActive(false);
     impl.connection_state = .closing;
     impl.connected = false;
     clearTlsHandshakeDeadline(impl);
@@ -3611,6 +3789,7 @@ fn discardQueuedWrites(impl: *Impl) void {
         const removed = impl.writes.remove(write);
         std.debug.assert(removed);
         impl.queued_write_bytes = completeQueuedWrite(impl.queued_write_bytes, write.bytes.len);
+        impl.serialized_allocator.operational.setSocketBytes(impl.queued_write_bytes);
         impl.allocator.free(write.bytes);
         releaseWriteRequest(impl, write);
     }
@@ -4233,6 +4412,7 @@ test "client write callback and discard each release once" {
     const callback_write = try acquireWriteRequest(&impl, callback_bytes);
     try impl.writes.put(impl.allocator, callback_write, {});
     impl.queued_write_bytes = callback_bytes.len;
+    impl.serialized_allocator.operational.setSocketBytes(impl.queued_write_bytes);
     var loop: xev.Loop = undefined;
     _ = onWrite(
         callback_write,
@@ -4248,12 +4428,16 @@ test "client write callback and discard each release once" {
     const discarded_write = try acquireWriteRequest(&impl, discarded_bytes);
     try impl.writes.put(impl.allocator, discarded_write, {});
     impl.queued_write_bytes = discarded_bytes.len;
+    impl.serialized_allocator.operational.setSocketBytes(impl.queued_write_bytes);
     impl.write_queue.push(&discarded_write.request);
     discardQueuedWrites(&impl);
     try std.testing.expectEqual(@as(usize, 1), impl.write_request_pool_count);
     try std.testing.expect(impl.write_request_pool_head == discarded_write);
     try std.testing.expectEqual(@as(usize, 0), impl.writes.count());
     try std.testing.expectEqual(@as(usize, 0), impl.queued_write_bytes);
+    const stats = serialized_allocator.operational.snapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.socket_write_bytes);
+    try std.testing.expectEqual(@as(u64, 9), stats.socket_write_bytes_high_water);
 }
 
 test "cleartext write batch coalesces chunks below target" {
@@ -4544,6 +4728,13 @@ test "ordinary connection loss reconnects without replaying a submitted unary" {
     try std.testing.expect(second.status.isOk());
     try std.testing.expectEqualStrings("second", second.payload);
     try std.testing.expectEqual(@as(usize, 1), handler.calls.load(.acquire));
+    const stats = channel.operationalStats();
+    try std.testing.expect(stats.reconnect_attempts >= 1);
+    try std.testing.expect(stats.reconnect_successes >= 1);
+    try std.testing.expect(stats.reconnect_transport_failure >= 1);
+    try std.testing.expectEqual(@as(u64, 0), stats.reconnect_goaway);
+    try std.testing.expectEqual(@as(u64, 1), stats.terminal_other);
+    try std.testing.expectEqual(@as(u64, 1), stats.terminal_ok);
 }
 
 test "queued unary deadline expires during reconnect backoff" {
@@ -4578,6 +4769,11 @@ test "queued unary deadline expires during reconnect backoff" {
     );
     defer result.deinit();
     try std.testing.expectEqual(status.Code.deadline_exceeded, result.status.code);
+    const stats = channel.operationalStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.active_unary_calls);
+    try std.testing.expectEqual(@as(u64, 0), stats.pending_unary_calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.pending_unary_calls_high_water);
+    try std.testing.expectEqual(@as(u64, 1), stats.terminal_deadline_exceeded);
 }
 
 test "channel shutdown cancels reconnect backoff and drains" {
@@ -4661,6 +4857,13 @@ test "client stream handle outlives channel teardown" {
     owner.retain();
     defer owner.release();
     try std.testing.expectEqual(@as(usize, 1), channel.streamAdmissionStats().retained_streams);
+    channel.shutdown();
+    channel.wait();
+    const stats = channel.operationalStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.active_streams);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_connections);
+    try std.testing.expectEqual(@as(u64, 1), stats.terminal_other);
+    try std.testing.expectEqual(@as(usize, 1), stats.stream_admission.retained_streams);
     channel.deinit();
     try std.testing.expectEqual(@as(usize, 1), owner.stream_admission.snapshot().retained_streams);
     const client_state: *ClientStreamState = @ptrCast(@alignCast(client_stream.context));
@@ -4864,6 +5067,7 @@ test "client stream provider defers and emits EOF only after drain" {
     const encoded = try frame.encode(impl.allocator, "request");
     try client_stream.outbound.append(impl.allocator, .{ .frame_bytes = encoded });
     client_stream.outbound_buffered = encoded.len;
+    client_stream.allocator_owner.operational.add("stream_outbound_bytes", encoded.len);
     client_stream.send_open = false;
     data_flags = 0;
     try std.testing.expectEqual(
@@ -4872,6 +5076,8 @@ test "client stream provider defers and emits EOF only after drain" {
     );
     try std.testing.expect(data_flags & c.NGHTTP2_DATA_FLAG_EOF != 0);
     try std.testing.expectEqual(@as(usize, 0), client_stream.outbound_buffered);
+    try std.testing.expectEqual(@as(u64, 0), serialized_allocator.operational.snapshot().stream_outbound_bytes);
+    try std.testing.expectEqual(@as(u64, 12), serialized_allocator.operational.snapshot().stream_outbound_bytes_high_water);
 }
 
 test "client receive resume retains credit when delivery pauses again" {
@@ -4923,6 +5129,7 @@ test "client receive resume retains credit when delivery pauses again" {
     client_stream.deferred_stream_credit = first.len + second.len;
     try decodeAvailableMessages(client_stream);
     try std.testing.expectEqual(@as(usize, 2), client_stream.inbound.items.len);
+    try std.testing.expectEqual(@as(u64, 16), serialized_allocator.operational.snapshot().stream_inbound_bytes);
     try std.testing.expectEqual(@as(usize, 0), receive_state.messages);
 
     try deliverInboundMessages(client_stream);
@@ -4944,6 +5151,8 @@ test "client receive resume retains credit when delivery pauses again" {
     ));
     try std.testing.expect(!canReturnDeferredStreamCredit(false, true));
     try client_stream.decoder.finish();
+    try std.testing.expectEqual(@as(u64, 0), serialized_allocator.operational.snapshot().stream_inbound_bytes);
+    try std.testing.expectEqual(@as(u64, 16), serialized_allocator.operational.snapshot().stream_inbound_bytes_high_water);
 }
 
 fn expectDeadlineHeapConsistent(impl: *const Impl) !void {
@@ -6805,6 +7014,13 @@ test "channel replaces a connection after GOAWAY without replaying calls" {
     try std.testing.expectEqual(@as(usize, 2), channel.impl.connect_count.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 2), handler.calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
+    const stats = channel.operationalStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.active_connections);
+    try std.testing.expectEqual(@as(u64, 1), stats.reconnect_attempts);
+    try std.testing.expectEqual(@as(u64, 1), stats.reconnect_successes);
+    try std.testing.expectEqual(@as(u64, 1), stats.reconnect_goaway);
+    try std.testing.expectEqual(@as(u64, 0), stats.reconnect_transport_failure);
+    try std.testing.expectEqual(@as(u64, 2), stats.terminal_ok);
 }
 
 test "server drain finishes an accepted RPC and rejects a replacement connection" {
@@ -8026,6 +8242,35 @@ test "channel performs reusable concurrent unary calls end to end" {
     const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
     var channel = try Channel.init(std.testing.allocator, target, .{});
     defer channel.deinit();
+    const Poller = struct {
+        channel: *Channel,
+        stop: std.atomic.Value(bool) = .init(false),
+        samples: usize = 0,
+        valid: bool = true,
+
+        fn run(self: *@This()) void {
+            var previous: OperationalStats = .{};
+            while (!self.stop.load(.acquire)) {
+                const stats = self.channel.operationalStats();
+                self.valid = self.valid and stats.active_connections <= 1 and
+                    stats.pending_unary_calls <= stats.active_unary_calls and
+                    stats.pending_unary_calls <= stats.pending_unary_calls_high_water and
+                    stats.socket_write_bytes <= stats.socket_write_bytes_high_water and
+                    stats.socket_write_bytes_high_water >= previous.socket_write_bytes_high_water and
+                    stats.terminal_ok >= previous.terminal_ok;
+                previous = stats;
+                self.samples += 1;
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+    var poller = Poller{ .channel = &channel };
+    const polling_thread = try std.Thread.spawn(.{}, Poller.run, .{&poller});
+    var polling_joined = false;
+    defer if (!polling_joined) {
+        poller.stop.store(true, .release);
+        polling_thread.join();
+    };
 
     var success = try channel.callUnary(
         std.testing.allocator,
@@ -8102,11 +8347,31 @@ test "channel performs reusable concurrent unary calls end to end" {
     try std.testing.expectEqual(status.Code.deadline_exceeded, deadline.status.code);
     try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
 
+    const before_shutdown = channel.operationalStats();
+    try std.testing.expectEqual(@as(u64, 11), before_shutdown.terminal_ok);
+    try std.testing.expectEqual(@as(u64, 3), before_shutdown.terminal_other);
+    try std.testing.expectEqual(@as(u64, 1), before_shutdown.terminal_deadline_exceeded);
+    try std.testing.expectEqual(@as(u64, 0), before_shutdown.active_unary_calls);
+    try std.testing.expectEqual(@as(u64, 0), before_shutdown.reconnect_attempts);
+    try std.testing.expectEqual(@as(u64, 0), before_shutdown.reconnect_successes);
     test_server.shutdown();
     test_server.wait();
     var unavailable = try channel.callUnary(std.testing.allocator, "/test.Echo/Unary", "after-close", .{});
     defer unavailable.deinit();
     try std.testing.expectEqual(status.Code.unavailable, unavailable.status.code);
+    channel.shutdown();
+    channel.wait();
+    poller.stop.store(true, .release);
+    polling_thread.join();
+    polling_joined = true;
+    try std.testing.expect(poller.samples > 0);
+    try std.testing.expect(poller.valid);
+    const stopped = channel.operationalStats();
+    try std.testing.expectEqual(@as(u64, 0), stopped.active_connections);
+    try std.testing.expectEqual(@as(u64, 0), stopped.active_unary_calls);
+    try std.testing.expectEqual(@as(u64, 0), stopped.pending_unary_calls);
+    try std.testing.expectEqual(@as(u64, 0), stopped.socket_write_bytes);
+    try std.testing.expect(stopped.socket_write_bytes_high_water > 0);
 }
 
 test "event-driven unary calls complete exactly once and release operations" {
@@ -9848,6 +10113,7 @@ test "unary admission releases reservations on validation and enqueue rejection"
         .{},
         .{ .on_complete = Callback.complete },
     ));
+    try std.testing.expectEqualDeep(OperationalStats{}, channel.operationalStats());
     const stats = channel.unaryAdmissionStats();
     try std.testing.expectEqual(@as(usize, 0), stats.retained_calls);
     try std.testing.expectEqual(@as(usize, 0), stats.retained_request_bytes);
@@ -9972,4 +10238,106 @@ test "stream admission is safe with concurrent reservations" {
     started = 0;
     try std.testing.expectEqual(@as(usize, 0), budget.snapshot().retained_streams);
     try std.testing.expectEqual(@as(usize, 0), budget.snapshot().reserved_buffer_bytes);
+}
+
+test "operational snapshots distinguish pending active retained and buffered ownership" {
+    var host = [_:0]u8{'x'};
+    var owner: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &owner, host[0..1 :0]);
+    defer impl.pending.deinit(impl.allocator);
+    defer impl.stream_states.deinit(impl.allocator);
+    var channel: Channel = .{ .impl = &impl };
+    try std.testing.expectEqualDeep(OperationalStats{}, channel.operationalStats());
+    impl.state = .running;
+    impl.accepting_streams = true;
+    // Drive the existing queues synchronously, without a second transport harness.
+    impl.stream_wake_notify_pending = true;
+    receiving_http2_impl = &impl;
+    defer receiving_http2_impl = null;
+    const operation = try Operation.init(&impl, "/test.Stats/Unary", "request", .{});
+    defer operation.deinit();
+    try std.testing.expect(try impl.enqueue(operation));
+    var stats = channel.operationalStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.active_unary_calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.pending_unary_calls);
+    try std.testing.expectEqual(@as(usize, 1), stats.unary_admission.retained_calls);
+    try std.testing.expect(impl.pending.pop().? == operation);
+    operation.endOperationalPending();
+    operation.setStaticOutcome(.ok, "");
+    operation.finish();
+    stats = channel.operationalStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.active_unary_calls);
+    try std.testing.expectEqual(@as(u64, 0), stats.pending_unary_calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.pending_unary_calls_high_water);
+    try std.testing.expectEqual(@as(u64, 1), stats.terminal_ok);
+    try std.testing.expectEqual(@as(usize, 1), stats.unary_admission.retained_calls);
+
+    var handle = try channel.openStream("/test.Stats/Stream", .{}, .{
+        .on_message = StreamTestCallbacks.onMessage,
+        .on_terminal = StreamTestCallbacks.onTerminal,
+    });
+    const client_stream: *ClientStreamState = @ptrCast(@alignCast(handle.context));
+    try handle.send("out", .{});
+    try queueInboundMessage(client_stream, .{
+        .payload = try impl.allocator.dupe(u8, "in"),
+        .consumed_bytes = 7,
+        .compressed = false,
+    });
+    stats = channel.operationalStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.active_streams);
+    try std.testing.expectEqual(@as(u64, 8), stats.stream_outbound_bytes);
+    try std.testing.expectEqual(@as(u64, 7), stats.stream_inbound_bytes);
+    handle.cancel();
+    terminalizeStream(client_stream, .init(.cancelled, "cancelled"));
+    terminalizeStream(client_stream, .init(.unknown, "duplicate ignored"));
+    releaseStreamLoopOwnership(client_stream);
+    impl.markStopped();
+    channel.wait();
+    stats = channel.operationalStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.active_streams);
+    try std.testing.expectEqual(@as(u64, 1), stats.terminal_cancelled);
+    try std.testing.expectEqual(@as(u64, 0), stats.terminal_other);
+    try std.testing.expectEqual(@as(usize, 1), stats.stream_admission.retained_streams);
+    try std.testing.expectEqual(@as(u64, 8), stats.stream_outbound_bytes);
+    try std.testing.expectEqual(@as(u64, 7), stats.stream_inbound_bytes);
+    try std.testing.expectError(error.StreamClosed, handle.send("late", .{}));
+    handle.deinit();
+    stats = channel.operationalStats();
+    try std.testing.expectEqual(@as(usize, 0), stats.stream_admission.retained_streams);
+    try std.testing.expectEqual(@as(u64, 0), stats.stream_outbound_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.stream_inbound_bytes);
+    try std.testing.expectEqual(@as(u64, 8), stats.stream_outbound_bytes_high_water);
+    try std.testing.expectEqual(@as(u64, 7), stats.stream_inbound_bytes_high_water);
+}
+
+test "operational counters saturate and high water survives exact gauge release" {
+    var accounting: OperationalAccounting = .{};
+    const maximum = std.math.maxInt(u64);
+    inline for (.{ "terminal_ok", "terminal_cancelled", "terminal_deadline_exceeded", "terminal_other", "reconnect_attempts", "reconnect_successes", "reconnect_goaway", "reconnect_transport_failure" }) |field| {
+        @field(accounting.stats, field) = maximum - 1;
+        accounting.increment(field);
+        accounting.increment(field);
+        try std.testing.expectEqual(maximum, @field(accounting.snapshot(), field));
+    }
+    inline for (.{ status.Code.ok, status.Code.cancelled, status.Code.deadline_exceeded, status.Code.unavailable }) |code| {
+        accounting.add("active_streams", 1);
+        accounting.terminal("active_streams", code);
+    }
+    try std.testing.expectEqual(maximum, accounting.snapshot().terminal_ok);
+    try std.testing.expectEqual(maximum, accounting.snapshot().terminal_cancelled);
+    try std.testing.expectEqual(maximum, accounting.snapshot().terminal_deadline_exceeded);
+    try std.testing.expectEqual(maximum, accounting.snapshot().terminal_other);
+    inline for (.{ "pending_unary_calls", "stream_inbound_bytes", "stream_outbound_bytes" }) |field| {
+        accounting.add(field, std.math.maxInt(usize));
+        accounting.subtract(field, std.math.maxInt(usize));
+        accounting.add(field, 1);
+        accounting.subtract(field, 1);
+        try std.testing.expectEqual(@as(u64, 0), @field(accounting.snapshot(), field));
+        try std.testing.expectEqual(@as(u64, std.math.maxInt(usize)), @field(accounting.snapshot(), field ++ "_high_water"));
+    }
+    accounting.setSocketBytes(std.math.maxInt(usize));
+    accounting.setSocketBytes(0);
+    try std.testing.expectEqual(@as(u64, 0), accounting.snapshot().socket_write_bytes);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(usize)), accounting.snapshot().socket_write_bytes_high_water);
 }
