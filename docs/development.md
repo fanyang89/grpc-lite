@@ -115,7 +115,7 @@ and receive resumptions. Those opt-in counters live only in the existing officia
 peer's handler; they are not transport telemetry. Port zero avoids fixed-port collisions.
 The runner traps failure/signals, terminates and reaps its peer/client, and bounds cleanup.
 Linux `/proc`, Python 3 (standard library only), and GNU coreutils are required.
-The absolute timeout path avoids non-GNU tools shadowing it through mise/PATH.
+The verified GNU timeout selection avoids incompatible mise/PATH shadows.
 
 Logs under `.zig-cache/official/streaming-soak/{harness,build,server,client}.log` are
 truncated per invocation. They record configuration, architecture, seed/workload,

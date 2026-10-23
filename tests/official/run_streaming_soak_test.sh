@@ -178,6 +178,7 @@ if [[ -n "$system_timeout" ]]; then
     "$project_root/tests/official/run_streaming_soak.sh" >"$path_only_root/tests/official/run_streaming_soak.sh"
   grep -qx 'gnu_timeout_paths=()' "$path_only_root/tests/official/run_streaming_soak.sh"
   cp "$project_root/tests/official/run_streaming_soak_test.sh" "$path_only_root/tests/official/"
+  cp "$resource_observer" "$path_only_root/tests/official/"
   PATH="$fallback_dir:$PATH" bash "$path_only_root/tests/official/run_streaming_soak_test.sh"
   printf '%s\n' 'PATH-only mandatory shell suite passed'
   # Exercise a relative PATH entry containing spaces and a valid symlink,
