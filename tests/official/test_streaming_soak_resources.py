@@ -25,11 +25,14 @@ class Clock:
 class Child:
     pid = 123
 
-    def __init__(self, clock, end=10, status=0):
+    def __init__(self, clock, end=10, status=0, first_poll_delay=0):
         self.clock, self.end, self.status = clock, end, status
         self.terminated = False
+        self.first_poll_delay = first_poll_delay
 
     def poll(self):
+        self.clock.sleep(self.first_poll_delay)
+        self.first_poll_delay = 0
         return self.status if self.clock.now >= self.end or self.terminated else None
 
     def wait(self, timeout=None):
@@ -45,15 +48,31 @@ class StreamingSoakResourcesTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
 
-    def observe(self, end=10, status=0, missing=False):
+    def observe(self, end=10, status=0, missing=False, baseline_delay=0, launch_delay=0, first_poll_delay=0):
         clock = Clock()
-        child = Child(clock, end, status)
+        child = Child(clock, end, status, first_poll_delay)
         metrics = {"rss_kib": 1024, "fds": 5, "threads": 2}
+        samples = 0
+
+        def sample(*_args):
+            nonlocal samples
+            if samples == 0:
+                clock.sleep(baseline_delay)
+            samples += 1
+            if missing:
+                raise FileNotFoundError()
+            return metrics
+
+        def launch(_command):
+            clock.sleep(launch_delay)
+            child.end = clock.now + end
+            return child
+
         with patch.object(resources.time, "monotonic", clock.monotonic), \
                 patch.object(resources.time, "sleep", clock.sleep), \
-                patch.object(resources.subprocess, "Popen", return_value=child), \
+                patch.object(resources.subprocess, "Popen", side_effect=launch), \
                 patch.object(resources, "identity", return_value="42"), \
-                patch.object(resources, "sample", side_effect=FileNotFoundError() if missing else None, return_value=metrics):
+                patch.object(resources, "sample", side_effect=sample):
             status = resources.observe(self.directory, 456, 10, 47, ["synthetic"])
         return status, json.loads((self.directory / "resources-summary.json").read_text()), child
 
@@ -84,6 +103,36 @@ class StreamingSoakResourcesTest(unittest.TestCase):
         self.assertIn("client_teardown", report["unavailable"])
         self.assertLess((self.directory / "resources.jsonl").stat().st_size, 1024 * 1024)
 
+    def test_traffic_clock_starts_after_baseline_and_client_launch(self):
+        status, report, _ = self.observe(baseline_delay=50, launch_delay=50)
+        self.assertEqual(status, 0)
+        self.assertEqual(report["screen"], "short_run")
+        for peer in report["comparisons"]:
+            self.assertGreater(peer["phases"]["warmup"]["count"], 0)
+            self.assertGreaterEqual(peer["phases"]["steady"]["count"], 9)
+        self.assertEqual(report["client_exit"], 0)
+
+    def test_missing_warmup_observation_is_incomplete_and_nonzero(self):
+        status, report, _ = self.observe(first_poll_delay=3)
+        self.assertEqual(status, 1)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["screen"], "incomplete")
+        self.assertEqual(report["comparison_errors"], [
+            "server: missing warmup samples", "client: missing warmup samples"])
+
+    def test_each_peer_requires_valid_warmup_samples(self):
+        self.observe()
+        rows = [json.loads(line) for line in (self.directory / "resources.jsonl").read_text().splitlines()]
+        for role in ("server", "client"):
+            for unavailable in (False, True):
+                with self.subTest(role=role, unavailable=unavailable):
+                    without_warmup = [row for row in rows if not (row["role"] == role and row["phase"] == "warmup")]
+                    if unavailable:
+                        without_warmup.append({"role": role, "phase": "warmup", "unavailable": "injected missing data"})
+                    report = resources.compare(without_warmup, 600)
+                    self.assertEqual(report["screen"], "incomplete")
+                    self.assertEqual(report["comparison_errors"], [f"{role}: missing warmup samples"])
+
     def test_timeout_reports_and_reaps_child(self):
         status, report, child = self.observe(end=1000)
         self.assertEqual(status, 1)
@@ -109,7 +158,7 @@ class StreamingSoakResourcesTest(unittest.TestCase):
         rows = []
         for role in ("server", "client"):
             for index in range(30):
-                rows.append({"role": role, "phase": "baseline" if index == 0 else "teardown" if index >= 27 else "steady",
+                rows.append({"role": role, "phase": "baseline" if index == 0 else "warmup" if index == 1 else "teardown" if index >= 27 else "steady",
                              "rss_kib": 1024 if index < 10 else 200000, "fds": 5 if index < 10 else 20, "threads": 2})
         report = resources.compare(rows, 600)
         self.assertEqual(report["screen"], "growth_alert")
@@ -138,6 +187,60 @@ class StreamingSoakResourcesTest(unittest.TestCase):
         report = json.loads((self.directory / "resources-summary.json").read_text())
         self.assertEqual(report["status"], "failed")
         self.assertLessEqual(log.stat().st_size, resources.LOG_BYTES)
+
+    def test_truncation_failure_never_publishes_passed(self):
+        summary = self.directory / "resources-summary.json"
+        summary.write_text('{"status":"observed"}')
+        log = self.directory / "build.log"
+        original = b"x" * (resources.LOG_BYTES + 100)
+        log.write_bytes(original)
+
+        def fail_truncation(path, _data):
+            self.assertEqual(path, log)
+            self.assertEqual(json.loads(summary.read_text())["status"], "observed")
+            raise OSError("injected truncation failure")
+
+        with patch.object(Path, "write_bytes", fail_truncation):
+            self.assertEqual(resources.finalize(self.directory, 0), 1)
+        report = json.loads(summary.read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["harness_exit"], 1)
+        self.assertIn("log finalization failed", report["errors"])
+        self.assertEqual(log.read_bytes(), original)
+        self.assertFalse(summary.with_suffix(".tmp").exists())
+
+    def test_shell_status_matches_injected_log_finalization_failure(self):
+        # Keep real outer dispatch/finalization; replace only the heavy workload
+        # and inject the exact write failure into the copied observer.
+        root = self.directory / "project"
+        official = root / "tests" / "official"
+        official.mkdir(parents=True)
+        runner = official / "run_streaming_soak.sh"
+        source = Path(__file__).with_name("run_streaming_soak.sh").read_text()
+        source = source.replace('    run_soak\n', """    printf '{"status":"observed"}\\n' >"$work_dir/resources-summary.json"
+    head -c 1048676 /dev/zero >"$work_dir/build.log"
+""")
+        runner.write_text(source)
+        observer = Path(resources.__file__).read_text()
+        observer = observer.replace('def version(command):', 'def version(command):\n    return "synthetic"\n\ndef unused_version(command):')
+        observer = observer.replace('if __name__ == "__main__":', '''def fail_truncation(path, data):
+    if path.name == "build.log":
+        raise OSError("injected truncation failure")
+    return original_write_bytes(path, data)
+
+original_write_bytes = Path.write_bytes
+Path.write_bytes = fail_truncation
+
+if __name__ == "__main__":''')
+        (official / "streaming_soak_resources.py").write_text(observer)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("STREAMING_SOAK_")}
+        result = subprocess.run(["bash", str(runner)], env=environment, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        report = json.loads((root / ".zig-cache/official/streaming-soak/resources-summary.json").read_text())
+        self.assertEqual(report["harness_exit"], result.returncode)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("log finalization failed", report["errors"])
+        self.assertIn("harness_exit=1", result.stdout)
 
     def test_handler_events_are_not_occupancy(self):
         (self.directory / "resources-summary.json").write_text('{"status":"observed"}')

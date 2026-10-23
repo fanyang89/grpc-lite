@@ -101,6 +101,8 @@ def compare(rows, duration):
                 key: {"min": min(row[key] for row in selected), "max": max(row[key] for row in selected),
                       "median": statistics.median(row[key] for row in selected)}
                 for key in METRICS if selected}}
+        if not phases["warmup"]["count"]:
+            errors.append(f"{role}: missing warmup samples")
         steady = [row for row in rows if row["role"] == role and row["phase"] == "steady" and "rss_kib" in row]
         checks = []
         width = len(steady) // 3
@@ -152,7 +154,6 @@ def observe(directory, server_pid, duration, seed, command):
     interval = max(.2, (duration + 35) / MAX_TICKS)
     start = time.monotonic()
     warmup = min(5, duration / 5)
-    deadline = start + duration + 30
     identities = {}
     interrupted = False
 
@@ -187,6 +188,9 @@ def observe(directory, server_pid, duration, seed, command):
                 raise RuntimeError("server baseline unavailable")
             # stdout is the existing client log. No payload, environment or argv dump.
             child = subprocess.Popen(command)
+            # Baseline collection and process creation are not traffic warmup.
+            traffic_start = time.monotonic()
+            deadline = traffic_start + duration + 30
             ticks = 0
             while child.poll() is None:
                 if interrupted:
@@ -195,7 +199,7 @@ def observe(directory, server_pid, duration, seed, command):
                     raise RuntimeError("client observation timeout")
                 if ticks >= MAX_TICKS:
                     raise RuntimeError("sample budget exhausted")
-                phase = "warmup" if time.monotonic() - start < warmup else "steady"
+                phase = "warmup" if time.monotonic() - traffic_start < warmup else "steady"
                 record("server", server_pid, phase)
                 record("client", child.pid, phase)
                 # A client exiting during /proc reads is not a zero measurement.
@@ -244,28 +248,33 @@ def finalize(directory, harness_exit):
     except (OSError, ValueError):
         result = {"schema": SCHEMA, "status": "missing_report", "unavailable": UNAVAILABLE}
     complete = result.get("status") == "observed"
+    try:
+        result["handler_events"] = {"available": False, "reason": "no terminal peer counters"}
+        server_log = directory / "server.log"
+        if server_log.exists():
+            with server_log.open("rb") as source:
+                source.seek(max(0, server_log.stat().st_size - LOG_BYTES))
+                tail = source.read(LOG_BYTES).decode("utf-8", errors="replace")
+            matches = re.findall(r"^streaming-soak messages=(\d{1,12}) would_block=(\d{1,12}) resumes=(\d{1,12})$", tail, re.MULTILINE)
+            if matches:
+                result["handler_events"] = {"available": True, **dict(zip(
+                    ("messages", "would_block", "resumes"), map(int, matches[-1])))}
+        # Bound retained log artifacts, preserving diagnostic tails. Never include binaries.
+        for name in ("harness", "build", "server", "client"):
+            log = directory / (name + ".log")
+            if log.exists() and log.stat().st_size > LOG_BYTES:
+                with log.open("rb") as source:
+                    source.seek(-LOG_BYTES + 256, os.SEEK_END)
+                    tail = source.read()
+                log.write_bytes(b"[earlier output truncated to bound retained artifact]\n" + tail)
+    except OSError:
+        complete = False
+        result.setdefault("errors", []).append("log finalization failed")
+    # Publish success atomically only after every log operation has completed.
     result["harness_exit"] = harness_exit if harness_exit or complete else 1
-    result["handler_events"] = {"available": False, "reason": "no terminal peer counters"}
-    server_log = directory / "server.log"
-    if server_log.exists():
-        with server_log.open("rb") as source:
-            source.seek(max(0, server_log.stat().st_size - LOG_BYTES))
-            tail = source.read(LOG_BYTES).decode("utf-8", errors="replace")
-        matches = re.findall(r"^streaming-soak messages=(\d{1,12}) would_block=(\d{1,12}) resumes=(\d{1,12})$", tail, re.MULTILINE)
-        if matches:
-            result["handler_events"] = {"available": True, **dict(zip(
-                ("messages", "would_block", "resumes"), map(int, matches[-1])))}
     result["status"] = "passed" if complete and harness_exit == 0 else "failed"
     write_json(path, result)
-    # Bound retained log artifacts, preserving diagnostic tails. Never include binaries.
-    for name in ("harness", "build", "server", "client"):
-        log = directory / (name + ".log")
-        if log.exists() and log.stat().st_size > LOG_BYTES:
-            with log.open("rb") as source:
-                source.seek(-LOG_BYTES + 256, os.SEEK_END)
-                tail = source.read()
-            log.write_bytes(b"[earlier output truncated to bound retained artifact]\n" + tail)
-    return 0 if complete else 1
+    return 0 if result["status"] == "passed" else 1
 
 
 def main():
