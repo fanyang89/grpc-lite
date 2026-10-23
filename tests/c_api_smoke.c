@@ -116,6 +116,10 @@ static void retained_server_on_remote_end(
 }
 
 static void test_retained_results_and_stream_outlive_channel(void) {
+  /* Inbound capacity must cover the default 64 KiB stream window. */
+  const uint64_t inbound_capacity = 64 * 1024;
+  const uint64_t outbound_capacity = 4096;
+  const uint64_t reserved_bytes = inbound_capacity + outbound_capacity;
   const grpc_lite_bytes_view method =
       {(const uint8_t *)"/test.Ownership/Echo", sizeof("/test.Ownership/Echo") - 1};
   grpc_lite_server *server = NULL;
@@ -137,7 +141,7 @@ static void test_retained_results_and_stream_outlive_channel(void) {
   channel_options.max_unary_calls = 1;
   channel_options.max_unary_request_bytes = method.size + 5 + 7;
   channel_options.max_streams = 1;
-  channel_options.max_stream_buffer_bytes = 8192;
+  channel_options.max_stream_buffer_bytes = reserved_bytes;
   grpc_lite_channel *channel = NULL;
   assert(grpc_lite_channel_create_managed(
       NULL, bytes(target, (size_t)target_size), &channel_options, &channel) == GRPC_LITE_OK);
@@ -163,8 +167,8 @@ static void test_retained_results_and_stream_outlive_channel(void) {
   stream_options.has_timeout = 1;
   stream_options.timeout_ns = UINT64_C(5000000000);
   stream_options.max_message_size = 1024;
-  stream_options.max_inbound_buffer_size = 4096;
-  stream_options.max_outbound_buffer_size = 4096;
+  stream_options.max_inbound_buffer_size = inbound_capacity;
+  stream_options.max_outbound_buffer_size = outbound_capacity;
   grpc_lite_client_stream_callbacks callbacks = GRPC_LITE_CLIENT_STREAM_CALLBACKS_INIT;
   callbacks.user_data = &state;
   callbacks.on_message = retained_on_message;
@@ -184,13 +188,13 @@ static void test_retained_results_and_stream_outlive_channel(void) {
   assert(pthread_mutex_unlock(&state.mutex) == 0);
   grpc_lite_stream_admission_stats stats = GRPC_LITE_STREAM_ADMISSION_STATS_INIT;
   assert(grpc_lite_channel_get_stream_admission_stats(channel, &stats) == GRPC_LITE_OK);
-  assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == 8192);
+  assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == reserved_bytes);
   grpc_lite_client_stream *rejected = NULL;
   assert(grpc_lite_channel_open_stream(
       channel, method, &stream_options, &callbacks, &rejected) == GRPC_LITE_ERROR_WOULD_BLOCK);
   assert(rejected == NULL);
   assert(grpc_lite_channel_get_stream_admission_stats(channel, &stats) == GRPC_LITE_OK);
-  assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == 8192);
+  assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == reserved_bytes);
   assert(stats.rejected_streams == 1);
 
   /* Actual destruction joins the loop; never query the released Channel. */
