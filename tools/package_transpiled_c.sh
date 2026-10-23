@@ -34,21 +34,11 @@ read_single_version() {
     printf '%s\n' "$values"
 }
 
-zon_version=$(read_single_version 'project version' \
-    's/^[[:space:]]*\.version = "\([^"]*\)",$/\1/p' "$project_root/build.zig.zon")
-cmake_version=$(read_single_version 'CMake project version' \
-    's/^project(grpc_lite VERSION \([^ ]*\) LANGUAGES C)$/\1/p' "$project_root/CMakeLists.txt")
-config_version=$(read_single_version 'CMake package version' \
-    's/^set(PACKAGE_VERSION "\([^"]*\)")$/\1/p' "$project_root/cmake/grpc_liteConfigVersion.cmake")
+zon_version=$(python3 "$project_root/tools/check_release_version.py")
 required_zig=$(read_single_version 'minimum Zig version' \
     's/^[[:space:]]*\.minimum_zig_version = "\([^"]*\)",$/\1/p' "$project_root/build.zig.zon")
 actual_zig=$(zig version)
 
-if [[ "$zon_version" != "$cmake_version" || "$zon_version" != "$config_version" ]]; then
-    printf 'Version mismatch: build.zig.zon=%s CMakeLists.txt=%s ConfigVersion=%s\n' \
-        "$zon_version" "$cmake_version" "$config_version" >&2
-    exit 1
-fi
 if [[ "$actual_zig" != "$required_zig" ]]; then
     printf 'Zig version mismatch: expected %s, got %s\n' "$required_zig" "$actual_zig" >&2
     exit 1

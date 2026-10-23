@@ -7,6 +7,8 @@ cd "$project_root"
 
 zig fmt --check build.zig src examples tests benchmarks
 actionlint
+python3 tools/check_release_version.py
+python3 tests/check_release_version_test.py
 
 .mise/tasks/check-transpiled-c
 archives=(.zig-cache/transpiled-c-dist/*.tar.gz)
