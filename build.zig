@@ -416,6 +416,10 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
     });
     applySanitizers(cpp_client_stream_allocation_module, sanitizers);
+    // This single-threaded subprocess allocation contract is not a race test.
+    // Its replacement new/delete conflict with libtsan's allocator interposition,
+    // so run it without TSan instrumentation while retaining selected UBSan.
+    cpp_client_stream_allocation_module.sanitize_thread = false;
     cpp_client_stream_allocation_module.addIncludePath(b.path("include"));
     cpp_client_stream_allocation_module.addCSourceFile(.{
         .file = b.path("tests/cpp_client_stream_allocation_test.cc"),
