@@ -257,12 +257,14 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     rm -rf /var/lib/apt/lists/*
 DOCKERFILE
     fi
-    security_args=()
-    if [[ ${GRPC_LITE_CMAKE_CONSUMER_ALLOW_UNCONFINED_SECCOMP:-0} == 1 ]]; then
-        printf '%s\n' 'WARNING: disabling Docker seccomp for this trusted io_uring consumer test only' >&2
-        security_args+=(--security-opt seccomp=unconfined)
-    fi
-    docker run --rm --network none "${security_args[@]}" --user "$(id -u):$(id -g)" \
+    # Preserve the pinned Moby default-deny rules, allowing only the additional
+    # io_uring syscalls needed by these trusted transport consumer tests.
+    python3 -B "$package_source/tests/consumer/seccomp/test_profile.py"
+    seccomp_profile="$work_dir/consumer-seccomp.json"
+    python3 "$package_source/tests/consumer/seccomp/allow_io_uring.py" "$seccomp_profile"
+    printf '%s\n' 'Consumer seccomp: pinned Moby default + io_uring_setup/enter/register'
+    docker run --rm --network none --security-opt "seccomp=$seccomp_profile" \
+        --user "$(id -u):$(id -g)" \
         -v "$work_dir:$work_dir" -v "$nghttp2_archive:$nghttp2_archive:ro" \
         -v "$cares_archive:$cares_archive:ro" \
         "$image" "$work_dir/source/tests/consumer/run_cmake_c.sh" "${isolated_args[@]}"

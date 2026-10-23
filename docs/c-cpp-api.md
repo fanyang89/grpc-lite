@@ -245,12 +245,17 @@ three smoke cases alongside the existing generated-code coverage. Its isolated c
 rejects a visible Zig executable and runs without network access. The harness's typed
 checks separately require Protobuf. `GRPC_LITE_KEEP_E2E=1` preserves CMake/CTest logs.
 The runtime needs Linux io_uring permission. Docker's default seccomp profile may
-reject `io_uring_setup` with `EPERM`, causing server startup failure, not a skipped
-or passing test. Prefer an environment/profile that permits the required syscalls.
-For trusted local test artifacts only, the explicit harness opt-in
-`GRPC_LITE_CMAKE_CONSUMER_ALLOW_UNCONFINED_SECCOMP=1` disables Docker seccomp for that
-consumer container, with a warning; network isolation and the nonroot user remain.
-It is not a deployment recommendation and does not change the harness default.
+reject `io_uring_setup` with `EPERM`. The harness therefore applies a scoped profile
+by default to its trusted consumer container, including existing CI/release callers:
+it verifies a vendored, commit-and-SHA-256-pinned Moby default allowlist, then adds
+only `io_uring_setup`, `io_uring_enter`, and `io_uring_register`. Upstream default-deny
+and all unrelated rules remain intact; network isolation and the nonroot user remain.
+No privileged mode, additional capabilities, unconfined fallback, or daemon-wide
+policy change is used. See [profile provenance and tests](../tests/consumer/seccomp/README.md).
+This is not a deployment sandbox recommendation. The host kernel/outer sandbox must
+also permit io_uring; failures are test failures, never skipped or counted as passes.
+The pre-isolated host route (`GRPC_LITE_NETWORK_ISOLATED=1`) must provide that permission
+itself.
 
 Maintainer validation with `mise run package-transpiled-c` followed by that harness is
 **locally packaged exact-artifact testing**, not proof that a published release was
