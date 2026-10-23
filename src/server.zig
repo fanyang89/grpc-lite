@@ -1835,7 +1835,12 @@ const Connection = struct {
                 },
                 .want_read => break,
                 .want_write => try self.drainTlsCiphertext(),
-                .peer_closed => return error.TlsPeerClosed,
+                .peer_closed => {
+                    // The handshake-completion path also reads buffered records;
+                    // classify here before either caller's generic close handler.
+                    self.latchCloseReason(.peer_transport);
+                    return error.TlsPeerClosed;
+                },
                 else => return error.TlsConnectionClosed,
             }
         }
@@ -2515,10 +2520,10 @@ fn onRead(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.
                     conn.driveTlsHandshake() catch conn.closeOnLoop(loop);
                 } else {
                     conn.receiveTlsPlaintext() catch |err| {
-                        if (err == error.TlsPeerClosed) {
-                            conn.latchCloseReason(.peer_transport);
-                            conn.closeGracefully(loop);
-                        } else conn.closeOnLoop(loop);
+                        if (err == error.TlsPeerClosed)
+                            conn.closeGracefully(loop)
+                        else
+                            conn.closeOnLoop(loop);
                     };
                 }
             }
@@ -5866,6 +5871,70 @@ test "malformed HTTP/2 settings close the connection promptly" {
     }
     try waitForAdmittedConnections(server.coordinator, 0);
     try std.testing.expectEqual(@as(u64, 2), server.operationalStats().close_protocol_local);
+}
+
+test "TLS server buffered peer close at handshake completion preserves close cause" {
+    if (!build_options.tls) return error.SkipZigTest;
+    const certificate = @embedFile("testdata/localhost-cert.pem");
+    const private_key = @embedFile("testdata/localhost-key.pem");
+    var server = try Server.init(std.testing.allocator, .{
+        .tls = .{ .certificate_chain_pem = certificate, .private_key_pem = private_key },
+    });
+    defer server.deinit();
+    const client_config = try tls_record.Config.createClient(std.testing.allocator, certificate, null);
+    defer client_config.destroy();
+
+    for ([_]?CloseReason{ null, .forced_shutdown }) |earlier_reason| {
+        const client = try tls_record.Session.create(std.testing.allocator, client_config, "localhost");
+        defer client.destroy();
+        var connection = Connection{
+            .server = server.impl,
+            .tls_session = try tls_record.Session.create(std.testing.allocator, server.impl.tls_config.?, null),
+            .tls_handshaking = true,
+            .close_reason = earlier_reason,
+            // Suppress HTTP/2 writes: this is an in-memory TLS pair, not a socket.
+            .queued_write_bytes = server.impl.write_high_watermark_bytes,
+        };
+        defer connection.clearTls();
+        const peer = connection.tls_session.?;
+        var client_complete = false;
+        var server_complete = false;
+        // Same bounded ciphertext exchange as tls_record's handshake tests. Queue
+        // close_notify with the client's last handshake output, before the Server
+        // transport observes completion and starts reading buffered plaintext.
+        for (0..32) |_| {
+            if (!client_complete) switch (client.handshake()) {
+                .complete => {
+                    client_complete = true;
+                    switch (try client.closeNotify()) {
+                        .complete => {},
+                        else => return error.UnexpectedTlsResult,
+                    }
+                },
+                .want_read, .want_write => {},
+                else => return error.TlsHandshakeFailed,
+            };
+            const client_bytes = client.ciphertext();
+            try peer.feedCiphertext(client_bytes);
+            client.consumeCiphertext(client_bytes.len);
+            if (!server_complete) switch (peer.handshake()) {
+                .complete => server_complete = true,
+                .want_read, .want_write => {},
+                else => return error.TlsHandshakeFailed,
+            };
+            const server_bytes = peer.ciphertext();
+            try client.feedCiphertext(server_bytes);
+            peer.consumeCiphertext(server_bytes.len);
+            if (client_complete and server_complete) break;
+        }
+        try std.testing.expect(client_complete and server_complete);
+        try std.testing.expectError(error.TlsPeerClosed, connection.driveTlsHandshake());
+        try std.testing.expect(!connection.tls_handshaking);
+        try std.testing.expectEqual(earlier_reason orelse .peer_transport, connection.close_reason.?);
+        // Mirror the handshake caller's generic close, without starting a loop.
+        connection.close();
+        try std.testing.expectEqual(earlier_reason orelse .peer_transport, connection.close_reason.?);
+    }
 }
 
 test "TLS server closes a silent handshake after the configured timeout" {
