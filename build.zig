@@ -507,7 +507,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(streaming_lifecycle);
 
     const run_streaming_lifecycle = b.addRunArtifact(streaming_lifecycle);
-    if (b.args) |args| run_streaming_lifecycle.addArgs(args);
+    run_streaming_lifecycle.addPassthruArgs();
     const run_streaming_lifecycle_step = b.step("run-streaming-lifecycle", "Run the raw streaming lifecycle example (normal, interrupt, or pre_handler_failure)");
     run_streaming_lifecycle_step.dependOn(&run_streaming_lifecycle.step);
 
