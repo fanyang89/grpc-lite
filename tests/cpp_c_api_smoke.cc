@@ -32,6 +32,20 @@ static_assert(offsetof(grpc_lite_channel_options,
                        max_response_header_list_size) ==
               offsetof(grpc_lite_channel_options, logger) + sizeof(void *));
 
+static_assert(offsetof(grpc_lite_channel_options, max_unary_calls) ==
+              offsetof(grpc_lite_channel_options, max_response_header_list_size) + 8);
+static_assert(offsetof(grpc_lite_channel_options, max_unary_request_bytes) ==
+              offsetof(grpc_lite_channel_options, max_unary_calls) + 8);
+static_assert(std::is_standard_layout_v<grpc_lite_unary_admission_stats>);
+static_assert(offsetof(grpc_lite_unary_admission_stats, struct_size) == 0);
+
+static_assert(offsetof(grpc_lite_channel_options, max_streams) ==
+              offsetof(grpc_lite_channel_options, max_unary_request_bytes) + 8);
+static_assert(offsetof(grpc_lite_channel_options, max_stream_buffer_bytes) ==
+              offsetof(grpc_lite_channel_options, max_streams) + 8);
+static_assert(std::is_standard_layout_v<grpc_lite_stream_admission_stats>);
+static_assert(offsetof(grpc_lite_stream_admission_stats, struct_size) == 0);
+
 int main() {
   grpc_lite_unary_options options = GRPC_LITE_UNARY_OPTIONS_INIT;
   grpc_lite_channel_options channel_options = GRPC_LITE_CHANNEL_OPTIONS_INIT;
@@ -67,6 +81,18 @@ int main() {
   assert(channel_options.initial_backoff_ns == UINT64_C(1000000000));
   assert(channel_options.max_backoff_ns == UINT64_C(120000000000));
   assert(channel_options.max_response_header_list_size == UINT64_C(65536));
+  assert(channel_options.max_streams == 1024);
+  assert(channel_options.max_stream_buffer_bytes == UINT64_C(1073741824));
+  grpc_lite_stream_admission_stats stream_stats = GRPC_LITE_STREAM_ADMISSION_STATS_INIT;
+  assert(stream_stats.struct_size == sizeof(stream_stats));
+  assert(grpc_lite_channel_get_stream_admission_stats(nullptr, &stream_stats) ==
+         GRPC_LITE_ERROR_INVALID_ARGUMENT);
+  assert(channel_options.max_unary_calls == 4096);
+  assert(channel_options.max_unary_request_bytes == UINT64_C(67108864));
+  grpc_lite_unary_admission_stats stats = GRPC_LITE_UNARY_ADMISSION_STATS_INIT;
+  assert(stats.struct_size == sizeof(stats));
+  assert(grpc_lite_channel_get_unary_admission_stats(nullptr, &stats) ==
+         GRPC_LITE_ERROR_INVALID_ARGUMENT);
   grpc_lite_channel *channel = reinterpret_cast<grpc_lite_channel *>(1);
   const grpc_lite_bytes_view invalid_target = {
       reinterpret_cast<const std::uint8_t *>("invalid"), 7};

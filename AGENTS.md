@@ -77,6 +77,8 @@ authoritative: change it before implementing a feature with a different decision
 | Per-message compression | Selected | Only `identity` and `gzip` |
 | GOAWAY connection replacement | Selected | New calls use a new connection; no RPC retry |
 | Graceful server drain | Selected | Stop admission, send GOAWAY, wait with timeout |
+| Client unary admission | Selected | Per-Channel retained unary count and logical request-byte caps; Zig and C/C++ configuration and snapshots; streaming admission is specified separately |
+| Client streaming admission | Selected | Per-Channel retained stream count and sum of configured inbound/outbound buffer capacities; reservations survive Channel teardown until stream destruction; Zig and C/C++ configuration and snapshots |
 | Server resource limits | Selected | Aggregate connection cap, per-connection stream cap, absolute cleartext preface timeout, and idle timeout only while no inbound RPC streams are active |
 | Native Zig TLS and ALPN | Selected | Optional mbedTLS; TLS 1.2+, mandatory `h2`, explicit PEM credentials |
 | Transpiled-C release bundles | Selected | Target-specific insecure Linux x86_64 and ARM64 packages; native CI packaging and no-Zig consumers |

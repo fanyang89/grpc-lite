@@ -55,6 +55,39 @@ the stream with `INTERNAL_ERROR`, or closes the connection if reset submission f
 reconnects with bounded exponential backoff without replaying submitted RPCs. Unsubmitted
 unary calls retain their original deadlines while waiting for a connection.
 
+ABI 1.7 appends `max_unary_calls` (default 4096) and `max_unary_request_bytes`
+(default 64 MiB) to `grpc_lite_channel_options`; the C++ `ChannelOptions` uses the
+same fields. Both limits must be nonzero and fit `size_t`. Older option prefixes
+retain the defaults for absent fields. Initialize options with
+`GRPC_LITE_CHANNEL_OPTIONS_INIT` and preserve `struct_size`.
+
+Unary quota rejection returns a result with gRPC `RESOURCE_EXHAUSTED`, not a C API
+error. The limits cover retained unary operations, including construction and result
+copying. Bytes charge the method path, five-byte frame header, uncompressed payload,
+and raw metadata keys/values, not total heap usage or response storage.
+
+Initialize `grpc_lite_unary_admission_stats` with
+`GRPC_LITE_UNARY_ADMISSION_STATS_INIT`, then call
+`grpc_lite_channel_get_unary_admission_stats`. C++ provides
+`Channel::GetUnaryAdmissionStats(UnaryAdmissionStats*)`. Snapshots report retained
+calls, retained request bytes, and a saturating quota-rejection count. They are
+thread-safe but must not race Channel destruction. These symbols require ABI 1.7
+or newer and exclude streaming.
+
+Streaming has a separate default admission
+budget of 1024 retained streams and 1 GiB of configured aggregate buffer capacity
+(64 streams at the default 8 MiB per direction). A rejected stream open returns
+`GRPC_LITE_ERROR_WOULD_BLOCK`; the grpcpp facade maps it to `RESOURCE_EXHAUSTED`.
+ABI 1.8 appends `max_streams` and `max_stream_buffer_bytes` to Channel options;
+both must be nonzero and fit `size_t`. Old prefixes retain the defaults. Initialize
+`grpc_lite_stream_admission_stats` with `GRPC_LITE_STREAM_ADMISSION_STATS_INIT` and
+call `grpc_lite_channel_get_stream_admission_stats`; C++ exposes
+`Channel::GetStreamAdmissionStats(StreamAdmissionStats*)`. These new symbols require
+ABI 1.8 or newer. Snapshots report `retained_streams`, `reserved_buffer_bytes`, and
+saturating `rejected_streams`. Buffer bytes are reserved capacities, not current
+occupancy or total heap usage. Closed streams still held by the application retain
+their reservation until their handle and transport ownership are both released.
+
 Use `grpc_lite_channel_shutdown` to stop admission and active work, then
 `grpc_lite_channel_wait` before exclusive destruction when calls may be concurrent.
 

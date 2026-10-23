@@ -41,7 +41,7 @@ inline Status ErrorStatus(grpc_lite::Error error) {
       code = StatusCode::OUT_OF_RANGE;
       break;
     case grpc_lite::ErrorCode::WouldBlock:
-      code = StatusCode::INTERNAL;
+      code = StatusCode::RESOURCE_EXHAUSTED;
       break;
     case grpc_lite::ErrorCode::Internal:
       code = StatusCode::INTERNAL;

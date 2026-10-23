@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define GRPC_LITE_ABI_MAJOR 1u
-#define GRPC_LITE_ABI_MINOR 6u
+#define GRPC_LITE_ABI_MINOR 8u
 #define GRPC_LITE_ABI_VERSION \
   ((GRPC_LITE_ABI_MAJOR << 16) | GRPC_LITE_ABI_MINOR)
 
@@ -147,11 +147,48 @@ typedef struct grpc_lite_channel_options {
   const grpc_lite_logger *logger;
   /* Finite cumulative response metadata limit; valid range is 1..UINT32_MAX. */
   uint64_t max_response_header_list_size;
+  /* Nonzero retained unary limits. Bytes charge logical request data, not total heap. */
+  uint64_t max_unary_calls;
+  uint64_t max_unary_request_bytes;
+  /* Nonzero retained stream count and sum of configured inbound/outbound capacities. */
+  uint64_t max_streams;
+  uint64_t max_stream_buffer_bytes;
 } grpc_lite_channel_options;
 
 #define GRPC_LITE_CHANNEL_OPTIONS_INIT \
   { sizeof(grpc_lite_channel_options), 0, UINT64_C(1000000000), \
-    UINT64_C(120000000000), 1600, 20, NULL, UINT64_C(65536) }
+    UINT64_C(120000000000), 1600, 20, NULL, UINT64_C(65536), 4096, UINT64_C(67108864), \
+    1024, UINT64_C(1073741824) }
+
+typedef struct grpc_lite_unary_admission_stats {
+  size_t struct_size;
+  uint64_t retained_calls;
+  uint64_t retained_request_bytes;
+  uint64_t rejected_calls;
+} grpc_lite_unary_admission_stats;
+
+#define GRPC_LITE_UNARY_ADMISSION_STATS_INIT \
+  { sizeof(grpc_lite_unary_admission_stats), 0, 0, 0 }
+
+/* Thread-safe snapshot; initialize out_stats with the macro above.
+ * Do not race channel destruction. Unknown output tail bytes are untouched. */
+grpc_lite_error grpc_lite_channel_get_unary_admission_stats(
+    grpc_lite_channel *channel, grpc_lite_unary_admission_stats *out_stats);
+
+typedef struct grpc_lite_stream_admission_stats {
+  size_t struct_size;
+  uint64_t retained_streams;
+  uint64_t reserved_buffer_bytes;
+  uint64_t rejected_streams;
+} grpc_lite_stream_admission_stats;
+
+#define GRPC_LITE_STREAM_ADMISSION_STATS_INIT \
+  { sizeof(grpc_lite_stream_admission_stats), 0, 0, 0 }
+
+/* Thread-safe snapshot; initialize out_stats with the macro above.
+ * Do not race channel destruction. Unknown output tail bytes are untouched. */
+grpc_lite_error grpc_lite_channel_get_stream_admission_stats(
+    grpc_lite_channel *channel, grpc_lite_stream_admission_stats *out_stats);
 
 /* Creates a connected insecure channel. Hostnames require a Runtime. */
 grpc_lite_error grpc_lite_channel_create(
