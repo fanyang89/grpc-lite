@@ -292,6 +292,10 @@ was checked against `25643b1` (2026-10-23). It describes existing behavior, not 
 limits. API contracts remain in [Zig](zig-api.md#unary-admission) and
 [C/C++](c-cpp-api.md#managed-channels).
 
+For the subsequent Zig Channel/Server operational snapshot fields, sampling rules and
+exclusions, see [Operational snapshots](zig-api.md#operational-snapshots). Their addition
+does not change this historical baseline or complete the validation gaps below.
+
 ### Accounting boundaries
 
 **Configured capacity** is permission to retain data, not preallocated memory.
