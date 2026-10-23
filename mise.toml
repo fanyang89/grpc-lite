@@ -31,6 +31,14 @@ run = "tools/package_transpiled_c.sh ${GRPC_LITE_TRANSPILED_C_DIST_DIR:-.zig-cac
 description = "Verify generated C bundle reproducibility"
 run = ".mise/tasks/check-transpiled-c"
 
+[tasks.check-release-version]
+description = "Check pre-tag metadata and documentation versions (optional --tag vX.Y.Z)"
+run = "python3 tools/check_release_version.py"
+
+[tasks.test-release-version]
+description = "Test release-version checks with deliberate mismatches"
+run = "python3 tests/check_release_version_test.py"
+
 [tasks.test]
 description = "Run all tests"
 run = "zig build test --summary all"

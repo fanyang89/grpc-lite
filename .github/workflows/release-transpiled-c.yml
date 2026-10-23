@@ -48,15 +48,7 @@ jobs:
           persist-credentials: false
 
       - name: Validate tag
-        run: |
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          version=${GITHUB_REF_NAME#v}
-          zon=$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)",$/\1/p' build.zig.zon)
-          cmake=$(sed -n 's/^project(grpc_lite VERSION \([^ ]*\) LANGUAGES C)$/\1/p' CMakeLists.txt)
-          config=$(sed -n 's/^set(PACKAGE_VERSION "\([^"]*\)")$/\1/p' cmake/grpc_liteConfigVersion.cmake)
-          test "$version" = "$zon"
-          test "$version" = "$cmake"
-          test "$version" = "$config"
+        run: python3 tools/check_release_version.py --tag "$GITHUB_REF_NAME"
 
       - name: Install pinned mise and Zig
         uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2

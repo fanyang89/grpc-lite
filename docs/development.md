@@ -39,6 +39,8 @@ mise run test-consumer-cpp
 mise run transpile-c
 mise run package-transpiled-c
 mise run check-transpiled-c
+mise run check-release-version
+mise run test-release-version
 mise run prepare-network-deps
 mise run prepare-tls-deps
 mise run prepare-gperftools
@@ -93,6 +95,62 @@ remains selected and is validated by the separate TLS tasks above. Fully offline
 must stage those dependencies as hashed `file://` archives and set
 `GRPC_LITE_NO_NETWORK=ON`. A colocated SHA-256 sidecar detects corruption but is not, by
 itself, publisher authentication.
+
+## Pre-tag version consistency
+
+Use this procedure on the exact candidate commit before creating a release tag. It
+checks consistency, not whether a version has already been published or which version
+should come next. Release selection and publication still require maintainer approval.
+
+1. Reconcile the candidate with current upstream history and releases first:
+
+   ```bash
+   git rev-parse HEAD origin/main
+   git ls-remote origin refs/heads/main 'refs/tags/v*'
+   gh release list --repo fanyang89/grpc-lite
+   ```
+
+   Inspect the version files at the relevant tag commits, not just on the working
+   branch. At the issue #49 audit, main `25643b1` had internally consistent `0.4.0`
+   metadata; Latest `v0.5.0` (`f284fe5`) and prerelease `v0.6.0` (`f256a25`) had
+   matching `0.5.0` and `0.6.0` metadata respectively on separate release history.
+   This is not evidence that published bundles are wrong and is not a reason to
+   blindly bump main or retag an existing release.
+2. For an approved new version, update `build.zig.zon`, the `project` version in
+   `CMakeLists.txt`, and `cmake/grpc_liteConfigVersion.cmake` together. Update concrete
+   `grpc-lite-transpiled-c-<version>-linux-<arch>` examples in `README.md` and `docs/`
+   (currently `docs/c-cpp-api.md`). These examples follow the source checkout's version,
+   not GitHub's Latest badge. Do not edit dependency/toolchain versions as part of a
+   project version bump. Generated C and manifests are regenerated, never hand-edited
+   or committed.
+3. Run the cheap source check and its deliberate-mismatch regression:
+
+   ```bash
+   mise run check-release-version
+   mise run test-release-version
+   # Set candidate_tag to the approved vMAJOR.MINOR.PATCH, without creating a tag.
+   mise run check-release-version --tag "$candidate_tag"
+   ```
+
+   The checker rejects missing/duplicate/malformed numeric versions, inconsistent
+   Zig/CMake/package versions, stale concrete bundle examples anywhere under `docs/`
+   or in `README.md`, and a proposed tag that differs from the source version.
+   It is also used by packaging and the existing tag-release validation step.
+4. After `mise install` and `mise run bootstrap`, run the existing
+   `mise run check-transpiled-c` on native Linux x86_64 and ARM64 runners. Packaging
+   checks the generated manifest's project version, source commit, dirty state, Zig
+   version, target, optimization, and TLS flag; the task also checks reproducibility
+   and checksums. Run `mise run test-consumer-cmake-c` to exercise the no-Zig/offline
+   CMake consumer, including rejection of a mismatched manifest. The lightweight
+   regression uses fixture C payloads; it does not replace these real generation and
+   consumer checks. Commit the candidate and rerun packaging from a clean tree so
+   release manifests identify that commit with `dirty: false`.
+5. Require `mise run check` before pushing, and review validation for the exact clean
+   candidate SHA before authorizing a tag. No tag/push/publish is performed by the
+   version checker. The existing release workflow still runs full validation on the
+   tag SHA, verifies tag/version agreement, clean manifest provenance, both native
+   bundles and their exact no-Zig consumers, and rechecks the remote tag before
+   publishing. Pre-tag checks complement rather than replace these release gates.
 
 ## Coverage
 

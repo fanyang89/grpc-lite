@@ -43,6 +43,11 @@ jobs:
       - name: Validate workflows
         run: mise run ci-lint
 
+      - name: Check release versions and mismatch regressions
+        run: |
+          mise run check-release-version
+          mise run test-release-version
+
   core-test:
     name: Core (${{ matrix.arch }}, ${{ matrix.optimize }})
     strategy:

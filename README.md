@@ -124,6 +124,8 @@ mise run check
 
 See the [development guide](docs/development.md) for individual tasks and build options.
 
+Release maintainers: follow the [pre-tag version consistency procedure](docs/development.md#pre-tag-version-consistency).
+
 ## License
 
 [MIT](LICENSE)
