@@ -1,4 +1,4 @@
-//! Raw loopback lifecycle: normal completion or cancellation during graceful drain.
+//! Raw loopback lifecycle: completion, cancellation during drain, or pre-handler failure.
 //! Run through tests/run_streaming_lifecycle.sh for an external shutdown watchdog.
 const std = @import("std");
 const grpc = @import("grpc_lite");
@@ -14,12 +14,13 @@ const limits: grpc.StreamBufferLimits = .{
     .max_inbound_buffer_size = window_size,
     .max_outbound_buffer_size = payload.len + 5,
 };
-const Mode = enum { normal, interrupt };
+const Mode = enum { normal, interrupt, pre_handler_failure };
 
 const Handler = struct {
     io: std.Io,
     call: ?grpc.ServerCall = null,
     responses_queued: std.Io.Event = .unset,
+    starts: usize = 0,
     requests: usize = 0,
     half_closes: usize = 0,
     sent: usize = 0,
@@ -31,6 +32,7 @@ const Handler = struct {
 
     fn onStart(context: ?*anyopaque, stream: grpc.ServerStream, _: *grpc.ServerContext) !void {
         const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.starts += 1;
         errdefer self.responses_queued.set(self.io);
         // Only this owning handle may escape the callback, never ServerStream.
         self.call = try stream.retain();
@@ -114,8 +116,8 @@ const Capture = struct {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 2) return error.ExpectedNormalOrInterrupt;
-    const mode = std.meta.stringToEnum(Mode, args[1]) orelse return error.ExpectedNormalOrInterrupt;
+    if (args.len != 2) return error.ExpectedLifecycleMode;
+    const mode = std.meta.stringToEnum(Mode, args[1]) orelse return error.ExpectedLifecycleMode;
 
     // These stack contexts and init.io/init.gpa outlive both joined loops, on
     // success AND every error path. Only main waits; callbacks only signal.
@@ -166,7 +168,10 @@ pub fn main(init: std.process.Init) !void {
         .write_low_watermark_bytes = 8 * 1024,
     });
     defer channel.deinit();
-    var stream = try channel.openStream(method, .{
+    // A valid but unregistered method deterministically returns UNIMPLEMENTED
+    // without starting Handler; no deadline race or transport hook is needed.
+    const request_method: []const u8 = if (mode == .pre_handler_failure) "/example.Lifecycle/Missing" else method;
+    var stream = try channel.openStream(request_method, .{
         .limits = limits,
         .timeout_ns = 10 * std.time.ns_per_s,
     }, .{
@@ -179,16 +184,28 @@ pub fn main(init: std.process.Init) !void {
     try stream.send(payload, .{});
     try stream.closeSend(); // Ends requests, not the response direction.
 
-    handler.responses_queued.waitUncancelable(init.io);
+    // Submission/deadline failures may never create a server handler. Observe
+    // client progress first: on_terminal publishes terminal before this event.
     capture.responses_received.waitUncancelable(init.io);
-    const call = handler.call orelse return error.MissingRetainedCall;
-    if (call.isTerminal() or capture.terminal.isSet()) return error.PrematureTermination;
-    server.shutdownGracefully(5 * std.time.ns_per_s);
-    switch (mode) {
-        .normal => try call.finish(.ok, &.{}),
-        .interrupt => stream.cancel(),
+    if (capture.terminal.isSet()) {
+        if (mode != .pre_handler_failure) return error.PrematureTermination;
+        // Do not wait for server publication or inspect handler.call here.
+        server.shutdown();
+    } else {
+        if (mode == .pre_handler_failure) return error.ExpectedPreHandlerFailure;
+        // Two responses imply handler execution, but this event is still needed
+        // to publish the retained handle before main accesses it.
+        handler.responses_queued.waitUncancelable(init.io);
+        const call = handler.call orelse return error.MissingRetainedCall;
+        if (call.isTerminal() or capture.terminal.isSet()) return error.PrematureTermination;
+        server.shutdownGracefully(5 * std.time.ns_per_s);
+        switch (mode) {
+            .normal => try call.finish(.ok, &.{}),
+            .interrupt => stream.cancel(),
+            .pre_handler_failure => unreachable,
+        }
+        capture.terminal.waitUncancelable(init.io);
     }
-    capture.terminal.waitUncancelable(init.io);
     // Keep the Channel alive to flush cancellation before joining the draining
     // Server. A forced drain timeout is NOT accepted as a successful cancellation.
     server.wait();
@@ -196,13 +213,24 @@ pub fn main(init: std.process.Init) !void {
     channel.wait();
 
     // Callback-owned counters are read only after the loops have joined.
-    const expected_code: grpc.StatusCode = if (mode == .normal) .ok else .cancelled;
-    const expected_reason: grpc.ServerTerminalReason = if (mode == .normal) .completed else .peer_cancelled;
-    if (handler.failed or handler.requests != 1 or handler.half_closes != 1 or
-        handler.sent != response_count or handler.blocked != 1 or handler.writable != 1 or
-        handler.terminals != 1 or handler.reason != expected_reason or !call.isTerminal() or
-        !capture.valid or capture.messages != response_count or capture.terminals != 1 or
-        capture.code != expected_code) return error.UnexpectedLifecycle;
+    const expected_code: grpc.StatusCode = switch (mode) {
+        .normal => .ok,
+        .interrupt => .cancelled,
+        .pre_handler_failure => .unimplemented,
+    };
+    if (!capture.valid or capture.terminals != 1 or capture.code != expected_code)
+        return error.UnexpectedClientTerminal;
+    if (mode == .pre_handler_failure) {
+        if (handler.starts != 0 or handler.call != null or handler.terminals != 0 or
+            handler.responses_queued.isSet() or capture.messages != 0)
+            return error.UnexpectedHandlerExecution;
+    } else {
+        const expected_reason: grpc.ServerTerminalReason = if (mode == .normal) .completed else .peer_cancelled;
+        if (handler.failed or handler.starts != 1 or handler.requests != 1 or handler.half_closes != 1 or
+            handler.sent != response_count or handler.blocked != 1 or handler.writable != 1 or
+            handler.terminals != 1 or handler.reason != expected_reason or !handler.call.?.isTerminal() or
+            capture.messages != response_count) return error.UnexpectedLifecycle;
+    }
 
     // Terminal notification alone does not release the retained admission slot.
     const retained = channel.streamAdmissionStats();
@@ -214,9 +242,13 @@ pub fn main(init: std.process.Init) !void {
     const released = channel.streamAdmissionStats();
     if (released.retained_streams != 0 or released.reserved_buffer_bytes != 0)
         return error.AdmissionNotReleased;
-    handler.call.?.deinit();
+    if (handler.call) |*call| call.deinit();
     handler.call = null;
 
+    if (mode == .pre_handler_failure) {
+        std.debug.print("EXPECTED_FAILURE streaming-lifecycle mode=pre_handler_failure status=unimplemented handler_started=0 server_terminal=0 server_event=unset messages=0 client_terminal=1 released=1 joined=1\n", .{});
+        return;
+    }
     // The smoke contract is emitted only after checking status, readiness, joins,
     // and both handle releases; a configured limit alone cannot produce PASS.
     std.debug.print("PASS streaming-lifecycle mode={s} status={s} backpressure=1 writable=1 half_close=1 messages=2 client_terminal=1 server_terminal=1 released=1 drained=1\n", .{ @tagName(mode), @tagName(expected_code) });
