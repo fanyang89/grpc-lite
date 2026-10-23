@@ -5,6 +5,21 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work_dir="$project_root/.zig-cache/official/streaming-soak"
 peer_pid=
 client_pid=
+gnu_timeout_paths=(/usr/bin/timeout /bin/timeout)
+
+select_gnu_timeout() {
+  local candidate version
+  # Prefer system coreutils over PATH entries that mise tools may shadow.
+  for candidate in "${gnu_timeout_paths[@]}" "$(type -P timeout || true)"; do
+    [[ -x "$candidate" ]] || continue
+    if version=$("$candidate" --version 2>/dev/null) && [[ "$version" == 'timeout (GNU coreutils)'* ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf 'GNU coreutils timeout is required (--signal and --kill-after with process-group cleanup); no compatible implementation found\n' >&2
+  return 2
+}
 
 configure() {
   case ${STREAMING_SOAK_MODE:-smoke} in
@@ -126,16 +141,20 @@ main() {
   # Only the outer invocation initializes artifacts, before even validating
   # configuration: invalid inputs must not leave stale success evidence.
   for log in harness build server client; do : >"$work_dir/$log.log"; done
-  local status=0 interrupted=0 runner_pid
+  local status=0 interrupted=0 runner_pid gnu_timeout
   configure >>"$work_dir/harness.log" 2>&1 || status=$?
   if ((status == 0 && $# != 0)); then
     printf 'configure via STREAMING_SOAK_* environment variables, not arguments\n' >>"$work_dir/harness.log"
     status=2
   fi
   if ((status == 0)); then
+    gnu_timeout=$(select_gnu_timeout 2>>"$work_dir/harness.log") || status=$?
+  fi
+  if ((status == 0)); then
+    printf 'gnu_timeout=%s\n' "$gnu_timeout" >>"$work_dir/harness.log"
     printf 'Streaming soak running; logs: %s (overall timeout %ss)\n' "$work_dir" "$overall_timeout"
     # GNU timeout covers builds AND all children; retain any validation output.
-    timeout --signal=TERM --kill-after=5s "${overall_timeout}s" bash "${BASH_SOURCE[0]}" --run \
+    "$gnu_timeout" --signal=TERM --kill-after=5s "${overall_timeout}s" bash "${BASH_SOURCE[0]}" --run \
       >>"$work_dir/harness.log" 2>&1 &
     runner_pid=$!
     # Forward signals sent only to this wrapper PID to timeout's process group.

@@ -84,8 +84,12 @@ STREAMING_SOAK_DURATION_SECONDS=60 STREAMING_SOAK_TIMEOUT_SECONDS=360 \
 ```
 
 The overall GNU `timeout` includes focused peer compilation, harness unit tests,
-startup, traffic and cleanup; it sends TERM, then KILL after five seconds. On shared
-validation hosts hold the exclusive lock for the **whole** invocation (including builds):
+startup, traffic and cleanup; it sends TERM, then KILL after five seconds. The runner
+verifies GNU coreutils identity, preferring `/usr/bin/timeout`, then `/bin/timeout`,
+then the `timeout` executable on PATH; it does not use incompatible mise shadows.
+If none is compatible, it records a fresh diagnostic and failure status before any
+build. The selected executable is logged; PATH is not rewritten. On shared validation
+hosts hold the exclusive lock for the **whole** invocation (including builds):
 
 ```bash
 flock -x /home/fanmi/tmp/pi/grpc-lite-validation.lock mise run soak-streaming

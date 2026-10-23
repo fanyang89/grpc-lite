@@ -94,4 +94,64 @@ for log in harness build server client; do
   grep -qx 'outer invocation marker' "$fixture_logs/$log.log"
 done
 grep -qx 'internal-seed=8' "$fixture_logs/harness.log"
+# A mise-like incompatible timeout shadows PATH. The real outer runner must
+# select system GNU timeout instead; stop its child before any build via a tiny
+# failing unit-test fixture, exercising the actual GNU options and exit status.
+shadow_dir="$test_dir/shadow"
+mkdir -p "$shadow_dir"
+cat >"$shadow_dir/timeout" <<'EOF'
+#!/bin/bash
+printf 'called\n' >>"$0.called"
+printf 'timeout (incompatible fixture)\n'
+exit 64
+EOF
+chmod +x "$shadow_dir/timeout"
+selected_timeout=$(PATH="$shadow_dir:$PATH" select_gnu_timeout)
+[[ "$selected_timeout" == /usr/bin/timeout || "$selected_timeout" == /bin/timeout ]]
+printf '#!/bin/bash\nexit 23\n' >"$fixture_root/tests/official/run_streaming_soak_test.sh"
+status=0
+PATH="$shadow_dir:$PATH" bash "$runner" >"$test_dir/output.log" 2>&1 || status=$?
+[[ "$status" == 23 && ! -e "$shadow_dir/timeout.called" ]]
+grep -qx "gnu_timeout=$selected_timeout" "$fixture_logs/harness.log"
+grep -qx 'harness_exit=23' "$fixture_logs/harness.log"
+
+# A verified PATH installation is supported when no system candidate exists.
+fallback_dir="$test_dir/fallback"
+mkdir -p "$fallback_dir"
+ln -s "$selected_timeout" "$fallback_dir/timeout"
+(
+  gnu_timeout_paths=()
+  [[ $(PATH="$fallback_dir:$PATH" select_gnu_timeout) == "$fallback_dir/timeout" ]]
+)
+
+# Simulate missing system candidates locally; do not mutate host installations.
+# An incompatible PATH command must produce fresh diagnostics/status, not launch
+# the workload, with both absent artifacts and pre-existing success artifacts.
+for previous in absent success; do
+  rm -rf "$fixture_logs"
+  if [[ "$previous" == success ]]; then
+    mkdir -p "$fixture_logs"
+    for log in harness build server client; do
+      printf 'PASS old success\nharness_exit=0\n' >"$fixture_logs/$log.log"
+    done
+  fi
+  status=0
+  bash -c '
+    source "$1"
+    gnu_timeout_paths=()
+    PATH="$2:$PATH"
+    main
+  ' _ "$runner" "$shadow_dir" >"$test_dir/output.log" 2>&1 || status=$?
+  [[ "$status" == 2 ]]
+  grep -q 'GNU coreutils timeout is required' "$fixture_logs/harness.log"
+  grep -qx 'harness_exit=2' "$fixture_logs/harness.log"
+  if grep -qE 'PASS|harness_exit=0' "$fixture_logs/harness.log"; then
+    printf 'stale success artifact after GNU timeout selection failed\n' >&2
+    exit 1
+  fi
+  cmp "$test_dir/output.log" "$fixture_logs/harness.log"
+  for log in build server client; do
+    [[ -f "$fixture_logs/$log.log" && ! -s "$fixture_logs/$log.log" ]]
+  done
+done
 printf '%s\n' 'streaming soak harness unit tests passed'
