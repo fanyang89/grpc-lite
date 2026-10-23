@@ -96,6 +96,11 @@ done
 grep -qx 'internal-seed=8' "$fixture_logs/harness.log"
 # Save a compatible executable before shadowing PATH; it may be PATH-only.
 selected_timeout=$(select_gnu_timeout)
+# Anchor relative selections before reusing them as targets in another directory;
+# do not dereference symlinks or split paths containing spaces.
+if [[ "$selected_timeout" != /* ]]; then
+  selected_timeout="$PWD/$selected_timeout"
+fi
 system_timeout=$(PATH='' select_gnu_timeout 2>/dev/null) || system_timeout=
 # A mise-like incompatible timeout shadows PATH. Where system GNU is installed,
 # exercise its precedence and the actual GNU options with a tiny child fixture
@@ -169,5 +174,14 @@ if [[ -n "$system_timeout" ]]; then
   cp "$project_root/tests/official/run_streaming_soak_test.sh" "$path_only_root/tests/official/"
   PATH="$fallback_dir:$PATH" bash "$path_only_root/tests/official/run_streaming_soak_test.sh"
   printf '%s\n' 'PATH-only mandatory shell suite passed'
+  # Exercise a relative PATH entry containing spaces and a valid symlink,
+  # not just the absolute fallback path used by the preceding invocation.
+  mkdir -p "$path_only_root/relative tools/bin"
+  ln -s "$selected_timeout" "$path_only_root/relative tools/bin/timeout"
+  (
+    cd "$path_only_root"
+    PATH="relative tools/bin:$PATH" bash tests/official/run_streaming_soak_test.sh
+  )
+  printf '%s\n' 'Relative PATH-only mandatory shell suite passed'
 fi
 printf '%s\n' 'streaming soak harness unit tests passed'
