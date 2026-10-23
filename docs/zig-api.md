@@ -322,8 +322,9 @@ See `examples/echo_server.zig` and `examples/echo_client.zig` for complete progr
 caller-owned values without allocating or invoking callbacks. The root aliases are
 `grpc.ChannelOperationalStats` (`grpc.channel.OperationalStats`) and
 `grpc.ServerOperationalStats` (`grpc.server.OperationalStats`). No snapshot needs
-`deinit`; it contains no borrowed mutable storage. These APIs are Zig-only; the existing
-C/C++ admission snapshots are unchanged.
+`deinit`; it contains no borrowed mutable storage. [C getters and thin C++ wrappers](c-cpp-api.md#operational-snapshots)
+expose the same metrics starting with ABI 1.9, with flat admission fields. Existing
+C/C++ admission options, snapshot layouts, getters, and minimum sizes are unchanged.
 
 Both methods may run concurrently with supported operations, `shutdown`, and `wait`,
 and may be called after `wait` while the owner is still alive. **Owner `deinit` requires

@@ -121,6 +121,114 @@ trailer blocks in an RPC. Oversize blocks are withheld atomically and finish onl
 with `RESOURCE_EXHAUSTED`; an accepted initial block survives oversized trailers and the
 connection remains reusable.
 
+## Operational Snapshots
+
+ABI **1.9** adds `grpc_lite_channel_get_operational_stats` and
+`grpc_lite_server_get_operational_stats`, plus const thin C++ methods
+`grpc_lite::Channel::GetOperationalStats(ChannelOperationalStats*)` and
+`grpc_lite::Server::GetOperationalStats(ServerOperationalStats*)`. These are not
+`grpc::Channel` / `grpc::Server` grpcpp APIs. Existing admission options, snapshot
+layouts, getters, and minimum sizes remain unchanged.
+
+C outputs have a `size_t struct_size` envelope and `uint64_t` metrics. Initialize
+with the matching macro; for example, given live Channel and Server handles:
+
+```c
+#include <grpc_lite/grpc_lite.h>
+
+void sample(grpc_lite_channel *channel, const grpc_lite_server *server) {
+  grpc_lite_channel_operational_stats cs =
+      GRPC_LITE_CHANNEL_OPERATIONAL_STATS_INIT;
+  grpc_lite_server_operational_stats ss =
+      GRPC_LITE_SERVER_OPERATIONAL_STATS_INIT;
+  grpc_lite_error ce = grpc_lite_channel_get_operational_stats(channel, &cs);
+  grpc_lite_error se = grpc_lite_server_get_operational_stats(server, &ss);
+  if (ce != GRPC_LITE_OK || se != GRPC_LITE_OK) return;
+  /* Consume cs and ss as independent samples, not a transaction. */
+}
+```
+
+Short outputs must end at a complete known metric boundary. The real minimum
+prefix macros end after the first metric, not after the envelope alone:
+
+- `GRPC_LITE_CHANNEL_OPERATIONAL_STATS_MIN_SIZE` is
+  `offsetof(grpc_lite_channel_operational_stats, unary_retained_calls) + sizeof(uint64_t)`.
+- `GRPC_LITE_SERVER_OPERATIONAL_STATS_MIN_SIZE` is
+  `offsetof(grpc_lite_server_operational_stats, admitted_connections) + sizeof(uint64_t)`.
+
+Both are currently 16 bytes on supported x86_64/ARM64 targets. Every subsequent
+complete metric boundary is supported; sizes at least `sizeof` the known structure
+are accepted for future extensions. Supply aligned writable storage for the declared
+extent. Only present known metrics are written: `struct_size` and any unknown tail
+are always preserved. Null output or an undersized/mid-field short size returns
+`GRPC_LITE_ERROR_INVALID_ARGUMENT` without writes. A null owner with valid output
+returns that error after zeroing its present known metrics. A valid live owner and
+valid output return `GRPC_LITE_OK`. Fabricated or destroyed non-null handles are
+invalid use, not safely detectable error arguments.
+
+C++ values have zero-default `std::uint64_t` metrics with the same flat names and
+units, but no `struct_size`, INIT call, or snapshot destruction requirement:
+
+```cpp
+#include <grpc_lite/grpc_lite.hpp>
+
+void Sample(const grpc_lite::Channel& channel, const grpc_lite::Server& server) {
+  grpc_lite::ChannelOperationalStats cs;
+  grpc_lite::ServerOperationalStats ss;
+  const grpc_lite::Error ce = channel.GetOperationalStats(&cs);
+  const grpc_lite::Error se = server.GetOperationalStats(&ss);
+  if (!ce.ok() || !se.ok()) return;
+  // Consume cs and ss as independent samples, not a transaction.
+}
+```
+
+Null C++ output and empty/moved-from owners return `ErrorCode::InvalidArgument`
+(including Server, not `InvalidState`); non-null outputs are cleared on error.
+Getters allocate nothing and invoke no callbacks. Snapshots are owning values without
+borrowed storage: copies survive owner destruction and require no deinit.
+**Getter calls still require a live owner.**
+Sampling may overlap supported operations, shutdown, and wait, including after wait.
+Synchronize shared output objects. Owner destruction and C++ owner moves require
+exclusive access: stop and join all readers first, even if client stream handles survive.
+
+See the native [complete field semantics](zig-api.md#operational-snapshots) for every
+field's units and lifetime boundary. The six C/C++ admission fields flatten native
+`unary_admission.{retained_calls, retained_request_bytes, rejected_calls}` with a
+`unary_` prefix and `stream_admission.{retained_streams, reserved_buffer_bytes,
+rejected_streams}` with a `stream_` prefix; all other names match. In particular:
+
+- Channel operational fields share one accounting lock, but admission is sampled
+  independently. Retained terminal handles are not active RPCs. Stream admission
+  reserves configured capacities, not current queue occupancy. Inbound queue charges
+  are decoded payload plus five bytes per frame (excluding decoder storage and
+  immediate callback delivery); outbound charges retain whole encoded frames until
+  fully consumed/destroyed, even during partial consumption. Terminal, detached,
+  application-retained queue charges can remain nonzero after wait. Reservation
+  release, terminal outcome, and queue destruction are distinct. Channel high-water
+  marks are lifetime aggregate peaks.
+- Server snapshots are approximate independent reactor samples. Streaming outbound
+  reservations include queued send commands and decrease with partial consumption;
+  unary responses and temporary encodings are excluded. Socket gauges charge owned
+  buffers through completion/discard, including in-flight writes, not peer delivery;
+  Server socket gauges exclude nghttp2/TLS-internal pending data. Server
+  `*_high_water_sum` fields sum non-simultaneous reactor peaks, not true global peaks.
+- Admission rejection counters count quota refusals. Server `rejected_connections`
+  excludes drain and initialization failures; `pre_ack_rejected_streams` counts
+  pre-ACK cap/defensive-guard refusals, excluding drain and allocation failures.
+  Decoder occupancy and generic post-ACK stream-cap rejection counts are unavailable,
+  not measured as zero. Channel terminal buckets are disjoint per accepted RPC;
+  Server close buckets are disjoint per admission-owning connection, counted at final
+  destruction with the first effective close reason. Rejected accepts and failures
+  before admission ownership are excluded from close counts.
+
+Event counters and Server aggregate sums saturate; lifetime high-water marks never
+decrease, and there is no reset. Samples are not global transactions. Neither snapshots
+nor reservations measure or bound heap use or RSS; queue charges are not allocation
+sizes or a deduplicated memory total. Spare capacity, decoder/metadata/HPACK storage, compression temporaries, TLS
+workspace, kernel buffers, allocator overhead/caches, and application copies are
+excluded. These APIs do not close the outstanding validation gaps in the
+[resource accounting evidence](development.md#resource-accounting-and-lifecycle-evidence).
+
 ## CMake Source Build
 
 Git checkouts and GitHub automatic “Source code” archives intentionally contain no
