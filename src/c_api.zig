@@ -207,6 +207,19 @@ const channel_options_stream_bytes_size = @offsetOf(ChannelOptions, "max_stream_
 
 const allocator = if (@import("builtin").is_test) std.testing.allocator else std.heap.c_allocator;
 
+// Only synchronous failing RPC-wrapper calls use this override. No handle may
+// escape it; successful handles retain the normal allocator/destroy contract.
+const RpcAllocationTest = if (@import("builtin").is_test) struct {
+    threadlocal var failing: ?*std.testing.FailingAllocator = null;
+} else struct {};
+
+fn rpcAllocator() std.mem.Allocator {
+    if (@import("builtin").is_test) {
+        if (RpcAllocationTest.failing) |failing| return failing.allocator();
+    }
+    return allocator;
+}
+
 const ChannelCreateOptions = struct {
     stream_admission: channel.StreamAdmissionOptions = .{},
     unary_admission: channel.UnaryAdmissionOptions = .{},
@@ -461,17 +474,18 @@ pub fn grpc_lite_channel_call_unary(
     const request_bytes = bytes(request) orelse return .invalid_argument;
     const options = parseUnaryOptions(options_pointer) orelse return .invalid_argument;
 
-    const storage = allocator.create(UnaryResultStorage) catch return .out_of_memory;
+    const rpc_allocator = rpcAllocator();
+    const storage = rpc_allocator.create(UnaryResultStorage) catch return .out_of_memory;
     // Error is a C status enum, not a Zig error union: errdefer would not run.
-    defer if (output.* == null) allocator.destroy(storage);
+    defer if (output.* == null) rpc_allocator.destroy(storage);
     storage.value = channelStorage(handle).value.callUnary(
-        allocator,
+        rpc_allocator,
         method,
         request_bytes,
         options,
     ) catch |err| blk: {
         if (err == error.UnaryAdmissionRejected) {
-            break :blk call.Result.init(allocator, .init(.resource_exhausted, "unary admission limit exceeded"), "") catch return .out_of_memory;
+            break :blk call.Result.init(rpc_allocator, .init(.resource_exhausted, "unary admission limit exceeded"), "") catch return .out_of_memory;
         }
         return switch (err) {
             error.OutOfMemory => .out_of_memory,
@@ -498,9 +512,10 @@ pub fn grpc_lite_channel_open_stream(
     const options = parseClientStreamOptions(options_pointer) orelse return .invalid_argument;
     const callbacks = parseClientStreamCallbacks(callbacks_pointer) orelse return .invalid_argument;
 
-    const storage = allocator.create(ClientStreamStorage) catch return .out_of_memory;
+    const rpc_allocator = rpcAllocator();
+    const storage = rpc_allocator.create(ClientStreamStorage) catch return .out_of_memory;
     // Error is a C status enum, not a Zig error union: errdefer would not run.
-    defer if (output.* == null) allocator.destroy(storage);
+    defer if (output.* == null) rpc_allocator.destroy(storage);
     storage.callbacks = callbacks;
     storage.ready = .init(false);
     storage.value = channelStorage(handle).value.openStream(method, options, .{
@@ -1986,6 +2001,78 @@ test "C allocation errors clear handles and restore admission after partial cons
     try std.testing.expectEqual(Error.ok, grpc_lite_channel_get_stream_admission_stats(handle, &stream_stats));
     try std.testing.expectEqualDeep(StreamAdmissionStats{}, stream_stats);
     try std.testing.expectEqual(baseline_bytes, failing.allocated_bytes - failing.freed_bytes);
+}
+
+test "C initial RPC wrapper and unary result copy allocation failures clear outputs" {
+    // Reuse the stopped-channel fixture so result copying is deterministic and
+    // neither allocator is mutated concurrently with a transport loop.
+    for ([_]bool{ false, true }) |reject_unary| {
+        var native = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var storage: ChannelStorage = .{ .value = try channel.Channel.init(native.allocator(), "127.0.0.1:1", .{
+            .reconnect = .{ .allow_initial_offline = true },
+            .unary_admission = .{ .max_request_bytes = if (reject_unary) 1 else 1024 },
+        }) };
+        defer storage.value.deinit();
+        const handle: *ChannelHandle = @ptrCast(&storage);
+        grpc_lite_channel_shutdown(handle);
+        grpc_lite_channel_wait(handle);
+        const native_bytes = native.allocated_bytes - native.freed_bytes;
+        var rejected_calls: u64 = 0;
+
+        // Offset zero fails the C storage itself, before native admission or
+        // construction. Offset one fails copying the nonempty status message:
+        // either the stopped-channel result or the quota-rejection fallback.
+        for (0..2) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+            const native_alloc_index = native.alloc_index;
+            var result: ?*UnaryResultHandle = @ptrFromInt(1);
+            {
+                RpcAllocationTest.failing = &failing;
+                defer RpcAllocationTest.failing = null;
+                try std.testing.expectEqual(Error.out_of_memory, grpc_lite_channel_call_unary(handle, view("/test.Echo/Unary"), view("request"), null, &result));
+            }
+            try std.testing.expectEqual(null, result);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            try std.testing.expectEqual(native_bytes, native.allocated_bytes - native.freed_bytes);
+            if (fail_index == 0 or reject_unary) try std.testing.expectEqual(native_alloc_index, native.alloc_index);
+            if (fail_index == 1 and reject_unary) rejected_calls += 1;
+            var stats: UnaryAdmissionStats = .{};
+            try std.testing.expectEqual(Error.ok, grpc_lite_channel_get_unary_admission_stats(handle, &stats));
+            try std.testing.expectEqualDeep(UnaryAdmissionStats{ .rejected_calls = rejected_calls }, stats);
+        }
+
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        const native_alloc_index = native.alloc_index;
+        var stream: ?*ClientStreamHandle = @ptrFromInt(1);
+        {
+            RpcAllocationTest.failing = &failing;
+            defer RpcAllocationTest.failing = null;
+            try std.testing.expectEqual(Error.out_of_memory, grpc_lite_channel_open_stream(handle, view("/test.Echo/Stream"), null, &RejectedOpenCallbacks.value, &stream));
+        }
+        try std.testing.expectEqual(null, stream);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        try std.testing.expectEqual(native_alloc_index, native.alloc_index);
+        var stream_stats: StreamAdmissionStats = .{};
+        try std.testing.expectEqual(Error.ok, grpc_lite_channel_get_stream_admission_stats(handle, &stream_stats));
+        try std.testing.expectEqualDeep(StreamAdmissionStats{}, stream_stats);
+
+        // Disarming restores the ordinary result/error mapping and ownership.
+        var result: ?*UnaryResultHandle = null;
+        try std.testing.expectEqual(Error.ok, grpc_lite_channel_call_unary(handle, view("/test.Echo/Unary"), view("request"), null, &result));
+        try std.testing.expectEqual(@as(i32, if (reject_unary) 8 else 14), grpc_lite_unary_result_status_code(result));
+        grpc_lite_unary_result_destroy(result);
+        if (reject_unary) rejected_calls += 1;
+        var stats: UnaryAdmissionStats = .{};
+        try std.testing.expectEqual(Error.ok, grpc_lite_channel_get_unary_admission_stats(handle, &stats));
+        try std.testing.expectEqualDeep(UnaryAdmissionStats{ .rejected_calls = rejected_calls }, stats);
+        try std.testing.expectEqual(Error.unavailable, grpc_lite_channel_open_stream(handle, view("/test.Echo/Stream"), null, &RejectedOpenCallbacks.value, &stream));
+        try std.testing.expectEqual(null, stream);
+        try std.testing.expectEqual(Error.ok, grpc_lite_channel_get_stream_admission_stats(handle, &stream_stats));
+        try std.testing.expectEqualDeep(StreamAdmissionStats{}, stream_stats);
+        try std.testing.expectEqual(native_bytes, native.allocated_bytes - native.freed_bytes);
+    }
 }
 
 test "C unary admission rejection is RESOURCE_EXHAUSTED without changing the ABI" {

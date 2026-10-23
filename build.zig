@@ -408,6 +408,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_cpp_native_api_test = b.addRunArtifact(cpp_native_api_test);
 
+    // Keep replacement new and C callback-capture stubs out of transport tests.
+    const cpp_client_stream_allocation_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    applySanitizers(cpp_client_stream_allocation_module, sanitizers);
+    cpp_client_stream_allocation_module.addIncludePath(b.path("include"));
+    cpp_client_stream_allocation_module.addCSourceFile(.{
+        .file = b.path("tests/cpp_client_stream_allocation_test.cc"),
+        .flags = &.{ "-std=c++17", "-fexceptions", "-fno-assume-sane-operator-new", "-Wall", "-Wextra", "-Werror" },
+    });
+    const cpp_client_stream_allocation_test = b.addExecutable(.{
+        .name = "cpp-client-stream-allocation-test",
+        .root_module = cpp_client_stream_allocation_module,
+    });
+    test_step.dependOn(&b.addRunArtifact(cpp_client_stream_allocation_test).step);
+
     const grpcpp_facade_test_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
