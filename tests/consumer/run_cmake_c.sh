@@ -86,6 +86,20 @@ run_isolated() {
         "$work_dir/negative-remote-override.log"
     rm -rf "$package_source/third_party/nghttp2"
 
+    # Build the raw example independently: Protobuf discovery is forbidden here,
+    # even though the existing typed generated-code checks below need Protobuf.
+    local raw_source="$work_dir/bounded-executor"
+    mkdir -p "$raw_source"
+    cp -R "$package_source/examples/cpp_bounded_executor/." "$raw_source/"
+    cmake -S "$raw_source" -B "$work_dir/build-bounded-executor" \
+        "${common[@]}" \
+        -DGRPC_LITE_SOURCE_DIR="$package_source" \
+        -DGRPC_LITE_TRANSPILED_C_DIR="$bundle_dir" \
+        -DGRPC_LITE_ENABLE_PROTOBUF=OFF \
+        -DCMAKE_DISABLE_FIND_PACKAGE_Protobuf=ON
+    cmake --build "$work_dir/build-bounded-executor" --target grpc_lite_bounded_executor
+    ctest --test-dir "$work_dir/build-bounded-executor" --output-on-failure
+
     cmake -S "$consumer_source" -B "$work_dir/build" \
         "${common[@]}" \
         -DGRPC_LITE_SOURCE_DIR="$package_source" \
@@ -243,7 +257,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     rm -rf /var/lib/apt/lists/*
 DOCKERFILE
     fi
-    docker run --rm --network none --user "$(id -u):$(id -g)" \
+    security_args=()
+    if [[ ${GRPC_LITE_CMAKE_CONSUMER_ALLOW_UNCONFINED_SECCOMP:-0} == 1 ]]; then
+        printf '%s\n' 'WARNING: disabling Docker seccomp for this trusted io_uring consumer test only' >&2
+        security_args+=(--security-opt seccomp=unconfined)
+    fi
+    docker run --rm --network none "${security_args[@]}" --user "$(id -u):$(id -g)" \
         -v "$work_dir:$work_dir" -v "$nghttp2_archive:$nghttp2_archive:ro" \
         -v "$cares_archive:$cares_archive:ro" \
         "$image" "$work_dir/source/tests/consumer/run_cmake_c.sh" "${isolated_args[@]}"
