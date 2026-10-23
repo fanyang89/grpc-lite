@@ -132,6 +132,10 @@ run = "scripts/interop.sh"
 description = "Run official grpc-go and generated C++ interoperability tests"
 run = "tests/official/run_unary.sh"
 
+[tasks.soak-streaming]
+description = "Run bounded native cleartext streaming soak (STREAMING_SOAK_MODE=smoke or extended)"
+run = "bash tests/official/run_streaming_soak.sh"
+
 [tasks.interop-tls]
 description = "Run TLS unary and streaming interoperability against grpc-go"
 depends = ["prepare-tls-deps"]

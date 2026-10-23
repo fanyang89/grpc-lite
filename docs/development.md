@@ -50,6 +50,7 @@ mise run fmt
 mise run ci-lint
 mise run interop
 mise run interop-official
+mise run soak-streaming
 mise run interop-tls
 mise run interop-http2
 mise run interop-http2-edge
@@ -60,10 +61,63 @@ mise run gen-grpcpp
 CI runs core tests on Linux x86_64 and arm64 in Debug and ReleaseSafe modes. Required
 x86_64 jobs instrument Zig, libxev, and nghttp2 with ThreadSanitizer and C undefined
 behavior detection. Runtime interop and vendored HTTP/2 edge cases run on both
-architectures. A scheduled x86_64 workflow runs extended unary soak tests.
+architectures. The soak workflow retains extended unary runs and adds a native
+cleartext x86_64 streaming smoke on relevant pull requests and extended scheduled runs.
 
 The authoritative compatibility matrix lives in
 [the official interop guide](../tests/official/README.md).
+
+## Streaming soak
+
+`mise run soak-streaming` reuses the official `FullDuplexCall` service with a dedicated
+grpc-go driver. Initial coverage is **native Linux x86_64, ReleaseSafe, cleartext IPv4,
+grpc-go client → grpc-lite server**, one connection and one persistent bidi stream.
+It does not claim native grpc-lite client, TLS/mTLS, ARM64, C/C++ bundle, sanitizer,
+resource plateau, or performance coverage. Runtime validation of this new harness is
+pending; the existing unary interop results are not streaming-soak evidence.
+
+```bash
+mise run soak-streaming                         # smoke: 10s traffic, 300s overall
+STREAMING_SOAK_MODE=extended mise run soak-streaming  # 600s traffic, 1200s overall
+STREAMING_SOAK_DURATION_SECONDS=60 STREAMING_SOAK_TIMEOUT_SECONDS=360 \
+  STREAMING_SOAK_SEED=123 mise run soak-streaming
+```
+
+The overall GNU `timeout` includes focused peer compilation, harness unit tests,
+startup, traffic and cleanup; it sends TERM, then KILL after five seconds. On shared
+validation hosts hold the exclusive lock for the **whole** invocation (including builds):
+
+```bash
+flock -x /home/fanmi/tmp/pi/grpc-lite-validation.lock mise run soak-streaming
+# Likewise wrap extended runs and the pre-push `mise run check` in this lock.
+```
+
+`STREAMING_SOAK_MODE` is `smoke` or `extended`; duration/timeout are positive integer
+seconds (at most five digits), and timeout must exceed duration + 30s. Seed is 1–9
+decimal digits, default `47`. Workload `bidi-slow-large-v1` deterministically varies
+request/response sizes from 1 MiB through 1 MiB + 65520 bytes using the seed and
+message index. Each batch independently sends two large requests, each requesting
+eight responses; their encoded sum exceeds the peer's 8 MiB outbound capacity within
+one handler callback. The consumer pauses for 150ms, then delays 10ms before each of
+the 16 responses. Fixed 65535-byte grpc-go flow-control windows disable adaptive growth. All batches share the same stream, repeat for at least the
+configured duration (and at least twice), then drain and half-close with a 30s RPC
+allowance. Batch count depends on machine speed; the seeded message sequence and
+pause/drain pattern do not.
+
+A passing run requires exact ordered response sizes/types/zero bodies, no missing or
+extra responses, OK terminal EOF, and at least two server `WouldBlock` observations
+and receive resumptions. Those opt-in counters live only in the existing official
+peer's handler; they are not transport telemetry. Port zero avoids fixed-port collisions.
+The runner traps failure/signals, terminates and reaps its peer/client, and bounds cleanup.
+
+Logs under `.zig-cache/official/streaming-soak/{harness,build,server,client}.log` are
+truncated per invocation. They record configuration, architecture, seed/workload,
+progress, terminal status, pressure/recovery counts and exit code; failure prints log
+tails. Only synthetic zero payloads are used, and payload bodies/metadata/credentials
+are not logged. CI uploads logs even on failure (14-day retention). The existing soak
+workflow runs smoke on relevant PRs, extended mode weekly, and allows manual mode/seed
+selection without changing its unary soak job. This is a correctness/liveness soak,
+not the benchmark or resource-sampling/plateau work owned by #48.
 
 ## Transpiled C Sources
 
@@ -299,7 +353,7 @@ are separate stages in `mise run check`.
 | C/C++ error surface and ownership | [C](../src/c_api.zig#L1869): failed creation clears handles; unary rejection is RESOURCE_EXHAUSTED; stats preserve unknown tails. [C smoke](../tests/c_api_smoke.c#L130), [C++ native](../tests/cpp_native_api_test.cc#L75): defaults, rejection, snapshots. | #44/#46: these smoke assertions do not prove wrapper lifetime under concurrent destruction or OOM at every conversion. Extend existing executables rather than duplicate ABI suites. |
 | Active call → shutdown / deadline / GOAWAY / disconnect | [Channel](../src/channel.zig#L6583): connection replacement, accepted RPC drain, drain timeout/escalation, active call/blocked write/reconnect shutdown. [Server](../src/server.zig#L5384): preface admission/deadline release. [grpcpp facade](../tests/grpcpp_streaming_facade_test.cc#L205): pre-cancel, active cancel, early Finish, deadline, abandoned reader. | #45: deterministically order cancel vs trailers/deadline/disconnect/GOAWAY/shutdown while send or receive is blocked; assert one terminal, no later callback, bounded wait and final reservation/command cleanup. Ordinary success tests are not a race matrix. |
 | Concurrent reserve/release and allocator use | [Channel](../src/channel.zig#L8600): four threads × 1000 budget attempts (unary and stream); serialized backing allocator and concurrent unary tests at [7408](../src/channel.zig#L7408). [Server](../src/server.zig#L5746): multi-reactor concurrent callbacks/allocations. | #45: reserve/open/send races against retirement with explicit barriers. Budget-only contention does not cover full open/destroy; TSAN passing does not establish all schedules. |
-| Streaming backpressure / sustained load | [Channel](../src/channel.zig#L8456): full/half-closed no-allocation sends and gzip wire-size admission; [Server](../src/server.zig#L4871): ordered queue reuse/cancel; [receive credit](../src/server.zig#L5933): paused stream isolation/resume; [typed](../tests/protobuf_adapter_test.zig#L405): all cardinalities. | #47: long-lived slow consumers, repeated pause/resume, large messages, sustained backpressure and recovery. [Scheduled soak](../.github/workflows/soak.yml) is unary only; benchmark bidi is throughput evidence, not soak. |
+| Streaming backpressure / sustained load | [Channel](../src/channel.zig#L8456): full/half-closed no-allocation sends and gzip wire-size admission; [Server](../src/server.zig#L4871): ordered queue reuse/cancel; [receive credit](../src/server.zig#L5933): paused stream isolation/resume; [typed](../tests/protobuf_adapter_test.zig#L405): all cardinalities. | #47 adds [streaming soak](#streaming-soak) for long-lived slow consumers, repeated pause/resume, large messages, sustained backpressure and recovery in the existing [soak workflow](../.github/workflows/soak.yml); runtime validation pending. Initial scope is native cleartext x86_64 server only; benchmark bidi remains throughput evidence, not soak. |
 | Resource reuse / process residency | [Server allocator test](../src/server.zig#L4353), write pools, and admission tests check local reuse/release. Baseline below samples process resources. | #48: time series through warmup, pressure, recovery and teardown, correlating reservation and actual queue occupancy; no existing benchmark occupancy export. No plateau established by these short runs. |
 
 Exclusive follow-up seams: #44 owns retained-handle/control tests and wrapper lifetime

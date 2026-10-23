@@ -1,6 +1,14 @@
 name: Soak
 
 on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/official/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - "mise.toml"
+      - ".github/workflows/soak.yml"
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -15,6 +23,17 @@ on:
         required: true
         type: number
         default: 900
+      streaming_mode:
+        description: Streaming soak mode (smoke=10s, extended=600s)
+        required: true
+        type: choice
+        options: [smoke, extended]
+        default: extended
+      streaming_seed:
+        description: Deterministic streaming workload seed (1-9 decimal digits)
+        required: true
+        type: string
+        default: "47"
 
 permissions:
   contents: read
@@ -25,6 +44,7 @@ concurrency:
 
 jobs:
   soak:
+    if: github.event_name != 'pull_request'
     name: Official unary soak (x64)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -59,6 +79,37 @@ jobs:
         with:
           name: official-unary-soak
           path: .zig-cache/official/*.log
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
+
+  streaming-soak:
+    name: Native cleartext streaming soak (x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      STREAMING_SOAK_MODE: ${{ github.event_name == 'pull_request' && 'smoke' || inputs.streaming_mode || 'extended' }}
+      STREAMING_SOAK_SEED: ${{ inputs.streaming_seed || '47' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install mise tools
+        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+        with:
+          version: 2026.7.14
+
+      - name: Run streaming soak
+        run: mise run soak-streaming
+
+      - name: Upload streaming soak logs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: native-cleartext-streaming-soak-x64
+          path: .zig-cache/official/streaming-soak/*.log
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 14
