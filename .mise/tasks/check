@@ -47,4 +47,5 @@ scripts/interop.sh
 tests/official/run_unary.sh
 tests/official/run_tls.sh
 tests/official/run_http2.sh
+python3 -B -m unittest discover -s tests/official -p test_http2_edge_runner.py
 tests/official/run_http2_edge.sh
