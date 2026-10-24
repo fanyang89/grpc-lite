@@ -30,6 +30,7 @@ comptime {
     @export(&c_api.grpc_lite_channel_shutdown, .{ .name = "grpc_lite_channel_shutdown" });
     @export(&c_api.grpc_lite_channel_get_unary_admission_stats, .{ .name = "grpc_lite_channel_get_unary_admission_stats" });
     @export(&c_api.grpc_lite_channel_get_stream_admission_stats, .{ .name = "grpc_lite_channel_get_stream_admission_stats" });
+    @export(&c_api.grpc_lite_channel_get_operational_stats, .{ .name = "grpc_lite_channel_get_operational_stats" });
     @export(&c_api.grpc_lite_channel_wait, .{ .name = "grpc_lite_channel_wait" });
     @export(&c_api.grpc_lite_channel_destroy, .{ .name = "grpc_lite_channel_destroy" });
     @export(&c_api.grpc_lite_channel_call_unary, .{ .name = "grpc_lite_channel_call_unary" });
@@ -43,6 +44,7 @@ comptime {
     @export(&c_api.grpc_lite_server_register_stream, .{ .name = "grpc_lite_server_register_stream" });
     @export(&c_api.grpc_lite_server_start, .{ .name = "grpc_lite_server_start" });
     @export(&c_api.grpc_lite_server_port, .{ .name = "grpc_lite_server_port" });
+    @export(&c_api.grpc_lite_server_get_operational_stats, .{ .name = "grpc_lite_server_get_operational_stats" });
     @export(&c_api.grpc_lite_server_shutdown, .{ .name = "grpc_lite_server_shutdown" });
     @export(&c_api.grpc_lite_server_shutdown_gracefully, .{ .name = "grpc_lite_server_shutdown_gracefully" });
     @export(&c_api.grpc_lite_server_wait, .{ .name = "grpc_lite_server_wait" });

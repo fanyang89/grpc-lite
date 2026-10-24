@@ -218,7 +218,85 @@ static void test_retained_results_and_stream_outlive_channel(void) {
   grpc_lite_server_destroy(server);
 }
 
+#if defined(__x86_64__) || defined(__aarch64__)
+_Static_assert(sizeof(grpc_lite_channel_operational_stats) == 208, "channel snapshot size");
+_Static_assert(_Alignof(grpc_lite_channel_operational_stats) == 8, "channel snapshot alignment");
+_Static_assert(offsetof(grpc_lite_channel_operational_stats, unary_retained_calls) == 8, "channel first metric");
+_Static_assert(offsetof(grpc_lite_channel_operational_stats, reconnect_transport_failure) == 200, "channel last metric");
+_Static_assert(GRPC_LITE_CHANNEL_OPERATIONAL_STATS_MIN_SIZE == 16, "channel minimum prefix");
+#endif
+
+static void check_channel_operational_prefixes(
+    grpc_lite_channel *owner, const grpc_lite_channel_operational_stats *expected) {
+  struct {
+    grpc_lite_channel_operational_stats stats;
+    uint8_t future[16];
+  } storage;
+  assert(grpc_lite_channel_get_operational_stats(owner, NULL) == GRPC_LITE_ERROR_INVALID_ARGUMENT);
+  for (size_t size = 0; size < sizeof(storage.stats) + 10; ++size) {
+    memset(&storage, 0xa5, sizeof(storage));
+    storage.stats.struct_size = size;
+    uint8_t wanted[sizeof(storage)];
+    memcpy(wanted, &storage, sizeof(wanted));
+    const size_t first = offsetof(grpc_lite_channel_operational_stats, unary_retained_calls);
+    const int valid = size >= sizeof(storage.stats) ||
+        (size >= GRPC_LITE_CHANNEL_OPERATIONAL_STATS_MIN_SIZE && (size - first) % sizeof(uint64_t) == 0);
+    grpc_lite_error error = grpc_lite_channel_get_operational_stats(owner, &storage.stats);
+    assert(error == (valid && owner != NULL ? GRPC_LITE_OK : GRPC_LITE_ERROR_INVALID_ARGUMENT));
+    if (valid) {
+      const size_t end = size < sizeof(storage.stats) ? size : sizeof(storage.stats);
+      if (owner != NULL) {
+        memcpy(wanted + first, (const uint8_t *)expected + first, end - first);
+      } else {
+        memset(wanted + first, 0, end - first);
+      }
+    }
+    assert(storage.stats.struct_size == size);
+    assert(memcmp(wanted, &storage, sizeof(wanted)) == 0);
+  }
+}
+
+#if defined(__x86_64__) || defined(__aarch64__)
+_Static_assert(sizeof(grpc_lite_server_operational_stats) == 120, "server snapshot size");
+_Static_assert(_Alignof(grpc_lite_server_operational_stats) == 8, "server snapshot alignment");
+_Static_assert(offsetof(grpc_lite_server_operational_stats, admitted_connections) == 8, "server first metric");
+_Static_assert(offsetof(grpc_lite_server_operational_stats, close_forced_shutdown) == 112, "server last metric");
+_Static_assert(GRPC_LITE_SERVER_OPERATIONAL_STATS_MIN_SIZE == 16, "server minimum prefix");
+#endif
+
+static void check_server_operational_prefixes(
+    const grpc_lite_server *owner, const grpc_lite_server_operational_stats *expected) {
+  struct {
+    grpc_lite_server_operational_stats stats;
+    uint8_t future[16];
+  } storage;
+  assert(grpc_lite_server_get_operational_stats(owner, NULL) == GRPC_LITE_ERROR_INVALID_ARGUMENT);
+  for (size_t size = 0; size < sizeof(storage.stats) + 10; ++size) {
+    memset(&storage, 0xa5, sizeof(storage));
+    storage.stats.struct_size = size;
+    uint8_t wanted[sizeof(storage)];
+    memcpy(wanted, &storage, sizeof(wanted));
+    const size_t first = offsetof(grpc_lite_server_operational_stats, admitted_connections);
+    const int valid = size >= sizeof(storage.stats) ||
+        (size >= GRPC_LITE_SERVER_OPERATIONAL_STATS_MIN_SIZE && (size - first) % sizeof(uint64_t) == 0);
+    grpc_lite_error error = grpc_lite_server_get_operational_stats(owner, &storage.stats);
+    assert(error == (valid && owner != NULL ? GRPC_LITE_OK : GRPC_LITE_ERROR_INVALID_ARGUMENT));
+    if (valid) {
+      const size_t end = size < sizeof(storage.stats) ? size : sizeof(storage.stats);
+      if (owner != NULL) {
+        memcpy(wanted + first, (const uint8_t *)expected + first, end - first);
+      } else {
+        memset(wanted + first, 0, end - first);
+      }
+    }
+    assert(storage.stats.struct_size == size);
+    assert(memcmp(wanted, &storage, sizeof(wanted)) == 0);
+  }
+}
+
 int main(void) {
+  check_channel_operational_prefixes(NULL, NULL);
+  check_server_operational_prefixes(NULL, NULL);
   grpc_lite_unary_options options = GRPC_LITE_UNARY_OPTIONS_INIT;
   grpc_lite_channel_options channel_options = GRPC_LITE_CHANNEL_OPTIONS_INIT;
   grpc_lite_logger logger = GRPC_LITE_LOGGER_INIT;
@@ -325,7 +403,36 @@ int main(void) {
   assert(stream_stats.rejected_streams == 1);
   grpc_lite_channel_shutdown(channel);
   grpc_lite_channel_wait(channel);
+  grpc_lite_channel_operational_stats operational = GRPC_LITE_CHANNEL_OPERATIONAL_STATS_INIT;
+  assert(grpc_lite_channel_get_operational_stats(channel, &operational) == GRPC_LITE_OK);
+  /* After wait, compare independent samples only while the owner is quiescent. */
+  assert(grpc_lite_channel_get_unary_admission_stats(channel, &stats) == GRPC_LITE_OK);
+  assert(grpc_lite_channel_get_stream_admission_stats(channel, &stream_stats) == GRPC_LITE_OK);
+  assert(operational.unary_retained_calls == stats.retained_calls);
+  assert(operational.unary_retained_request_bytes == stats.retained_request_bytes);
+  assert(operational.unary_rejected_calls == stats.rejected_calls);
+  assert(operational.stream_retained_streams == stream_stats.retained_streams);
+  assert(operational.stream_reserved_buffer_bytes == stream_stats.reserved_buffer_bytes);
+  assert(operational.stream_rejected_streams == stream_stats.rejected_streams);
+  assert(operational.unary_rejected_calls == 1 && operational.stream_rejected_streams == 1);
+  assert(operational.active_unary_calls == 0 && operational.active_streams == 0);
+  assert(operational.active_connections == 0 && operational.pending_unary_calls == 0);
+  check_channel_operational_prefixes(channel, &operational);
   grpc_lite_channel_destroy(channel);
   test_retained_results_and_stream_outlive_channel();
+
+  grpc_lite_server *server = NULL;
+  grpc_lite_server_operational_stats server_stats = GRPC_LITE_SERVER_OPERATIONAL_STATS_INIT;
+  assert(grpc_lite_server_create(&server_options, &server) == GRPC_LITE_OK);
+  assert(grpc_lite_server_get_operational_stats(server, &server_stats) == GRPC_LITE_OK);
+  check_server_operational_prefixes(server, &server_stats);
+  assert(grpc_lite_server_start(server) == GRPC_LITE_OK);
+  assert(grpc_lite_server_get_operational_stats(server, &server_stats) == GRPC_LITE_OK);
+  assert(server_stats.admitted_connections == 0 && server_stats.active_rpcs == 0);
+  grpc_lite_server_shutdown(server);
+  grpc_lite_server_wait(server);
+  assert(grpc_lite_server_get_operational_stats(server, &server_stats) == GRPC_LITE_OK);
+  check_server_operational_prefixes(server, &server_stats);
+  grpc_lite_server_destroy(server);
   return 0;
 }

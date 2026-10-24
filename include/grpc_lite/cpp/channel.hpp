@@ -48,6 +48,36 @@ struct StreamAdmissionStats {
   std::uint64_t rejected_streams = 0;
 };
 
+// Owning ABI 1.9 snapshot values; field units and accounting boundaries match
+// grpc_lite_channel_operational_stats in grpc_lite.h, not heap/RSS usage.
+struct ChannelOperationalStats {
+  std::uint64_t unary_retained_calls = 0;
+  std::uint64_t unary_retained_request_bytes = 0;
+  std::uint64_t unary_rejected_calls = 0;
+  std::uint64_t stream_retained_streams = 0;
+  std::uint64_t stream_reserved_buffer_bytes = 0;
+  std::uint64_t stream_rejected_streams = 0;
+  std::uint64_t active_unary_calls = 0;
+  std::uint64_t active_streams = 0;
+  std::uint64_t active_connections = 0;
+  std::uint64_t pending_unary_calls = 0;
+  std::uint64_t pending_unary_calls_high_water = 0;
+  std::uint64_t stream_inbound_bytes = 0;
+  std::uint64_t stream_inbound_bytes_high_water = 0;
+  std::uint64_t stream_outbound_bytes = 0;
+  std::uint64_t stream_outbound_bytes_high_water = 0;
+  std::uint64_t socket_write_bytes = 0;
+  std::uint64_t socket_write_bytes_high_water = 0;
+  std::uint64_t terminal_ok = 0;
+  std::uint64_t terminal_cancelled = 0;
+  std::uint64_t terminal_deadline_exceeded = 0;
+  std::uint64_t terminal_other = 0;
+  std::uint64_t reconnect_attempts = 0;
+  std::uint64_t reconnect_successes = 0;
+  std::uint64_t reconnect_goaway = 0;
+  std::uint64_t reconnect_transport_failure = 0;
+};
+
 class ClientStream;
 
 class Channel {
@@ -121,6 +151,47 @@ class Channel {
     const Error error(grpc_lite_channel_get_stream_admission_stats(channel_, &stats));
     if (!error.ok()) return error;
     *out = {stats.retained_streams, stats.reserved_buffer_bytes, stats.rejected_streams};
+    return {};
+  }
+
+  // Safe alongside operations/shutdown/wait, including after Wait(), but not
+  // owner destruction or moves. Stop/join readers before destroying the owner.
+  // Samples are not global transactions; synchronize shared output storage.
+  Error GetOperationalStats(ChannelOperationalStats* out) const {
+    if (out == nullptr) return Error(ErrorCode::InvalidArgument);
+    *out = {};
+    grpc_lite_channel_operational_stats stats =
+        GRPC_LITE_CHANNEL_OPERATIONAL_STATS_INIT;
+    const Error error(
+        grpc_lite_channel_get_operational_stats(channel_, &stats));
+    if (!error.ok()) return error;
+    out->unary_retained_calls = stats.unary_retained_calls;
+    out->unary_retained_request_bytes = stats.unary_retained_request_bytes;
+    out->unary_rejected_calls = stats.unary_rejected_calls;
+    out->stream_retained_streams = stats.stream_retained_streams;
+    out->stream_reserved_buffer_bytes = stats.stream_reserved_buffer_bytes;
+    out->stream_rejected_streams = stats.stream_rejected_streams;
+    out->active_unary_calls = stats.active_unary_calls;
+    out->active_streams = stats.active_streams;
+    out->active_connections = stats.active_connections;
+    out->pending_unary_calls = stats.pending_unary_calls;
+    out->pending_unary_calls_high_water = stats.pending_unary_calls_high_water;
+    out->stream_inbound_bytes = stats.stream_inbound_bytes;
+    out->stream_inbound_bytes_high_water =
+        stats.stream_inbound_bytes_high_water;
+    out->stream_outbound_bytes = stats.stream_outbound_bytes;
+    out->stream_outbound_bytes_high_water =
+        stats.stream_outbound_bytes_high_water;
+    out->socket_write_bytes = stats.socket_write_bytes;
+    out->socket_write_bytes_high_water = stats.socket_write_bytes_high_water;
+    out->terminal_ok = stats.terminal_ok;
+    out->terminal_cancelled = stats.terminal_cancelled;
+    out->terminal_deadline_exceeded = stats.terminal_deadline_exceeded;
+    out->terminal_other = stats.terminal_other;
+    out->reconnect_attempts = stats.reconnect_attempts;
+    out->reconnect_successes = stats.reconnect_successes;
+    out->reconnect_goaway = stats.reconnect_goaway;
+    out->reconnect_transport_failure = stats.reconnect_transport_failure;
     return {};
   }
 

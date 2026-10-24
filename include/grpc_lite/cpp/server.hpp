@@ -37,6 +37,25 @@ struct ServerOptions {
   std::uint32_t max_concurrent_streams_per_connection = 100;
 };
 
+// Owning ABI 1.9 snapshot values; field units and accounting boundaries match
+// grpc_lite_server_operational_stats in grpc_lite.h, not heap/RSS usage.
+struct ServerOperationalStats {
+  std::uint64_t admitted_connections = 0;
+  std::uint64_t active_rpcs = 0;
+  std::uint64_t rejected_connections = 0;
+  std::uint64_t pre_ack_rejected_streams = 0;
+  std::uint64_t streaming_outbound_reserved_bytes = 0;
+  std::uint64_t streaming_outbound_reserved_bytes_high_water_sum = 0;
+  std::uint64_t socket_queued_write_bytes = 0;
+  std::uint64_t socket_queued_write_bytes_high_water_sum = 0;
+  std::uint64_t close_peer_transport = 0;
+  std::uint64_t close_protocol_local = 0;
+  std::uint64_t close_preface_timeout = 0;
+  std::uint64_t close_idle_timeout = 0;
+  std::uint64_t close_graceful_drain = 0;
+  std::uint64_t close_forced_shutdown = 0;
+};
+
 struct ServerMethodOptions {
   bool receive_initially_paused = false;
   bool explicit_initial_metadata = true;
@@ -252,6 +271,36 @@ class Server {
     if (out == nullptr) return Error(ErrorCode::InvalidArgument);
     return Error(grpc_lite_server_port(server_, out));
   }
+  // Safe alongside operations/shutdown/wait, including after Wait(), but not
+  // owner destruction or moves. Stop/join readers before destroying the owner.
+  // Samples are not global transactions; synchronize shared output storage.
+  Error GetOperationalStats(ServerOperationalStats* out) const {
+    if (out == nullptr) return Error(ErrorCode::InvalidArgument);
+    *out = {};
+    grpc_lite_server_operational_stats stats =
+        GRPC_LITE_SERVER_OPERATIONAL_STATS_INIT;
+    const Error error(grpc_lite_server_get_operational_stats(server_, &stats));
+    if (!error.ok()) return error;
+    out->admitted_connections = stats.admitted_connections;
+    out->active_rpcs = stats.active_rpcs;
+    out->rejected_connections = stats.rejected_connections;
+    out->pre_ack_rejected_streams = stats.pre_ack_rejected_streams;
+    out->streaming_outbound_reserved_bytes =
+        stats.streaming_outbound_reserved_bytes;
+    out->streaming_outbound_reserved_bytes_high_water_sum =
+        stats.streaming_outbound_reserved_bytes_high_water_sum;
+    out->socket_queued_write_bytes = stats.socket_queued_write_bytes;
+    out->socket_queued_write_bytes_high_water_sum =
+        stats.socket_queued_write_bytes_high_water_sum;
+    out->close_peer_transport = stats.close_peer_transport;
+    out->close_protocol_local = stats.close_protocol_local;
+    out->close_preface_timeout = stats.close_preface_timeout;
+    out->close_idle_timeout = stats.close_idle_timeout;
+    out->close_graceful_drain = stats.close_graceful_drain;
+    out->close_forced_shutdown = stats.close_forced_shutdown;
+    return {};
+  }
+
   void Shutdown() { grpc_lite_server_shutdown(server_); }
   void ShutdownGracefully(std::uint64_t timeout_ns) {
     grpc_lite_server_shutdown_gracefully(server_, timeout_ns);

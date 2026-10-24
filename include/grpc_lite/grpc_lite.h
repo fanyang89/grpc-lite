@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define GRPC_LITE_ABI_MAJOR 1u
-#define GRPC_LITE_ABI_MINOR 8u
+#define GRPC_LITE_ABI_MINOR 9u
 #define GRPC_LITE_ABI_VERSION \
   ((GRPC_LITE_ABI_MAJOR << 16) | GRPC_LITE_ABI_MINOR)
 
@@ -189,6 +189,115 @@ typedef struct grpc_lite_stream_admission_stats {
  * Do not race channel destruction. Unknown output tail bytes are untouched. */
 grpc_lite_error grpc_lite_channel_get_stream_admission_stats(
     grpc_lite_channel *channel, grpc_lite_stream_admission_stats *out_stats);
+
+/* Operational snapshots require ABI 1.9. Initialize with the matching INIT macro.
+ * struct_size uses the existing size_t ABI envelope; all metrics are uint64_t.
+ * Supported short outputs end at any complete metric field, starting at MIN_SIZE;
+ * other short sizes are invalid. Sizes >= sizeof the known struct are accepted.
+ * Only present known metrics are written; struct_size and unknown tail stay intact.
+ * NULL output or invalid size: INVALID_ARGUMENT, no writes. NULL owner with valid
+ * output: INVALID_ARGUMENT, present known metrics zeroed. Otherwise: OK.
+ * Supply a valid, aligned writable output of struct_size bytes and a live owner.
+ * Forged/destroyed non-NULL handles are invalid, not detectable error arguments.
+ * No allocation, callbacks, borrowed pointers or snapshot destruction required.
+ * Safe alongside supported operations/shutdown/wait, including after wait, but
+ * NEVER during/after owner destruction. Stop and join readers before destroy,
+ * even if client stream handles survive. Synchronize shared output storage.
+ * Samples are not transport transactions. Counters saturate; lifetime high-water
+ * marks do not decrease; no reset. Byte metrics do not measure/bound heap or RSS:
+ * decoder, metadata/HPACK, scratch, TLS internals, spare capacity, OS overhead and
+ * application copies are excluded. See docs/zig-api.md Operational Snapshots.
+ */
+/* O(1): operational fields share one accounting lock; unary/stream admission
+ * are independently sampled. Admission counts include retained terminal handles;
+ * stream_reserved_buffer_bytes sums configured capacities, not queued bytes.
+ * active_* RPC counts end at first terminal outcome, before callbacks; usable
+ * active_connections includes GOAWAY drain, excludes dialing/backoff (at most 1).
+ * pending_unary_calls ends at submission start or pre-submit terminal outcome.
+ * Inbound bytes charge decoded payload + 5 bytes/frame; outbound bytes charge
+ * whole encoded frames until consumed/destroyed. Both include retained detached
+ * queues and may remain nonzero after wait. Socket writes charge owned buffers
+ * until completion/discard. High waters are Channel-lifetime aggregate peaks.
+ * terminal_* are disjoint final-status buckets for accepted RPCs. Reconnect
+ * attempts count later TCP submissions (not DNS/backoff); successes activate them.
+ * GOAWAY/recovery triggers may overlap and do not imply replay or all dial errors.
+ */
+typedef struct grpc_lite_channel_operational_stats {
+  size_t struct_size;
+  uint64_t unary_retained_calls;
+  uint64_t unary_retained_request_bytes;
+  uint64_t unary_rejected_calls;
+  uint64_t stream_retained_streams;
+  uint64_t stream_reserved_buffer_bytes;
+  uint64_t stream_rejected_streams;
+  uint64_t active_unary_calls;
+  uint64_t active_streams;
+  uint64_t active_connections;
+  uint64_t pending_unary_calls;
+  uint64_t pending_unary_calls_high_water;
+  uint64_t stream_inbound_bytes;
+  uint64_t stream_inbound_bytes_high_water;
+  uint64_t stream_outbound_bytes;
+  uint64_t stream_outbound_bytes_high_water;
+  uint64_t socket_write_bytes;
+  uint64_t socket_write_bytes_high_water;
+  uint64_t terminal_ok;
+  uint64_t terminal_cancelled;
+  uint64_t terminal_deadline_exceeded;
+  uint64_t terminal_other;
+  uint64_t reconnect_attempts;
+  uint64_t reconnect_successes;
+  uint64_t reconnect_goaway;
+  uint64_t reconnect_transport_failure;
+} grpc_lite_channel_operational_stats;
+
+#define GRPC_LITE_CHANNEL_OPERATIONAL_STATS_INIT \
+  { sizeof(grpc_lite_channel_operational_stats), \
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+#define GRPC_LITE_CHANNEL_OPERATIONAL_STATS_MIN_SIZE \
+  (offsetof(grpc_lite_channel_operational_stats, unary_retained_calls) + sizeof(uint64_t))
+
+grpc_lite_error grpc_lite_channel_get_operational_stats(
+    grpc_lite_channel *channel, grpc_lite_channel_operational_stats *out_stats);
+
+/* O(reactors): independent atomic samples, approximate (not globally consistent);
+ * aggregate sums saturate. admitted_connections includes initializing/closing
+ * slots; active_rpcs includes invalid/unhandled inbound entries until retirement,
+ * not retained ServerCall controls. Rejections count connection-cap and pre-ACK
+ * stream-cap/defensive-guard refusals, not drain/init/allocation failures; generic
+ * post-ACK protocol stream rejections are unavailable, not measured as zero.
+ * Streaming bytes charge remaining encoded frames including queued commands,
+ * excluding unary responses/send temporaries. Socket bytes charge owned buffers
+ * until completion/discard. *_high_water_sum sums non-simultaneous reactor peaks,
+ * NOT true global peaks. close_* are disjoint final connection-destruction counts:
+ * first effective close reason wins; pre-object failures excluded. protocol_local
+ * includes TLS handshake timeout; forced_shutdown includes drain timeout.
+ */
+typedef struct grpc_lite_server_operational_stats {
+  size_t struct_size;
+  uint64_t admitted_connections;
+  uint64_t active_rpcs;
+  uint64_t rejected_connections;
+  uint64_t pre_ack_rejected_streams;
+  uint64_t streaming_outbound_reserved_bytes;
+  uint64_t streaming_outbound_reserved_bytes_high_water_sum;
+  uint64_t socket_queued_write_bytes;
+  uint64_t socket_queued_write_bytes_high_water_sum;
+  uint64_t close_peer_transport;
+  uint64_t close_protocol_local;
+  uint64_t close_preface_timeout;
+  uint64_t close_idle_timeout;
+  uint64_t close_graceful_drain;
+  uint64_t close_forced_shutdown;
+} grpc_lite_server_operational_stats;
+
+#define GRPC_LITE_SERVER_OPERATIONAL_STATS_INIT \
+  { sizeof(grpc_lite_server_operational_stats), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+#define GRPC_LITE_SERVER_OPERATIONAL_STATS_MIN_SIZE \
+  (offsetof(grpc_lite_server_operational_stats, admitted_connections) + sizeof(uint64_t))
+
+grpc_lite_error grpc_lite_server_get_operational_stats(
+    const grpc_lite_server *server, grpc_lite_server_operational_stats *out_stats);
 
 /* Creates a connected insecure channel. Hostnames require a Runtime. */
 grpc_lite_error grpc_lite_channel_create(
