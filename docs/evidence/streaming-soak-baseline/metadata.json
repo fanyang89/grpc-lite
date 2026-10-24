@@ -1,0 +1,163 @@
+{
+  "build": {
+    "binary_sha256": {
+      "client": "d6c72cc2c30cb7aafeded9534111b4159b065ba9344a88c68fd045eac776e191",
+      "server": "f48298a312439ce13b3724bd557f77f489cefc177eaa303ab8057cd598da9ee5"
+    },
+    "client_allocator": "standard Go runtime allocator/GC",
+    "go_metadata": {
+      "CGO_ENABLED": 1,
+      "GOAMD64": "v1",
+      "GOARCH": "amd64",
+      "GOOS": "linux",
+      "compiler": "gc",
+      "grpc_go": "v1.82.1",
+      "protobuf": "v1.36.11"
+    },
+    "server": "native Linux x86_64 ReleaseSafe; cleartext; no TLS/sanitizer/gperftools",
+    "server_allocator": "init.gpa: Zig 0.17 SafeAllocator backed by page_allocator; reactor-local allocator caches; C dependency allocation paths separate; source-derived, not live heap accounting"
+  },
+  "clean_before_and_after_each_trial": true,
+  "environment_capture_note": "Trial 1 exports verified from lifecycle script; trials 2/3 selected environment JSON identical. Optional override null values are captured for trials 2/3; trial 1 had no equivalent full selected-variable record. Original observer environment records match except timestamp. PATH/tool locations omitted.",
+  "host": {
+    "ancestor_user_pids_max": 251100,
+    "clock_ticks_per_second": 100,
+    "cores": 16,
+    "cpu": "AMD Ryzen 9 9955HX",
+    "frequency": "scaling and boost enabled; not pinned",
+    "kernel": "7.2.8-200.fc44.x86_64",
+    "libc": "glibc 2.43",
+    "lifecycle_allowed_cpus": "0-31",
+    "lifecycle_allowed_memory_nodes": "0",
+    "logical_cpus": 32,
+    "memory_total_kib": 97478316,
+    "numa_nodes": 1,
+    "os": "Fedora Linux 44 (Server Edition)",
+    "peer_affinity": "not separately sampled",
+    "physical_exclusivity": false,
+    "session_cgroup": {
+      "cpu.max": "max 100000",
+      "memory.max": "max",
+      "path": "${SESSION_CGROUP}",
+      "pids.max": "max"
+    },
+    "sockets": 1,
+    "swap_total_kib": 8388604,
+    "user_slice_effective_cpus": "0-31"
+  },
+  "provenance": "Selected fields transcribed from preserved lifecycle/host/environment/binary/build/client/cleanup records; not a new measurement.",
+  "revision": "c96ba3bdc65fe446dab9bd40042e070393f288b2",
+  "schema": 1,
+  "selected_environment": {
+    "CC": null,
+    "CFLAGS": null,
+    "CXX": null,
+    "CXXFLAGS": null,
+    "GOCACHE": "${PRIVATE_CACHE}/go-build",
+    "GOFLAGS": null,
+    "GOGC": null,
+    "GOMAXPROCS": null,
+    "GOMEMLIMIT": null,
+    "GOMODCACHE": "${PRIVATE_CACHE}/go-mod",
+    "GOPROXY": "off",
+    "GOSUMDB": "off",
+    "GOTOOLCHAIN": "local",
+    "LDFLAGS": null,
+    "LD_LIBRARY_PATH": null,
+    "LD_PRELOAD": null,
+    "MALLOC_ARENA_MAX": null,
+    "MALLOC_CONF": null,
+    "MISE_AUTO_INSTALL": "false",
+    "STREAMING_SOAK_DURATION_SECONDS": null,
+    "STREAMING_SOAK_SEED": "47",
+    "STREAMING_SOAK_TIMEOUT_SECONDS": null,
+    "ZIG_GLOBAL_CACHE_DIR": "${PRIVATE_CACHE}/zig"
+  },
+  "tools": {
+    "cmake": "4.3.4",
+    "gnu_timeout": "9.10",
+    "go": "1.26.5",
+    "mise": "2026.10.17",
+    "ninja": "1.13.2",
+    "python": "3.12.13",
+    "zig": "0.17.0"
+  },
+  "tree": "105a1b0404f474ab23580129ad7226029340241a",
+  "trials": [
+    {
+      "client_result": {
+        "cycles": 1744,
+        "elapsed_seconds": 600.158,
+        "received": 27904,
+        "sent": 3488,
+        "terminal": "OK"
+      },
+      "external_process_monitor": false,
+      "invocation_end_utc": "2026-10-23T19:44:26Z",
+      "invocation_exit": 0,
+      "invocation_start_utc": "2026-10-23T19:34:17Z",
+      "load_average_after_1_5_15_minutes": [
+        0.35,
+        0.48,
+        0.94
+      ],
+      "load_average_before_1_5_15_minutes": [
+        0.49,
+        1.01,
+        1.47
+      ],
+      "peer_pids_absent_after_runner": true,
+      "trial": 1
+    },
+    {
+      "client_result": {
+        "cycles": 1740,
+        "elapsed_seconds": 600.294,
+        "received": 27840,
+        "sent": 3480,
+        "terminal": "OK"
+      },
+      "external_process_monitor": true,
+      "invocation_end_utc": "2026-10-24T03:47:33Z",
+      "invocation_exit": 0,
+      "invocation_start_utc": "2026-10-24T03:37:23Z",
+      "load_average_after_1_5_15_minutes": [
+        0.39,
+        0.4,
+        0.28
+      ],
+      "load_average_before_1_5_15_minutes": [
+        0.21,
+        0.18,
+        0.12
+      ],
+      "peer_pids_absent_after_runner": true,
+      "trial": 2
+    },
+    {
+      "client_result": {
+        "cycles": 1743,
+        "elapsed_seconds": 600.288,
+        "received": 27888,
+        "sent": 3486,
+        "terminal": "OK"
+      },
+      "external_process_monitor": true,
+      "invocation_end_utc": "2026-10-24T04:00:26Z",
+      "invocation_exit": 0,
+      "invocation_start_utc": "2026-10-24T03:50:17Z",
+      "load_average_after_1_5_15_minutes": [
+        0.29,
+        0.25,
+        0.26
+      ],
+      "load_average_before_1_5_15_minutes": [
+        0.24,
+        0.3,
+        0.26
+      ],
+      "peer_pids_absent_after_runner": true,
+      "trial": 3
+    }
+  ]
+}

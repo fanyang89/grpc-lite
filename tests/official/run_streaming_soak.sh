@@ -5,6 +5,7 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work_dir="$project_root/.zig-cache/official/streaming-soak"
 peer_pid=
 client_pid=
+resource_observer="$project_root/tests/official/streaming_soak_resources.py"
 gnu_timeout_paths=(/usr/bin/timeout /bin/timeout)
 
 select_gnu_timeout() {
@@ -84,6 +85,7 @@ run_soak() {
   cd "$project_root"
   {
     bash tests/official/run_streaming_soak_test.sh
+    python3 -B -m unittest discover -s tests/official -p 'test_streaming_soak_resources.py'
     zig build streaming-soak-peer -Doptimize=ReleaseSafe
     cd tests/official
     go test -mod=readonly ./streaming_soak
@@ -108,7 +110,9 @@ run_soak() {
     printf 'timed out waiting for peer readiness\n' >&2
     return 1
   fi
-  "$work_dir/streaming-soak-client" --target="127.0.0.1:$port" --duration="${duration}s" \
+  python3 "$resource_observer" observe --directory "$work_dir" --server-pid "$peer_pid" \
+    --duration "$duration" --seed "$seed" -- \
+    "$work_dir/streaming-soak-client" --target="127.0.0.1:$port" --duration="${duration}s" \
     --timeout="$((duration + 30))s" --seed="$seed" >"$work_dir/client.log" 2>&1 &
   client_pid=$!
   wait "$client_pid"
@@ -141,7 +145,12 @@ main() {
   # Only the outer invocation initializes artifacts, before even validating
   # configuration: invalid inputs must not leave stale success evidence.
   for log in harness build server client; do : >"$work_dir/$log.log"; done
+  # Invalidate evidence even if Python is missing or metadata capture fails.
+  rm -f "$work_dir/resources-summary.json" "$work_dir/resources-environment.json" \
+    "$work_dir/resources-summary.tmp" "$work_dir/resources-environment.tmp"
+  : >"$work_dir/resources.jsonl"
   local status=0 interrupted=0 runner_pid gnu_timeout
+  python3 "$resource_observer" init --directory "$work_dir" --root "$project_root" || status=$?
   configure >>"$work_dir/harness.log" 2>&1 || status=$?
   if ((status == 0 && $# != 0)); then
     printf 'configure via STREAMING_SOAK_* environment variables, not arguments\n' >>"$work_dir/harness.log"
@@ -167,6 +176,10 @@ main() {
       status=$interrupted
     fi
     trap - INT TERM
+  fi
+  # Missing/incomplete observation must never become a successful harness report.
+  if ! python3 "$resource_observer" finalize --directory "$work_dir" --harness-exit "$status"; then
+    if ((status == 0)); then status=1; fi
   fi
   cat "$work_dir/harness.log"
   printf 'harness_exit=%d\n' "$status" | tee -a "$work_dir/harness.log"

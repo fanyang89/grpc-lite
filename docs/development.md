@@ -73,13 +73,17 @@ The authoritative compatibility matrix lives in
 grpc-go driver. Initial coverage is **native Linux x86_64, ReleaseSafe, cleartext IPv4,
 grpc-go client → grpc-lite server**, one connection and one persistent bidi stream.
 It does not claim native grpc-lite client, TLS/mTLS, ARM64, C/C++ bundle, sanitizer,
-resource plateau, or performance coverage. Runtime validation of this new harness is
-pending; the existing unary interop results are not streaming-soak evidence.
+a proven stable resource plateau, or performance coverage. Three default 600-second
+trials now provide an [initial measured baseline](#initial-measured-streaming-baseline);
+the existing unary interop results are not streaming-soak evidence.
+
+Set `VALIDATION_LOCK` to the shared host validation-lock path before these commands.
 
 ```bash
-mise run soak-streaming                         # smoke: 10s traffic, 300s overall
-STREAMING_SOAK_MODE=extended mise run soak-streaming  # 600s traffic, 1200s overall
-STREAMING_SOAK_DURATION_SECONDS=60 STREAMING_SOAK_TIMEOUT_SECONDS=360 \
+flock -x "$VALIDATION_LOCK" mise run soak-streaming # smoke
+flock -x "$VALIDATION_LOCK" env STREAMING_SOAK_MODE=extended mise run soak-streaming
+flock -x "$VALIDATION_LOCK" env \
+  STREAMING_SOAK_DURATION_SECONDS=60 STREAMING_SOAK_TIMEOUT_SECONDS=360 \
   STREAMING_SOAK_SEED=123 mise run soak-streaming
 ```
 
@@ -92,7 +96,7 @@ build. The selected executable is logged; PATH is not rewritten. On shared valid
 hosts hold the exclusive lock for the **whole** invocation (including builds):
 
 ```bash
-flock -x /home/fanmi/tmp/pi/grpc-lite-validation.lock mise run soak-streaming
+flock -x "$VALIDATION_LOCK" mise run soak-streaming
 # Likewise wrap extended runs and the pre-push `mise run check` in this lock.
 ```
 
@@ -113,6 +117,8 @@ extra responses, OK terminal EOF, and at least two server `WouldBlock` observati
 and receive resumptions. Those opt-in counters live only in the existing official
 peer's handler; they are not transport telemetry. Port zero avoids fixed-port collisions.
 The runner traps failure/signals, terminates and reaps its peer/client, and bounds cleanup.
+Linux `/proc`, Python 3 (standard library only), and GNU coreutils are required.
+The verified GNU timeout selection avoids incompatible mise/PATH shadows.
 
 Logs under `.zig-cache/official/streaming-soak/{harness,build,server,client}.log` are
 truncated per invocation. They record configuration, architecture, seed/workload,
@@ -121,7 +127,159 @@ tails. Only synthetic zero payloads are used, and payload bodies/metadata/creden
 are not logged. CI uploads logs even on failure (14-day retention). The existing soak
 workflow runs smoke on relevant PRs, extended mode weekly, and allows manual mode/seed
 selection without changing its unary soak job. This is a correctness/liveness soak,
-not the benchmark or resource-sampling/plateau work owned by #48.
+not a throughput benchmark. The #48 process observer below shares this exact workload.
+
+
+### Streaming resource observer (#48)
+
+[`streaming_soak_resources.py`](../tests/official/streaming_soak_resources.py) launches
+and waits for the **actual grpc-go client binary**, samples that child PID and the
+runner's **actual native server PID** (not bash, mise, or compiler PIDs), and records
+Linux process start ticks to reject PID reuse. It samples `VmRSS` (KiB), open FD count
+and `Threads`; unreadable/missing fields are unavailable, never fabricated zeros.
+A client exiting during a read may produce an unavailable final row; that row is
+excluded from comparisons only when child exit is confirmed. Otherwise missing process
+data fails the observation. Server data must remain available through post-client idle.
+
+Artifacts in `.zig-cache/official/streaming-soak/`, uploaded by the existing workflow:
+
+- `resources.jsonl`: schema-defined role/PID/start-ticks, monotonic elapsed seconds,
+  phase, RSS/FD/thread counts or explicit unavailable reason. At most 3611 rows
+  (1800 two-peer ticks, one server baseline, ten server idle samples).
+- `resources-summary.json`: schema version, workload duration/seed, cadence, child and
+  harness exits, phase min/max/medians, comparisons/tolerances, errors and unavailable
+  counters; terminal peer `messages`, `would_block`, `resumes` events when present.
+- `resources-environment.json`: revision/dirty flag, kernel/architecture/libc, CPU count,
+  Python/Zig/Go versions, build profile, wall-clock start, readable cgroup-v2 root limits.
+  Nested cgroup limits, CPU affinity and external host load are not inferred; record them
+  separately when scheduling an isolated baseline. No environment dump, command-line
+  dump, hostname, FD targets, payloads, metadata or credentials are collected.
+
+Artifacts are reset **before** configuration validation. A missing report, failed client,
+missing phase data, growth alert, or outer timeout cannot leave a successful summary.
+Retained existing logs are tail-capped at 1 MiB each on finalization; their live writing
+still has #47's overall time bound, not a new byte-quota mechanism. Samples have a fixed
+row budget; the cadence is `max(0.2s, (duration + 35s) / 1800)`. Sampling overhead is part
+of this instrumented run, so do not compare it to uninstrumented throughput numbers.
+Metadata capture uses bounded two-second version queries before the overall workload
+clock. Finalization is outside that clock. SIGKILL/host loss may leave incomplete evidence,
+not a passing report; the next invocation resets it.
+
+**Phases and provisional screening policy** (not measured results):
+
+1. Server baseline immediately before client launch; warmup is the first
+   `min(5s, duration/5)` after launch. Startup allocations are expected. Warmup-to-steady
+   median deltas are informational, not leak alarms.
+2. Steady traffic includes the driver's repeated pause/slow-drain cycles on the same
+   stream. Compare medians of the first and last thirds of steady samples (at least
+   three samples each). These are time windows, **not** exact batch-pressure boundaries.
+3. Teardown means ten server samples over two seconds **after client exit**, while the
+   server remains alive. Compare server FD/thread median against its pre-client baseline,
+   and RSS against its steady median. This is post-RPC idle, not Server deinitialization.
+   Client pre-exit teardown and server post-deinit live heap are unavailable.
+
+| Comparison | Provisional allowed positive delta | Reason for this workload |
+| --- | --- | --- |
+| Steady RSS, native server | larger of 32 MiB or 25% of early median | Several 1 MiB messages, 8 MiB outbound capacity and cached allocator/container pages; not an RSS cap |
+| Steady RSS, grpc-go client | larger of 64 MiB or 25% of early median | Sixteen large responses per batch plus Go GC/allocator residency; not live heap accounting |
+| Steady FD count, either peer | 2 | One connection; allow transient descriptor sampling, but flag accumulating sockets |
+| Steady threads | server 0; Go client 4 | Native reactor count is fixed; Go may lazily grow runtime workers |
+| Server post-client idle FD / threads | baseline +1 / +0 | Socket close may still be asynchronous; native workers should not accumulate |
+| Server post-client idle RSS | larger of 32 MiB or 25% of steady median | Freed buffers/pages need not be returned to the OS |
+
+Exceeding a tolerance is a **growth alert**, not proof of a leak. Passing is only
+`within_provisional_tolerances` for traffic of at least 60s; shorter smoke runs are
+`short_run`, never a plateau baseline. A passing RSS screen cannot exclude a slow leak
+or allocator fragmentation. Cache retention can explain elevated but stable RSS;
+continued growth needs repeated isolated runs and allocation/live-object evidence.
+**Process exit is not proof of pre-exit zero live heap.**
+
+Reservation snapshots and actual transport queue occupancy are **unavailable** here:
+the client is grpc-go, the native peer exports no such snapshots, and the existing
+WouldBlock/resume handler counters measure events, not bytes or retained objects.
+Configured capacities are not occupancy. No new public statistics API, transport
+limit, or generic allocator instrumentation is introduced; #50/#51 remain separate.
+
+#### Initial measured streaming baseline
+
+Three fresh-peer trials on 2026-10-23/24 at reviewed source
+`c96ba3bdc65fe446dab9bd40042e070393f288b2` (clean tree
+`105a1b0404f474ab23580129ad7226029340241a`) passed the **unchanged provisional screen**.
+All actual invocation/client/harness exits were 0; terminal status was OK. This is an
+initial repeatable observation, **not statistical tolerance calibration, a proven
+stable plateau, or leak freedom**. No transport, runner or tolerance tuning was done.
+
+The [small evidence bundle](evidence/streaming-soak-baseline/README.md) contains original
+summaries/environment records, losslessly compressed raw samples and SHA256 manifests,
+selected safe host/build metadata, a machine-readable aggregate, and independent
+Python/DuckDB recomputation commands. Numbers below were recomputed from all 10,221
+raw rows; no missing rows were excluded. RSS is KiB (1024 bytes), FDs/threads are counts.
+
+Same hardware/software and binary hashes in all trials: AMD Ryzen 9 9955HX, 16 cores /
+32 threads, one NUMA node, 97,478,316 KiB RAM; Fedora 44 Server,
+Linux `7.2.8-200.fc44.x86_64`, glibc 2.43, Zig 0.17.0, Go 1.26.5, Python 3.12.13.
+Native ReleaseSafe server uses `init.gpa` (Zig SafeAllocator backed by page_allocator),
+with reactor-local caches and separate C dependency allocation paths; client uses Go's
+standard allocator/GC. This identification comes from source/build records, not live
+heap accounting. No TLS, sanitizer or gperftools; no explicit Go GC/memory/CPU overrides.
+
+Each trial used `STREAMING_SOAK_MODE=extended STREAMING_SOAK_SEED=47 mise run soak-streaming`
+with duration/timeout overrides unset: 600s requested traffic, 630s RPC allowance,
+1200s runner timeout, five-second warmup, nominal sampling cadence
+`635/1800 = 0.3527777778s` plus read overhead. Per role: 15 warmup and 1683 steady
+samples; first/last steady thirds are 561 samples each. Server additionally has one
+pre-client baseline and ten post-client idle samples, spaced 0.2s over a fixed two-second
+window. JSON `teardown` means **server still alive after client exit**, not deinit.
+Elapsed sample times are observer-relative monotonic seconds; client-reported traffic
+elapsed below is a different clock interval. Compilation precedes sampling.
+
+| Observed result | Trial 1 | Trial 2 | Trial 3 |
+| --- | ---: | ---: | ---: |
+| Client traffic elapsed (s) | 600.158 | 600.294 | 600.288 |
+| Cycles / sent / received | 1744 / 3488 / 27904 | 1740 / 3480 / 27840 | 1743 / 3486 / 27888 |
+| Handler WouldBlock / resumes | 5232 / 3488 | 5220 / 3480 | 5229 / 3486 |
+| Server baseline / warmup RSS median | 3764 / 12996 | 3820 / 13100 | 3768 / 13008 |
+| Server steady RSS median [min,max] | 12908 [5928,18096] | 12408 [5816,18212] | 12512 [5968,17948] |
+| Server early → late RSS median; delta | 12300 → 13284; +984 | 12352 → 13344; +992 | 12756 → 12584; −172 |
+| Server idle RSS median; idle−steady | 4852; −8056 | 4908; −7500 | 4996; −7516 |
+| Server idle−baseline RSS (informational) | +1088 | +1088 | +1228 |
+| Client warmup RSS median | 33612 | 32912 | 33320 |
+| Client steady RSS median [min,max] | 35008 [27388,42236] | 35252 [27216,41984] | 34932 [27032,41844] |
+| Client early → late RSS median; delta | 34908 → 34956; +48 | 34852 → 35376; +524 | 34612 → 35192; +580 |
+| Server steady FDs / threads | 9 / 2 | 9 / 2 | 9 / 2 |
+| Client steady FDs / threads (medians) | 7 / 22 | 7 / 21 | 7 / 21 |
+| Client early → late thread median | 21 → 22 | 21 → 22 | 20 → 21 |
+
+Across the three **trial medians**, server/client steady RSS medians are 12512/35008 KiB;
+median within-trial late−early deltas are +984/+524 KiB (not pooled time-series estimates).
+Warmup→steady RSS deltas are server −88/−692/−496 and client +1396/+2340/+1612 KiB.
+All early/late FD deltas are zero; server thread deltas zero, client +1 each. All server
+idle FD/thread medians return to baseline 8/2. Idle RSS stays 1088–1228 KiB above
+pre-client baseline; **no evidence attributes that residual specifically to benign caches**.
+
+The policy above remains a workload-informed **provisional positive-growth screen**:
+32/64 MiB RSS budgets dominate the 25% terms in these trials. These loose budgets allow
+multi-message buffering and allocator/GC residency; three correlated ten-minute traces
+do not estimate a false-positive rate or justify tightening/widening them. Negative
+deltas pass, and medians can miss transient peaks or slow growth. The raw phase ranges
+and unchanged tolerances are retained, not replaced by a leak-free label.
+
+Builds, traffic and evidence copying held the shared lifecycle lock and reused installed
+tools/private caches. This was not a dedicated host: no CPU pinning/fixed frequency,
+peer affinity not separately sampled, external activity not excluded. Trials 2/3 added
+a two-second process monitor absent from trial 1 (299 traffic snapshots each, no owned
+compiler observed). The [bundle qualifications](evidence/streaming-soak-baseline/README.md#qualifications-and-recorded-interruptions)
+disclose an out-of-lock build-graph preflight and a post-validation provider failure.
+Admission reservations, queue occupancy, live heap, client pre-exit idle and server
+post-deinit accounting remain unavailable; kernel memory is not measured. Exit/cleanup
+is not zero-live-heap proof. No new workload or full check ran for this documentation
+pass: **final-tree `mise run check` remains pending before any push**, as does independent
+acceptance review. Lightweight observer checks, when needed, require no build/workload:
+
+```bash
+python3 -B -m unittest discover -s tests/official -p test_streaming_soak_resources.py -v
+bash tests/official/run_streaming_soak_test.sh
+```
 
 ## Transpiled C Sources
 
@@ -361,15 +519,15 @@ are separate stages in `mise run check`.
 | C/C++ error surface and ownership | [C](../src/c_api.zig#L1869): failed creation clears handles; unary rejection is RESOURCE_EXHAUSTED; stats preserve unknown tails. [C smoke](../tests/c_api_smoke.c#L130), [C++ native](../tests/cpp_native_api_test.cc#L75): defaults, rejection, snapshots. | #44/#46: these smoke assertions do not prove wrapper lifetime under concurrent destruction or OOM at every conversion. Extend existing executables rather than duplicate ABI suites. |
 | Active call → shutdown / deadline / GOAWAY / disconnect | [Channel](../src/channel.zig#L6583): connection replacement, accepted RPC drain, drain timeout/escalation, active call/blocked write/reconnect shutdown. [Server](../src/server.zig#L5384): preface admission/deadline release. [grpcpp facade](../tests/grpcpp_streaming_facade_test.cc#L205): pre-cancel, active cancel, early Finish, deadline, abandoned reader. | #45: deterministically order cancel vs trailers/deadline/disconnect/GOAWAY/shutdown while send or receive is blocked; assert one terminal, no later callback, bounded wait and final reservation/command cleanup. Ordinary success tests are not a race matrix. |
 | Concurrent reserve/release and allocator use | [Channel](../src/channel.zig#L8600): four threads × 1000 budget attempts (unary and stream); serialized backing allocator and concurrent unary tests at [7408](../src/channel.zig#L7408). [Server](../src/server.zig#L5746): multi-reactor concurrent callbacks/allocations. | #45: reserve/open/send races against retirement with explicit barriers. Budget-only contention does not cover full open/destroy; TSAN passing does not establish all schedules. |
-| Streaming backpressure / sustained load | [Channel](../src/channel.zig#L8456): full/half-closed no-allocation sends and gzip wire-size admission; [Server](../src/server.zig#L4871): ordered queue reuse/cancel; [receive credit](../src/server.zig#L5933): paused stream isolation/resume; [typed](../tests/protobuf_adapter_test.zig#L405): all cardinalities. | #47 adds [streaming soak](#streaming-soak) for long-lived slow consumers, repeated pause/resume, large messages, sustained backpressure and recovery in the existing [soak workflow](../.github/workflows/soak.yml); runtime validation pending. Initial scope is native cleartext x86_64 server only; benchmark bidi remains throughput evidence, not soak. |
-| Resource reuse / process residency | [Server allocator test](../src/server.zig#L4353), write pools, and admission tests check local reuse/release. Baseline below samples process resources. | #48: time series through warmup, pressure, recovery and teardown, correlating reservation and actual queue occupancy; no existing benchmark occupancy export. No plateau established by these short runs. |
+| Streaming backpressure / sustained load | [Channel](../src/channel.zig#L8456): full/half-closed no-allocation sends and gzip wire-size admission; [Server](../src/server.zig#L4871): ordered queue reuse/cancel; [receive credit](../src/server.zig#L5933): paused stream isolation/resume; [typed](../tests/protobuf_adapter_test.zig#L405): all cardinalities. | #47 adds [streaming soak](#streaming-soak) for long-lived slow consumers, repeated pause/resume, large messages, sustained backpressure and recovery in the existing [soak workflow](../.github/workflows/soak.yml); [three measured trials](#initial-measured-streaming-baseline) now pass. Initial scope is native cleartext x86_64 server only; benchmark bidi remains throughput evidence, not soak. |
+| Resource reuse / process residency | [Server allocator test](../src/server.zig#L4353), write pools, and admission tests check local reuse/release. Baseline below samples process resources. | #48 implements [phase-separated process observation](#streaming-resource-observer-48) on the existing #47 runner, including failure reports and provisional growth screens. [Initial measured streaming baseline](#initial-measured-streaming-baseline) published; reservation/queue occupancy and pre-exit zero heap remain explicitly unavailable. |
 
 Exclusive follow-up seams: #44 owns retained-handle/control tests and wrapper lifetime
 assertions; #45 owns deterministic terminal-event ordering using existing
 `TestObserver`, semaphores and raw nghttp2 peers; #46 owns allocation/construction/submit
 rollback helpers using `FailingAllocator`/`checkAllAllocationFailures`; #47 owns
-`tests/official` streaming soak plus the existing scheduled workflow; #48 owns benchmark
-measurement/evidence around existing binaries, `/proc` and optional gperftools. These are
+`tests/official` streaming soak plus the existing scheduled workflow; #48 attaches process
+measurement/evidence to that same runner using `/proc`, without another workload. These are
 recommendations, not implementation authorization. #44–46 share `channel.zig` and
 `server.zig`: serialize edits to those files, partition by the named test families, and
 reuse one observer/failure seam rather than creating competing harnesses. #47 should not
@@ -438,7 +596,8 @@ Local raw evidence is retained at `/home/fanmi/tmp/grpc-lite-issue43-evidence/`
 (`test.log`, `check.log`, `check-retry.log`, `check-retry.exit`, `check-final.log`,
 `measure-summary.jsonl`, per-scenario JSON/samples/logs and `measure.py`); this path is
 run-local, not a portable artifact link. The table and commands above are the committed
-baseline; #48 needs isolated, longer, phase-separated measurement.
+baseline; #48 now supplies the separate [initial streaming baseline](#initial-measured-streaming-baseline)
+above, with explicit isolation and accounting limitations.
 
 ## Dependencies
 
