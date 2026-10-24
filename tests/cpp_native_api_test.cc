@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -124,7 +125,9 @@ void TestInvalidObjects() {
 struct RoundTripState {
   std::mutex mutex;
   std::condition_variable completed;
-  bool done = false;
+  unsigned headers_received = 0;
+  unsigned messages = 0;
+  unsigned terminals = 0;
   bool client_ok = false;
   bool server_context_ok = false;
   bool server_terminal = false;
@@ -135,7 +138,11 @@ struct RoundTripState {
   std::string response;
 };
 
-void TestRoundTrip() {
+void TestRoundTripRetainedStreamOwnership() {
+  // Inbound capacity must cover the default 64 KiB stream window.
+  constexpr std::uint64_t inbound_capacity = 64 * 1024;
+  constexpr std::uint64_t outbound_capacity = 4096;
+  constexpr std::uint64_t reserved_bytes = inbound_capacity + outbound_capacity;
   Runtime runtime;
   assert(Runtime::Create(&runtime).ok());
 
@@ -215,8 +222,13 @@ void TestRoundTrip() {
 
   auto logger_token = std::make_shared<int>(2);
   std::weak_ptr<int> logger_weak = logger_token;
+  auto callback_token = std::make_shared<int>(3);
+  std::weak_ptr<int> callback_weak = callback_token;
+  ClientStream survivor;
   {
     grpc_lite::ChannelOptions channel_options;
+    channel_options.max_streams = 1;
+    channel_options.max_stream_buffer_bytes = reserved_bytes;
     channel_options.logger =
         [token = std::move(logger_token), &log_count](
             grpc_lite::LogLevel, std::string_view) {
@@ -237,43 +249,103 @@ void TestRoundTrip() {
     assert(request_metadata.Add("x-client-bin", std::string("\0x", 2)).ok());
     grpc_lite::ClientStreamOptions stream_options;
     stream_options.metadata = &request_metadata;
+    stream_options.has_timeout = true;
+    stream_options.timeout_ns = UINT64_C(5000000000);
+    stream_options.max_message_size = 1024;
+    stream_options.max_inbound_buffer_size = inbound_capacity;
+    stream_options.max_outbound_buffer_size = outbound_capacity;
     grpc_lite::ClientStreamCallbacks client_callbacks;
     client_callbacks.on_headers = [&state](grpc_lite::MetadataEntries entries) {
       std::lock_guard<std::mutex> lock(state.mutex);
+      assert(state.headers_received == state.terminals);
+      ++state.headers_received;
       state.headers = std::move(entries);
     };
     client_callbacks.on_message =
         [&state](std::string payload, grpc_lite::Compression compression) {
           std::lock_guard<std::mutex> lock(state.mutex);
+          assert(state.messages == state.terminals);
+          ++state.messages;
           state.response = std::move(payload);
           assert(compression == grpc_lite::Compression::Identity);
           return grpc_lite::ReceiveAction::Continue;
         };
     client_callbacks.on_terminal =
-        [&state](grpc_lite::Status status,
-                 grpc_lite::MetadataEntries trailers) {
+        [&state, token = std::move(callback_token)](
+            grpc_lite::Status status, grpc_lite::MetadataEntries trailers) {
+          assert(*token == 3);
+          assert(status.ok());
           std::lock_guard<std::mutex> lock(state.mutex);
           state.client_ok = status.ok();
           state.trailers = std::move(trailers);
-          state.done = true;
+          ++state.terminals;
           state.completed.notify_one();
         };
 
     ClientStream stream;
     assert(ClientStream::Open(channel, "/test.Native/Echo", stream_options,
-                              std::move(client_callbacks), &stream)
+                              client_callbacks, &stream)
                .ok());
     assert(stream.Send(std::string("request\0bytes", 13)).ok());
     assert(stream.CloseSend().ok());
 
     std::unique_lock<std::mutex> lock(state.mutex);
     assert(state.completed.wait_for(lock, std::chrono::seconds(5),
-                                    [&state] { return state.done; }));
+                                    [&state] { return state.terminals == 1; }));
+    lock.unlock();
+    grpc_lite::StreamAdmissionStats stats;
+    assert(channel.GetStreamAdmissionStats(&stats).ok());
+    assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == reserved_bytes);
+    ClientStream rejected;
+    assert(ClientStream::Open(channel, "/test.Native/Echo", stream_options,
+                              client_callbacks, &rejected).code() ==
+           grpc_lite::ErrorCode::WouldBlock);
+    assert(channel.GetStreamAdmissionStats(&stats).ok());
+    assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == reserved_bytes);
+    assert(stats.rejected_streams == 1);
+
+    // Moving transfers the reservation; resetting releases only the new owner.
+    ClientStream moved = std::move(stream);
+    assert(stream.Send("late").code() == grpc_lite::ErrorCode::InvalidState);
+    assert(channel.GetStreamAdmissionStats(&stats).ok());
+    assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == reserved_bytes);
+    moved = ClientStream{};
+    // Terminal notification can precede transport retirement. Observe release,
+    // rather than relying on a sleep or assuming callback return retires it.
+    const auto release_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+      assert(channel.GetStreamAdmissionStats(&stats).ok());
+      if (stats.retained_streams == 0) break;
+      assert(std::chrono::steady_clock::now() < release_deadline);
+      std::this_thread::yield();
+    } while (true);
+    assert(stats.reserved_buffer_bytes == 0 && stats.rejected_streams == 1);
+    assert(ClientStream::Open(channel, "/test.Native/Echo", stream_options,
+                              std::move(client_callbacks), &survivor).ok());
+    client_callbacks = {};
+    assert(survivor.Send(std::string("request\0bytes", 13)).ok());
+    assert(survivor.CloseSend().ok());
+    lock.lock();
+    assert(state.completed.wait_for(lock, std::chrono::seconds(5),
+                                    [&state] { return state.terminals == 2; }));
     lock.unlock();
     channel.Shutdown();
     channel.Wait();
-  }
+    assert(channel.GetStreamAdmissionStats(&stats).ok());
+    assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == reserved_bytes);
+    assert(stats.rejected_streams == 1);
+  }  // Destroy the actual Channel while survivor still owns its stream.
   assert(logger_weak.expired());
+  assert(!callback_weak.expired());
+  assert(survivor.Send("late").code() == grpc_lite::ErrorCode::Closed);
+  assert(survivor.CloseSend().code() == grpc_lite::ErrorCode::Closed);
+  assert(survivor.ResumeReceive().code() == grpc_lite::ErrorCode::Closed);
+  survivor.Cancel();
+  survivor = ClientStream{};
+  assert(callback_weak.expired());
+  assert(state.headers_received == 2 && state.messages == 2);
+  assert(state.terminals == 2);
 
   server.ShutdownGracefully(UINT64_C(1000000000));
   server.Wait();
@@ -297,6 +369,6 @@ void TestRoundTrip() {
 int main() {
   TestMetadata();
   TestInvalidObjects();
-  TestRoundTrip();
+  TestRoundTripRetainedStreamOwnership();
   return 0;
 }

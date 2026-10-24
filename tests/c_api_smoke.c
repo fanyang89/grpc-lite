@@ -1,8 +1,11 @@
 #include <grpc_lite/grpc_lite.h>
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static grpc_lite_bytes_view bytes(const void *data, size_t size) {
   grpc_lite_bytes_view value = {(const uint8_t *)data, size};
@@ -55,6 +58,164 @@ static uint32_t on_server_message(
   (void)payload;
   (void)compression;
   return GRPC_LITE_RECEIVE_CONTINUE;
+}
+
+struct retained_stream_state {
+  pthread_mutex_t mutex;
+  pthread_cond_t completed;
+  unsigned messages;
+  unsigned terminals;
+};
+
+static uint32_t retained_on_message(
+    void *user_data,
+    grpc_lite_client_stream *stream,
+    grpc_lite_bytes_view payload,
+    uint32_t compression) {
+  struct retained_stream_state *state = user_data;
+  (void)stream;
+  assert(compression == GRPC_LITE_COMPRESSION_IDENTITY);
+  assert(payload.size == 8 && memcmp(payload.data, "response", 8) == 0);
+  assert(pthread_mutex_lock(&state->mutex) == 0);
+  assert(state->terminals == 0);
+  ++state->messages;
+  assert(pthread_mutex_unlock(&state->mutex) == 0);
+  return GRPC_LITE_RECEIVE_CONTINUE;
+}
+
+static void retained_on_terminal(
+    void *user_data,
+    grpc_lite_client_stream *stream,
+    int32_t status_code,
+    grpc_lite_bytes_view status_message,
+    const grpc_lite_metadata_view *trailing_metadata) {
+  struct retained_stream_state *state = user_data;
+  (void)stream;
+  (void)status_message;
+  (void)trailing_metadata;
+  assert(status_code == 0);
+  assert(pthread_mutex_lock(&state->mutex) == 0);
+  assert(++state->terminals == 1);
+  assert(pthread_cond_signal(&state->completed) == 0);
+  assert(pthread_mutex_unlock(&state->mutex) == 0);
+}
+
+static void retained_server_on_remote_end(
+    void *user_data,
+    grpc_lite_server_stream *stream,
+    const grpc_lite_server_context *context) {
+  grpc_lite_server_call *call = NULL;
+  (void)user_data;
+  (void)context;
+  assert(grpc_lite_server_stream_retain(stream, &call) == GRPC_LITE_OK);
+  assert(grpc_lite_server_call_send(
+      call, bytes("response", 8), GRPC_LITE_COMPRESSION_IDENTITY) == GRPC_LITE_OK);
+  assert(grpc_lite_server_call_finish(
+      call, 0, bytes(NULL, 0), NULL) == GRPC_LITE_OK);
+  grpc_lite_server_call_destroy(call);
+}
+
+static void test_retained_results_and_stream_outlive_channel(void) {
+  /* Inbound capacity must cover the default 64 KiB stream window. */
+  const uint64_t inbound_capacity = 64 * 1024;
+  const uint64_t outbound_capacity = 4096;
+  const uint64_t reserved_bytes = inbound_capacity + outbound_capacity;
+  const grpc_lite_bytes_view method =
+      {(const uint8_t *)"/test.Ownership/Echo", sizeof("/test.Ownership/Echo") - 1};
+  grpc_lite_server *server = NULL;
+  grpc_lite_server_method_options method_options = GRPC_LITE_SERVER_METHOD_OPTIONS_INIT;
+  grpc_lite_server_method_callbacks method_callbacks = GRPC_LITE_SERVER_METHOD_CALLBACKS_INIT;
+  method_options.explicit_initial_metadata = 0;
+  method_callbacks.on_message = on_server_message;
+  method_callbacks.on_remote_end = retained_server_on_remote_end;
+  assert(grpc_lite_server_create(NULL, &server) == GRPC_LITE_OK);
+  assert(grpc_lite_server_register_stream(
+      server, method, &method_options, &method_callbacks) == GRPC_LITE_OK);
+  assert(grpc_lite_server_start(server) == GRPC_LITE_OK);
+  uint32_t port = 0;
+  assert(grpc_lite_server_port(server, &port) == GRPC_LITE_OK);
+  char target[32];
+  const int target_size = snprintf(target, sizeof(target), "127.0.0.1:%u", (unsigned)port);
+  assert(target_size > 0 && (size_t)target_size < sizeof(target));
+  grpc_lite_channel_options channel_options = GRPC_LITE_CHANNEL_OPTIONS_INIT;
+  channel_options.max_unary_calls = 1;
+  channel_options.max_unary_request_bytes = method.size + 5 + 7;
+  channel_options.max_streams = 1;
+  channel_options.max_stream_buffer_bytes = reserved_bytes;
+  grpc_lite_channel *channel = NULL;
+  assert(grpc_lite_channel_create_managed(
+      NULL, bytes(target, (size_t)target_size), &channel_options, &channel) == GRPC_LITE_OK);
+
+  grpc_lite_unary_options unary_options = GRPC_LITE_UNARY_OPTIONS_INIT;
+  unary_options.has_timeout = 1;
+  unary_options.timeout_ns = UINT64_C(5000000000);
+  grpc_lite_unary_result *results[2] = {NULL, NULL};
+  grpc_lite_unary_admission_stats unary_stats = GRPC_LITE_UNARY_ADMISSION_STATS_INIT;
+  for (size_t i = 0; i < 2; ++i) {
+    assert(grpc_lite_channel_call_unary(
+        channel, method, bytes("request", 7), &unary_options, &results[i]) == GRPC_LITE_OK);
+    assert(grpc_lite_unary_result_status_code(results[i]) == 0);
+    /* Copied results do not retain unary admission, even before result destroy. */
+    assert(grpc_lite_channel_get_unary_admission_stats(channel, &unary_stats) == GRPC_LITE_OK);
+    assert(unary_stats.retained_calls == 0 && unary_stats.retained_request_bytes == 0);
+    assert(unary_stats.rejected_calls == 0);
+  }
+
+  struct retained_stream_state state = {
+      PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0};
+  grpc_lite_client_stream_options stream_options = GRPC_LITE_CLIENT_STREAM_OPTIONS_INIT;
+  stream_options.has_timeout = 1;
+  stream_options.timeout_ns = UINT64_C(5000000000);
+  stream_options.max_message_size = 1024;
+  stream_options.max_inbound_buffer_size = inbound_capacity;
+  stream_options.max_outbound_buffer_size = outbound_capacity;
+  grpc_lite_client_stream_callbacks callbacks = GRPC_LITE_CLIENT_STREAM_CALLBACKS_INIT;
+  callbacks.user_data = &state;
+  callbacks.on_message = retained_on_message;
+  callbacks.on_terminal = retained_on_terminal;
+  grpc_lite_client_stream *stream = NULL;
+  assert(grpc_lite_channel_open_stream(
+      channel, method, &stream_options, &callbacks, &stream) == GRPC_LITE_OK);
+  assert(grpc_lite_client_stream_close_send(stream) == GRPC_LITE_OK);
+  struct timespec deadline;
+  assert(timespec_get(&deadline, TIME_UTC) == TIME_UTC);
+  deadline.tv_sec += 5;
+  assert(pthread_mutex_lock(&state.mutex) == 0);
+  while (state.terminals == 0) {
+    assert(pthread_cond_timedwait(&state.completed, &state.mutex, &deadline) == 0);
+  }
+  assert(state.messages == 1 && state.terminals == 1);
+  assert(pthread_mutex_unlock(&state.mutex) == 0);
+  grpc_lite_stream_admission_stats stats = GRPC_LITE_STREAM_ADMISSION_STATS_INIT;
+  assert(grpc_lite_channel_get_stream_admission_stats(channel, &stats) == GRPC_LITE_OK);
+  assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == reserved_bytes);
+  grpc_lite_client_stream *rejected = NULL;
+  assert(grpc_lite_channel_open_stream(
+      channel, method, &stream_options, &callbacks, &rejected) == GRPC_LITE_ERROR_WOULD_BLOCK);
+  assert(rejected == NULL);
+  assert(grpc_lite_channel_get_stream_admission_stats(channel, &stats) == GRPC_LITE_OK);
+  assert(stats.retained_streams == 1 && stats.reserved_buffer_bytes == reserved_bytes);
+  assert(stats.rejected_streams == 1);
+
+  /* Actual destruction joins the loop; never query the released Channel. */
+  grpc_lite_channel_destroy(channel);
+  channel = NULL;
+  assert(grpc_lite_client_stream_send(
+      stream, bytes("late", 4), GRPC_LITE_COMPRESSION_IDENTITY) == GRPC_LITE_ERROR_CLOSED);
+  assert(grpc_lite_client_stream_close_send(stream) == GRPC_LITE_ERROR_CLOSED);
+  assert(grpc_lite_client_stream_resume_receive(stream) == GRPC_LITE_ERROR_CLOSED);
+  grpc_lite_client_stream_cancel(stream);
+  grpc_lite_client_stream_destroy(stream);
+  assert(state.messages == 1 && state.terminals == 1);
+  assert(pthread_cond_destroy(&state.completed) == 0);
+  assert(pthread_mutex_destroy(&state.mutex) == 0);
+  for (size_t i = 0; i < 2; ++i) {
+    const grpc_lite_bytes_view payload = grpc_lite_unary_result_payload(results[i]);
+    assert(payload.size == 8 && memcmp(payload.data, "response", 8) == 0);
+    assert(grpc_lite_unary_result_status_code(results[i]) == 0);
+    grpc_lite_unary_result_destroy(results[i]);
+  }
+  grpc_lite_server_destroy(server);
 }
 
 int main(void) {
@@ -165,5 +326,6 @@ int main(void) {
   grpc_lite_channel_shutdown(channel);
   grpc_lite_channel_wait(channel);
   grpc_lite_channel_destroy(channel);
+  test_retained_results_and_stream_outlive_channel();
   return 0;
 }
