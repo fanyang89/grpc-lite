@@ -315,6 +315,112 @@ replaced with `DEADLINE_EXCEEDED`.
 
 See `examples/echo_server.zig` and `examples/echo_client.zig` for complete programs.
 
+## Operational Snapshots
+
+`Channel.operationalStats(self: *Channel) ChannelOperationalStats` and
+`Server.operationalStats(self: *const Server) ServerOperationalStats` return
+caller-owned values without allocating or invoking callbacks. The root aliases are
+`grpc.ChannelOperationalStats` (`grpc.channel.OperationalStats`) and
+`grpc.ServerOperationalStats` (`grpc.server.OperationalStats`). No snapshot needs
+`deinit`; it contains no borrowed mutable storage. These APIs are Zig-only; the existing
+C/C++ admission snapshots are unchanged.
+
+Both methods may run concurrently with supported operations, `shutdown`, and `wait`,
+and may be called after `wait` while the owner is still alive. **Owner `deinit` requires
+exclusive access**: stop and join snapshot readers before deinitializing the Channel or
+Server, and never query a destroyed owner, even if a client stream handle survives it.
+
+Fields start at zero when their accounting owner is initialized; live snapshots reflect
+activity since then (a successfully connected Channel can already have an active
+connection when `init` returns). There is no reset API. Event counters saturate at
+`maxInt(u64)` and high-water marks never decrease. Current local gauges use matching
+addition/subtraction, not saturating subtraction; Server aggregate sums saturate.
+These are accounting samples, not transactions with transport/container mutations.
+
+### Channel operational fields
+
+Sampling is O(1). Operational fields are copied under one accounting mutex; the two
+admission snapshots are acquired independently, not atomically with each other or the
+operational fields. All top-level fields below are `u64` except the two admission structs.
+Counts are objects/events and byte fields are logical charges, not allocated capacity.
+
+| Field | Meaning and ownership boundary |
+| --- | --- |
+| `unary_admission` | `UnaryAdmissionStats`: `retained_calls: usize`, `retained_request_bytes: usize`, `rejected_calls: u64`. Existing [unary admission](#unary-admission) ownership, logical request bytes, and quota rejection counter. |
+| `stream_admission` | `StreamAdmissionStats`: `retained_streams: usize`, `reserved_buffer_bytes: usize`, `rejected_streams: u64`. Existing [streaming admission](#streaming-admission) ownership, sum of configured buffer capacities, and quota rejection counter. |
+| `active_unary_calls`, `active_streams` | Accepted enqueue/open through the first terminal outcome, decremented before callbacks. Failed enqueue/open is not active; terminal retained handles are not active RPCs. |
+| `active_connections` | Usable transport, including GOAWAY draining; excludes dialing, backoff and closing. At most one: replacement starts after the old TCP connection closes. |
+| `pending_unary_calls` | Accepted unary work until submission starts or a pre-submit terminal outcome, including work waiting during reconnect. |
+| `pending_unary_calls_high_water` | Channel-lifetime peak pending unary count. |
+| `stream_inbound_bytes` | Queued decoded uncompressed payload plus a five-byte frame charge per message. Excludes decoder storage and payload delivered immediately to a callback. |
+| `stream_inbound_bytes_high_water` | Channel-lifetime peak aggregate inbound queue charge. |
+| `stream_outbound_bytes` | Whole encoded frames, including gzip wire size. A partially consumed frame retains its full charge until fully consumed or destroyed. |
+| `stream_outbound_bytes_high_water` | Channel-lifetime peak aggregate outbound queue charge, not a sum of per-stream peaks. |
+| `socket_write_bytes` | Owned socket-write buffers until full completion/discard, including in-flight writes; TLS ciphertext when enabled. Not bytes delivered to the peer. |
+| `socket_write_bytes_high_water` | Channel-lifetime peak aggregate socket-write charge. |
+| `terminal_ok`, `terminal_cancelled`, `terminal_deadline_exceeded`, `terminal_other` | One mutually exclusive final-status bucket per accepted unary/stream RPC, even when application callback delivery is suppressed. `terminal_other` includes unavailable, resource exhaustion and application failures. |
+| `reconnect_attempts` | TCP connect submissions after the initial TCP attempt, including later address candidates. DNS-only failures and backoff scheduling are excluded. |
+| `reconnect_successes` | Successful transport activations from those later TCP attempts. |
+| `reconnect_goaway` | GOAWAY entering drain. |
+| `reconnect_transport_failure` | Usable transport failure initiating recovery when reconnect is enabled. A draining transport can contribute to both reconnect trigger counters; these are not exhaustive or disjoint failed-dial reasons. No RPC replay is implied. |
+
+Stream queue byte gauges include terminal, detached, application-retained buffers until
+final stream destruction. **They can remain nonzero after `Channel.wait()`**. Their
+accounting storage survives with the retained stream, but querying still requires a live
+Channel. Releasing a reservation, reaching a terminal outcome, and freeing queue storage
+are distinct boundaries; high-water marks persist after current gauges return to zero.
+
+```zig
+const snapshot: grpc.ChannelOperationalStats = channel.operationalStats();
+// Configured capacity reserved by retained streams:
+const reserved_capacity = snapshot.stream_admission.reserved_buffer_bytes;
+// Current whole encoded-frame queue charge, including retained terminal buffers:
+const queued_frames = snapshot.stream_outbound_bytes;
+```
+
+### Server operational fields
+
+Sampling is O(reactors), loading independent atomics without acquiring a snapshot lock
+or traversing mutable transport containers. Fields and reactor contributions are sampled
+at different instants: the result is **approximate**, not a globally consistent snapshot.
+All fields are `u64`; byte gauges count owned slices/reservations, not configured capacity.
+
+| Field | Meaning and ownership boundary |
+| --- | --- |
+| `admitted_connections` | Existing coordinator admission count: initializing, active, draining and asynchronously closing slots through final connection destruction. |
+| `active_rpcs` | Successfully inserted inbound HTTP/2 request-stream entries, including malformed/unhandled RPC requests, until transport retirement. Excludes retained `ServerCall` controls after retirement. |
+| `rejected_connections` | Accepts refused by the aggregate connection cap only; excludes drain and initialization failures. |
+| `pre_ack_rejected_streams` | Pre-SETTINGS-ACK stream-cap refusals plus the defensive application cap guard. Excludes drain refusals and allocation failures. Pinned nghttp2 uniquely identifies the pre-ACK path via request HEADERS/`NGHTTP2_ERR_REFUSED_STREAM`; generic post-ACK protocol cap rejections are unavailable and not counted. |
+| `streaming_outbound_reserved_bytes` | Remaining encoded streaming frame bytes, including queued cross-thread send commands. Released as consumed/discarded/destroyed; unlike the Channel whole-frame charge, partial consumption reduces this gauge. Excludes unary responses and temporary send encodings. |
+| `streaming_outbound_reserved_bytes_high_water_sum` | Sum of reactor-lifetime outbound reservation peaks. |
+| `socket_queued_write_bytes` | Owned socket-write buffers until full completion/discard, including in-flight writes; TLS ciphertext when enabled. Excludes nghttp2/TLS-internal pending data. |
+| `socket_queued_write_bytes_high_water_sum` | Sum of reactor-lifetime socket-write peaks. |
+| `close_peer_transport` | Read/write transport failures or TLS peer EOF. |
+| `close_protocol_local` | Protocol/local failure or nghttp2 session termination, including TLS handshake timeout. |
+| `close_preface_timeout` | Absolute cleartext preface timeout. |
+| `close_idle_timeout` | Idle expiry, including GOAWAY-write completion or fallback close. |
+| `close_graceful_drain` | Graceful shutdown's drained connection closure. |
+| `close_forced_shutdown` | Immediate shutdown or graceful drain timeout. |
+
+The `*_high_water_sum` fields are conservative sums of non-simultaneous reactor peaks,
+**not true global peaks**. Close counters are mutually exclusive for each admission-owning
+connection object. The first effective close initiation (including close-after-write)
+latches the reason; the counter increments once at final object destruction. Later
+shutdown/errors cannot overwrite it. Rejected accepts and failures before object admission
+ownership do not count as closed objects. Decoder occupancy and post-ACK stream-cap
+rejection counts are explicitly unavailable, not zero-valued measurements.
+
+### Memory scope
+
+Neither snapshot measures or bounds total heap use or RSS. Stream and socket ownership
+are separate gauges, not a deduplicated memory total. Excluded costs include spare
+capacity, decoder/metadata/HPACK storage, compression temporaries, TLS workspace, kernel
+buffers, allocator overhead/caches, and application copies. Admission reservations are
+configured/logical budgets rather than allocated bytes; queue charges are not allocation
+sizes. See the [resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence)
+for the historical baseline and its explicitly outstanding validation matrix. These APIs
+do not supply missing baseline time series or close those lifecycle/race coverage gaps.
+
 ## TLS
 
 TLS is an optional mbedTLS 3.6.6 dependency:

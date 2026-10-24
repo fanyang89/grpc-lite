@@ -235,6 +235,94 @@ pub const LocalAddress = struct {
     port: u16,
 };
 
+/// Approximate, independently sampled Server-lifetime statistics, all in counts
+/// or bytes (u64). Zero at init; no reset. Counters, high-water marks and aggregate
+/// sums saturate. Local gauges account actual owned objects/allocated byte slices,
+/// not configured capacities, and release exactly (no saturating subtraction).
+/// Safe during operations/shutdown/wait and after wait, never during/after deinit.
+/// No borrowed pointers, callbacks, allocation or global hot-path lock. Sampling
+/// costs O(reactors). Excludes decoder occupancy (unavailable), metadata, HPACK,
+/// TLS internals, compression scratch, spare capacity and allocator/OS overhead;
+/// these fields neither measure nor bound heap or RSS.
+pub const OperationalStats = struct {
+    /// Existing admission ownership: initializing, active AND closing connections.
+    admitted_connections: u64 = 0,
+    /// Admitted inbound HTTP/2 request stream entries, including invalid/unhandled
+    /// RPC requests, until transport retirement; excludes retained ServerCall controls.
+    active_rpcs: u64 = 0,
+    /// Accepts refused by the aggregate connection cap, not drain/init failures.
+    rejected_connections: u64 = 0,
+    /// Pre-SETTINGS-ACK stream-cap refusals plus the defensive application cap
+    /// guard. Pinned nghttp2 reports the former as REQUEST HEADERS/REFUSED_STREAM;
+    /// its post-ACK generic protocol rejections are unavailable, not included.
+    /// Drain refusals and allocation failures are not quota rejections.
+    pre_ack_rejected_streams: u64 = 0,
+    /// Encoded streaming frame bytes remaining, including queued send commands.
+    /// Released as consumed/discarded; excludes unary responses and send temporaries.
+    streaming_outbound_reserved_bytes: u64 = 0,
+    /// Sum of per-reactor lifetime HWMs: conservative non-simultaneous peak,
+    /// NOT the true global peak. Same byte units/scope as the associated gauge.
+    streaming_outbound_reserved_bytes_high_water_sum: u64 = 0,
+    /// Owned socket write buffers until full completion/discard (TLS ciphertext
+    /// when enabled); separate from stream reservations and nghttp2 queues.
+    socket_queued_write_bytes: u64 = 0,
+    /// Sum of per-reactor lifetime HWMs, NOT the true global peak.
+    socket_queued_write_bytes_high_water_sum: u64 = 0,
+    /// Mutually exclusive final destruction counts for admission-owned connection
+    /// objects. First effective close initiation wins, including close-after-write;
+    /// later shutdown/errors cannot overwrite it. Pre-object failures are excluded.
+    close_peer_transport: u64 = 0,
+    /// Includes local/protocol errors and TLS handshake timeout.
+    close_protocol_local: u64 = 0,
+    close_preface_timeout: u64 = 0,
+    close_idle_timeout: u64 = 0,
+    close_graceful_drain: u64 = 0,
+    /// Immediate shutdown or graceful drain timeout.
+    close_forced_shutdown: u64 = 0,
+};
+
+const CloseReason = enum {
+    peer_transport,
+    protocol_local,
+    preface_timeout,
+    idle_timeout,
+    graceful_drain,
+    forced_shutdown,
+};
+
+// Each metric has one serialized writer: the owning reactor, except outbound
+// reservations, whose writers already hold Impl.mutex. Snapshot readers only load
+// atomics, so no container traversal or new lock order is introduced. Current
+// gauges fit u64 because they count actual address-space-owned allocations, not
+// the (potentially overflowing) sum of configured capacity permissions.
+const OperationalGauge = struct {
+    current: std.atomic.Value(u64) = .init(0),
+    high_water: std.atomic.Value(u64) = .init(0),
+
+    fn add(self: *OperationalGauge, bytes: usize) void {
+        const value = self.current.load(.monotonic) + bytes;
+        self.current.store(value, .monotonic);
+        self.high_water.store(@max(value, self.high_water.load(.monotonic)), .monotonic);
+    }
+
+    fn subtract(self: *OperationalGauge, bytes: usize) void {
+        self.current.store(self.current.load(.monotonic) - bytes, .monotonic);
+    }
+};
+
+const ReactorOperationalStats = struct {
+    active_rpcs: std.atomic.Value(u64) = .init(0),
+    rejected_connections: std.atomic.Value(u64) = .init(0),
+    pre_ack_rejected_streams: std.atomic.Value(u64) = .init(0),
+    outbound: OperationalGauge = .{},
+    socket: OperationalGauge = .{},
+    closes: [6]std.atomic.Value(u64) = @splat(.init(0)),
+
+    fn count(counter: *std.atomic.Value(u64)) void {
+        counter.store(counter.load(.monotonic) +| 1, .monotonic);
+    }
+};
+
 pub const Server = struct {
     impl: *Impl,
     coordinator: *Coordinator,
@@ -380,6 +468,27 @@ pub const Server = struct {
             );
         }
         coordinator.log_mutex.unlock(coordinator.io());
+    }
+
+    /// See OperationalStats for approximation, ownership and lifetime rules.
+    pub fn operationalStats(self: *const Server) OperationalStats {
+        var result: OperationalStats = .{
+            .admitted_connections = self.coordinator.admitted_connections.load(.monotonic),
+        };
+        for (self.coordinator.reactors) |reactor| {
+            const stats = &reactor.operational_stats;
+            result.active_rpcs +|= stats.active_rpcs.load(.monotonic);
+            result.rejected_connections +|= stats.rejected_connections.load(.monotonic);
+            result.pre_ack_rejected_streams +|= stats.pre_ack_rejected_streams.load(.monotonic);
+            result.streaming_outbound_reserved_bytes +|= stats.outbound.current.load(.monotonic);
+            result.streaming_outbound_reserved_bytes_high_water_sum +|= stats.outbound.high_water.load(.monotonic);
+            result.socket_queued_write_bytes +|= stats.socket.current.load(.monotonic);
+            result.socket_queued_write_bytes_high_water_sum +|= stats.socket.high_water.load(.monotonic);
+            inline for (@typeInfo(CloseReason).@"enum".field_names, 0..) |name, index| {
+                @field(result, "close_" ++ name) +|= stats.closes[index].load(.monotonic);
+            }
+        }
+        return result;
     }
 
     pub fn localAddress(self: *const Server) !LocalAddress {
@@ -613,6 +722,7 @@ const StartupError = error{
 };
 
 const Impl = struct {
+    operational_stats: ReactorOperationalStats = .{},
     // Shared storage may be touched by application and reactor threads.
     shared_allocator: std.mem.Allocator,
     coordinator: *Coordinator,
@@ -1097,6 +1207,7 @@ const Stream = struct {
     // Queued and currently processing commands each retain this stream once.
     command_refs: usize = 0,
     transport_closed: bool = false,
+    operationally_active: bool = false,
     force_abort_requested: bool = false,
 
     fn init(allocator: std.mem.Allocator, connection: *Connection, id: i32) Stream {
@@ -1111,6 +1222,11 @@ const Stream = struct {
 
     fn deinit(self: *Stream) void {
         removeStreamDeadline(self);
+        if (self.outbound_reserved_bytes != 0) {
+            self.connection.server.lock();
+            self.connection.server.operational_stats.outbound.subtract(self.outbound_reserved_bytes);
+            self.connection.server.unlock();
+        }
         if (self.streaming) |*streaming| streaming.deinit(self.allocator);
         if (self.path) |path| self.allocator.free(path);
         self.request_body.deinit(self.allocator);
@@ -1315,7 +1431,11 @@ fn serverCallSend(context: *anyopaque, payload: []const u8, options: raw_stream.
     try checkRetainedSendLocked(target, options);
     try checkOutboundCapacityLocked(target, encoded.len);
     target.outbound_reserved_bytes += encoded.len;
-    errdefer target.outbound_reserved_bytes -= encoded.len;
+    server.operational_stats.outbound.add(encoded.len);
+    errdefer {
+        target.outbound_reserved_bytes -= encoded.len;
+        server.operational_stats.outbound.subtract(encoded.len);
+    }
     command_owned = false;
     try enqueueStreamCommandLocked(server, target, command);
     if (options.compression == .gzip) target.response_gzip_requested = true;
@@ -1403,7 +1523,11 @@ fn streamSend(context: *anyopaque, payload: []const u8, options: raw_stream.Send
     try checkBorrowedSendLocked(target, options);
     try checkOutboundCapacityLocked(target, encoded.len);
     target.outbound_reserved_bytes += encoded.len;
-    errdefer target.outbound_reserved_bytes -= encoded.len;
+    server.operational_stats.outbound.add(encoded.len);
+    errdefer {
+        target.outbound_reserved_bytes -= encoded.len;
+        server.operational_stats.outbound.subtract(encoded.len);
+    }
     if (options.compression == .gzip) target.response_gzip_requested = true;
     command_owned = false;
     try enqueueStreamCommandLocked(server, target, command);
@@ -1470,6 +1594,7 @@ const ConnectionDeadline = struct {
 const Connection = struct {
     server: *Impl,
     owns_admission: bool = false,
+    close_reason: ?CloseReason = null,
     tcp: xev.TCP = undefined,
     session: ?*c.nghttp2_session = null,
     streams: std.AutoHashMapUnmanaged(i32, *Stream) = .empty,
@@ -1519,6 +1644,7 @@ const Connection = struct {
         c.nghttp2_option_set_no_auto_window_update(options, 1);
 
         c.nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, onBeginHeaders);
+        c.nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(callbacks, onInvalidFrameReceived);
         c.nghttp2_session_callbacks_set_on_header_callback(callbacks, onHeader);
         c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, onDataChunk);
         c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, onFrameReceived);
@@ -1646,6 +1772,7 @@ const Connection = struct {
         };
         errdefer self.pending_writes -= 1;
         self.queued_write_bytes = try addQueuedWriteBytes(self.queued_write_bytes, bytes.len);
+        self.server.operational_stats.socket.add(bytes.len);
         self.tcp.queueWrite(
             &self.server.loop,
             &self.write_queue,
@@ -1708,7 +1835,12 @@ const Connection = struct {
                 },
                 .want_read => break,
                 .want_write => try self.drainTlsCiphertext(),
-                .peer_closed => return error.TlsPeerClosed,
+                .peer_closed => {
+                    // The handshake-completion path also reads buffered records;
+                    // classify here before either caller's generic close handler.
+                    self.latchCloseReason(.peer_transport);
+                    return error.TlsPeerClosed;
+                },
                 else => return error.TlsConnectionClosed,
             }
         }
@@ -1744,6 +1876,7 @@ const Connection = struct {
 
     fn closeGracefully(self: *Connection, loop: *xev.Loop) void {
         if (self.closing or self.close_after_writes) return;
+        self.latchCloseReason(.protocol_local);
         if (comptime build_options.tls) {
             if (self.tls_session) |tls_session| {
                 while (true) {
@@ -1782,7 +1915,17 @@ const Connection = struct {
         ) != 0) return error.NativeFailure;
     }
 
+    fn latchCloseReason(self: *Connection, reason: CloseReason) void {
+        if (self.close_reason == null) self.close_reason = reason;
+    }
+
+    fn closeWithReason(self: *Connection, loop: *xev.Loop, reason: CloseReason) void {
+        self.latchCloseReason(reason);
+        self.closeOnLoop(loop);
+    }
+
     fn close(self: *Connection) void {
+        self.latchCloseReason(.protocol_local);
         if (!self.server.loop_initialized) {
             clearConnectionDeadline(self);
             self.closing = true;
@@ -1792,6 +1935,7 @@ const Connection = struct {
     }
 
     fn closeOnLoop(self: *Connection, loop: *xev.Loop) void {
+        self.latchCloseReason(.protocol_local);
         self.server.removeDirtyConnection(self);
         clearConnectionDeadline(self);
         if (self.closing) return;
@@ -1842,6 +1986,7 @@ const Connection = struct {
             const write: *WriteRequest = @fieldParentPtr("request", request);
             self.pending_writes -= 1;
             self.queued_write_bytes = completeQueuedWrite(self.queued_write_bytes, write.bytes.len);
+            self.server.operational_stats.socket.subtract(write.bytes.len);
             self.allocator().free(write.bytes);
             releaseWriteRequest(self, write);
         }
@@ -1885,6 +2030,7 @@ const Connection = struct {
         std.debug.assert(removed);
         if (self.owns_admission) {
             self.owns_admission = false;
+            ReactorOperationalStats.count(&server.operational_stats.closes[@backingInt(self.close_reason orelse .protocol_local)]);
             server.coordinator.releaseConnection();
         }
         server.localAllocator().destroy(self);
@@ -2265,6 +2411,7 @@ fn onConnection(server: ?*Impl, loop: *xev.Loop, _: *xev.Completion, result: xev
         return .disarm;
     }
     if (!server_ptr.coordinator.tryClaimConnection()) {
+        ReactorOperationalStats.count(&server_ptr.operational_stats.rejected_connections);
         closeFd(tcp.fd);
         return rearmListener(server_ptr);
     }
@@ -2348,7 +2495,7 @@ fn onRead(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.
     const conn = connection orelse return .disarm;
     conn.read_active = false;
     const length = result catch {
-        conn.closeOnLoop(loop);
+        conn.closeWithReason(loop, .peer_transport);
         conn.submitCloseIfReady(loop);
         conn.finishCloseIfReady();
         return .disarm;
@@ -2361,7 +2508,7 @@ fn onRead(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.
         if (conn.tls_session) |tls_session| {
             if (bytes.len == 0) {
                 tls_session.markTransportEof();
-                conn.closeOnLoop(loop);
+                conn.closeWithReason(loop, .peer_transport);
             } else {
                 tls_session.feedCiphertext(bytes) catch {
                     conn.closeOnLoop(loop);
@@ -2405,6 +2552,7 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
     const connection = request.connection;
     connection.pending_writes -= 1;
     connection.queued_write_bytes = completeQueuedWrite(connection.queued_write_bytes, request.bytes.len);
+    connection.server.operational_stats.socket.subtract(request.bytes.len);
     // WriteQueue retries partial writes and calls back with the full buffer length.
     const completed: ?usize = result catch null;
     const write_succeeded = completed != null and completed.? == request.bytes.len;
@@ -2417,7 +2565,7 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
         return .disarm;
     }
     if (!write_succeeded) {
-        connection.closeOnLoop(loop);
+        connection.closeWithReason(loop, .peer_transport);
         connection.finishCloseIfReady();
         return .disarm;
     }
@@ -2482,7 +2630,7 @@ fn onShutdown(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.Async.Wai
     impl.unlock();
     switch (state) {
         .draining => beginDrain(impl),
-        .stopping => stopImmediately(impl),
+        .stopping => stopImmediately(impl, .forced_shutdown),
         else => {},
     }
     return .rearm;
@@ -2491,7 +2639,7 @@ fn onShutdown(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, _: xev.Async.Wai
 fn onStreamAsync(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
     const impl = server orelse return .disarm;
     result catch {
-        stopImmediately(impl);
+        stopImmediately(impl, .protocol_local);
         return .disarm;
     };
     processStreamCommands(impl);
@@ -2656,6 +2804,7 @@ fn releaseOutboundReservation(target: *Stream, length: usize, notify_writable: b
     const server = target.connection.server;
     server.lock();
     target.outbound_reserved_bytes -= length;
+    server.operational_stats.outbound.subtract(length);
     const writable = notify_writable and
         target.writable_requested and
         target.streaming_active and
@@ -2773,7 +2922,10 @@ fn discardStreamCommands(target: *Stream) void {
         std.debug.assert(target.command_refs != 0);
         target.command_refs -= 1;
         switch (command.action) {
-            .send => |bytes| target.outbound_reserved_bytes -= bytes.len,
+            .send => |bytes| {
+                target.outbound_reserved_bytes -= bytes.len;
+                server.operational_stats.outbound.subtract(bytes.len);
+            },
             else => {},
         }
         command.deinit(server.shared_allocator);
@@ -2784,6 +2936,11 @@ fn retireStream(target: *Stream) bool {
     removeStreamDeadline(target);
     const server = target.connection.server;
     server.lock();
+    if (target.operationally_active) {
+        target.operationally_active = false;
+        const active = server.operational_stats.active_rpcs.load(.monotonic);
+        server.operational_stats.active_rpcs.store(active - 1, .monotonic);
+    }
     target.transport_closed = true;
     target.streaming_active = false;
     if (target.call_control) |control| control.target = null;
@@ -2878,7 +3035,7 @@ fn beginDrain(server: *Impl) void {
     for (server.connections.items) |connection| {
         if (connection.draining or connection.closing or connection.session == null) continue;
         if (connection.tls_handshaking) {
-            connection.closeOnLoop(&server.loop);
+            connection.closeWithReason(&server.loop, .graceful_drain);
             continue;
         }
         connection.draining = true;
@@ -2898,6 +3055,7 @@ fn beginDrain(server: *Impl) void {
 
 fn maybeCloseDrainedConnection(connection: *Connection) void {
     if (connection.draining and !connection.closing and connection.streams.count() == 0 and connection.pending_writes == 0) {
+        connection.latchCloseReason(.graceful_drain);
         if (connection.server.loop_initialized)
             connection.closeGracefully(&connection.server.loop)
         else
@@ -2922,13 +3080,13 @@ fn onDrainTimeout(server: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.
     impl.lock();
     if (impl.state == .draining) impl.state = .stopping;
     impl.unlock();
-    stopImmediately(impl);
+    stopImmediately(impl, .forced_shutdown);
     return .disarm;
 }
 
-fn stopImmediately(server: *Impl) void {
+fn stopImmediately(server: *Impl, reason: CloseReason) void {
     closeListener(server);
-    for (server.connections.items) |connection| connection.closeOnLoop(&server.loop);
+    for (server.connections.items) |connection| connection.closeWithReason(&server.loop, reason);
     maybeStopLoop(server);
 }
 
@@ -2990,13 +3148,29 @@ fn refuseStream(session: ?*c.nghttp2_session, stream_id: i32) c_int {
     return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
 }
 
+// In pinned nghttp2 1.69.0, session_on_request_headers_received reports only
+// the pending concurrent-stream cap as REQUEST HEADERS/ERR_REFUSED_STREAM.
+// This path never invokes onBeginHeaders, so the defensive guard cannot double
+// count it. Generic ERR_PROTO after SETTINGS ACK is deliberately not inferred.
+fn onInvalidFrameReceived(_: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, lib_error_code: c_int, user_data: ?*anyopaque) callconv(.c) c_int {
+    const native_frame = received_frame.?.*;
+    if (native_frame.hd.type == c.NGHTTP2_HEADERS and
+        native_frame.headers.cat == c.NGHTTP2_HCAT_REQUEST and
+        lib_error_code == c.NGHTTP2_ERR_REFUSED_STREAM)
+    {
+        const connection: *Connection = @ptrCast(@alignCast(user_data.?));
+        if (!connection.draining) ReactorOperationalStats.count(&connection.server.operational_stats.pre_ack_rejected_streams);
+    }
+    return 0;
+}
+
 fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
     const native_frame = received_frame.?;
     if (native_frame.*.hd.type != c.NGHTTP2_HEADERS or native_frame.*.headers.cat != c.NGHTTP2_HCAT_REQUEST) return 0;
     const connection: *Connection = @ptrCast(@alignCast(user_data.?));
-    if (connection.draining or
-        connection.streams.count() >= connection.server.max_concurrent_streams_per_connection)
-    {
+    if (connection.draining) return refuseStream(session, native_frame.*.hd.stream_id);
+    if (connection.streams.count() >= connection.server.max_concurrent_streams_per_connection) {
+        ReactorOperationalStats.count(&connection.server.operational_stats.pre_ack_rejected_streams);
         return refuseStream(session, native_frame.*.hd.stream_id);
     }
     const local_allocator = connection.allocator();
@@ -3007,6 +3181,9 @@ fn onBeginHeaders(session: ?*c.nghttp2_session, received_frame: ?*const c.nghttp
         local_allocator.destroy(stream);
         return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     };
+    stream.operationally_active = true;
+    const active = connection.server.operational_stats.active_rpcs.load(.monotonic);
+    connection.server.operational_stats.active_rpcs.store(active + 1, .monotonic);
     if (connection.connection_deadline) |value| {
         if (value.kind == .idle) clearConnectionDeadline(connection);
     }
@@ -3711,9 +3888,10 @@ fn expireDeadlines(server: *Impl, now: u64) void {
                     .tls_handshake => {
                         if (connection.tls_handshaking) connection.closeOnLoop(&server.loop);
                     },
-                    .cleartext_preface => connection.closeOnLoop(&server.loop),
+                    .cleartext_preface => connection.closeWithReason(&server.loop, .preface_timeout),
                     .idle => {
                         if (connection.streams.count() != 0 or connection.draining) continue;
+                        connection.latchCloseReason(.idle_timeout);
                         connection.draining = true;
                         connection.submitGoAway(
                             connection.highest_accepted_stream_id,
@@ -4327,6 +4505,7 @@ test "server write callback and discard each release once" {
     const callback_write = try acquireWriteRequest(&connection, callback_bytes);
     connection.pending_writes = 1;
     connection.queued_write_bytes = callback_bytes.len;
+    server.impl.operational_stats.socket.add(callback_bytes.len);
     var loop: xev.Loop = undefined;
     _ = onWrite(
         callback_write,
@@ -4342,12 +4521,16 @@ test "server write callback and discard each release once" {
     const discarded_write = try acquireWriteRequest(&connection, discarded_bytes);
     connection.pending_writes = 1;
     connection.queued_write_bytes = discarded_bytes.len;
+    server.impl.operational_stats.socket.add(discarded_bytes.len);
     connection.write_queue.push(&discarded_write.request);
     connection.discardQueuedWrites();
     try std.testing.expectEqual(@as(usize, 1), connection.write_request_pool_count);
     try std.testing.expect(connection.write_request_pool_head == discarded_write);
     try std.testing.expectEqual(@as(usize, 0), connection.pending_writes);
     try std.testing.expectEqual(@as(usize, 0), connection.queued_write_bytes);
+    const stats = server.operationalStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.socket_queued_write_bytes);
+    try std.testing.expectEqual(@as(u64, discarded_bytes.len), stats.socket_queued_write_bytes_high_water_sum);
 }
 
 test "reactor local small allocations avoid serialized backing operations" {
@@ -4455,6 +4638,9 @@ test "cross-thread server stream commands retain shared ownership" {
     thread.join();
     try std.testing.expect(worker.send_error == null);
     try std.testing.expect(worker.finish_error == null);
+    const queued = server.operationalStats();
+    try std.testing.expectEqual(@as(u64, "from-worker".len + frame.header_size), queued.streaming_outbound_reserved_bytes);
+    try std.testing.expectEqual(queued.streaming_outbound_reserved_bytes, queued.streaming_outbound_reserved_bytes_high_water_sum);
 
     processStreamCommands(server.impl);
     try std.testing.expectEqual(@as(usize, 0), target.command_refs);
@@ -4608,6 +4794,7 @@ test "retained server call abort is allocation free and submits a reset" {
     try feedTestRequest(&connection, .{});
     const target = connection.streams.get(1).?;
     try std.testing.expect(capture.call != null);
+    try std.testing.expectEqual(@as(u64, 1), server.operationalStats().active_rpcs);
 
     const original_backing = server.coordinator.serialized_allocator.backing;
     defer server.coordinator.serialized_allocator.backing = original_backing;
@@ -4656,6 +4843,8 @@ test "retained server call abort is allocation free and submits a reset" {
     try std.testing.expectEqual(@as(usize, 1), capture.terminals);
     try std.testing.expectEqual(raw_stream.ServerTerminalReason.local_error, capture.terminal_reason.?);
     try std.testing.expect(capture.call.?.isTerminal());
+    // A still-retained control is not an active transport RPC.
+    try std.testing.expectEqual(@as(u64, 0), server.operationalStats().active_rpcs);
 }
 
 test "shared stream command allocation failure does not use local storage" {
@@ -5229,6 +5418,8 @@ test "server resource stream admission remains bounded before SETTINGS acknowled
     try feedTestRequest(&connection, .{ .stream_id = 5, .include_preface = false, .end_stream = false });
     try std.testing.expectEqual(@as(usize, 2), connection.streams.count());
     try std.testing.expectEqual(@as(i32, 3), connection.highest_accepted_stream_id);
+    try std.testing.expectEqual(@as(u64, 2), server.operationalStats().active_rpcs);
+    try std.testing.expectEqual(@as(u64, 1), server.operationalStats().pre_ack_rejected_streams);
     var output: [*c]const u8 = null;
     var saw_refused_stream = false;
     while (true) {
@@ -5253,6 +5444,17 @@ test "server resource stream admission remains bounded before SETTINGS acknowled
     try feedTestRequest(&connection, .{ .stream_id = 7, .include_preface = false, .end_stream = false });
     try std.testing.expectEqual(@as(usize, 2), connection.streams.count());
     try std.testing.expectEqual(@as(i32, 7), connection.highest_accepted_stream_id);
+    // Also exercise the defensive application guard independently of nghttp2.
+    var refused: c.nghttp2_frame = std.mem.zeroes(c.nghttp2_frame);
+    refused.headers.hd.type = c.NGHTTP2_HEADERS;
+    refused.headers.hd.stream_id = 9;
+    refused.headers.cat = c.NGHTTP2_HCAT_REQUEST;
+    try std.testing.expectEqual(@as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE), onBeginHeaders(connection.session, &refused, &connection));
+    try std.testing.expectEqual(@as(u64, 2), server.operationalStats().pre_ack_rejected_streams);
+    connection.draining = true;
+    refused.headers.hd.stream_id = 11;
+    try std.testing.expectEqual(@as(c_int, c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE), onBeginHeaders(connection.session, &refused, &connection));
+    try std.testing.expectEqual(@as(u64, 2), server.operationalStats().pre_ack_rejected_streams);
 }
 
 test "server resource acknowledged stream excess emits protocol error GOAWAY" {
@@ -5317,6 +5519,8 @@ test "server resource acknowledged stream excess emits protocol error GOAWAY" {
         }
     }
     try std.testing.expect(saw_protocol_error);
+    // nghttp2 rejects this before application admission; do not guess its cause.
+    try std.testing.expectEqual(@as(u64, 0), server.operationalStats().pre_ack_rejected_streams);
 }
 
 test "server resource cleartext SETTINGS transitions one tagged deadline to idle" {
@@ -5404,11 +5608,16 @@ test "server resource aggregate connection admission spans reactors" {
     const excess_two = try address.connect(io, .{ .mode = .stream, .timeout = .none });
     try std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake);
     try std.testing.expectEqual(@as(usize, 1), server.coordinator.admitted_connections.load(.acquire));
+    try waitForSocketEof(excess_one.socket.handle);
+    try waitForSocketEof(excess_two.socket.handle);
+    try std.testing.expectEqual(@as(u64, 1), server.operationalStats().admitted_connections);
+    try std.testing.expectEqual(@as(u64, 2), server.operationalStats().rejected_connections);
     excess_one.close(io);
     excess_two.close(io);
 
     first.close(io);
     try waitForAdmittedConnections(server.coordinator, 0);
+    try std.testing.expectEqual(@as(u64, 1), server.operationalStats().close_peer_transport);
     const replacement = try address.connect(io, .{ .mode = .stream, .timeout = .none });
     defer replacement.close(io);
     try waitForAdmittedConnections(server.coordinator, 1);
@@ -5447,6 +5656,8 @@ test "server resource silent and incomplete cleartext prefaces expire" {
         try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
     }
     try waitForSocketEof(slow.socket.handle);
+    try waitForAdmittedConnections(server.coordinator, 0);
+    try std.testing.expectEqual(@as(u64, 4), server.operationalStats().close_preface_timeout);
 }
 
 test "server resource fragmented valid cleartext preface survives into idle" {
@@ -5571,6 +5782,8 @@ test "server resource PING traffic does not refresh idle expiry" {
     }
     try std.testing.expectEqual(output.len, offset);
     try std.testing.expect(saw_no_error_goaway);
+    try waitForAdmittedConnections(server.coordinator, 0);
+    try std.testing.expectEqual(@as(u64, 1), server.operationalStats().close_idle_timeout);
 }
 
 test "server resource active stream is idle-exempt until final close" {
@@ -5631,6 +5844,10 @@ test "server resource shutdown releases preface admission and deadlines" {
             server.shutdown();
         server.wait();
         try std.testing.expectEqual(@as(usize, 0), server.coordinator.admitted_connections.load(.acquire));
+        const stats = server.operationalStats();
+        try expectOperationalGaugesZero(stats);
+        try std.testing.expectEqual(@as(u64, if (graceful) 1 else 0), stats.close_graceful_drain);
+        try std.testing.expectEqual(@as(u64, if (graceful) 0 else 1), stats.close_forced_shutdown);
         for (server.coordinator.reactors) |reactor| {
             try std.testing.expectEqual(@as(usize, 0), reactor.deadline_heap.items.len);
         }
@@ -5651,6 +5868,72 @@ test "malformed HTTP/2 settings close the connection promptly" {
         const output = try exchangeRawHttp2(&server, input);
         defer std.testing.allocator.free(output);
         try std.testing.expect(output.len != 0);
+    }
+    try waitForAdmittedConnections(server.coordinator, 0);
+    try std.testing.expectEqual(@as(u64, 2), server.operationalStats().close_protocol_local);
+}
+
+test "TLS server buffered peer close at handshake completion preserves close cause" {
+    if (!build_options.tls) return error.SkipZigTest;
+    const certificate = @embedFile("testdata/localhost-cert.pem");
+    const private_key = @embedFile("testdata/localhost-key.pem");
+    var server = try Server.init(std.testing.allocator, .{
+        .tls = .{ .certificate_chain_pem = certificate, .private_key_pem = private_key },
+    });
+    defer server.deinit();
+    const client_config = try tls_record.Config.createClient(std.testing.allocator, certificate, null);
+    defer client_config.destroy();
+
+    for ([_]?CloseReason{ null, .forced_shutdown }) |earlier_reason| {
+        const client = try tls_record.Session.create(std.testing.allocator, client_config, "localhost");
+        defer client.destroy();
+        var connection = Connection{
+            .server = server.impl,
+            .tls_session = try tls_record.Session.create(std.testing.allocator, server.impl.tls_config.?, null),
+            .tls_handshaking = true,
+            .close_reason = earlier_reason,
+            // Suppress HTTP/2 writes: this is an in-memory TLS pair, not a socket.
+            .queued_write_bytes = server.impl.write_high_watermark_bytes,
+        };
+        defer connection.clearTls();
+        const peer = connection.tls_session.?;
+        var client_complete = false;
+        var server_complete = false;
+        // Same bounded ciphertext exchange as tls_record's handshake tests. Queue
+        // close_notify with the client's last handshake output, before the Server
+        // transport observes completion and starts reading buffered plaintext.
+        for (0..32) |_| {
+            if (!client_complete) switch (client.handshake()) {
+                .complete => {
+                    client_complete = true;
+                    switch (try client.closeNotify()) {
+                        .complete => {},
+                        else => return error.UnexpectedTlsResult,
+                    }
+                },
+                .want_read, .want_write => {},
+                else => return error.TlsHandshakeFailed,
+            };
+            const client_bytes = client.ciphertext();
+            try peer.feedCiphertext(client_bytes);
+            client.consumeCiphertext(client_bytes.len);
+            if (!server_complete) switch (peer.handshake()) {
+                .complete => server_complete = true,
+                .want_read, .want_write => {},
+                else => return error.TlsHandshakeFailed,
+            };
+            const server_bytes = peer.ciphertext();
+            try client.feedCiphertext(server_bytes);
+            peer.consumeCiphertext(server_bytes.len);
+            if (client_complete and server_complete) break;
+        }
+        try std.testing.expect(client_complete and server_complete);
+        try std.testing.expectError(error.TlsPeerClosed, connection.driveTlsHandshake());
+        try std.testing.expect(!connection.tls_handshaking);
+        try std.testing.expectEqual(earlier_reason orelse .peer_transport, connection.close_reason.?);
+        // Mirror the handshake caller's generic close, without starting a loop.
+        connection.close();
+        try std.testing.expectEqual(earlier_reason orelse .peer_transport, connection.close_reason.?);
     }
 }
 
@@ -5944,6 +6227,7 @@ test "multi-reactor startup failure rolls back launched shards" {
     server.coordinator.reactors[1].test_fail_startup = true;
 
     try std.testing.expectError(error.AsyncInitializationFailed, server.start());
+    try std.testing.expectEqualDeep(OperationalStats{}, server.operationalStats());
     try std.testing.expect(!capture.started.load(.acquire));
     for (server.coordinator.reactors) |reactor| {
         try std.testing.expect(reactor.thread == null);
@@ -6119,6 +6403,13 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
             try std.testing.expect(reactor.stream_handlers.contains("/test.Reactors/Bidi"));
         }
         try server.start();
+        var poller = OperationalStatsPoller{ .server = &server };
+        const polling_thread = try std.Thread.spawn(.{}, OperationalStatsPoller.run, .{&poller});
+        var polling = true;
+        defer if (polling) {
+            poller.stop.store(true, .release);
+            polling_thread.join();
+        };
 
         var target_buffer: [32]u8 = undefined;
         const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try server.port()});
@@ -6151,6 +6442,14 @@ test "multi-reactor callbacks and transport allocations are concurrent-safe" {
 
         server.shutdown();
         server.wait();
+        poller.stop.store(true, .release);
+        polling_thread.join();
+        polling = false;
+        try std.testing.expect(poller.samples != 0 and poller.monotonic);
+        const stats = server.operationalStats();
+        try expectOperationalGaugesZero(stats);
+        try std.testing.expect(stats.socket_queued_write_bytes_high_water_sum > 0);
+        try std.testing.expect(stats.streaming_outbound_reserved_bytes_high_water_sum > 0);
         server.deinit();
         server_active = false;
         try std.testing.expectEqual(std.heap.Check.ok, backing.deinit());
@@ -7200,6 +7499,7 @@ test "server streaming send rejects full and closed calls without allocation" {
     target.accepts_response_gzip = true;
     var control: ServerCallControl = .{ .allocator = server.impl.shared_allocator, .server = server.impl, .target = &target };
     target.outbound_reserved_bytes = server.impl.stream_limits.max_outbound_buffer_size;
+    server.impl.operational_stats.outbound.add(target.outbound_reserved_bytes);
     const original_backing = server.coordinator.serialized_allocator.backing;
     defer server.coordinator.serialized_allocator.backing = original_backing;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -7220,4 +7520,156 @@ test "server streaming send rejects full and closed calls without allocation" {
     try std.testing.expectEqual(@as(usize, 0), target.command_refs);
     try std.testing.expectEqual(@as(usize, 0), server.impl.stream_commands.items.len);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+fn expectOperationalGaugesZero(stats: OperationalStats) !void {
+    try std.testing.expectEqual(@as(u64, 0), stats.admitted_connections);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_rpcs);
+    try std.testing.expectEqual(@as(u64, 0), stats.streaming_outbound_reserved_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.socket_queued_write_bytes);
+}
+
+const OperationalStatsPoller = struct {
+    server: *const Server,
+    stop: std.atomic.Value(bool) = .init(false),
+    samples: usize = 0,
+    monotonic: bool = true,
+
+    fn run(self: *@This()) void {
+        var previous: OperationalStats = .{};
+        while (!self.stop.load(.acquire)) {
+            const current = self.server.operationalStats();
+            self.monotonic = self.monotonic and
+                current.socket_queued_write_bytes_high_water_sum >= previous.socket_queued_write_bytes_high_water_sum and
+                current.streaming_outbound_reserved_bytes_high_water_sum >= previous.streaming_outbound_reserved_bytes_high_water_sum;
+            previous = current;
+            self.samples +|= 1;
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+test "server operational stats aggregate non-simultaneous peaks and saturate" {
+    var server = try Server.init(std.testing.allocator, .{ .reactor_count = 2 });
+    defer server.deinit();
+    try std.testing.expectEqualDeep(OperationalStats{}, server.operationalStats());
+    const first = &server.coordinator.reactors[0].operational_stats;
+    const second = &server.coordinator.reactors[1].operational_stats;
+    first.outbound.add(11);
+    first.outbound.subtract(11);
+    second.outbound.add(17);
+    second.outbound.subtract(17);
+    first.socket.add(19);
+    first.socket.subtract(19);
+    second.socket.add(23);
+    second.socket.subtract(23);
+    const peaks = server.operationalStats();
+    try expectOperationalGaugesZero(peaks);
+    try std.testing.expectEqual(@as(u64, 28), peaks.streaming_outbound_reserved_bytes_high_water_sum);
+    try std.testing.expectEqual(@as(u64, 42), peaks.socket_queued_write_bytes_high_water_sum);
+
+    const max = std.math.maxInt(u64);
+    first.rejected_connections.store(max - 1, .monotonic);
+    ReactorOperationalStats.count(&first.rejected_connections);
+    ReactorOperationalStats.count(&first.rejected_connections);
+    second.rejected_connections.store(1, .monotonic);
+    first.outbound.high_water.store(max, .monotonic);
+    first.outbound.add(1);
+    first.outbound.subtract(1);
+    first.socket.high_water.store(max, .monotonic);
+    for (&first.closes) |*counter| {
+        counter.store(max, .monotonic);
+        ReactorOperationalStats.count(counter);
+    }
+    const saturated = server.operationalStats();
+    try std.testing.expectEqual(max, saturated.rejected_connections);
+    try std.testing.expectEqual(max, saturated.streaming_outbound_reserved_bytes_high_water_sum);
+    try std.testing.expectEqual(max, saturated.socket_queued_write_bytes_high_water_sum);
+    inline for (@typeInfo(CloseReason).@"enum".field_names) |name| {
+        try std.testing.expectEqual(max, @field(saturated, "close_" ++ name));
+    }
+}
+
+test "server operational stats close reasons latch once at owned destruction" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    inline for (@typeInfo(CloseReason).@"enum".field_names, 0..) |name, index| {
+        const connection = try server.impl.localAllocator().create(Connection);
+        connection.* = .{ .server = server.impl, .close_completed = true };
+        try server.impl.connections.append(server.impl.localAllocator(), connection);
+        try std.testing.expect(server.coordinator.tryClaimConnection());
+        connection.owns_admission = true;
+        connection.latchCloseReason(@fromBackingInt(@intCast(index)));
+        connection.latchCloseReason(.forced_shutdown);
+        connection.close();
+        try std.testing.expectEqual(@as(u64, 0), @field(server.operationalStats(), "close_" ++ name));
+        connection.finishCloseIfReady();
+        try std.testing.expectEqual(@as(u64, 1), @field(server.operationalStats(), "close_" ++ name));
+    }
+    // An object that never took ownership of admission is not a closed connection.
+    const unadmitted = try server.impl.localAllocator().create(Connection);
+    unadmitted.* = .{ .server = server.impl, .close_completed = true };
+    try server.impl.connections.append(server.impl.localAllocator(), unadmitted);
+    unadmitted.close();
+    unadmitted.finishCloseIfReady();
+    try std.testing.expectEqual(@as(u64, 1), server.operationalStats().close_protocol_local);
+    try expectOperationalGaugesZero(server.operationalStats());
+}
+
+test "server operational stats drain timeout retires active RPC" {
+    var server = try Server.init(std.testing.allocator, .{ .reactor_count = 2 });
+    defer server.deinit();
+    try server.start();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", try server.port());
+    const stream = try address.connect(std.testing.io, .{ .mode = .stream, .timeout = .none });
+    defer stream.close(std.testing.io);
+    // Reuse the existing raw peer encoder and leave the request direction open.
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(std.testing.allocator);
+    try request.appendSlice(std.testing.allocator, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{
+        0, 0, 0, c.NGHTTP2_SETTINGS, 0, 0, 0, 0, 0,
+    });
+    try appendRawTestHeaders(&request, 1, "/test.Echo/Unary", false);
+    try writeTestStream(stream, std.testing.io, request.items);
+    for (0..2000) |_| {
+        if (server.operationalStats().active_rpcs == 1) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u64, 1), server.operationalStats().active_rpcs);
+    server.shutdownGracefully(0);
+    server.wait();
+    const stats = server.operationalStats();
+    try expectOperationalGaugesZero(stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.close_forced_shutdown);
+    try std.testing.expectEqual(@as(u64, 0), stats.close_graceful_drain);
+}
+
+test "server operational stats fixed size overhead" {
+    inline for (.{
+        .{ Impl, "operational_stats" },
+        .{ Connection, "close_reason" },
+        .{ Stream, "operationally_active" },
+    }) |entry| {
+        const T = entry[0];
+        const info = @typeInfo(T).@"struct";
+        const WithoutMetric = comptime blk: {
+            var names: [info.field_names.len - 1][]const u8 = undefined;
+            var types: [names.len]type = undefined;
+            var attrs: [names.len]std.builtin.Type.Struct.FieldAttributes = undefined;
+            var index: usize = 0;
+            for (info.field_names, info.field_types, info.field_attrs) |name, FieldType, attr| {
+                if (std.mem.eql(u8, name, entry[1])) continue;
+                names[index] = name;
+                types[index] = FieldType;
+                attrs[index] = attr;
+                index += 1;
+            }
+            break :blk @Struct(.auto, null, &names, &types, &attrs);
+        };
+        try std.testing.expect(@sizeOf(T) >= @sizeOf(WithoutMetric));
+        std.debug.print("{s}: before={d} after={d} delta={d} bytes\n", .{
+            @typeName(T), @sizeOf(WithoutMetric), @sizeOf(T), @sizeOf(T) - @sizeOf(WithoutMetric),
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(ReactorOperationalStats));
 }
