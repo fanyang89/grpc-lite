@@ -445,6 +445,10 @@ operations are messages on persistent streams. `repeated` is intentionally compr
 
 ## Resource accounting and lifecycle evidence
 
+For worked admission calculations, a measured tuning procedure and dependency-aware
+snapshot diagnosis, see the [capacity-tuning and overload guide](capacity-tuning.md).
+It consumes the evidence here without changing the baseline or provisional tolerances.
+
 This inventory for [issue #43](https://github.com/fanyang89/grpc-lite/issues/43)
 was checked against `25643b1` (2026-10-23). It describes existing behavior, not new
 limits. API contracts remain in [Zig](zig-api.md#unary-admission) and
