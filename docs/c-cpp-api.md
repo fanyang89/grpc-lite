@@ -195,6 +195,78 @@ control without using C directly.
 Hostname channels require explicit Runtime ownership. Use
 `grpc_lite::Runtime` with `grpc_lite::Channel::CreateManaged`, or the equivalent C API.
 
+## No-Zig Bounded Executor Example
+
+`examples/cpp_bounded_executor` is a standalone raw C++ consumer using the low-level
+API, not generated services. It owns one worker and permits **one total outstanding
+job with no waiting backlog**. Reactor submission uses `try_lock`: contention, a
+busy worker, or closed admission rejects immediately with `RESOURCE_EXHAUSTED`.
+This is application executor admission, separate from transport resource limits.
+
+The callback retains a `ServerCall` and moves it into the executor only on acceptance.
+It never saves the borrowed `ServerStream` or context. Rejection finishes and releases
+the retained call on the reactor; accepted work releases it on the worker. Command
+failure uses `Abort` rather than leaving a call unfinished. The sample consumes an
+empty request and returns fixed raw protobuf bytes; it needs neither `protoc` nor the
+external Protobuf runtime. Typed generated code still needs the application's official
+Protobuf dependency, as described below.
+
+Use the **same-version source tag and release asset**, verify/extract the asset as
+above, then build in an environment without Zig:
+
+```bash
+! command -v zig
+cmake -S grpc-lite/examples/cpp_bounded_executor -B build-bounded -G Ninja \
+  -DGRPC_LITE_SOURCE_DIR="$PWD/grpc-lite" \
+  -DGRPC_LITE_TRANSPILED_C_DIR="$PWD/grpc-lite-transpiled-c-0.4.0-linux-x86_64" \
+  -DGRPC_LITE_ENABLE_PROTOBUF=OFF \
+  -DCMAKE_DISABLE_FIND_PACKAGE_Protobuf=ON
+cmake --build build-bounded --target grpc_lite_bounded_executor
+ctest --test-dir build-bounded --output-on-failure
+```
+
+The bundle remains **cleartext-only Linux x86_64/ARM64**. Choose the matching
+architecture asset. CMake still needs nghttp2 and c-ares; use the offline archive
+options above when network access is unavailable. Zig is needed only by maintainers
+producing the generated-C asset, not by this consumer build.
+
+The executable accepts `success`, `overload`, or `shutdown`. An application-controlled
+work gate models blocking downstream work on the worker, making overload deterministic
+without sleeps. The shutdown scenario closes executor admission, verifies rejection,
+requests graceful transport drain while an accepted call is still pending, releases
+work, joins the worker, and checks the accepted response. All scenarios verify that a
+closed, idle executor still rejects. Retained calls are released before Server
+destruction, and Runtime outlives all threads and handles. Real applications must bound
+or cancel their downstream work too: a transport drain timeout does not join application
+workers. The tiny single-response example aborts on send failure; it is not a general
+streaming `WouldBlock`/`on_writable` implementation.
+
+`tests/consumer/run_cmake_c.sh <asset.tar.gz> <asset.tar.gz.sha256>` reuses the existing
+independent generated-C harness: it archives source HEAD, verifies the exact supplied
+asset/checksum, builds a copied example with Protobuf discovery disabled, and runs all
+three smoke cases alongside the existing generated-code coverage. Its isolated consumer
+rejects a visible Zig executable and runs without network access. The harness's typed
+checks separately require Protobuf. `GRPC_LITE_KEEP_E2E=1` preserves CMake/CTest logs.
+The runtime needs Linux io_uring permission. Docker's default seccomp profile may
+reject `io_uring_setup` with `EPERM`. The harness therefore applies a scoped profile
+by default to its trusted consumer container, including existing CI/release callers:
+it verifies a vendored, commit-and-SHA-256-pinned Moby default allowlist, then adds
+only `io_uring_setup`, `io_uring_enter`, and `io_uring_register`. Upstream default-deny
+and all unrelated rules remain intact; network isolation and the nonroot user remain.
+No privileged mode, additional capabilities, unconfined fallback, or daemon-wide
+policy change is used. See [profile provenance and tests](../tests/consumer/seccomp/README.md).
+This is not a deployment sandbox recommendation. The host kernel/outer sandbox must
+also permit io_uring; failures are test failures, never skipped or counted as passes.
+The pre-isolated host route (`GRPC_LITE_NETWORK_ISOLATED=1`) must provide that permission
+itself.
+
+Maintainer validation with `mise run package-transpiled-c` followed by that harness is
+**locally packaged exact-artifact testing**, not proof that a published release was
+tested. Published-release testing must instead supply that release's downloaded asset
+and checksum with its matching tagged source (including this example). Record the
+source commit, asset checksum, architecture, and test logs in either case. No published
+release validation is implied by the local packaging command.
+
 ## Synchronous grpcpp Facade
 
 `<grpcpp/grpcpp.h>` provides the common synchronous client and generated server shapes:
