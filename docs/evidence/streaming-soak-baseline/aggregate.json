@@ -1,0 +1,830 @@
+{
+  "across_trials": {
+    "client": {
+      "fds": {
+        "late_minus_early_trial_deltas": {
+          "max": 0,
+          "median": 0,
+          "min": 0
+        },
+        "steady_trial_medians": {
+          "max": 7,
+          "median": 7,
+          "min": 7
+        }
+      },
+      "rss_kib": {
+        "late_minus_early_trial_deltas": {
+          "max": 580,
+          "median": 524,
+          "min": 48
+        },
+        "steady_trial_medians": {
+          "max": 35252,
+          "median": 35008,
+          "min": 34932
+        }
+      },
+      "threads": {
+        "late_minus_early_trial_deltas": {
+          "max": 1,
+          "median": 1,
+          "min": 1
+        },
+        "steady_trial_medians": {
+          "max": 22,
+          "median": 21,
+          "min": 21
+        }
+      }
+    },
+    "server": {
+      "fds": {
+        "late_minus_early_trial_deltas": {
+          "max": 0,
+          "median": 0,
+          "min": 0
+        },
+        "steady_trial_medians": {
+          "max": 9,
+          "median": 9,
+          "min": 9
+        }
+      },
+      "rss_kib": {
+        "late_minus_early_trial_deltas": {
+          "max": 992,
+          "median": 984,
+          "min": -172
+        },
+        "steady_trial_medians": {
+          "max": 12908,
+          "median": 12512,
+          "min": 12408
+        }
+      },
+      "threads": {
+        "late_minus_early_trial_deltas": {
+          "max": 0,
+          "median": 0,
+          "min": 0
+        },
+        "steady_trial_medians": {
+          "max": 2,
+          "median": 2,
+          "min": 2
+        }
+      }
+    }
+  },
+  "schema": 1,
+  "trials": [
+    {
+      "client_result": {
+        "cycles": 1744,
+        "elapsed_seconds": 600.158,
+        "received": 27904,
+        "sent": 3488,
+        "terminal": "OK"
+      },
+      "handler_events": {
+        "available": true,
+        "messages": 3488,
+        "resumes": 3488,
+        "would_block": 5232
+      },
+      "roles": {
+        "client": {
+          "deltas": {
+            "fds": {
+              "late_minus_early": 0,
+              "warmup_to_steady": 0
+            },
+            "rss_kib": {
+              "late_minus_early": 48,
+              "warmup_to_steady": 1396
+            },
+            "threads": {
+              "late_minus_early": 1,
+              "warmup_to_steady": 3
+            }
+          },
+          "windows": {
+            "baseline": {
+              "count": 0
+            },
+            "steady": {
+              "count": 1683,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 7
+              },
+              "rss_kib": {
+                "max": 42236,
+                "median": 35008,
+                "min": 27388
+              },
+              "threads": {
+                "max": 22,
+                "median": 22,
+                "min": 19
+              }
+            },
+            "steady_first_third": {
+              "count": 561,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 7
+              },
+              "rss_kib": {
+                "max": 40576,
+                "median": 34908,
+                "min": 27388
+              },
+              "threads": {
+                "max": 22,
+                "median": 21,
+                "min": 19
+              }
+            },
+            "steady_last_third": {
+              "count": 561,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 7
+              },
+              "rss_kib": {
+                "max": 42124,
+                "median": 34956,
+                "min": 29504
+              },
+              "threads": {
+                "max": 22,
+                "median": 22,
+                "min": 22
+              }
+            },
+            "teardown": {
+              "count": 0
+            },
+            "warmup": {
+              "count": 15,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 4
+              },
+              "rss_kib": {
+                "max": 39368,
+                "median": 33612,
+                "min": 1780
+              },
+              "threads": {
+                "max": 19,
+                "median": 19,
+                "min": 1
+              }
+            }
+          }
+        },
+        "server": {
+          "deltas": {
+            "fds": {
+              "idle_minus_baseline": 0.0,
+              "idle_screen_delta": 0.0,
+              "late_minus_early": 0,
+              "warmup_to_steady": 0
+            },
+            "rss_kib": {
+              "idle_minus_baseline": 1088.0,
+              "idle_screen_delta": -8056.0,
+              "late_minus_early": 984,
+              "warmup_to_steady": -88
+            },
+            "threads": {
+              "idle_minus_baseline": 0.0,
+              "idle_screen_delta": 0.0,
+              "late_minus_early": 0,
+              "warmup_to_steady": 0
+            }
+          },
+          "windows": {
+            "baseline": {
+              "count": 1,
+              "fds": {
+                "max": 8,
+                "median": 8,
+                "min": 8
+              },
+              "rss_kib": {
+                "max": 3764,
+                "median": 3764,
+                "min": 3764
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "steady": {
+              "count": 1683,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 9
+              },
+              "rss_kib": {
+                "max": 18096,
+                "median": 12908,
+                "min": 5928
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "steady_first_third": {
+              "count": 561,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 9
+              },
+              "rss_kib": {
+                "max": 18096,
+                "median": 12300,
+                "min": 6768
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "steady_last_third": {
+              "count": 561,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 9
+              },
+              "rss_kib": {
+                "max": 17540,
+                "median": 13284,
+                "min": 5936
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "teardown": {
+              "count": 10,
+              "fds": {
+                "max": 8,
+                "median": 8.0,
+                "min": 8
+              },
+              "rss_kib": {
+                "max": 4852,
+                "median": 4852.0,
+                "min": 4852
+              },
+              "threads": {
+                "max": 2,
+                "median": 2.0,
+                "min": 2
+              }
+            },
+            "warmup": {
+              "count": 15,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 8
+              },
+              "rss_kib": {
+                "max": 13136,
+                "median": 12996,
+                "min": 3764
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            }
+          }
+        }
+      },
+      "samples": 3407,
+      "trial": 1
+    },
+    {
+      "client_result": {
+        "cycles": 1740,
+        "elapsed_seconds": 600.294,
+        "received": 27840,
+        "sent": 3480,
+        "terminal": "OK"
+      },
+      "handler_events": {
+        "available": true,
+        "messages": 3480,
+        "resumes": 3480,
+        "would_block": 5220
+      },
+      "roles": {
+        "client": {
+          "deltas": {
+            "fds": {
+              "late_minus_early": 0,
+              "warmup_to_steady": 0
+            },
+            "rss_kib": {
+              "late_minus_early": 524,
+              "warmup_to_steady": 2340
+            },
+            "threads": {
+              "late_minus_early": 1,
+              "warmup_to_steady": 2
+            }
+          },
+          "windows": {
+            "baseline": {
+              "count": 0
+            },
+            "steady": {
+              "count": 1683,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 7
+              },
+              "rss_kib": {
+                "max": 41984,
+                "median": 35252,
+                "min": 27216
+              },
+              "threads": {
+                "max": 22,
+                "median": 21,
+                "min": 19
+              }
+            },
+            "steady_first_third": {
+              "count": 561,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 7
+              },
+              "rss_kib": {
+                "max": 41984,
+                "median": 34852,
+                "min": 27216
+              },
+              "threads": {
+                "max": 21,
+                "median": 21,
+                "min": 19
+              }
+            },
+            "steady_last_third": {
+              "count": 561,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 7
+              },
+              "rss_kib": {
+                "max": 41036,
+                "median": 35376,
+                "min": 28464
+              },
+              "threads": {
+                "max": 22,
+                "median": 22,
+                "min": 22
+              }
+            },
+            "teardown": {
+              "count": 0
+            },
+            "warmup": {
+              "count": 15,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 3
+              },
+              "rss_kib": {
+                "max": 37004,
+                "median": 32912,
+                "min": 1148
+              },
+              "threads": {
+                "max": 19,
+                "median": 19,
+                "min": 1
+              }
+            }
+          }
+        },
+        "server": {
+          "deltas": {
+            "fds": {
+              "idle_minus_baseline": 0.0,
+              "idle_screen_delta": 0.0,
+              "late_minus_early": 0,
+              "warmup_to_steady": 0
+            },
+            "rss_kib": {
+              "idle_minus_baseline": 1088.0,
+              "idle_screen_delta": -7500.0,
+              "late_minus_early": 992,
+              "warmup_to_steady": -692
+            },
+            "threads": {
+              "idle_minus_baseline": 0.0,
+              "idle_screen_delta": 0.0,
+              "late_minus_early": 0,
+              "warmup_to_steady": 0
+            }
+          },
+          "windows": {
+            "baseline": {
+              "count": 1,
+              "fds": {
+                "max": 8,
+                "median": 8,
+                "min": 8
+              },
+              "rss_kib": {
+                "max": 3820,
+                "median": 3820,
+                "min": 3820
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "steady": {
+              "count": 1683,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 9
+              },
+              "rss_kib": {
+                "max": 18212,
+                "median": 12408,
+                "min": 5816
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "steady_first_third": {
+              "count": 561,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 9
+              },
+              "rss_kib": {
+                "max": 17352,
+                "median": 12352,
+                "min": 5816
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "steady_last_third": {
+              "count": 561,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 9
+              },
+              "rss_kib": {
+                "max": 16548,
+                "median": 13344,
+                "min": 5996
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "teardown": {
+              "count": 10,
+              "fds": {
+                "max": 8,
+                "median": 8.0,
+                "min": 8
+              },
+              "rss_kib": {
+                "max": 4908,
+                "median": 4908.0,
+                "min": 4908
+              },
+              "threads": {
+                "max": 2,
+                "median": 2.0,
+                "min": 2
+              }
+            },
+            "warmup": {
+              "count": 15,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 8
+              },
+              "rss_kib": {
+                "max": 15904,
+                "median": 13100,
+                "min": 3820
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            }
+          }
+        }
+      },
+      "samples": 3407,
+      "trial": 2
+    },
+    {
+      "client_result": {
+        "cycles": 1743,
+        "elapsed_seconds": 600.288,
+        "received": 27888,
+        "sent": 3486,
+        "terminal": "OK"
+      },
+      "handler_events": {
+        "available": true,
+        "messages": 3486,
+        "resumes": 3486,
+        "would_block": 5229
+      },
+      "roles": {
+        "client": {
+          "deltas": {
+            "fds": {
+              "late_minus_early": 0,
+              "warmup_to_steady": 0
+            },
+            "rss_kib": {
+              "late_minus_early": 580,
+              "warmup_to_steady": 1612
+            },
+            "threads": {
+              "late_minus_early": 1,
+              "warmup_to_steady": 2
+            }
+          },
+          "windows": {
+            "baseline": {
+              "count": 0
+            },
+            "steady": {
+              "count": 1683,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 7
+              },
+              "rss_kib": {
+                "max": 41844,
+                "median": 34932,
+                "min": 27032
+              },
+              "threads": {
+                "max": 22,
+                "median": 21,
+                "min": 19
+              }
+            },
+            "steady_first_third": {
+              "count": 561,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 7
+              },
+              "rss_kib": {
+                "max": 41796,
+                "median": 34612,
+                "min": 27032
+              },
+              "threads": {
+                "max": 21,
+                "median": 20,
+                "min": 19
+              }
+            },
+            "steady_last_third": {
+              "count": 561,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 7
+              },
+              "rss_kib": {
+                "max": 41844,
+                "median": 35192,
+                "min": 27132
+              },
+              "threads": {
+                "max": 22,
+                "median": 21,
+                "min": 21
+              }
+            },
+            "teardown": {
+              "count": 0
+            },
+            "warmup": {
+              "count": 15,
+              "fds": {
+                "max": 7,
+                "median": 7,
+                "min": 4
+              },
+              "rss_kib": {
+                "max": 37448,
+                "median": 33320,
+                "min": 576
+              },
+              "threads": {
+                "max": 19,
+                "median": 19,
+                "min": 1
+              }
+            }
+          }
+        },
+        "server": {
+          "deltas": {
+            "fds": {
+              "idle_minus_baseline": 0.0,
+              "idle_screen_delta": 0.0,
+              "late_minus_early": 0,
+              "warmup_to_steady": 0
+            },
+            "rss_kib": {
+              "idle_minus_baseline": 1228.0,
+              "idle_screen_delta": -7516.0,
+              "late_minus_early": -172,
+              "warmup_to_steady": -496
+            },
+            "threads": {
+              "idle_minus_baseline": 0.0,
+              "idle_screen_delta": 0.0,
+              "late_minus_early": 0,
+              "warmup_to_steady": 0
+            }
+          },
+          "windows": {
+            "baseline": {
+              "count": 1,
+              "fds": {
+                "max": 8,
+                "median": 8,
+                "min": 8
+              },
+              "rss_kib": {
+                "max": 3768,
+                "median": 3768,
+                "min": 3768
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "steady": {
+              "count": 1683,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 9
+              },
+              "rss_kib": {
+                "max": 17948,
+                "median": 12512,
+                "min": 5968
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "steady_first_third": {
+              "count": 561,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 9
+              },
+              "rss_kib": {
+                "max": 17948,
+                "median": 12756,
+                "min": 5968
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "steady_last_third": {
+              "count": 561,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 9
+              },
+              "rss_kib": {
+                "max": 17088,
+                "median": 12584,
+                "min": 6088
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            },
+            "teardown": {
+              "count": 10,
+              "fds": {
+                "max": 8,
+                "median": 8.0,
+                "min": 8
+              },
+              "rss_kib": {
+                "max": 4996,
+                "median": 4996.0,
+                "min": 4996
+              },
+              "threads": {
+                "max": 2,
+                "median": 2.0,
+                "min": 2
+              }
+            },
+            "warmup": {
+              "count": 15,
+              "fds": {
+                "max": 9,
+                "median": 9,
+                "min": 8
+              },
+              "rss_kib": {
+                "max": 15080,
+                "median": 13008,
+                "min": 3768
+              },
+              "threads": {
+                "max": 2,
+                "median": 2,
+                "min": 2
+              }
+            }
+          }
+        }
+      },
+      "samples": 3407,
+      "trial": 3
+    }
+  ],
+  "units": {
+    "elapsed_seconds": "observer monotonic seconds",
+    "fds": "count",
+    "rss_kib": "KiB (1024 bytes)",
+    "threads": "count"
+  }
+}

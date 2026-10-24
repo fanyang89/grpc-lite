@@ -1,0 +1,23 @@
+{
+  "architecture": "x86_64",
+  "build": "native ReleaseSafe; cleartext; default peer allocators; no sanitizer/gperftools",
+  "cgroup_limits": {
+    "cpu.max": "unavailable (v2 root limit not readable; nested limits not inferred)",
+    "memory.max": "unavailable (v2 root limit not readable; nested limits not inferred)",
+    "pids.max": "unavailable (v2 root limit not readable; nested limits not inferred)"
+  },
+  "cpu_count": 32,
+  "dirty": false,
+  "go": "go version go1.26.5 linux/amd64",
+  "kernel": "7.2.8-200.fc44.x86_64",
+  "libc": [
+    "glibc",
+    "2.43"
+  ],
+  "python": "3.12.13",
+  "revision": "c96ba3bdc65fe446dab9bd40042e070393f288b2",
+  "schema": 1,
+  "time_unix": 1792813817.163948,
+  "workload": "bidi-slow-large-v1",
+  "zig": "0.17.0"
+}

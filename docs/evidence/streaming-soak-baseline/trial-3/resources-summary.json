@@ -1,0 +1,230 @@
+{
+  "client_exit": 0,
+  "comparison_errors": [],
+  "comparisons": [
+    {
+      "checks": [
+        {
+          "comparison": "steady_last_third_minus_first_third",
+          "delta": -172,
+          "metric": "rss_kib",
+          "ok": true,
+          "tolerance": 32768
+        },
+        {
+          "comparison": "steady_last_third_minus_first_third",
+          "delta": 0,
+          "metric": "fds",
+          "ok": true,
+          "tolerance": 2
+        },
+        {
+          "comparison": "steady_last_third_minus_first_third",
+          "delta": 0,
+          "metric": "threads",
+          "ok": true,
+          "tolerance": 0
+        },
+        {
+          "comparison": "post_client_idle_minus_steady_rss_or_pre_client_baseline",
+          "delta": -7516.0,
+          "metric": "rss_kib",
+          "ok": true,
+          "tolerance": 32768
+        },
+        {
+          "comparison": "post_client_idle_minus_steady_rss_or_pre_client_baseline",
+          "delta": 0.0,
+          "metric": "fds",
+          "ok": true,
+          "tolerance": 1
+        },
+        {
+          "comparison": "post_client_idle_minus_steady_rss_or_pre_client_baseline",
+          "delta": 0.0,
+          "metric": "threads",
+          "ok": true,
+          "tolerance": 0
+        }
+      ],
+      "phases": {
+        "baseline": {
+          "count": 1,
+          "fds": {
+            "max": 8,
+            "median": 8,
+            "min": 8
+          },
+          "rss_kib": {
+            "max": 3768,
+            "median": 3768,
+            "min": 3768
+          },
+          "threads": {
+            "max": 2,
+            "median": 2,
+            "min": 2
+          }
+        },
+        "steady": {
+          "count": 1683,
+          "fds": {
+            "max": 9,
+            "median": 9,
+            "min": 9
+          },
+          "rss_kib": {
+            "max": 17948,
+            "median": 12512,
+            "min": 5968
+          },
+          "threads": {
+            "max": 2,
+            "median": 2,
+            "min": 2
+          }
+        },
+        "teardown": {
+          "count": 10,
+          "fds": {
+            "max": 8,
+            "median": 8.0,
+            "min": 8
+          },
+          "rss_kib": {
+            "max": 4996,
+            "median": 4996.0,
+            "min": 4996
+          },
+          "threads": {
+            "max": 2,
+            "median": 2.0,
+            "min": 2
+          }
+        },
+        "warmup": {
+          "count": 15,
+          "fds": {
+            "max": 9,
+            "median": 9,
+            "min": 8
+          },
+          "rss_kib": {
+            "max": 15080,
+            "median": 13008,
+            "min": 3768
+          },
+          "threads": {
+            "max": 2,
+            "median": 2,
+            "min": 2
+          }
+        }
+      },
+      "role": "server",
+      "warmup_to_steady_delta_informational": {
+        "fds": 0,
+        "rss_kib": -496,
+        "threads": 0
+      }
+    },
+    {
+      "checks": [
+        {
+          "comparison": "steady_last_third_minus_first_third",
+          "delta": 580,
+          "metric": "rss_kib",
+          "ok": true,
+          "tolerance": 65536
+        },
+        {
+          "comparison": "steady_last_third_minus_first_third",
+          "delta": 0,
+          "metric": "fds",
+          "ok": true,
+          "tolerance": 2
+        },
+        {
+          "comparison": "steady_last_third_minus_first_third",
+          "delta": 1,
+          "metric": "threads",
+          "ok": true,
+          "tolerance": 4
+        }
+      ],
+      "phases": {
+        "baseline": {
+          "count": 0
+        },
+        "steady": {
+          "count": 1683,
+          "fds": {
+            "max": 7,
+            "median": 7,
+            "min": 7
+          },
+          "rss_kib": {
+            "max": 41844,
+            "median": 34932,
+            "min": 27032
+          },
+          "threads": {
+            "max": 22,
+            "median": 21,
+            "min": 19
+          }
+        },
+        "teardown": {
+          "count": 0
+        },
+        "warmup": {
+          "count": 15,
+          "fds": {
+            "max": 7,
+            "median": 7,
+            "min": 4
+          },
+          "rss_kib": {
+            "max": 37448,
+            "median": 33320,
+            "min": 576
+          },
+          "threads": {
+            "max": 19,
+            "median": 19,
+            "min": 1
+          }
+        }
+      },
+      "role": "client",
+      "warmup_to_steady_delta_informational": {
+        "fds": 0,
+        "rss_kib": 1612,
+        "threads": 2
+      }
+    }
+  ],
+  "duration_seconds": 600,
+  "errors": [],
+  "handler_events": {
+    "available": true,
+    "messages": 3486,
+    "resumes": 3486,
+    "would_block": 5229
+  },
+  "harness_exit": 0,
+  "sample_interval_seconds": 0.3527777777777778,
+  "samples": 3407,
+  "schema": 1,
+  "screen": "within_provisional_tolerances",
+  "seed": 47,
+  "status": "passed",
+  "unavailable": {
+    "admission_reservations": "grpc-go client; native server has no exported reservation snapshot",
+    "client_teardown": "client exits after RPC; no pre-exit idle observation hook",
+    "live_heap_bytes": "RSS includes allocator caches, stacks, code and libraries",
+    "queue_occupancy": "not exported by the existing peer; WouldBlock/resumes are events, not occupancy",
+    "server_post_deinit": "server remains alive during post-client idle; process exit is not zero-live-heap proof"
+  },
+  "warmup_seconds": 5
+}
