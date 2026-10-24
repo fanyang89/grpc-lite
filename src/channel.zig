@@ -591,6 +591,7 @@ const TestObserver = if (builtin.is_test) struct {
     connect_cancel_confirmed: std.atomic.Value(bool) = .init(false),
     reconnect_scheduled: std.atomic.Value(bool) = .init(false),
     operation_submitted: std.atomic.Value(bool) = .init(false),
+    goaway_received: std.atomic.Value(bool) = .init(false),
     deadline_timer_callbacks: std.atomic.Value(usize) = .init(0),
     deadline_timer_armed: std.atomic.Value(bool) = .init(false),
     deadline_timer_target_ns: std.atomic.Value(u64) = .init(0),
@@ -2996,6 +2997,7 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
             if (!terminalizeStreamsForGoAway(impl, native_frame.*.goaway.last_stream_id)) {
                 return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             }
+            if (comptime builtin.is_test) impl.test_observer.goaway_received.store(true, .release);
             impl.async_handle.notify() catch {};
         }
         return 0;
@@ -5995,6 +5997,163 @@ test "raw nghttp2 peer covers response header boundaries isolation and HPACK reu
     accepted.deinit();
 }
 
+test "streaming termination ordering with blocked send cancel deadline and GOAWAY" {
+    const Schedule = enum { cancel_deadline_goaway, deadline_cancel_goaway, goaway_cancel_deadline, accepted_goaway_cancel_deadline };
+    const Capture = struct {
+        requests: usize = 0,
+        terminals: usize = 0,
+        other_callbacks: usize = 0,
+        code: status.Code = .unknown,
+
+        fn onRequest(_: ?*c.nghttp2_session, native_frame: ?*const c.nghttp2_frame, context: ?*anyopaque) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (native_frame.?.*.headers.cat == c.NGHTTP2_HCAT_REQUEST) self.requests += 1;
+            return 0;
+        }
+
+        fn onMessage(context: ?*anyopaque, _: stream.ClientStream, _: []const u8, _: Compression) stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.other_callbacks += 1;
+            return .continue_receiving;
+        }
+
+        fn onWritable(context: ?*anyopaque, _: stream.ClientStream) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.other_callbacks += 1;
+        }
+
+        fn onTerminal(context: ?*anyopaque, _: stream.ClientStream, result: status.Status, _: *const metadata.Metadata) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.terminals += 1;
+            self.code = result.code;
+        }
+    };
+
+    for (std.enums.values(Schedule)) |schedule| {
+        var host = [_:0]u8{'x'};
+        var serialized_allocator: SerializedAllocator = undefined;
+        var impl: Impl = undefined;
+        initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+        // Manually pump the existing nghttp2 fixture: no socket/loop or wall clock race.
+        // GOAWAY may notify the async handle, but only this thread advances callbacks.
+        impl.async_handle = try xev.Async.init();
+        defer impl.async_handle.deinit();
+        impl.connection_state = .active;
+        impl.stream_wake_notify_pending = true;
+        defer impl.stream_states.deinit(impl.allocator);
+        defer impl.streams.deinit(impl.allocator);
+        defer impl.deadline_heap.deinit(impl.allocator);
+        try initializeSession(&impl);
+        defer c.nghttp2_session_del(impl.session);
+
+        var capture = Capture{};
+        var callbacks: ?*c.nghttp2_session_callbacks = null;
+        try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_session_callbacks_new(&callbacks));
+        defer c.nghttp2_session_callbacks_del(callbacks);
+        c.nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, Capture.onRequest);
+        var peer_options: ?*c.nghttp2_option = null;
+        try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_option_new(&peer_options));
+        defer c.nghttp2_option_del(peer_options);
+        c.nghttp2_option_set_no_http_messaging(peer_options, 1);
+        var peer: ?*c.nghttp2_session = null;
+        try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_session_server_new2(&peer, callbacks, &capture, peer_options));
+        defer c.nghttp2_session_del(peer);
+        const settings = [_]c.nghttp2_settings_entry{.{ .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, .value = 0 }};
+        try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_submit_settings(peer, c.NGHTTP2_FLAG_NONE, &settings, settings.len));
+        _ = try transferNghttp2Sessions(impl.session, peer);
+        _ = try transferNghttp2Sessions(peer, impl.session);
+
+        const client_stream = try ClientStreamState.init(&impl, "/test.Termination/BlockedSend", .{ .limits = .{
+            .max_message_size = 16,
+            .max_inbound_buffer_size = 21,
+            .max_outbound_buffer_size = 21,
+        } }, .{
+            .context = &capture,
+            .on_message = Capture.onMessage,
+            .on_writable = Capture.onWritable,
+            .on_terminal = Capture.onTerminal,
+        });
+        var handle = client_stream.handle();
+        var handle_alive = true;
+        defer if (handle_alive) {
+            _ = impl.streams.remove(client_stream.stream_id);
+            if (client_stream.loop_owned) releaseStreamLoopOwnership(client_stream);
+            handle.deinit();
+        };
+        try impl.stream_states.put(impl.allocator, client_stream, {});
+        try submitClientStream(&impl, client_stream);
+        try handle.send("0123456789abcdef", .{});
+        _ = try transferNghttp2Sessions(impl.session, peer);
+        try std.testing.expectEqual(@as(usize, 1), capture.requests);
+        try std.testing.expectEqual(@as(i32, 0), c.nghttp2_session_get_stream_remote_window_size(impl.session, client_stream.stream_id));
+        try std.testing.expectEqual(@as(usize, 21), client_stream.outbound_buffered);
+        try std.testing.expectError(error.WouldBlock, handle.send("x", .{}));
+        client_stream.deadline_ns = 100;
+        try deadlineHeapInsertOrUpdate(&impl, .{ .client_stream = client_stream }, 100);
+        try expireDeadlines(&impl, 99);
+        try std.testing.expect(!client_stream.deadline_expired);
+
+        // These are selected orderings, not all permutations. In the first two,
+        // a reset is queued but deliberately not flushed until GOAWAY arrives.
+        switch (schedule) {
+            .cancel_deadline_goaway => {
+                handle.cancel();
+                try processClientStreamCommands(client_stream);
+                try expireDeadlines(&impl, 100);
+            },
+            .deadline_cancel_goaway => {
+                try expireDeadlines(&impl, 100);
+                handle.cancel();
+                try processClientStreamCommands(client_stream);
+            },
+            .goaway_cancel_deadline, .accepted_goaway_cancel_deadline => {},
+        }
+        const accepted = schedule == .accepted_goaway_cancel_deadline;
+        try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_submit_goaway(
+            peer,
+            c.NGHTTP2_FLAG_NONE,
+            if (accepted) client_stream.stream_id else 0,
+            c.NGHTTP2_NO_ERROR,
+            null,
+            0,
+        ));
+        _ = try transferNghttp2Sessions(peer, impl.session);
+        if (accepted) {
+            try std.testing.expectEqual(@as(usize, 0), capture.terminals);
+            try std.testing.expectEqual(@as(usize, 21), client_stream.outbound_buffered);
+        }
+        handle.cancel();
+        try processClientStreamCommands(client_stream);
+        try expireDeadlines(&impl, 100);
+        _ = try transferNghttp2Sessions(impl.session, peer);
+        _ = try transferNghttp2Sessions(peer, impl.session);
+
+        const expected: status.Code = switch (schedule) {
+            .cancel_deadline_goaway, .accepted_goaway_cancel_deadline => .cancelled,
+            .deadline_cancel_goaway => .deadline_exceeded,
+            .goaway_cancel_deadline => .unavailable,
+        };
+        try std.testing.expectEqual(expected, capture.code);
+        try std.testing.expectEqual(@as(usize, 1), capture.terminals);
+        try std.testing.expectEqual(@as(usize, 0), impl.streams.count());
+        try std.testing.expectEqual(@as(usize, 0), impl.stream_states.count());
+        try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+        try std.testing.expect(impl.stream_wake_head == null and impl.stream_wake_tail == null);
+        try std.testing.expectError(error.StreamClosed, handle.send("late", .{}));
+        handle.deinit();
+        handle_alive = false;
+        // Drain late protocol work after application lifetime; it must not replay
+        // the request or call the now-released stream's application callbacks.
+        _ = try transferNghttp2Sessions(impl.session, peer);
+        _ = try transferNghttp2Sessions(peer, impl.session);
+        try std.testing.expectEqual(@as(usize, 1), capture.requests);
+        try std.testing.expectEqual(@as(usize, 1), capture.terminals);
+        try std.testing.expectEqual(@as(usize, 0), capture.other_callbacks);
+        try std.testing.expectEqual(@as(usize, 0), serialized_allocator.stream_admission.snapshot().retained_streams);
+        try std.testing.expectEqual(@as(usize, 0), serialized_allocator.stream_admission.snapshot().reserved_buffer_bytes);
+    }
+}
+
 test "client session advertises the default and reconnect response header list size" {
     const Reader = struct {
         fn advertised(session: ?*c.nghttp2_session) !u32 {
@@ -6975,6 +7134,226 @@ test "channel shutdown cancels an active blocked write" {
     try std.testing.expect(waiter_finished);
     try std.testing.expect(worker.returned_result);
     try std.testing.expectEqual(status.Code.unavailable, worker.code);
+}
+
+test "streaming termination ordering with paused receive disconnect shutdown and GOAWAY replacement" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const Schedule = enum { cancel_disconnect, disconnect_cancel, shutdown_cancel, cancel_shutdown, goaway_cancel_replacement };
+    const Handler = struct {
+        server: *server.Server,
+        send_goaway: bool,
+        terminal_reason: ?stream.ServerTerminalReason = null,
+        probes: usize = 0,
+        starts: usize = 0,
+        messages: usize = 0,
+        cancels: usize = 0,
+        terminals: usize = 0,
+
+        fn onStart(context: ?*anyopaque, _: stream.ServerStream, _: *service.ServerContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.starts += 1;
+        }
+
+        fn onMessage(context: ?*anyopaque, target: stream.ServerStream, _: *service.ServerContext, _: []const u8, _: Compression) !stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.messages += 1;
+            if (self.send_goaway) try self.server.impl.connections.items[0].submitGoAway(1, c.NGHTTP2_NO_ERROR);
+            try target.send("first", .{});
+            try target.send("queued", .{});
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, _: stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onCancel(context: ?*anyopaque, _: stream.ServerStream, _: *service.ServerContext) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.cancels += 1;
+        }
+
+        fn onTerminal(context: ?*anyopaque, _: stream.ServerCallId, reason: stream.ServerTerminalReason) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.terminals += 1;
+            self.terminal_reason = reason;
+        }
+
+        fn probe(self: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            self.probes += 1;
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Capture = struct {
+        paused: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        released: std.atomic.Value(bool) = .init(false),
+        headers: usize = 0,
+        messages: usize = 0,
+        terminals: usize = 0,
+        late_callbacks: usize = 0,
+        unexpected_callbacks: usize = 0,
+        code: status.Code = .unknown,
+
+        fn observe(self: *@This()) void {
+            if (self.done.load(.acquire) or self.released.load(.acquire)) self.late_callbacks += 1;
+        }
+
+        fn onHeaders(context: ?*anyopaque, _: stream.ClientStream, _: *const metadata.Metadata) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.observe();
+            self.headers += 1;
+        }
+
+        fn onMessage(context: ?*anyopaque, _: stream.ClientStream, _: []const u8, _: Compression) stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.observe();
+            self.messages += 1;
+            // The loop cannot process any terminal event until this callback
+            // returns pause. The test thread never reads loop-only queue fields.
+            self.paused.store(true, .release);
+            return .pause;
+        }
+
+        fn onUnexpected(context: ?*anyopaque, _: stream.ClientStream) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.observe();
+            self.unexpected_callbacks += 1;
+        }
+
+        fn onTerminal(context: ?*anyopaque, _: stream.ClientStream, result: status.Status, _: *const metadata.Metadata) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.observe();
+            self.terminals += 1;
+            self.code = result.code;
+            self.done.store(true, .release);
+        }
+    };
+    const Waiter = struct {
+        channel: *Channel,
+        server: *server.Server,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.channel.wait();
+            self.server.wait();
+            self.done.store(true, .release);
+        }
+    };
+
+    for (std.enums.values(Schedule)) |schedule| {
+        // Captures outlive both joined loops, including failure-path deinit.
+        var capture = Capture{};
+        var handler: Handler = undefined;
+        var test_server = try server.Server.init(std.testing.allocator, .{});
+        defer test_server.deinit();
+        handler = .{ .server = &test_server, .send_goaway = schedule == .goaway_cancel_replacement };
+        try test_server.registerUnary("/test.Termination/Probe", service.UnaryHandler.bind(Handler, &handler, Handler.probe));
+        try test_server.registerStream("/test.Termination/PausedReceive", .{
+            .context = &handler,
+            .on_start = Handler.onStart,
+            .on_message = Handler.onMessage,
+            .on_remote_end = Handler.onRemoteEnd,
+            .on_cancel = Handler.onCancel,
+            .on_terminal = Handler.onTerminal,
+        });
+        try test_server.start();
+        var target_buffer: [32]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+        var channel = try Channel.init(std.testing.allocator, target, .{});
+        defer channel.deinit();
+        var client_stream = try channel.openStream("/test.Termination/PausedReceive", .{
+            .timeout_ns = 10 * std.time.ns_per_s,
+            .limits = .{ .max_message_size = 16, .max_inbound_buffer_size = 64 * 1024, .max_outbound_buffer_size = 21 },
+        }, .{
+            .context = &capture,
+            .on_headers = Capture.onHeaders,
+            .on_message = Capture.onMessage,
+            .on_remote_end = Capture.onUnexpected,
+            .on_writable = Capture.onUnexpected,
+            .on_terminal = Capture.onTerminal,
+        });
+        var stream_alive = true;
+        defer if (stream_alive) client_stream.deinit();
+        try client_stream.send("request", .{});
+        try std.testing.expect(waitForTestFlag(&capture.paused, 5 * std.time.ns_per_s));
+
+        switch (schedule) {
+            .cancel_disconnect => {
+                client_stream.cancel();
+                // Observe reset completion before disconnect, not a guessed sleep.
+                try std.testing.expect(waitForTestFlag(&capture.done, 5 * std.time.ns_per_s));
+                test_server.shutdown();
+            },
+            .disconnect_cancel => {
+                test_server.shutdown();
+                try std.testing.expect(waitForTestFlag(&capture.done, 5 * std.time.ns_per_s));
+                client_stream.cancel();
+            },
+            .shutdown_cancel => {
+                channel.shutdown();
+                try std.testing.expect(waitForTestFlag(&capture.done, 5 * std.time.ns_per_s));
+                client_stream.cancel();
+            },
+            .goaway_cancel_replacement => {
+                try std.testing.expect(waitForTestFlag(&channel.impl.test_observer.goaway_received, 5 * std.time.ns_per_s));
+                try std.testing.expect(!capture.done.load(.acquire));
+                client_stream.cancel();
+                try std.testing.expect(waitForTestFlag(&capture.done, 5 * std.time.ns_per_s));
+                // Only this explicit new RPC may reach the replacement connection.
+                var probe = try channel.callUnary(std.testing.allocator, "/test.Termination/Probe", "probe", .{ .timeout_ns = 5 * std.time.ns_per_s });
+                defer probe.deinit();
+                try std.testing.expect(probe.status.isOk());
+                try std.testing.expectEqualStrings("probe", probe.payload);
+                try std.testing.expectEqual(@as(usize, 2), channel.impl.connect_count.load(.acquire));
+            },
+            .cancel_shutdown => {
+                // Cancellation is published before shutdown, but its queued reset
+                // need not retire first. Either cancelled or unavailable is legal.
+                client_stream.cancel();
+                channel.shutdown();
+            },
+        }
+        try std.testing.expect(waitForTestFlag(&capture.done, 5 * std.time.ns_per_s));
+        try std.testing.expectError(error.StreamClosed, client_stream.resumeReceive());
+        try std.testing.expectError(error.StreamClosed, client_stream.send("late", .{}));
+        client_stream.deinit();
+        stream_alive = false;
+        capture.released.store(true, .release);
+        channel.shutdown();
+        test_server.shutdown();
+        var waiter = Waiter{ .channel = &channel, .server = &test_server };
+        const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+        const finished = waitForTestFlag(&waiter.done, 5 * std.time.ns_per_s);
+        // Always join; the test runner's timeout is the final guard for a broken
+        // shutdown, as in the existing blocked-write/reconnect shutdown tests.
+        waiter_thread.join();
+        try std.testing.expect(finished);
+        switch (schedule) {
+            .cancel_disconnect, .goaway_cancel_replacement => try std.testing.expectEqual(status.Code.cancelled, capture.code),
+            .disconnect_cancel, .shutdown_cancel => try std.testing.expectEqual(status.Code.unavailable, capture.code),
+            .cancel_shutdown => try std.testing.expect(capture.code == .cancelled or capture.code == .unavailable),
+        }
+        try std.testing.expectEqual(@as(usize, 1), capture.headers);
+        try std.testing.expectEqual(@as(usize, 1), capture.messages);
+        try std.testing.expectEqual(@as(usize, 1), capture.terminals);
+        try std.testing.expectEqual(@as(usize, 0), capture.late_callbacks);
+        try std.testing.expectEqual(@as(usize, 0), capture.unexpected_callbacks);
+        try std.testing.expectEqual(@as(usize, 1), handler.starts);
+        try std.testing.expectEqual(@as(usize, 1), handler.messages);
+        try std.testing.expectEqual(@as(usize, 1), handler.cancels);
+        try std.testing.expectEqual(@as(usize, 1), handler.terminals);
+        try std.testing.expect(handler.terminal_reason == .peer_cancelled or
+            handler.terminal_reason == .server_shutdown or handler.terminal_reason == .transport_error);
+        try std.testing.expectEqual(@as(usize, if (schedule == .goaway_cancel_replacement) 1 else 0), handler.probes);
+        try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+        try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
+        try std.testing.expectEqual(@as(usize, 0), channel.impl.stream_states.count());
+        try std.testing.expectEqual(@as(usize, 0), channel.impl.streams.count());
+        try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
+        try std.testing.expect(channel.impl.stream_wake_head == null and channel.impl.stream_wake_tail == null);
+        try std.testing.expectEqual(@as(usize, 0), channel.impl.writes.count());
+        try std.testing.expectEqual(@as(usize, 0), test_server.impl.stream_commands.items.len);
+        try std.testing.expectEqual(@as(usize, 0), test_server.impl.connections.items.len);
+    }
 }
 
 test "channel shutdown drains an active reconnect completion" {
