@@ -3250,6 +3250,15 @@ fn onStreamClose(_: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_d
         client_stream.mutex.unlock(syncIo());
         if (cancel_requested and !released) {
             setForcedStreamStatus(client_stream, .init(.cancelled, "stream cancelled"));
+        } else if (error_code == c.NGHTTP2_CANCEL) {
+            // A peer reset can arrive before the local deadline timer callback.
+            // Preserve explicit cancellation and any previously selected outcome.
+            if (client_stream.deadline_ns) |deadline| {
+                if (fast_clock.validatedNow(syncIo()) >= deadline) {
+                    client_stream.deadline_expired = true;
+                    setForcedStreamStatus(client_stream, .init(.deadline_exceeded, "deadline exceeded"));
+                }
+            }
         }
         if (client_stream.terminal or client_stream.forced_status != null or released or
             (!client_stream.receive_paused and client_stream.inbound_head == client_stream.inbound.items.len))
@@ -5931,6 +5940,58 @@ test "streaming oversized trailers preserve accepted initial metadata" {
     _ = onStreamClose(impl.session, stream_id, c.NGHTTP2_CANCEL, &impl);
     var handle = client_stream.handle();
     handle.deinit();
+}
+
+test "peer cancellation observes expired streaming deadline before timer callback" {
+    const Case = struct {
+        deadline: ?u64,
+        cancel: bool = false,
+        forced: ?status.Status = null,
+        expected: status.Code,
+    };
+    for ([_]Case{
+        .{ .deadline = 0, .expected = .deadline_exceeded },
+        .{ .deadline = null, .expected = .cancelled },
+        .{ .deadline = std.math.maxInt(u64), .expected = .cancelled },
+        .{ .deadline = 0, .cancel = true, .expected = .cancelled },
+        .{ .deadline = 0, .forced = .init(.resource_exhausted, "quota"), .expected = .resource_exhausted },
+    }) |case| {
+        const TerminalState = struct {
+            count: usize = 0,
+            code: status.Code = .unknown,
+
+            fn onTerminal(context: ?*anyopaque, _: stream.ClientStream, final_status: status.Status, _: *const metadata.Metadata) void {
+                const self: *@This() = @ptrCast(@alignCast(context.?));
+                self.count += 1;
+                self.code = final_status.code;
+            }
+        };
+        var host = [_:0]u8{'x'};
+        var serialized_allocator: SerializedAllocator = undefined;
+        var impl: Impl = undefined;
+        initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+        defer impl.stream_states.deinit(impl.allocator);
+        defer impl.streams.deinit(impl.allocator);
+        try initializeSession(&impl);
+        defer c.nghttp2_session_del(impl.session);
+        var state: TerminalState = .{};
+        const client_stream = try ClientStreamState.init(&impl, "/test.Deadline/Reset", .{}, .{
+            .context = &state,
+            .on_message = StreamTestCallbacks.onMessage,
+            .on_terminal = TerminalState.onTerminal,
+        });
+        try impl.stream_states.put(impl.allocator, client_stream, {});
+        try submitClientStream(&impl, client_stream);
+        client_stream.deadline_ns = case.deadline;
+        client_stream.cancel_requested = case.cancel;
+        client_stream.forced_status = case.forced;
+        _ = onStreamClose(impl.session, client_stream.stream_id, c.NGHTTP2_CANCEL, &impl);
+        var handle = client_stream.handle();
+        defer handle.deinit();
+        try std.testing.expectEqual(@as(usize, 1), state.count);
+        try std.testing.expectEqual(case.expected, state.code);
+        try std.testing.expectEqual(@as(usize, 0), impl.streams.count());
+    }
 }
 
 test "pending streaming cancellation wins over response header quota" {
