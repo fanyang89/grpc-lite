@@ -503,7 +503,7 @@ pub const Channel = struct {
         appendStreamWake(self.impl, client_stream);
         if (!self.impl.stream_wake_notify_pending) {
             self.impl.stream_wake_notify_pending = true;
-            self.impl.async_handle.notify() catch {
+            self.impl.notifyAdmission() catch {
                 self.impl.stream_wake_notify_pending = false;
                 removeStreamWake(self.impl, client_stream);
                 return error.ChannelUnavailable;
@@ -581,6 +581,9 @@ const ConnectionState = enum { resolving, connecting, handshaking, active, drain
 const ResolveState = enum { idle, pending, ready, failed, cancelled };
 
 const TestObserver = if (builtin.is_test) struct {
+    // Per-channel one-shot faults; dormant unless a test arms them.
+    fail_admission_notify: std.atomic.Value(bool) = .init(false),
+    fail_cancellation_reset: std.atomic.Value(bool) = .init(false),
     write_requested: std.atomic.Value(bool) = .init(false),
     write_observed: std.atomic.Value(bool) = .init(false),
     write_observed_sem: std.Io.Semaphore = .{},
@@ -692,13 +695,20 @@ const Impl = struct {
     queued_write_bytes: usize = 0,
     test_observer: TestObserver = .{},
 
+    fn notifyAdmission(self: *Impl) !void {
+        if (comptime builtin.is_test) {
+            if (self.test_observer.fail_admission_notify.swap(false, .monotonic)) return error.TestNotifyFailure;
+        }
+        try self.async_handle.notify();
+    }
+
     fn enqueue(self: *Impl, operation: *Operation) !bool {
         self.mutex.lockUncancelable(syncIo());
         defer self.mutex.unlock(syncIo());
         if (self.state != .running) return false;
         try self.pending.append(self.allocator, operation);
         if (receiving_http2_impl == self) return true;
-        if (self.async_handle.notify()) |_| {} else |_| {
+        if (self.notifyAdmission()) |_| {} else |_| {
             _ = self.pending.pop();
             return false;
         }
@@ -2059,12 +2069,7 @@ fn processClientStreamCommands(client_stream: *ClientStreamState) !void {
 
     if (cancel_requested and !client_stream.rst_submitted) {
         if (!app_released) setForcedStreamStatus(client_stream, .init(.cancelled, "stream cancelled"));
-        if (c.nghttp2_submit_rst_stream(
-            impl.session,
-            c.NGHTTP2_FLAG_NONE,
-            client_stream.stream_id,
-            c.NGHTTP2_CANCEL,
-        ) != 0) return error.NativeFailure;
+        if (submitCancellationReset(impl, client_stream.stream_id) != 0) return error.NativeFailure;
         client_stream.rst_submitted = true;
     }
     if (should_resume_data and !client_stream.rst_submitted) {
@@ -3154,6 +3159,13 @@ fn onDeadlineTimer(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.
     return .disarm;
 }
 
+fn submitCancellationReset(impl: *Impl, stream_id: i32) c_int {
+    if (comptime builtin.is_test) {
+        if (impl.test_observer.fail_cancellation_reset.swap(false, .monotonic)) return c.NGHTTP2_ERR_NOMEM;
+    }
+    return c.nghttp2_submit_rst_stream(impl.session, c.NGHTTP2_FLAG_NONE, stream_id, c.NGHTTP2_CANCEL);
+}
+
 fn expireDeadlines(impl: *Impl, now: u64) !void {
     var flush_needed = false;
     while (deadlineHeapPeek(impl)) |next| {
@@ -3186,7 +3198,7 @@ fn expireDeadlines(impl: *Impl, now: u64) !void {
                 if (operation.stream_id < 0 or impl.operations.get(operation.stream_id) != operation) continue;
                 operation.deadline_expired = true;
                 operation.setOutcome(.deadline_exceeded, "deadline exceeded") catch {};
-                if (c.nghttp2_submit_rst_stream(impl.session, c.NGHTTP2_FLAG_NONE, operation.stream_id, c.NGHTTP2_CANCEL) != 0) {
+                if (submitCancellationReset(impl, operation.stream_id) != 0) {
                     return error.DeadlineCancellationFailed;
                 }
                 flush_needed = true;
@@ -3204,12 +3216,7 @@ fn expireDeadlines(impl: *Impl, now: u64) !void {
                 if (impl.streams.get(client_stream.stream_id) != client_stream) continue;
                 setForcedStreamStatus(client_stream, .init(.deadline_exceeded, "deadline exceeded"));
                 if (!client_stream.rst_submitted) {
-                    if (c.nghttp2_submit_rst_stream(
-                        impl.session,
-                        c.NGHTTP2_FLAG_NONE,
-                        client_stream.stream_id,
-                        c.NGHTTP2_CANCEL,
-                    ) != 0) return error.DeadlineCancellationFailed;
+                    if (submitCancellationReset(impl, client_stream.stream_id) != 0) return error.DeadlineCancellationFailed;
                     client_stream.rst_submitted = true;
                     flush_needed = true;
                 }
@@ -9112,6 +9119,600 @@ test "successful terminal client streams retain admission until release and outl
     try std.testing.expectEqual(@as(usize, 0), rejected_state.terminals.load(.acquire));
 }
 
+const AdmissionFailureCallbacks = struct {
+    completions: usize = 0,
+    messages: usize = 0,
+    terminals: usize = 0,
+    other_callbacks: usize = 0,
+    terminal_code: status.Code = .unknown,
+    completion_code: status.Code = .unknown,
+
+    fn complete(context: ?*anyopaque, result: call.AsyncResult) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.completions += 1;
+        self.completion_code = result.status.code;
+    }
+
+    fn onMessage(context: ?*anyopaque, _: stream.ClientStream, _: []const u8, _: Compression) stream.ReceiveAction {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.messages += 1;
+        return .continue_receiving;
+    }
+
+    fn terminal(context: ?*anyopaque, _: stream.ClientStream, result: status.Status, _: *const metadata.Metadata) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.terminals += 1;
+        self.terminal_code = result.code;
+    }
+
+    fn onHeaders(context: ?*anyopaque, handle: stream.ClientStream, _: *const metadata.Metadata) void {
+        onOther(context, handle);
+    }
+
+    fn onOther(context: ?*anyopaque, _: stream.ClientStream) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.other_callbacks += 1;
+    }
+
+    fn streamCallbacks(self: *@This()) stream.ClientCallbacks {
+        return .{
+            .context = self,
+            .on_headers = onHeaders,
+            .on_message = onMessage,
+            .on_remote_end = onOther,
+            .on_writable = onOther,
+            .on_terminal = terminal,
+        };
+    }
+};
+
+test "unary enqueue notify failure preserves pending work and restores admission" {
+    var host = [_:0]u8{'x'};
+    var owner: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &owner, host[0..1 :0]);
+    defer impl.pending.deinit(impl.allocator);
+    impl.async_handle = try xev.Async.init();
+    defer impl.async_handle.deinit();
+    impl.state = .running;
+    var channel: Channel = .{ .impl = &impl };
+    var accepted: AdmissionFailureCallbacks = .{};
+    var rejected: AdmissionFailureCallbacks = .{};
+    const callbacks: call.Callbacks = .{ .context = &accepted, .on_complete = AdmissionFailureCallbacks.complete };
+    try channel.callUnaryAsync("/test.Notify/Unary", "kept", .{}, callbacks);
+    const kept = impl.pending.items[0];
+    const reserved = channel.unaryAdmissionStats();
+    impl.test_observer.fail_admission_notify.store(true, .monotonic);
+    try std.testing.expectError(error.ChannelUnavailable, channel.callUnaryAsync("/test.Notify/Unary", "rejected", .{}, .{
+        .context = &rejected,
+        .on_complete = AdmissionFailureCallbacks.complete,
+    }));
+    try std.testing.expect(!impl.test_observer.fail_admission_notify.load(.monotonic));
+    try std.testing.expectEqualDeep(reserved, channel.unaryAdmissionStats());
+    try std.testing.expectEqual(@as(usize, 1), impl.pending.items.len);
+    try std.testing.expect(impl.pending.items[0] == kept);
+    try std.testing.expectEqual(@as(usize, 0), rejected.completions);
+    try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+    try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+    try std.testing.expect(impl.waiting_operation_head == null and impl.waiting_operation_tail == null);
+    // A real notify succeeds after the one-shot fault, without replacing the channel.
+    try channel.callUnaryAsync("/test.Notify/Unary", "recovered", .{}, callbacks);
+    while (impl.pending.pop()) |operation| {
+        operation.setStaticOutcome(.unavailable, "fixture completion");
+        operation.finish();
+    }
+    try std.testing.expectEqual(@as(usize, 2), accepted.completions);
+    try std.testing.expectEqual(@as(usize, 0), rejected.completions);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+}
+
+test "stream open notify failure restores wake registry and handle reservations" {
+    var host = [_:0]u8{'x'};
+    var owner: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &owner, host[0..1 :0]);
+    defer impl.stream_states.deinit(impl.allocator);
+    impl.async_handle = try xev.Async.init();
+    defer impl.async_handle.deinit();
+    impl.state = .running;
+    impl.accepting_streams = true;
+    var channel: Channel = .{ .impl = &impl };
+    var callbacks: AdmissionFailureCallbacks = .{};
+    var kept_handle = try channel.openStream("/test.Notify/Duplex", .{}, callbacks.streamCallbacks());
+    const kept: *ClientStreamState = @ptrCast(@alignCast(kept_handle.context));
+    const reserved = channel.streamAdmissionStats();
+    const references = owner.references.load(.monotonic);
+    // As after onAsync consumes a notification, existing wakes can still be queued.
+    impl.stream_wake_notify_pending = false;
+    impl.test_observer.fail_admission_notify.store(true, .monotonic);
+    try std.testing.expectError(error.ChannelUnavailable, channel.openStream("/test.Notify/Duplex", .{
+        .timeout_ns = std.time.ns_per_s,
+    }, callbacks.streamCallbacks()));
+    try std.testing.expect(!impl.test_observer.fail_admission_notify.load(.monotonic));
+    try std.testing.expect(!impl.stream_wake_notify_pending);
+    try std.testing.expect(impl.stream_wake_head == kept and impl.stream_wake_tail == kept);
+    try std.testing.expect(kept.wake_queued and kept.wake_next == null and kept.loop_owned);
+    try std.testing.expectEqual(@as(usize, 1), impl.stream_states.count());
+    try std.testing.expect(impl.stream_states.contains(kept));
+    try std.testing.expectEqual(@as(usize, 0), impl.streams.count());
+    try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+    try std.testing.expectEqualDeep(reserved, channel.streamAdmissionStats());
+    try std.testing.expectEqual(references, owner.references.load(.monotonic));
+    var recovered = try channel.openStream("/test.Notify/Duplex", .{}, callbacks.streamCallbacks());
+    try std.testing.expect(impl.stream_wake_notify_pending);
+    releaseStreamLoopOwnership(@ptrCast(@alignCast(recovered.context)));
+    recovered.deinit();
+    releaseStreamLoopOwnership(kept);
+    kept_handle.deinit();
+    try std.testing.expectEqual(@as(usize, 0), callbacks.other_callbacks);
+    try std.testing.expectEqual(@as(usize, 0), callbacks.messages);
+    try std.testing.expectEqual(@as(usize, 0), callbacks.terminals);
+    try std.testing.expectEqual(@as(usize, 0), impl.stream_states.count());
+    try std.testing.expect(impl.stream_wake_head == null and impl.stream_wake_tail == null);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.monotonic));
+}
+
+// Exhaust valid native request IDs without corrupting session state or injecting a
+// Zig allocator failure. The next submit_request2 must reject inside nghttp2.
+fn exhaustTestRequestIds(impl: *Impl) !void {
+    try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_session_set_next_stream_id(impl.session, std.math.maxInt(i32)));
+    const headers = [_]c.nghttp2_nv{
+        nativeHeader(":method", "POST"),
+        nativeHeader(":scheme", "http"),
+        nativeHeader(":path", "/test.Exhaust/Ids"),
+        nativeHeader(":authority", "localhost"),
+    };
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), c.nghttp2_submit_request2(impl.session, null, &headers, headers.len, null, null));
+    try std.testing.expect(c.nghttp2_session_get_next_stream_id(impl.session) > std.math.maxInt(i32));
+}
+
+test "native request submission failure cleans accepted unary and stream ownership and recovers" {
+    for ([_]bool{ false, true }) |streaming| {
+        var host = [_:0]u8{'x'};
+        var owner: SerializedAllocator = undefined;
+        var impl: Impl = undefined;
+        initTestImpl(&impl, &owner, host[0..1 :0]);
+        defer impl.pending.deinit(impl.allocator);
+        defer impl.operations.deinit(impl.allocator);
+        defer impl.stream_states.deinit(impl.allocator);
+        defer impl.streams.deinit(impl.allocator);
+        defer impl.deadline_heap.deinit(impl.allocator);
+        impl.loop = try xev.Loop.init(.{});
+        defer impl.loop.deinit();
+        impl.async_handle = try xev.Async.init();
+        defer impl.async_handle.deinit();
+        impl.state = .running;
+        impl.connection_state = .active;
+        impl.accepting_streams = true;
+        // Pump queues synchronously without socket flushes or real timer scheduling.
+        impl.stopping_on_loop = true;
+        try initializeSession(&impl);
+        defer if (impl.session) |session| c.nghttp2_session_del(session);
+        try exhaustTestRequestIds(&impl);
+        var channel: Channel = .{ .impl = &impl };
+        var callbacks: AdmissionFailureCallbacks = .{};
+        for ([_]bool{ true, false }) |fail_submission| {
+            var handle: ?stream.ClientStream = null;
+            if (streaming) {
+                handle = try channel.openStream("/test.Submit/Duplex", .{ .timeout_ns = std.math.maxInt(u64) }, callbacks.streamCallbacks());
+            } else {
+                try channel.callUnaryAsync("/test.Submit/Unary", "payload", .{ .timeout_ns = std.math.maxInt(u64) }, .{
+                    .context = &callbacks,
+                    .on_complete = AdmissionFailureCallbacks.complete,
+                });
+            }
+            defer if (handle) |*owned| owned.deinit();
+            const reserved = channel.streamAdmissionStats();
+            processPending(&impl);
+            processStreamWakes(&impl);
+            if (fail_submission) {
+                try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+                try std.testing.expectEqual(@as(usize, 0), impl.streams.count());
+                if (handle) |owned| {
+                    const state: *ClientStreamState = @ptrCast(@alignCast(owned.context));
+                    try std.testing.expectEqual(@as(i32, -1), state.stream_id);
+                    try std.testing.expect(state.terminal and !state.loop_owned and state.impl == null);
+                    try std.testing.expect(state.deadline_heap_index == null);
+                }
+            } else {
+                // A fresh native session admits the same request after exhaustion.
+                try std.testing.expectEqual(@as(usize, if (streaming) 0 else 1), impl.operations.count());
+                try std.testing.expectEqual(@as(usize, if (streaming) 1 else 0), impl.streams.count());
+                impl.stopping_on_loop = false;
+                beginStop(&impl, "fixture completion");
+            }
+            const expected: usize = if (fail_submission) 1 else 2;
+            try std.testing.expectEqual(if (streaming) 0 else expected, callbacks.completions);
+            try std.testing.expectEqual(if (streaming) expected else 0, callbacks.terminals);
+            try std.testing.expectEqual(status.Code.unavailable, if (streaming) callbacks.terminal_code else callbacks.completion_code);
+            try std.testing.expectEqual(@as(usize, 0), callbacks.other_callbacks);
+            try std.testing.expectEqual(@as(usize, 0), callbacks.messages);
+            try std.testing.expectEqual(@as(usize, 0), impl.pending.items.len);
+            try std.testing.expect(impl.waiting_operation_head == null and impl.waiting_operation_tail == null);
+            try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+            try std.testing.expectEqual(@as(usize, 0), impl.streams.count());
+            try std.testing.expectEqual(@as(usize, 0), impl.stream_states.count());
+            try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+            try std.testing.expect(impl.stream_wake_head == null and impl.stream_wake_tail == null);
+            try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+            try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+            try std.testing.expectEqualDeep(reserved, channel.streamAdmissionStats());
+            if (handle) |*owned| {
+                try std.testing.expectError(error.StreamClosed, owned.send("late", .{}));
+                owned.deinit();
+                handle = null;
+            }
+            try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+            try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
+            try std.testing.expectEqual(@as(usize, 1), owner.references.load(.monotonic));
+            try std.testing.expectEqual(if (streaming) 0 else expected, callbacks.completions);
+            try std.testing.expectEqual(if (streaming) expected else 0, callbacks.terminals);
+            if (fail_submission) {
+                c.nghttp2_session_del(impl.session);
+                impl.session = null;
+                try initializeSession(&impl);
+            }
+        }
+    }
+}
+
+test "cancellation reset failure stops once and deadline timer fallback drains ownership" {
+    const Cause = enum { unary_deadline_timer, stream_deadline_timer, unary_deadline_schedule, stream_deadline_schedule, cancel, release };
+    for (std.enums.values(Cause)) |cause| {
+        var host = [_:0]u8{'x'};
+        var owner: SerializedAllocator = undefined;
+        var impl: Impl = undefined;
+        initTestImpl(&impl, &owner, host[0..1 :0]);
+        defer impl.pending.deinit(impl.allocator);
+        defer impl.operations.deinit(impl.allocator);
+        defer impl.stream_states.deinit(impl.allocator);
+        defer impl.streams.deinit(impl.allocator);
+        defer impl.deadline_heap.deinit(impl.allocator);
+        impl.loop = try xev.Loop.init(.{});
+        defer impl.loop.deinit();
+        impl.async_handle = try xev.Async.init();
+        defer impl.async_handle.deinit();
+        impl.state = .running;
+        impl.connection_state = .active;
+        impl.accepting_streams = true;
+        impl.stopping_on_loop = true;
+        try initializeSession(&impl);
+        defer if (impl.session) |session| c.nghttp2_session_del(session);
+        var channel: Channel = .{ .impl = &impl };
+        var callbacks: AdmissionFailureCallbacks = .{};
+        try channel.callUnaryAsync("/test.Reset/Unary", "payload", .{}, .{
+            .context = &callbacks,
+            .on_complete = AdmissionFailureCallbacks.complete,
+        });
+        const operation = impl.pending.items[0];
+        var handle = try channel.openStream("/test.Reset/Duplex", .{}, callbacks.streamCallbacks());
+        var handle_owned = true;
+        defer if (handle_owned) handle.deinit();
+        const state: *ClientStreamState = @ptrCast(@alignCast(handle.context));
+        const reserved = channel.streamAdmissionStats();
+        processPending(&impl);
+        processStreamWakes(&impl);
+        try std.testing.expect(operation.stream_id > 0 and state.stream_id > 0);
+        // Serialize HEADERS before injecting NOMEM: resetting a merely queued
+        // request can cancel it allocation-free, unlike an active native stream.
+        while (true) {
+            var data: [*c]const u8 = null;
+            const length = c.nghttp2_session_mem_send2(impl.session, &data);
+            try std.testing.expect(length >= 0);
+            if (length == 0) break;
+        }
+        try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(operation)), c.nghttp2_session_get_stream_user_data(impl.session, operation.stream_id));
+        try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(state)), c.nghttp2_session_get_stream_user_data(impl.session, state.stream_id));
+        try std.testing.expectEqual(@as(usize, 0), callbacks.completions + callbacks.terminals);
+        impl.stopping_on_loop = false;
+        impl.test_observer.fail_cancellation_reset.store(true, .monotonic);
+        const unary_deadline = cause == .unary_deadline_timer or cause == .unary_deadline_schedule;
+        const stream_deadline = cause == .stream_deadline_timer or cause == .stream_deadline_schedule;
+        switch (cause) {
+            .unary_deadline_timer, .stream_deadline_timer, .unary_deadline_schedule, .stream_deadline_schedule => {
+                if (unary_deadline) {
+                    operation.deadline_ns = 0;
+                    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = operation }, 0);
+                } else {
+                    state.deadline_ns = 0;
+                    try deadlineHeapInsertOrUpdate(&impl, .{ .client_stream = state }, 0);
+                }
+                // Exercise both production DeadlineCancellationFailed handlers,
+                // not merely expireDeadlines' error return or test-written cleanup.
+                if (cause == .unary_deadline_timer or cause == .stream_deadline_timer) {
+                    try std.testing.expectEqual(xev.CallbackAction.disarm, onDeadlineTimer(&impl, &impl.loop, &impl.deadline_completion, {}));
+                } else {
+                    scheduleDeadlineTimer(&impl);
+                }
+            },
+            .cancel, .release => {
+                if (cause == .release) {
+                    handle.deinit();
+                    handle_owned = false;
+                } else {
+                    handle.cancel();
+                }
+                processStreamWakes(&impl);
+            },
+        }
+        try std.testing.expect(!impl.test_observer.fail_cancellation_reset.load(.monotonic));
+        try std.testing.expect(impl.stopping_on_loop and impl.session == null and !impl.accepting_streams);
+        try std.testing.expectEqual(State.stopping, impl.state);
+        try std.testing.expectEqual(@as(usize, 1), callbacks.completions);
+        try std.testing.expectEqual(if (unary_deadline) status.Code.deadline_exceeded else status.Code.unavailable, callbacks.completion_code);
+        try std.testing.expectEqual(@as(usize, if (cause == .release) 0 else 1), callbacks.terminals);
+        // Connection-wide fallback is UNAVAILABLE for streams, even if forced status was set.
+        if (handle_owned) {
+            try std.testing.expectEqual(status.Code.unavailable, callbacks.terminal_code);
+            try std.testing.expect(state.terminal and state.transport_closed and !state.loop_owned and state.impl == null);
+            try std.testing.expect(!state.rst_submitted and state.deadline_heap_index == null);
+            if (stream_deadline) {
+                try std.testing.expect(state.deadline_expired);
+                try std.testing.expectEqual(status.Code.deadline_exceeded, state.forced_status.?.code);
+            }
+            try std.testing.expectEqualDeep(reserved, channel.streamAdmissionStats());
+            try std.testing.expectError(error.StreamClosed, handle.send("late", .{}));
+            handle.deinit();
+            handle_owned = false;
+        }
+        try std.testing.expectEqual(@as(usize, 0), callbacks.other_callbacks);
+        try std.testing.expectEqual(@as(usize, 0), callbacks.messages);
+        try std.testing.expectEqual(@as(usize, 0), impl.pending.items.len);
+        try std.testing.expect(impl.waiting_operation_head == null and impl.waiting_operation_tail == null);
+        try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+        try std.testing.expectEqual(@as(usize, 0), impl.streams.count());
+        try std.testing.expectEqual(@as(usize, 0), impl.stream_states.count());
+        try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+        try std.testing.expect(impl.stream_wake_head == null and impl.stream_wake_tail == null);
+        try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+        try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+        try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+        try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
+        try std.testing.expectEqual(@as(usize, 1), owner.references.load(.monotonic));
+        beginStop(&impl, "duplicate stop");
+        try std.testing.expectEqual(@as(usize, 1), callbacks.completions);
+        try std.testing.expectEqual(@as(usize, if (cause == .release) 0 else 1), callbacks.terminals);
+    }
+}
+
+fn testUnaryEnqueueAllocationFailures(allocator: std.mem.Allocator) !void {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    serialized_allocator.backing = allocator;
+    defer impl.pending.deinit(impl.allocator);
+    impl.state = .running;
+    // Use the existing receive-dispatch enqueue path; no event loop or notify fault is simulated.
+    const previous = receiving_http2_impl;
+    receiving_http2_impl = &impl;
+    defer receiving_http2_impl = previous;
+    var channel: Channel = .{ .impl = &impl };
+    var callbacks: AdmissionFailureCallbacks = .{};
+    channel.callUnaryAsync("/test.Rollback/Unary", "payload", .{}, .{
+        .context = &callbacks,
+        .on_complete = AdmissionFailureCallbacks.complete,
+    }) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), callbacks.completions);
+        try std.testing.expectEqual(@as(usize, 0), impl.pending.items.len);
+        try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+        try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+        try std.testing.expectEqual(@as(u64, 0), channel.unaryAdmissionStats().rejected_calls);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 1), impl.pending.items.len);
+    const operation = impl.pending.pop().?;
+    operation.setStaticOutcome(.unavailable, "fixture completion");
+    operation.finish();
+    try std.testing.expectEqual(@as(usize, 1), callbacks.completions);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+}
+
+test "unary public enqueue rolls back every allocation failure without a rejected callback" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testUnaryEnqueueAllocationFailures, .{});
+}
+
+fn testStreamOpenAllocationFailures(allocator: std.mem.Allocator) !void {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    serialized_allocator.backing = allocator;
+    defer impl.stream_states.deinit(impl.allocator);
+    impl.state = .running;
+    impl.accepting_streams = true;
+    // A pending notification lets the public open reach registry insertion without a live loop.
+    impl.stream_wake_notify_pending = true;
+    var channel: Channel = .{ .impl = &impl };
+    var callbacks: AdmissionFailureCallbacks = .{};
+    var handle = channel.openStream("/test.Rollback/Duplex", .{}, callbacks.streamCallbacks()) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), callbacks.messages);
+        try std.testing.expectEqual(@as(usize, 0), callbacks.terminals);
+        try std.testing.expectEqual(@as(usize, 0), impl.stream_states.count());
+        try std.testing.expect(impl.stream_wake_head == null and impl.stream_wake_tail == null);
+        try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+        try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
+        try std.testing.expectEqual(@as(u64, 0), channel.streamAdmissionStats().rejected_streams);
+        try std.testing.expectEqual(@as(usize, 1), serialized_allocator.references.load(.monotonic));
+        return err;
+    };
+    const client_stream: *ClientStreamState = @ptrCast(@alignCast(handle.context));
+    try std.testing.expectEqual(@as(usize, 1), impl.stream_states.count());
+    try std.testing.expect(impl.stream_wake_head == client_stream and impl.stream_wake_tail == client_stream);
+    releaseStreamLoopOwnership(client_stream);
+    handle.deinit();
+    try std.testing.expectEqual(@as(usize, 0), callbacks.messages);
+    try std.testing.expectEqual(@as(usize, 0), callbacks.terminals);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
+    try std.testing.expectEqual(@as(usize, 1), serialized_allocator.references.load(.monotonic));
+}
+
+test "stream public open rolls back every allocation failure through registry insertion" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testStreamOpenAllocationFailures, .{});
+}
+
+fn testUnaryResultCopyAdmissionFailure(allocator: std.mem.Allocator) !void {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var channel: Channel = .{ .impl = &impl };
+    // Unavailable blocking calls still copy an owned result. Fail only its allocator.
+    var result = channel.callUnary(allocator, "/test.Rollback/Unary", "payload", .{}) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+        try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+        return err;
+    };
+    defer result.deinit();
+    try std.testing.expectEqual(status.Code.unavailable, result.status.code);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+    try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+}
+
+test "unary result copy allocation failure releases the request reservation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testUnaryResultCopyAdmissionFailure, .{});
+}
+
+test "accepted unary submission allocation failure completes once and releases admission" {
+    for ([_]bool{ false, true }) |with_deadline| {
+        var host = [_:0]u8{'x'};
+        var serialized_allocator: SerializedAllocator = undefined;
+        var impl: Impl = undefined;
+        initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+        defer impl.pending.deinit(impl.allocator);
+        defer impl.operations.deinit(impl.allocator);
+        defer impl.deadline_heap.deinit(impl.allocator);
+        impl.state = .running;
+        impl.connection_state = .active;
+        // Only process the pending queue, without flushing a session or arming a timer.
+        impl.stopping_on_loop = true;
+        const previous = receiving_http2_impl;
+        receiving_http2_impl = &impl;
+        defer receiving_http2_impl = previous;
+        var channel: Channel = .{ .impl = &impl };
+        var callbacks: AdmissionFailureCallbacks = .{};
+        try channel.callUnaryAsync("/test.Rollback/Unary", "payload", .{
+            .timeout_ns = if (with_deadline) std.time.ns_per_s else null,
+        }, .{ .context = &callbacks, .on_complete = AdmissionFailureCallbacks.complete });
+        try std.testing.expectEqual(@as(usize, 1), channel.unaryAdmissionStats().retained_calls);
+        try std.testing.expectEqual(@as(usize, "/test.Rollback/Unary".len + frame.header_size + "payload".len), channel.unaryAdmissionStats().retained_request_bytes);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        serialized_allocator.backing = failing.allocator();
+        processPending(&impl);
+        serialized_allocator.backing = std.testing.allocator;
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 1), callbacks.completions);
+        try std.testing.expectEqual(@as(usize, 0), impl.pending.items.len);
+        try std.testing.expect(impl.waiting_operation_head == null and impl.waiting_operation_tail == null);
+        try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+        try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+        try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+        try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_request_bytes);
+        try std.testing.expectEqual(@as(u64, 0), channel.unaryAdmissionStats().rejected_calls);
+    }
+}
+
+test "accepted stream submission allocation failure retires loop ownership but preserves handle reservation" {
+    for ([_]bool{ false, true }) |with_deadline| {
+        var host = [_:0]u8{'x'};
+        var serialized_allocator: SerializedAllocator = undefined;
+        var impl: Impl = undefined;
+        initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+        defer impl.stream_states.deinit(impl.allocator);
+        defer impl.streams.deinit(impl.allocator);
+        defer impl.deadline_heap.deinit(impl.allocator);
+        impl.state = .running;
+        impl.connection_state = .active;
+        impl.accepting_streams = true;
+        impl.stream_wake_notify_pending = true;
+        var channel: Channel = .{ .impl = &impl };
+        var callbacks: AdmissionFailureCallbacks = .{};
+        var handle = try channel.openStream("/test.Rollback/Duplex", .{
+            .timeout_ns = if (with_deadline) std.time.ns_per_s else null,
+        }, callbacks.streamCallbacks());
+        var handle_owned = true;
+        defer if (handle_owned) handle.deinit();
+        const reserved = channel.streamAdmissionStats();
+        const client_stream: *ClientStreamState = @ptrCast(@alignCast(handle.context));
+        // The first allocation is deadline-heap growth or the HTTP/2 stream registry.
+        // Neither failure reaches nghttp2 or needs a socket/event loop.
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        serialized_allocator.backing = failing.allocator();
+        processStreamWakes(&impl);
+        serialized_allocator.backing = std.testing.allocator;
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 1), callbacks.terminals);
+        try std.testing.expectEqual(status.Code.unavailable, callbacks.terminal_code);
+        try std.testing.expectEqual(@as(usize, 0), callbacks.messages);
+        try std.testing.expect(client_stream.terminal and !client_stream.loop_owned);
+        try std.testing.expectEqual(@as(i32, -1), client_stream.stream_id);
+        try std.testing.expectEqual(@as(usize, 0), impl.stream_states.count());
+        try std.testing.expectEqual(@as(usize, 0), impl.streams.count());
+        try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+        try std.testing.expect(impl.stream_wake_head == null and impl.stream_wake_tail == null);
+        try std.testing.expectEqualDeep(reserved, channel.streamAdmissionStats());
+        // Explicit destruction below checks the final release without duplicating lifetime tests.
+        handle.deinit();
+        handle_owned = false;
+        try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+        try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
+        try std.testing.expectEqual(@as(usize, 1), serialized_allocator.references.load(.monotonic));
+    }
+}
+
+test "client stream send allocation failures preserve queued frames and admission" {
+    for (0..2) |fail_index| {
+        var host = [_:0]u8{'x'};
+        var serialized_allocator: SerializedAllocator = undefined;
+        var impl: Impl = undefined;
+        initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+        var callbacks: AdmissionFailureCallbacks = .{};
+        const client_stream = try ClientStreamState.init(&impl, "/test.Rollback/Duplex", .{}, callbacks.streamCallbacks());
+        client_stream.loop_owned = false;
+        var handle = client_stream.handle();
+        var handle_owned = true;
+        defer if (handle_owned) handle.deinit();
+        try handle.send("queued", .{});
+        // Fill the existing descriptor capacity so the next send must grow the queue.
+        while (client_stream.outbound.items.len < client_stream.outbound.capacity) try handle.send("queued", .{});
+        const count = client_stream.outbound.items.len;
+        const buffered = client_stream.outbound_buffered;
+        const reserved = serialized_allocator.stream_admission.snapshot();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        serialized_allocator.backing = failing.allocator();
+        const sent = handle.send("new", .{});
+        serialized_allocator.backing = std.testing.allocator;
+        try std.testing.expectError(error.OutOfMemory, sent);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        try std.testing.expectEqual(count, client_stream.outbound.items.len);
+        try std.testing.expectEqual(buffered, client_stream.outbound_buffered);
+        try std.testing.expectEqual(@as(usize, 0), client_stream.outbound_head);
+        for (client_stream.outbound.items) |item| {
+            try std.testing.expectEqual(@as(usize, 0), item.offset);
+            try std.testing.expectEqualStrings("queued", item.frame_bytes[frame.header_size..]);
+        }
+        try std.testing.expectEqualDeep(reserved, serialized_allocator.stream_admission.snapshot());
+        try std.testing.expectEqual(@as(usize, 0), callbacks.terminals);
+        try handle.send("recovered", .{});
+        try std.testing.expectEqual(count + 1, client_stream.outbound.items.len);
+        try std.testing.expectEqual(buffered + frame.header_size + "recovered".len, client_stream.outbound_buffered);
+        handle.deinit();
+        handle_owned = false;
+        try std.testing.expectEqual(@as(usize, 0), serialized_allocator.stream_admission.snapshot().retained_streams);
+        try std.testing.expectEqual(@as(usize, 0), serialized_allocator.stream_admission.snapshot().reserved_buffer_bytes);
+        try std.testing.expectEqual(@as(usize, 1), serialized_allocator.references.load(.monotonic));
+    }
+}
+
 test "unary admission enforces exact count and byte boundaries and recovers" {
     var admission: UnaryAdmission = .{ .limits = .{ .max_calls = 2, .max_request_bytes = 10 } };
     try admission.reserve(6);
@@ -9307,26 +9908,37 @@ test "stream admission rejects before allocation and releases failed opens" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     serialized_allocator.backing = failing.allocator();
     var channel: Channel = .{ .impl = &impl };
-    var received: usize = 0;
-    const callbacks: stream.ClientCallbacks = .{
-        .context = &received,
-        .on_message = StreamTestCallbacks.onMessage,
-        .on_terminal = StreamTestCallbacks.onTerminal,
-    };
+    var observed: AdmissionFailureCallbacks = .{};
+    const callbacks = observed.streamCallbacks();
     try std.testing.expectError(error.StreamAdmissionRejected, channel.openStream("/test.Stream/Duplex", .{}, callbacks));
+    try std.testing.expectError(error.InvalidInboundBufferSize, channel.openStream("/test.Stream/Duplex", .{
+        .limits = .{ .max_message_size = 1, .max_inbound_buffer_size = 6 },
+    }, callbacks));
     try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), observed.messages);
+    try std.testing.expectEqual(@as(usize, 0), observed.terminals);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
     try std.testing.expectEqual(@as(u64, 1), channel.streamAdmissionStats().rejected_streams);
     serialized_allocator.backing = std.testing.allocator;
     serialized_allocator.stream_admission.limits = .{};
     try std.testing.expectError(error.InvalidMetadataKey, channel.openStream("/test.Stream/Duplex", .{
         .metadata = &.{.{ .key = "grpc-invalid", .value = "value" }},
     }, callbacks));
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
     try std.testing.expectError(error.ChannelUnavailable, channel.openStream("/test.Stream/Duplex", .{}, callbacks));
     try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
     try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
     try std.testing.expectError(error.InvalidStreamAdmissionLimits, channel.openStream("/test.Stream/Duplex", .{
         .limits = .{ .max_outbound_buffer_size = std.math.maxInt(usize) },
     }, callbacks));
+    try std.testing.expectEqual(@as(usize, 0), observed.messages);
+    try std.testing.expectEqual(@as(usize, 0), observed.terminals);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().retained_streams);
+    try std.testing.expectEqual(@as(usize, 0), channel.streamAdmissionStats().reserved_buffer_bytes);
+    try std.testing.expectEqual(@as(u64, 1), channel.streamAdmissionStats().rejected_streams);
+    try std.testing.expectEqual(@as(usize, 1), serialized_allocator.references.load(.monotonic));
 }
 
 test "channel rejects zero stream admission limits" {

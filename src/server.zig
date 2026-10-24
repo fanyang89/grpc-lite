@@ -1316,9 +1316,9 @@ fn serverCallSend(context: *anyopaque, payload: []const u8, options: raw_stream.
     try checkOutboundCapacityLocked(target, encoded.len);
     target.outbound_reserved_bytes += encoded.len;
     errdefer target.outbound_reserved_bytes -= encoded.len;
-    if (options.compression == .gzip) target.response_gzip_requested = true;
     command_owned = false;
     try enqueueStreamCommandLocked(server, target, command);
+    if (options.compression == .gzip) target.response_gzip_requested = true;
 }
 
 fn serverCallFinish(
@@ -4677,6 +4677,234 @@ test "shared stream command allocation failure does not use local storage" {
     server.coordinator.serialized_allocator.backing = original_backing;
     try std.testing.expectEqual(@as(usize, 0), server.impl.stream_commands.items.len);
     try std.testing.expectEqual(@as(usize, 0), target.command_refs);
+}
+
+const RetainedCommandFailureAction = enum {
+    send,
+    gzip_send,
+    initial_metadata,
+    finish,
+
+    const entries = [_]metadata.Entry{
+        .{ .key = "x-first", .value = "first" },
+        .{ .key = "x-second", .value = "second" },
+    };
+
+    fn invoke(self: @This(), call: raw_stream.ServerCall) !void {
+        switch (self) {
+            .send => try call.send("new payload", .{}),
+            .gzip_send => try call.send("new payload", .{ .compression = .gzip }),
+            .initial_metadata => try call.sendInitialMetadata(&entries, .gzip),
+            .finish => try call.finish(.init(.ok, "finished"), &entries),
+        }
+    }
+};
+
+// A null allocation index selects a real eventfd write failure, not allocator
+// failure. No loop is running while this fixture changes the backing allocator.
+fn testRetainedCommandFailure(action: RetainedCommandFailureAction, fail_index: ?usize, prior_gzip_requested: bool) !void {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    server.impl.stream_async = try xev.Async.init();
+    defer server.impl.stream_async.deinit();
+    var connection = Connection{ .server = server.impl };
+    const target = try std.testing.allocator.create(Stream);
+    target.* = Stream.init(std.testing.allocator, &connection, 1);
+    var target_owned = true;
+    defer if (target_owned) std.debug.assert(retireStream(target));
+    target.streaming = testSendStreamingState();
+    target.streaming_active = true;
+    target.accepts_response_gzip = true;
+    target.response_gzip_requested = prior_gzip_requested;
+    target.response_headers_queued = action != .initial_metadata;
+    if (action == .initial_metadata) target.streaming.?.handler.initial_metadata_mode = .explicit;
+    const control = try server.impl.shared_allocator.create(ServerCallControl);
+    control.* = .{ .allocator = server.impl.shared_allocator, .server = server.impl, .target = target };
+    target.call_control = control;
+    var retained = try target.serverHandle().retain();
+    defer retained.deinit();
+
+    // Before initial metadata, receive-resume is legal queued work. For send
+    // and finish also preserve an owned frame and its outbound reservation.
+    try server.impl.stream_commands.ensureTotalCapacityPrecise(server.impl.shared_allocator, if (action == .initial_metadata) 1 else 2);
+    target.receive_paused = true;
+    try retained.resumeReceive();
+    if (action != .initial_metadata) try retained.send("queued", .{});
+    try std.testing.expectEqual(server.impl.stream_commands.capacity, server.impl.stream_commands.items.len);
+    if (fail_index == null) {
+        // Notification is attempted only on empty -> nonempty. Move existing
+        // sends to the outbound queue so their reservations still must survive.
+        processStreamCommands(server.impl);
+    }
+    const count = server.impl.stream_commands.items.len;
+    const reserved = target.outbound_reserved_bytes;
+    const headers_queued = target.response_headers_queued;
+    const resume_queued = target.resume_queued;
+    const queued_bytes = if (action == .initial_metadata)
+        null
+    else if (fail_index != null)
+        server.impl.stream_commands.items[1].action.send.ptr
+    else
+        target.streaming.?.nextOutbound().?.bytes.ptr;
+
+    if (fail_index) |index| {
+        const original_backing = server.coordinator.serialized_allocator.backing;
+        defer server.coordinator.serialized_allocator.backing = original_backing;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = index,
+            .resize_fail_index = 0,
+        });
+        server.coordinator.serialized_allocator.backing = failing.allocator();
+        const result = action.invoke(retained);
+        server.coordinator.serialized_allocator.backing = original_backing;
+        try std.testing.expectError(error.OutOfMemory, result);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    } else if (comptime builtin.os.tag == .linux) {
+        const valid_fd = server.impl.stream_async.fd;
+        defer server.impl.stream_async.fd = valid_fd;
+        // -1 cannot be reused by another thread; the real libxev write returns
+        // NotOpenForWriting and enters enqueueStreamCommandLocked's catch.
+        server.impl.stream_async.fd = -1;
+        const result = action.invoke(retained);
+        server.impl.stream_async.fd = valid_fd;
+        try std.testing.expectError(error.NotOpenForWriting, result);
+    } else return error.SkipZigTest;
+
+    try std.testing.expectEqual(count, server.impl.stream_commands.items.len);
+    try std.testing.expectEqual(count, target.command_refs);
+    try std.testing.expectEqual(reserved, target.outbound_reserved_bytes);
+    try std.testing.expectEqual(headers_queued, target.response_headers_queued);
+    try std.testing.expectEqual(resume_queued, target.resume_queued);
+    try std.testing.expectEqual(prior_gzip_requested, target.response_gzip_requested);
+    try std.testing.expectEqual(Compression.identity, target.response_compression);
+    try std.testing.expect(!target.response_headers_submitted);
+    try std.testing.expect(!target.finish_queued);
+    try std.testing.expect(!target.response_finished);
+    try std.testing.expect(!target.writable_requested);
+    try std.testing.expect(!retained.isCancelled());
+    try std.testing.expect(!retained.isTerminal());
+    try std.testing.expectEqual(@as(usize, 2), control.references.load(.monotonic));
+    for (server.impl.stream_commands.items, 0..) |command, index| {
+        try std.testing.expect(command.target == target);
+        if (index == 0) {
+            try std.testing.expect(command.action == .resume_receive);
+        } else {
+            try std.testing.expect(command.action.send.ptr == queued_bytes.?);
+            try std.testing.expectEqualStrings("queued", command.action.send[frame.header_size..]);
+        }
+    }
+    if (fail_index == null and queued_bytes != null) {
+        const outbound = target.streaming.?.nextOutbound().?;
+        try std.testing.expect(outbound.bytes.ptr == queued_bytes.?);
+        try std.testing.expectEqual(@as(usize, 0), outbound.offset);
+        try std.testing.expectEqualStrings("queued", outbound.bytes[frame.header_size..]);
+    }
+
+    try action.invoke(retained);
+    try std.testing.expectEqual(count + 1, server.impl.stream_commands.items.len);
+    try std.testing.expectEqual(count + 1, target.command_refs);
+    const recovered = server.impl.stream_commands.items[count];
+    try std.testing.expect(recovered.target == target);
+    switch (action) {
+        .send, .gzip_send => {
+            const bytes = recovered.action.send;
+            try std.testing.expectEqual(reserved + bytes.len, target.outbound_reserved_bytes);
+            const decoded = try frame.decodeUnaryWithCompression(std.testing.allocator, bytes, 1024, if (action == .gzip_send) .gzip else .identity);
+            defer std.testing.allocator.free(decoded);
+            try std.testing.expectEqualStrings("new payload", decoded);
+            try std.testing.expectEqual(prior_gzip_requested or action == .gzip_send, target.response_gzip_requested);
+        },
+        .initial_metadata => {
+            try std.testing.expect(target.response_headers_queued);
+            try std.testing.expectEqual(Compression.gzip, target.response_compression);
+            try std.testing.expectEqualDeep(&RetainedCommandFailureAction.entries, recovered.action.initial_metadata.entries.items());
+        },
+        .finish => {
+            try std.testing.expect(target.finish_queued);
+            try std.testing.expectEqualStrings("finished", recovered.action.finish.message);
+            try std.testing.expectEqualDeep(&RetainedCommandFailureAction.entries, recovered.action.finish.trailing_metadata.?.items());
+        },
+    }
+    processStreamCommands(server.impl);
+    try std.testing.expectEqual(@as(usize, 0), server.impl.stream_commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), target.command_refs);
+    try std.testing.expect(!target.resume_queued);
+    if (action == .finish) {
+        try std.testing.expect(target.response_finished);
+        try std.testing.expectEqualStrings("finished", target.response_message);
+        try std.testing.expectEqualDeep(&RetainedCommandFailureAction.entries, target.trailing_metadata.items());
+    }
+    const released = target.streaming.?.clearOutbound();
+    releaseOutboundReservation(target, released, false);
+    try std.testing.expectEqual(@as(usize, 0), target.outbound_reserved_bytes);
+    try std.testing.expect(retireStream(target));
+    target_owned = false;
+    try std.testing.expect(retained.isTerminal());
+    try std.testing.expect(control.target == null);
+    try std.testing.expectEqual(@as(usize, 1), control.references.load(.monotonic));
+}
+
+test "retained server send frame and enqueue allocation failures preserve queued work" {
+    // Identity frame allocation, then forced command-array growth.
+    for (0..2) |index| try testRetainedCommandFailure(.send, index, false);
+}
+
+test "retained server gzip construction and enqueue failures restore compression intent" {
+    // Gzip output, history, encoded frame, then command-array growth.
+    for ([_]bool{ false, true }) |prior| {
+        for (0..4) |index| try testRetainedCommandFailure(.gzip_send, index, prior);
+    }
+}
+
+test "retained server initial metadata construction and enqueue failures preserve queued work" {
+    // First key/value/list, second key/value, then command-array growth.
+    for (0..6) |index| try testRetainedCommandFailure(.initial_metadata, index, false);
+}
+
+test "retained server finish construction and enqueue failures preserve queued work" {
+    // Status message, first key/value/list, second key/value, command growth.
+    for (0..7) |index| try testRetainedCommandFailure(.finish, index, false);
+}
+
+test "retained server command notify failures roll back ownership and recover" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]RetainedCommandFailureAction{ .send, .gzip_send, .initial_metadata, .finish }) |action| {
+        try testRetainedCommandFailure(action, null, false);
+    }
+    try testRetainedCommandFailure(.gzip_send, null, true);
+}
+
+test "submitStreamingFailureReset native rejection leaves reset retryable" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var streaming = testSendStreamingState();
+    defer streaming.deinit(std.testing.allocator);
+    try server.registerStream("/test.Echo/Unary", streaming.handler);
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer deinitTestConnection(&connection);
+    try feedTestRequest(&connection, .{});
+    const target = connection.streams.get(1).?;
+    target.reset_after_trailers = true;
+    const queued = c.nghttp2_session_get_outbound_queue_size(connection.session);
+    {
+        const valid_id = target.id;
+        defer target.id = valid_id;
+        // nghttp2 rejects stream zero with INVALID_ARGUMENT. This exercises
+        // the real native return branch, not a Zig allocation failure or OOM.
+        target.id = 0;
+        try std.testing.expectError(error.NativeFailure, submitStreamingFailureReset(target));
+    }
+    try std.testing.expect(target.reset_after_trailers);
+    try std.testing.expect(!target.reset_submitted);
+    try std.testing.expect(!connection.closing);
+    try std.testing.expectEqual(queued, c.nghttp2_session_get_outbound_queue_size(connection.session));
+    try submitStreamingFailureReset(target);
+    try std.testing.expect(target.reset_submitted);
+    try std.testing.expectEqual(queued + 1, c.nghttp2_session_get_outbound_queue_size(connection.session));
+    try submitStreamingFailureReset(target);
+    try std.testing.expectEqual(queued + 1, c.nghttp2_session_get_outbound_queue_size(connection.session));
 }
 
 fn testServerInitAndRegistrationAllocations(allocator: std.mem.Allocator) !void {

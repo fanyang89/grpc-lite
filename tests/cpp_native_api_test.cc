@@ -122,6 +122,60 @@ void TestInvalidObjects() {
   channel.Wait();
 }
 
+void TestRejectedOpenCleanup() {
+  grpc_lite::ChannelOptions channel_options;
+  channel_options.allow_initial_offline = true;
+  channel_options.max_stream_buffer_bytes = UINT64_C(16777216);
+  Channel channel;
+  assert(Channel::CreateManaged(nullptr, "127.0.0.1:1", channel_options,
+                                &channel).ok());
+  // No live transport can race validation, quota rejection, or enqueue rejection.
+  channel.Shutdown();
+  channel.Wait();
+  std::atomic<unsigned> callback_count{0};
+  std::uint64_t rejected_streams = 0;
+  for (unsigned case_index = 0; case_index < 5; ++case_index) {
+    grpc_lite::ClientStreamOptions options;
+    std::string method = "/test.Native/Rejected";
+    auto expected = grpc_lite::ErrorCode::InvalidArgument;
+    switch (case_index) {
+      case 0: method = "invalid"; break;
+      case 1: options.send_compression = static_cast<grpc_lite::Compression>(2); break;
+      case 2: options.max_message_size = 0; break;
+      case 3:
+        options.max_inbound_buffer_size = UINT64_C(16777216);
+        expected = grpc_lite::ErrorCode::WouldBlock;
+        ++rejected_streams;
+        break;
+      case 4: expected = grpc_lite::ErrorCode::Unavailable; break;
+    }
+    auto token = std::make_shared<int>(1);
+    std::weak_ptr<int> weak = token;
+    grpc_lite::ClientStreamCallbacks callbacks;
+    callbacks.on_headers = [&](grpc_lite::MetadataEntries) { ++callback_count; };
+    callbacks.on_message = [&](std::string, grpc_lite::Compression) {
+      ++callback_count;
+      return grpc_lite::ReceiveAction::Continue;
+    };
+    callbacks.on_remote_end = [&] { ++callback_count; };
+    callbacks.on_writable = [&] { ++callback_count; };
+    callbacks.on_terminal = [&, token = std::move(token)](
+        grpc_lite::Status, grpc_lite::MetadataEntries) { ++callback_count; };
+    ClientStream rejected;
+    assert(ClientStream::Open(channel, method, options, std::move(callbacks),
+                              &rejected).code() == expected);
+    callbacks = {};
+    // Failed Open releases its allocated callback state and leaves no stream owner.
+    assert(weak.expired());
+    assert(rejected.Send("x").code() == grpc_lite::ErrorCode::InvalidState);
+    assert(callback_count.load() == 0);
+    grpc_lite::StreamAdmissionStats stats;
+    assert(channel.GetStreamAdmissionStats(&stats).ok());
+    assert(stats.retained_streams == 0 && stats.reserved_buffer_bytes == 0);
+    assert(stats.rejected_streams == rejected_streams);
+  }
+}
+
 struct RoundTripState {
   std::mutex mutex;
   std::condition_variable completed;
@@ -286,6 +340,21 @@ void TestRoundTripRetainedStreamOwnership() {
     assert(ClientStream::Open(channel, "/test.Native/Echo", stream_options,
                               client_callbacks, &stream)
                .ok());
+    // Rejected sends must not change admission or poison the following valid send.
+    grpc_lite::StreamAdmissionStats before_send;
+    assert(channel.GetStreamAdmissionStats(&before_send).ok());
+    assert(before_send.retained_streams == 1 && before_send.reserved_buffer_bytes == reserved_bytes);
+    assert(before_send.rejected_streams == 0);
+    assert(stream.Send(std::string(1025, 'x')).code() == grpc_lite::ErrorCode::OutOfRange);
+    assert(stream.Send("x", grpc_lite::Compression::Gzip).code() ==
+           grpc_lite::ErrorCode::InvalidArgument);
+    assert(stream.Send("x", static_cast<grpc_lite::Compression>(2)).code() ==
+           grpc_lite::ErrorCode::InvalidArgument);
+    grpc_lite::StreamAdmissionStats after_send;
+    assert(channel.GetStreamAdmissionStats(&after_send).ok());
+    assert(after_send.retained_streams == before_send.retained_streams);
+    assert(after_send.reserved_buffer_bytes == before_send.reserved_buffer_bytes);
+    assert(after_send.rejected_streams == before_send.rejected_streams);
     assert(stream.Send(std::string("request\0bytes", 13)).ok());
     assert(stream.CloseSend().ok());
 
@@ -369,6 +438,7 @@ void TestRoundTripRetainedStreamOwnership() {
 int main() {
   TestMetadata();
   TestInvalidObjects();
+  TestRejectedOpenCleanup();
   TestRoundTripRetainedStreamOwnership();
   return 0;
 }
