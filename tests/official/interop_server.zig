@@ -5,6 +5,7 @@ const testing = @import("grpc_testing");
 const Config = struct {
     port: u16 = 10000,
     use_tls: bool = false,
+    streaming_soak: bool = false,
     client_ca_file: []const u8 = "",
     tls_cert_file: []const u8 = "",
     tls_key_file: []const u8 = "",
@@ -32,6 +33,8 @@ const StreamState = struct {
     remote_ended: bool = false,
     receive_paused: bool = false,
     aggregate_sent: bool = false,
+    would_block_count: usize = 0,
+    resume_count: usize = 0,
 
     fn deinit(self: *StreamState, allocator: std.mem.Allocator) void {
         self.responses.deinit(allocator);
@@ -41,6 +44,7 @@ const StreamState = struct {
 
 const Service = struct {
     allocator: std.mem.Allocator,
+    report_stream_stats: bool = false,
     streams: std.AutoHashMapUnmanaged(*anyopaque, *StreamState) = .empty,
 
     fn init(allocator: std.mem.Allocator) Service {
@@ -348,6 +352,7 @@ const Service = struct {
         if (state.receive_paused) {
             state.receive_paused = false;
             try stream.resumeReceive();
+            state.resume_count += 1;
         }
     }
 
@@ -386,7 +391,10 @@ const Service = struct {
                     .body = body,
                 },
             };
-            if (!try sendMessage(self.allocator, stream, response, spec.compression)) return false;
+            if (!try sendMessage(self.allocator, stream, response, spec.compression)) {
+                state.would_block_count += 1;
+                return false;
+            }
             state.next_response += 1;
         }
         state.responses.clearRetainingCapacity();
@@ -400,7 +408,16 @@ const Service = struct {
     }
 
     fn removeState(self: *@This(), stream: grpc.ServerStream) void {
-        if (self.streams.fetchRemove(stream.context)) |entry| self.destroyState(entry.value);
+        if (self.streams.fetchRemove(stream.context)) |entry| {
+            if (self.report_stream_stats) {
+                std.debug.print("streaming-soak messages={d} would_block={d} resumes={d}\n", .{
+                    entry.value.message_count,
+                    entry.value.would_block_count,
+                    entry.value.resume_count,
+                });
+            }
+            self.destroyState(entry.value);
+        }
     }
 
     fn destroyState(self: *@This(), state: *StreamState) void {
@@ -466,6 +483,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (client_ca_file_pem) |bytes| init.gpa.free(bytes);
 
     var service = Service.init(init.gpa);
+    service.report_stream_stats = config.streaming_soak;
     defer service.deinit();
     var server = try grpc.Server.init(init.gpa, .{
         .host = "127.0.0.1",
@@ -545,6 +563,8 @@ fn parseArgs(args: []const []const u8) !Config {
             index += 1;
             if (index >= args.len) return error.MissingPort;
             config.port = try std.fmt.parseInt(u16, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--streaming_soak")) {
+            config.streaming_soak = true;
         } else if (std.mem.startsWith(u8, arg, "--client_ca_file=")) {
             config.client_ca_file = arg["--client_ca_file=".len..];
         } else if (std.mem.startsWith(u8, arg, "--use_tls=")) {

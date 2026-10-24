@@ -904,7 +904,10 @@ fn addProtobufSupport(
     );
     interop_client.root_module.addImport("grpc_testing", interop_proto);
     interop_client.step.dependOn(generate_interop_proto.step);
-    b.installArtifact(interop_server);
+    const install_interop_server = b.addInstallArtifact(interop_server, .{});
+    b.getInstallStep().dependOn(&install_interop_server.step);
+    const streaming_soak_peer = b.step("streaming-soak-peer", "Build the native official peer for streaming soak");
+    streaming_soak_peer.dependOn(&install_interop_server.step);
     b.installArtifact(interop_client);
 
     const benchmark_server = addExample(
