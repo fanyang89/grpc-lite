@@ -167,6 +167,97 @@ command, grpc-lite closes the connection to guarantee local cleanup.
 shared storage. Handlers that decide metadata outside `on_start` can use
 `receive_initially_paused = true` and `initial_metadata_mode = .explicit`.
 
+### Runnable bounded lifecycle example
+
+[`examples/streaming_lifecycle.zig`](../examples/streaming_lifecycle.zig) runs a raw
+IPv4 loopback client and server in one process. It sends the protobuf wire bytes
+`08 01` directly: no schema, generated code, protobuf runtime, or global `Runtime`
+is needed. After the usual `mise install` and `mise run bootstrap` setup:
+
+```bash
+# Recommended: all three modes, each under an external shutdown watchdog.
+mise run test-streaming-lifecycle
+zig build test-streaming-lifecycle -Dprotobuf=false -Doptimize=ReleaseSafe --summary all
+
+# Individual modes (without the external watchdog).
+zig build run-streaming-lifecycle -Dprotobuf=false -- normal
+zig build run-streaming-lifecycle -Dprotobuf=false -- interrupt
+zig build run-streaming-lifecycle -Dprotobuf=false -- pre_handler_failure
+
+# Install the raw artifact, then smoke-test it directly.
+zig build -Dprotobuf=false
+bash tests/run_streaming_lifecycle.sh ./zig-out/bin/grpc-lite-streaming-lifecycle
+```
+
+Execution requires Linux with usable `io_uring` (including permission under any
+container/seccomp policy), IPv4 loopback sockets, Bash, and GNU coreutils
+`/usr/bin/timeout`. The [smoke script](../tests/run_streaming_lifecycle.sh) deliberately
+rejects a missing/non-GNU watchdog rather than using a possibly incompatible PATH
+command. Each mode has a 20-second timeout and a further 2-second kill grace. A
+watchdog expiry, nonzero exit, or missing/duplicate expected evidence line fails.
+The smoke step joins existing `zig build test` / `mise run check` coverage and
+inherits optimization and sanitizer settings through `addExample`. Since Bash
+executes the binary directly, automatic smoke coverage requires the target OS,
+architecture, and ABI to match the build host; explicitly requesting the smoke
+step for another target fails rather than executing it. Cross-target installation
+remains available; the individual run step uses Zig's normal artifact runner.
+
+For `normal` and `interrupt`, the intended ordering is:
+
+1. Main queues one request and calls `closeSend`. This half-closes requests only;
+   responses remain independent.
+2. The server's `on_remote_end` callback attempts two responses. The first fills
+   the outbound queue; the second must return `WouldBlock`. The unsent index is
+   retained and retried only from `on_writable`, without polling or sleeping.
+3. Main first waits for client progress or terminal notification. An early terminal
+   is an error in these modes and enters cleanup without waiting on a server
+   event that might never be set. Otherwise, after both responses arrive, main
+   waits for the server readiness event before reading the retained `ServerCall`.
+   With final status still pending, it requests graceful drain with a 5-second
+   bound while the RPC is active.
+4. In `normal` mode, main finishes the retained `ServerCall` with OK. In
+   `interrupt` mode, main explicitly cancels the client stream and requires
+   client CANCELLED and server `peer_cancelled`. Drain stops admission and lets
+   the active RPC finish; forced drain expiry is not an accepted outcome here.
+   The 10-second RPC deadline is a failure bound, not the intended interruption.
+5. Main waits for terminal notification, joins the draining Server while keeping
+   the Channel alive to flush cancellation, then shuts down and joins the
+   Channel. Only after both joins does it validate callback counters, release the
+   owning `ClientStream` and retained `ServerCall`, and tear down Channel/Server.
+   Terminal notification alone does not release admission: the example checks
+   one retained stream / 4103 reserved bytes before `ClientStream.deinit`, then
+   zero afterward. Contexts, allocator, and `init.io` outlive loops and handles;
+   error-path defers also join before releasing retained server state.
+
+The third mode, `pre_handler_failure`, deliberately calls an unregistered method.
+It uses the same client-first wait but expects exactly one UNIMPLEMENTED terminal
+and zero messages. It requests immediate Server shutdown instead of graceful
+drain, joins both loops, then verifies no handler started, no server-handler
+terminal callback ran, no `ServerCall` was retained, and the server readiness
+event remains unset. It also checks the same admission release boundary. Only
+this checked outcome emits `EXPECTED_FAILURE` and exits zero; it demonstrates
+early-failure cleanup, not backpressure or graceful-drain success. Unexpected
+statuses (including deadline expiry), abnormal failure in `normal`/`interrupt`,
+and watchdog termination remain failures.
+
+Callbacks run on transport loop threads and must not block. Here they only
+validate bounded data, issue transport commands, and signal events; only main
+waits or prints. Callback messages, metadata, and stream views are borrowed and
+must not be retained or deinitialized. Only an explicitly retained owning
+`ServerCall` crosses from the server callback to main; events publish it and
+loop joins protect final counter reads.
+
+Both endpoints advertise a **4096-byte initial stream window** and configure
+**4096-byte inbound capacity**. Inbound capacity must cover the advertised window;
+using 4096 with the default 65536-byte window would be invalid. The maximum
+payload is 2 bytes and outbound capacity is **7 bytes** (payload plus the
+five-byte gRPC frame header), deliberately fitting only one response. Client
+admission permits one retained stream with **4103 bytes** of configured buffer
+capacity. The source also sets one reactor, one connection, one concurrent RPC,
+header and unary-admission budgets, write watermarks, and preface/idle timeouts.
+These are explicit queue/admission limits, **not a total heap bound**; see
+[Resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence).
+
 ## Server
 
 ```zig
