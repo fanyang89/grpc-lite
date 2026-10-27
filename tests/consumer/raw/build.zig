@@ -36,4 +36,6 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
     });
     b.installArtifact(executable);
+    const run = b.addRunArtifact(executable);
+    b.step("test", "Run the independent public API consumer").dependOn(&run.step);
 }

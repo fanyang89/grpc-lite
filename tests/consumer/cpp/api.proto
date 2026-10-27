@@ -1,0 +1,12 @@
+syntax = "proto3";
+package consumer;
+
+message Message { bytes value = 1; }
+
+service Echo {
+  rpc Unary(Message) returns (Message);
+  rpc Missing(Message) returns (Message);
+  rpc Upload(stream Message) returns (Message);
+  rpc Download(Message) returns (stream Message);
+  rpc Chat(stream Message) returns (stream Message);
+}

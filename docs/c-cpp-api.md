@@ -3,6 +3,9 @@
 grpc-lite provides a stable C ABI, a low-level C++ RAII API in `grpc_lite::*`, and a
 focused synchronous grpcpp-shaped facade in `grpc::*`. All three use the same transport.
 
+See the [public surface inventory and upgrade guide](upgrading.md) for supported
+headers, source-versus-binary compatibility, and migration steps.
+
 ## Installed Package
 
 `zig build` installs the versioned shared library, static archive, C and C++ headers,

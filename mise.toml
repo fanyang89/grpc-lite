@@ -84,11 +84,11 @@ depends = ["prepare-tls-deps"]
 run = "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Dtls=true -Dsanitize-thread=false -Dsanitize-c=true --summary all"
 
 [tasks.test-consumer]
-description = "Build a raw consumer from the package archive"
+description = "Build and run raw public API consumers from the package archive"
 run = "tests/consumer/run_raw.sh"
 
 [tasks.test-consumer-cpp]
-description = "Generate, build, and run the C++ package consumer"
+description = "Check installed headers and run unary/streaming C++ package consumers"
 run = "tests/consumer/run_cpp.sh"
 
 [tasks.test-c-abi]

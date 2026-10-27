@@ -108,11 +108,13 @@ CompletionQueue, callback/reactor, generic service, or policy stack.
 
 - [Zig API](docs/zig-api.md): runtime, channels, streaming, servers, TLS, and protobuf
 - [C and C++ APIs](docs/c-cpp-api.md): stable ABI, source builds, grpcpp facade, and codegen
+- [Upgrading](docs/upgrading.md): supported surfaces, compatibility boundaries, and consumer fixtures
 - [Development](docs/development.md): toolchain, CI, profiling, benchmarks, and dependencies
 - [Official interop](tests/official/README.md): required gRPC and HTTP/2 compatibility matrix
 
-Public types re-exported by `src/root.zig`, the installed C ABI, and installed C++
-headers are the supported API surfaces. Lower-level Zig modules may change before 1.0.
+The [public surface inventory](docs/upgrading.md#supported-surface-inventory) defines
+supported Zig exports and installed C/C++ headers. Implementation namespaces and
+lower-level Zig modules are not application compatibility surfaces.
 
 ## Development
 

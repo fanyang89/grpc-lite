@@ -1,7 +1,7 @@
 const std = @import("std");
 const grpc = @import("grpc_lite");
 
-test "stable public API compiles for downstream consumers" {
+test "supported public API compiles for downstream consumers" {
     comptime {
         _ = grpc.Channel;
         _ = grpc.ChannelOptions;
@@ -11,6 +11,15 @@ test "stable public API compiles for downstream consumers" {
         _ = grpc.Runtime;
         _ = grpc.CallOptions;
         _ = grpc.CallResult;
+        _ = grpc.AsyncCallResult;
+        _ = grpc.UnaryCallCallbacks;
+        _ = grpc.UnaryAdmissionOptions;
+        _ = grpc.UnaryAdmissionStats;
+        _ = grpc.StreamAdmissionOptions;
+        _ = grpc.StreamAdmissionStats;
+        _ = grpc.ClientTlsIdentity;
+        _ = grpc.Logger;
+        _ = grpc.LogLevel;
         _ = grpc.Server;
         _ = grpc.ServerOptions;
         _ = grpc.ServerOperationalStats;
@@ -42,7 +51,6 @@ test "stable public API compiles for downstream consumers" {
 
     _ = try std.SemanticVersion.parse(grpc.version);
     const channel_options: grpc.ChannelOptions = .{};
-    try std.testing.expectEqualStrings("grpc-lite/" ++ grpc.version, channel_options.user_agent);
     try std.testing.expectEqualStrings("grpc-lite/" ++ grpc.version, channel_options.user_agent);
     try std.testing.expectEqual(@as(u32, 64 * 1024), channel_options.max_response_header_list_size);
 
