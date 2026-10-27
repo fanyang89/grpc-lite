@@ -73,7 +73,18 @@ prefetch_url_package \
     'N-V-__8AAGKVkABvsDVHhSU8seHKvtJ8Q23b9Y0OMiFVWt-y' \
     'gperftools.tar.gz'
 
-git -C "$project_root" archive --format=tar.gz --output="$archive" HEAD
+package_source="$work_dir/package"
+mkdir -p "$package_source"
+git -C "$project_root" archive HEAD | tar -x -C "$package_source"
+git -C "$project_root" diff --binary HEAD >"$work_dir/worktree.patch"
+if [[ -s "$work_dir/worktree.patch" ]]; then
+    git -C "$package_source" apply --whitespace=nowarn "$work_dir/worktree.patch"
+fi
+while IFS= read -r -d '' path; do
+    mkdir -p "$package_source/$(dirname "$path")"
+    cp -a "$project_root/$path" "$package_source/$path"
+done < <(git -C "$project_root" ls-files --others --exclude-standard -z)
+tar -czf "$archive" -C "$package_source" .
 package_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zig fetch "$archive")
 
 cp "$project_root/tests/consumer/raw/build.zig" "$consumer/build.zig"
@@ -96,6 +107,10 @@ cat >"$consumer/build.zig.zon" <<EOF
 EOF
 
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" --summary all
+/usr/bin/timeout --kill-after=2s 30s "$consumer/zig-out/bin/grpc-lite-raw-consumer"
+ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
+    -Doptimize=ReleaseSafe --summary all
+/usr/bin/timeout --kill-after=2s 30s "$consumer/zig-out/bin/grpc-lite-raw-consumer"
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
     -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe \
     -Dsanitize-thread=true -Dsanitize-c=false --summary all
@@ -112,6 +127,7 @@ prefetch_zigfetch_url_package \
     'mbedtls.tar.gz'
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
     -Dtls=true --summary all
+/usr/bin/timeout --kill-after=2s 30s "$consumer/zig-out/bin/grpc-lite-raw-consumer"
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
     -Doptimize=ReleaseFast -Dgperftools=true --summary all
 "$consumer/zig-out/bin/grpc-lite-raw-consumer"

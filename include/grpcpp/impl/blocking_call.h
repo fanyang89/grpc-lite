@@ -1,7 +1,7 @@
 #ifndef GRPCPP_IMPL_BLOCKING_CALL_H
 #define GRPCPP_IMPL_BLOCKING_CALL_H
 
-#include <grpc_lite/grpc_lite.hpp>
+#include <grpc_lite/cpp/client_stream.hpp>
 #include <grpcpp/client_context.h>
 #include <grpcpp/support/status.h>
 

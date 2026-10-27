@@ -3,6 +3,9 @@
 The public Zig transport is raw-byte based. Applications may use protobuf wire bytes
 directly or opt into the shared zig-protobuf runtime and typed adapters.
 
+See the [public surface inventory and upgrade guide](upgrading.md) for supported
+exports, toolchain constraints, and ownership/error regression fixtures.
+
 ## Runtime and Channels
 
 IPv4 literals require no global setup. Hostname targets use c-ares and require a Runtime

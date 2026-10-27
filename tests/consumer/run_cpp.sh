@@ -46,6 +46,7 @@ while IFS= read -r -d '' path; do
     cp -a "$project_root/$path" "$package_source/$path"
 done < <(git -C "$project_root" ls-files --others --exclude-standard -z)
 cp -R "$package_source/examples/cpp/." "$consumer_source/"
+cp -R "$package_source/tests/consumer/cpp" "$work_dir/public-cpp"
 
 (
     cd "$package_source"
@@ -60,6 +61,10 @@ cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="$stage"
 cmake --build "$work_dir/build"
+cmake -S "$work_dir/public-cpp" -B "$work_dir/public-build" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$stage"
+cmake --build "$work_dir/public-build"
+ctest --test-dir "$work_dir/public-build" --output-on-failure
 
 : >"$work_dir/server.log"
 "$stage/bin/grpc-lite-cpp-e2e-server" 0 >"$work_dir/server.log" 2>&1 &
