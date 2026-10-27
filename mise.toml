@@ -91,6 +91,10 @@ run = "tests/consumer/run_raw.sh"
 description = "Generate, build, and run the C++ package consumer"
 run = "tests/consumer/run_cpp.sh"
 
+[tasks.test-c-abi]
+description = "Check the released C ABI baseline and run an old-header shared-library consumer"
+run = "bash tests/consumer/run_abi.sh"
+
 [tasks.test-consumer-cmake-c]
 description = "Build the generated C bundle without Zig or network access"
 depends = ["check-transpiled-c"]

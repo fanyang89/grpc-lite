@@ -1,0 +1,14 @@
+{
+  "release": "v0.5.0",
+  "release_url": "https://github.com/fanyang89/grpc-lite/releases/tag/v0.5.0",
+  "published_at": "2026-10-15T11:27:07Z",
+  "commit": "f284fe5a40a1a2eb38d1cb17bf6a3d6258be637a",
+  "source_path": "include/grpc_lite/grpc_lite.h",
+  "source_url": "https://github.com/fanyang89/grpc-lite/blob/f284fe5a40a1a2eb38d1cb17bf6a3d6258be637a/include/grpc_lite/grpc_lite.h",
+  "source_sha256": "4496ee04a474f42c0a0e50dc23d09fdd88a70c3e8230fe771296edcdfa965b6d",
+  "snapshot_transform": "Remove /* ... */ comments with Python re.S, rstrip each line, drop blank lines, join with LF and one final LF. No declarations or macro values changed.",
+  "snapshot_sha256": "06f69bf63dcaa6046ffaa0291c6a50fd0b43647c0aafc466e72a68e54f501c57",
+  "abi": "1.6",
+  "soname": "libgrpc_lite.so.1",
+  "inventory": {"structures": 10, "fields": 59, "functions": 56, "constants": 37}
+}

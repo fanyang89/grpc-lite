@@ -86,6 +86,10 @@ jobs:
       - name: Test
         run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
 
+      - name: Check released C ABI baseline and old-header consumer
+        if: matrix.optimize == 'ReleaseSafe'
+        run: mise run test-c-abi
+
   package-consumer:
     name: Package consumer
     runs-on: ubuntu-24.04

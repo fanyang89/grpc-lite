@@ -34,6 +34,64 @@ outlive dependent handles. The API provides:
 - event-driven server registration and retained cross-thread calls
 - metadata, bounded backpressure, cancellation observation, and graceful drain
 
+### Released C ABI Regression
+
+Run `mise run test-c-abi` to check the current installed native shared library
+against **v0.5.0, C ABI 1.6**, the selected released baseline. This is grpc-lite's
+own C ABI, **not grpc-core or grpcpp ABI compatibility**. The baseline is the
+latest non-prerelease selected when this check was introduced; it does not move
+automatically when a new release appears.
+
+`tests/consumer/abi/baseline/provenance.json` records the release URL, publication
+time, immutable source commit, upstream header SHA-256, and snapshot SHA-256.
+The vendored header removes only comments and blank lines; it preserves every
+declaration and initializer. Validation needs no baseline download, Git tag, old
+Zig compiler, or old library build. This is an old-header/current-library test,
+not execution of a downloaded release asset.
+
+The check uses the host GCC-compatible C compiler (`CC`, default `cc`), Python 3,
+and binutils `nm`/`readelf` to verify:
+
+- All 56 baseline functions remain exported by the ELF shared library, with
+  unchanged public function signatures and callback/field types.
+- All 10 public value structures preserve alignment, field offsets and widths.
+  Only Channel and Server options may grow; their released prefixes must not
+  shrink. Other baseline value structures retain their exact size.
+- Error/enum values and feature-bit assignments stay fixed. ABI versions encode
+  `(major << 16) | minor`; the baseline major stays 1, the minor must be at least
+  6, the current header and runtime versions agree, and the SONAME remains
+  `libgrpc_lite.so.1`. Product release numbers are separate from ABI versions.
+
+A separate C consumer is compiled with **only the frozen baseline header** and
+linked dynamically to the freshly built `ReleaseSafe` library. It runs unary and
+event-driven streaming round trips, callback invocation, retained server calls,
+deadlines, and ordered teardown using every combination of these old option
+prefixes (byte sizes on supported Linux x86_64/ARM64):
+
+| Options | Accepted old extents |
+| --- | --- |
+| Channel | 40 (through jitter), 48 (logger), 56 (response header limit / full baseline) |
+| Server | 56 (buffers), 64 (logger), 72 (connections), 80 (preface timeout), 88 (idle timeout), 100 (stream limit), 104 (full baseline including padding) |
+
+Each option allocation is placed immediately before an inaccessible page, rounded
+only for alignment, so reads of missing whole fields fail rather than silently
+reading a current-sized stack object. Missing resource-limit fields must still
+permit valid calls with finite library defaults. Existing Zig parser tests check
+the exact default values and per-field validation in more detail.
+
+The same task runs deliberate incompatible header/shared-library fixtures:
+removed exports, signature/callback changes, layout/type changes, changed enum
+values, ABI major/minor violations, and a wrong SONAME must fail. An appended
+Channel option is a passing control. The task is part of `mise run check` and
+the existing required core CI jobs on native Linux x86_64 and ARM64. Runtime
+execution requires io_uring permission; failure is not skipped.
+
+Baseline updates require an explicit released-version selection and review of
+the provenance, snapshot, declaration inventory, extension rules, and consumer.
+Do not refresh the snapshot from the working header to make an ABI failure pass.
+This focused check does not prove every behavior, compiler/platform ABI, or
+compatibility of the C++ facade; normal transport and interop tests still apply.
+
 `grpc_lite_features()` reports capabilities usable through the C ABI, rather than every
 transport capability compiled into the library. `GRPC_LITE_FEATURE_TLS` remains defined
 for source compatibility, but the returned mask leaves it clear because C Channel and
