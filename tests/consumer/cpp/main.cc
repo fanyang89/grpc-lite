@@ -80,7 +80,11 @@ int main() {
   std::uint32_t port = 0;
   REQUIRE(server.Port(&port).ok());
   const std::string target = "127.0.0.1:" + std::to_string(port);
-  auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+  // Wait for the initial connection before issuing fail-fast fixture RPCs.
+  grpc::ChannelArguments arguments;
+  arguments.SetAllowInitialOffline(false);
+  auto channel = grpc::CreateCustomChannel(
+      target, grpc::InsecureChannelCredentials(), arguments);
   auto stub = consumer::Echo::NewStub(channel);
   consumer::Message request;
   request.set_value(std::string("a\0b", 3));
@@ -88,7 +92,12 @@ int main() {
   {
     grpc::ClientContext context;
     SetDeadline(context);
-    REQUIRE(stub->Unary(&context, request, &response).ok());
+    const auto status = stub->Unary(&context, request, &response);
+    if (!status.ok()) {
+      std::cerr << "Unary failed: " << status.error_code() << ": "
+                << status.error_message() << '\n';
+    }
+    REQUIRE(status.ok());
     REQUIRE(response.value() == request.value());
   }
   {
