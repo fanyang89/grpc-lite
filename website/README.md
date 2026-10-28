@@ -18,6 +18,8 @@ in `docs/meta.json`. Each page has `title` and `description` frontmatter and a
 single Markdown H1. Ordinary repository-relative links work in GitHub and are
 rewritten at build time: documentation links stay on the site, while source,
 test, and evidence links point to GitHub. Missing local targets fail the build.
+Only user documentation belongs in `docs/`. Maintainer workflows, historical records,
+and evidence live in `development/`, outside the page and search content source.
 Evidence bundles remain on GitHub, including their original checksummed files.
 
 ## Validation and deployment

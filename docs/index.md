@@ -30,8 +30,8 @@ mise run build
 mise run test
 ```
 
-See the [development guide](development.md) for build options and validation tasks,
-or the [examples](../examples) for runnable clients and servers.
+See the [Zig guide](zig-api.md) and [C/C++ build instructions](c-cpp-api.md#cmake-source-build)
+for integration options, or the [examples](../examples) for runnable clients and servers.
 
 ## Integrate with Zig
 
@@ -68,7 +68,7 @@ defer result.deinit();
 - Read the [Zig API guide](zig-api.md) for streaming, deadlines, metadata, and TLS.
 - Follow the [C/C++ guide](c-cpp-api.md) for release bundles and service generation.
 - Review [capacity tuning](capacity-tuning.md) before sizing production workloads.
-- Check the [interop profile](../tests/official/README.md) for supported gRPC cases.
+- Check [compatibility](compatibility.md) for supported platforms and gRPC features.
 
 grpc-lite targets a selected gRPC subset: IPv6, automatic RPC retries, reflection,
 xDS, and the full grpcpp API are out of scope.

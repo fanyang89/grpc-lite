@@ -2,14 +2,15 @@
   "title": "Documentation",
   "pages": [
     "index",
-    "upgrading",
+    "compatibility",
     "---APIs---",
     "zig-api",
     "c-cpp-api",
     "---Operations---",
+    "resource-limits",
     "capacity-tuning",
-    "development",
-    "[Official interoperability](https://github.com/fanyang89/grpc-lite/blob/main/tests/official/README.md)",
-    "[Streaming-soak evidence](https://github.com/fanyang89/grpc-lite/blob/main/docs/evidence/streaming-soak-baseline/README.md)"
+    "profiling",
+    "---Upgrading---",
+    "upgrading"
   ]
 }

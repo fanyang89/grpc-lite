@@ -6,22 +6,20 @@ description: Resource budgets, admission limits, and overload handling.
 # Measured capacity tuning and overload diagnosis
 
 Use this runbook to choose and verify deployment-specific limits, not to infer a
-universal streams-per-core or memory guarantee. The [accounting inventory](development.md#accounting-boundaries)
-is the detailed budget/ownership reference; the [measured baseline](development.md#initial-measured-streaming-baseline)
-and its [evidence bundle](evidence/streaming-soak-baseline/README.md) remain authoritative.
+universal streams-per-core or memory guarantee. See [resource limits](resource-limits.md)
+for budget and ownership boundaries.
 
 ## Availability and prerequisites
 
-This guide is based on documentation baseline `f054638e08f9f2b89025c50a1e86529b0b4f1f9c`.
-**The sibling implementations below are not included in that baseline or by this
-documentation change.** Check the deployed source/runtime before using them:
+Use matching headers and runtime libraries. Check the deployed API before collecting
+snapshots, especially when upgrading an older application:
 
-| Surface | Requirement / pinned contract |
+| Surface | Requirement |
 | --- | --- |
-| Existing unary/stream admission options and snapshots | Available in the baseline: [Zig](zig-api.md#unary-admission), [C/C++](c-cpp-api.md#managed-channels) (ABI 1.7 unary, 1.8 streaming). |
-| Zig Channel/Server operational snapshots (#50/#51) | Requires the implementation represented by PR #68, [`b894e5550400e5beb0760a9f6e0ff3a48c5043ee`][zig-stats]. |
-| C/C++ operational snapshots | Requires the implementation represented by PR #70, [`14e250329b6ff9cf9fab34297baa007456ae74e2`][c-stats], ABI 1.9 headers **and runtime**. Low-level `grpc_lite` wrappers, not the `grpc::` facade. |
-| Raw C++ bounded executor example | Requires PR #67 source at [`87456528be994aedbca85c77984eb4506d1afc9c`][executor], with matching generated-C asset when building without Zig. The example is not present in the baseline. |
+| Unary/stream admission options and snapshots | [Zig](zig-api.md#unary-admission), [C/C++](c-cpp-api.md#managed-channels) (ABI 1.7 unary, 1.8 streaming). |
+| Zig Channel/Server operational snapshots | `operationalStats()`; see the [Zig contract][zig-stats]. |
+| C/C++ operational snapshots | ABI 1.9 headers **and runtime**. Low-level `grpc_lite` wrappers, not the `grpc::` facade; see [C/C++][c-stats]. |
+| Raw C++ bounded executor example | Use the [source example][executor] with a matching generated-C asset when building without Zig. |
 
 Without these dependencies, use admission snapshots, application event/status counters,
 connection logs and process sampling; mark operational queue/reconnect/Server metrics
@@ -70,11 +68,7 @@ C/C++ unary reports `RESOURCE_EXHAUSTED`; low-level stream open reports `WOULD_B
 can later return retryable `WouldBlock` on send. Follow writable notification rather
 than spinning, blocking a reactor, or growing an unbounded application retry queue.
 
-These boundaries are implemented in [baseline Channel construction/destruction][channel-source]
-and [buffer validation][buffer-source]. Existing source tests include
-`unary admission enforces exact count and byte boundaries and recovers`,
-`stream admission enforces count and capacity reservations`, and
-`client stream handle outlives channel teardown`; they are not deployment load tests.
+See [resource limits](resource-limits.md) for ownership and accounting boundaries.
 
 ## Tune by controlled comparison
 
@@ -83,10 +77,10 @@ and [buffer validation][buffer-source]. Existing source tests include
    RPC latency/error objectives, acceptable rejection rate, and process/host headroom.
    Pin source, binaries, architecture, allocator, TLS/build mode and tool versions.
    Record CPU affinity/frequency, cgroup limits and background host load. Schedule a
-   separate approved measurement window; on a shared host serialize the entire build,
-   traffic and cleanup lifecycle using the [existing lock procedure](development.md#streaming-soak).
-2. **Collect a baseline with explicit phases.** Reuse [benchmarks](development.md#benchmarks)
-   for completion/latency and the [soak observer](development.md#streaming-resource-observer-48)
+   measurement window; on a shared host serialize the entire build,
+   traffic and cleanup lifecycle to avoid interference.
+2. **Collect a baseline with explicit phases.** Reuse [benchmarks](profiling.md#benchmarks)
+   for completion/latency and process sampling
    for repeated pressure/recovery and RSS/FD/thread samples. Keep startup/warmup,
    early/late steady traffic and post-client idle separate; include overload and recovery
    in deployment tests. Record offered, accepted and completed work plus status and
@@ -121,7 +115,7 @@ and [buffer validation][buffer-source]. Existing source tests include
    rejection and cancellation. For illustration, four workers plus eight waiting jobs
    retaining at most 256 KiB copied payload each imply at most `12 × 256 KiB = 3 MiB`
    of those copies only, excluding results, retained calls and stacks. This is an
-   application budget, not a library option. The [dependency-gated example][executor]
+   application budget, not a library option. The [bounded executor example][executor]
    deliberately uses one worker, one total outstanding job and no waiting backlog;
    `try_lock` contention, full or closed admission rejects immediately. Transfer an
    owning `ServerCall` only on acceptance; never save borrowed `ServerStream` or
@@ -136,11 +130,11 @@ and [buffer validation][buffer-source]. Existing source tests include
 
 ## Read snapshots as ownership samples
 
-The rest of this section **requires the operational-snapshot dependencies above**.
+The rest of this section requires the operational-snapshot APIs listed above.
 Use Zig `channel.operationalStats()` / `server.operationalStats()`, C
 `grpc_lite_channel_get_operational_stats` / `grpc_lite_server_get_operational_stats`
 with the matching `GRPC_LITE_*_OPERATIONAL_STATS_INIT`, or low-level C++
-`GetOperationalStats`. Check getter errors. The [pinned Zig][zig-stats] and
+`GetOperationalStats`. Check getter errors. The [Zig][zig-stats] and
 [C/C++ contracts][c-stats] define every field; table names below use Zig spelling.
 C/C++ flatten admission fields with `unary_` / `stream_` prefixes, for example
 `stream_admission.reserved_buffer_bytes` becomes `stream_reserved_buffer_bytes`.
@@ -178,29 +172,17 @@ no per-process RSS ceiling follows from transport admission.
 
 ## What the existing measurements justify
 
-The [three 600-second seed-47 trials](evidence/streaming-soak-baseline/README.md) cover
-one grpc-go client connection and one persistent bidi stream to a native ReleaseSafe,
-cleartext x86_64 server, not a Channel/reactor capacity sweep. The unchanged provisional
-screen passed in all three. As one worked reading of [aggregate.json](evidence/streaming-soak-baseline/aggregate.json),
-trial 1 server early/late RSS medians were 12,300/13,284 KiB: delta `984 KiB`.
-Its allowed positive delta was `max(32768, 0.25 × 12300) = 32768 KiB`, not a fitted
-capacity or leak threshold. Post-client idle RSS was `4852 − 3764 = 1088 KiB` above
-pre-client baseline; this is server-still-alive idle, not Server deinit or attributed cache.
+Historical streaming-soak measurements passed a provisional resource-growth screen
+for one grpc-go connection and one persistent bidirectional stream to a native
+ReleaseSafe, cleartext x86_64 server. They were not a Channel/reactor capacity sweep
+and do not establish leak freedom, a long-term memory plateau or a universal limit.
 
-The [metadata](evidence/streaming-soak-baseline/metadata.json) records Ryzen 9 9955HX,
-Fedora 44/glibc 2.43, Zig SafeAllocator/page backing plus reactor caches and separate C
-allocation paths, and Go's allocator/GC. Hardware, allocator and workload changes require
-new comparisons. The host was not physically isolated or frequency-pinned; background
-activity was not excluded and trials 2/3 added a process monitor absent from trial 1.
-Three fixed-seed correlated ten-minute traces do not establish a long-term plateau,
-leak freedom, statistical calibration or a universal maximum. Medians can miss peaks
-and slow leaks. Reservations, queue occupancy, live heap, kernel memory, client pre-exit
-idle and server post-deinit accounting were not measured. No TLS/mTLS, native-client,
-ARM64 or C/C++ capacity claim follows. This guide adds no measurements and does not
-replace the pending independent review and exact-final-tree `mise run check` before push.
+The measurements did not capture live heap, queue occupancy or post-Server-destruction
+accounting. They provide no TLS/mTLS, native-client, ARM64 or C/C++ capacity guarantee.
+Validate your own workload and deployment before choosing limits. The
+[dated measurement report and original artifacts](../development/evidence/streaming-soak-baseline/README.md)
+are available on GitHub as supporting evidence.
 
-[zig-stats]: https://github.com/fanyang89/grpc-lite/blob/b894e5550400e5beb0760a9f6e0ff3a48c5043ee/docs/zig-api.md#operational-snapshots
-[c-stats]: https://github.com/fanyang89/grpc-lite/blob/14e250329b6ff9cf9fab34297baa007456ae74e2/docs/c-cpp-api.md#operational-snapshots
-[executor]: https://github.com/fanyang89/grpc-lite/blob/87456528be994aedbca85c77984eb4506d1afc9c/examples/cpp_bounded_executor/main.cc
-[channel-source]: https://github.com/fanyang89/grpc-lite/blob/f054638e08f9f2b89025c50a1e86529b0b4f1f9c/src/channel.zig
-[buffer-source]: https://github.com/fanyang89/grpc-lite/blob/f054638e08f9f2b89025c50a1e86529b0b4f1f9c/src/stream.zig
+[zig-stats]: zig-api.md#operational-snapshots
+[c-stats]: c-cpp-api.md#operational-snapshots
+[executor]: ../examples/cpp_bounded_executor/main.cc

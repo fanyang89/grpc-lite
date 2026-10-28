@@ -5,7 +5,7 @@ Three actual default 600s, seed-47 trials at source
 `105a1b0404f474ab23580129ad7226029340241a`, on 2026-10-23/24.
 All invocation/client/harness exits were 0; all passed the **unchanged provisional
 screen**, not a statistically calibrated plateau/leak test. See the
-[results, phase semantics and tolerances](../../development.md#initial-measured-streaming-baseline).
+[results, phase semantics and tolerances](../../records.md#initial-measured-streaming-baseline).
 No workload was rerun to publish this bundle.
 
 ## Contents and provenance
@@ -60,7 +60,7 @@ lifecycle script, not an equivalent selected-variable JSON capture.
 From the repository root:
 
 ```bash
-cd docs/evidence/streaming-soak-baseline
+cd development/evidence/streaming-soak-baseline
 sha256sum -c SHA256SUMS
 python3 -B recompute.py > /tmp/streaming-soak-aggregate.json
 cmp aggregate.json /tmp/streaming-soak-aggregate.json
