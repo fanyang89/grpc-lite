@@ -1,3 +1,8 @@
+---
+title: Zig API
+description: Channels, streaming, servers, TLS, and typed protobuf adapters.
+---
+
 # Zig API
 
 The public Zig transport is raw-byte based. Applications may use protobuf wire bytes

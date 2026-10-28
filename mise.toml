@@ -11,6 +11,18 @@ actionlint = "1.7.12"
 description = "Fetch build dependencies"
 run = "zig build --fetch=needed"
 
+[tasks.docs-dev]
+description = "Run the Fumadocs site (Node.js 22; first run npm --prefix website ci)"
+run = "npm --prefix website run dev"
+
+[tasks.docs-build]
+description = "Build the static documentation site"
+run = "npm --prefix website run build"
+
+[tasks.docs-check]
+description = "Type-check and build the documentation site"
+run = "npm --prefix website run typecheck && npm --prefix website run build"
+
 [tasks.build]
 description = "Build grpc-lite"
 run = "zig build"

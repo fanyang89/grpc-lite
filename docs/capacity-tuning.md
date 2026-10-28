@@ -1,3 +1,8 @@
+---
+title: Capacity tuning
+description: Resource budgets, admission limits, and overload handling.
+---
+
 # Measured capacity tuning and overload diagnosis
 
 Use this runbook to choose and verify deployment-specific limits, not to infer a

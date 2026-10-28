@@ -1,3 +1,8 @@
+---
+title: C and C++ APIs
+description: Stable C ABI, release bundles, CMake integration, and the synchronous C++ facade.
+---
+
 # C and C++ APIs
 
 grpc-lite provides a stable C ABI, a low-level C++ RAII API in `grpc_lite::*`, and a
