@@ -73,7 +73,7 @@ authoritative: change it before implementing a feature with a different decision
 | Large messages and HTTP/2 flow control | Required | Include padding and max-stream tests |
 | ASCII and binary metadata | Required | Emit padded base64; accept padded, unpadded, and comma-joined `-bin` values |
 | Status codes and Unicode status messages | Required | Preserve percent-encoded UTF-8 bytes |
-| Deadlines | Required | Explicit public cancellation is streaming-only |
+| Deadlines | Required | Explicit public cancellation supports raw Zig unary and streaming calls |
 | Per-message compression | Selected | Only `identity` and `gzip` |
 | GOAWAY connection replacement | Selected | New calls use a new connection; no RPC retry |
 | Graceful server drain | Selected | Stop admission, send GOAWAY, wait with timeout |
@@ -104,7 +104,7 @@ Raw streaming APIs are planned as all-event-driven while implementation is ongoi
 
 - Application callbacks run on transport loop threads and must not block.
 - Half-close ends only the local send direction. Explicit cancellation terminates both
-  directions and is exposed only for streaming calls.
+  directions. Raw Zig unary calls support an optional single-use cancellation object.
 - `ServerStream` is callback-borrowed; retained cross-thread server work uses an owning
   `ServerCall` and releases it before Server teardown.
 - Public objects use explicit allocators, clear ownership, and deterministic `deinit`.
