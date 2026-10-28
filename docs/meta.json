@@ -2,10 +2,12 @@
   "title": "Documentation",
   "pages": [
     "index",
+    "zig-quickstart",
     "compatibility",
     "---APIs---",
     "zig-api",
     "c-cpp-api",
+    "c-cpp-reference",
     "---Operations---",
     "resource-limits",
     "capacity-tuning",

@@ -28,7 +28,7 @@ application-retained stream reservations. The backing allocator must outlive the
 stream handle. Failed construction rolls reservations back.
 
 See [Zig admission](zig-api.md#unary-admission) and
-[C/C++ managed channels](c-cpp-api.md#managed-channels) for configuration and errors.
+[C/C++ managed channels](c-cpp-reference.md#managed-channels) for configuration and errors.
 
 ## Buffers and server limits
 

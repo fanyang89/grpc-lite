@@ -33,6 +33,8 @@ investigation. Link to historical evidence only as optional supporting material.
 
 ## Historical records
 
+- [C/C++ validation](c-cpp-validation.md): ABI baseline and generated-C consumer harness.
+
 - [Development baseline archive](records.md): resource accounting
   investigation, streaming-soak measurements, and original execution qualifications.
 - [Streaming-soak evidence](evidence/streaming-soak-baseline/README.md)

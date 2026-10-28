@@ -16,7 +16,7 @@ snapshots, especially when upgrading an older application:
 
 | Surface | Requirement |
 | --- | --- |
-| Unary/stream admission options and snapshots | [Zig](zig-api.md#unary-admission), [C/C++](c-cpp-api.md#managed-channels) (ABI 1.7 unary, 1.8 streaming). |
+| Unary/stream admission options and snapshots | [Zig](zig-api.md#unary-admission), [C/C++](c-cpp-reference.md#managed-channels) (ABI 1.7 unary, 1.8 streaming). |
 | Zig Channel/Server operational snapshots | `operationalStats()`; see the [Zig contract][zig-stats]. |
 | C/C++ operational snapshots | ABI 1.9 headers **and runtime**. Low-level `grpc_lite` wrappers, not the `grpc::` facade; see [C/C++][c-stats]. |
 | Raw C++ bounded executor example | Use the [source example][executor] with a matching generated-C asset when building without Zig. |
@@ -184,5 +184,5 @@ Validate your own workload and deployment before choosing limits. The
 are available on GitHub as supporting evidence.
 
 [zig-stats]: zig-api.md#operational-snapshots
-[c-stats]: c-cpp-api.md#operational-snapshots
+[c-stats]: c-cpp-reference.md#operational-snapshots
 [executor]: ../examples/cpp_bounded_executor/main.cc

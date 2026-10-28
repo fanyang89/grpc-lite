@@ -457,7 +457,7 @@ It consumes the evidence here without changing the baseline or provisional toler
 This inventory for [issue #43](https://github.com/fanyang89/grpc-lite/issues/43)
 was checked against `25643b1` (2026-10-23). It describes existing behavior, not new
 limits. API contracts remain in [Zig](../docs/zig-api.md#unary-admission) and
-[C/C++](../docs/c-cpp-api.md#managed-channels).
+[C/C++](../docs/c-cpp-reference.md#managed-channels).
 
 For the subsequent Zig Channel/Server operational snapshot fields, sampling rules and
 exclusions, see [Operational snapshots](../docs/zig-api.md#operational-snapshots). Their addition
@@ -508,7 +508,7 @@ Ownership outside those budgets matters:
   callback and protobuf copies outside transport accounting; application executors own
   their workers/queues. See [C unary/open/destroy](../src/c_api.zig#L450),
   [C++ client stream](../include/grpc_lite/cpp/client_stream.hpp) and
-  [executor lifetime](../docs/c-cpp-api.md#generated-services).
+  [executor lifetime](../docs/c-cpp-reference.md#generated-services).
 - nghttp2, libxev, c-ares, TLS state, libc allocator caches, application-retained results,
   thread stacks and OS socket buffers are not summed by admission snapshots. Allocation
   release need not immediately reduce RSS; no process-wide heap ceiling is promised.

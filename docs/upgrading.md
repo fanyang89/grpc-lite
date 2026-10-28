@@ -20,8 +20,8 @@ source-compatible**. An intentional source break must update this guide with its
 migration, the relevant API guide, and the affected consumers in the same change.
 Do not quietly weaken a fixture to accommodate an accidental break. The separate
 C ABI major/minor and SONAME rules still apply; a product version is not an ABI
-version. See [released C ABI compatibility](c-cpp-api.md#released-c-abi-compatibility)
-for the selected baseline and supported option prefixes.
+version. See [released C ABI compatibility](c-cpp-reference.md#released-c-abi-compatibility)
+for option initialization and runtime version requirements.
 
 ## Supported surface inventory
 
