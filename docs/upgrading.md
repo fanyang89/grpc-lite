@@ -1,3 +1,8 @@
+---
+title: Public API and upgrades
+description: Compatibility boundaries, supported APIs, and upgrade migration steps.
+---
+
 # Public API and Upgrade Guide
 
 ## Compatibility boundaries
