@@ -106,11 +106,13 @@ CompletionQueue, callback/reactor, generic service, or policy stack.
 
 ## Documentation
 
+Read the [documentation site](https://fanyang89.github.io/grpc-lite/).
+
 - [Zig API](docs/zig-api.md): runtime, channels, streaming, servers, TLS, and protobuf
 - [C and C++ APIs](docs/c-cpp-api.md): stable ABI, source builds, grpcpp facade, and codegen
 - [Upgrading](docs/upgrading.md): supported surfaces, compatibility boundaries, and consumer fixtures
-- [Development](docs/development.md): toolchain, CI, profiling, benchmarks, and dependencies
-- [Official interop](tests/official/README.md): required gRPC and HTTP/2 compatibility matrix
+- [Capacity tuning](docs/capacity-tuning.md): resource budgets and overload diagnosis
+- [Compatibility](docs/compatibility.md): supported platforms and gRPC features
 
 The [public surface inventory](docs/upgrading.md#supported-surface-inventory) defines
 supported Zig exports and installed C/C++ headers. Implementation namespaces and
@@ -124,9 +126,9 @@ mise run bootstrap
 mise run check
 ```
 
-See the [development guide](docs/development.md) for individual tasks and build options.
+See the [development guide](development/README.md) for contributor workflows and validation tasks.
 
-Release maintainers: follow the [pre-tag version consistency procedure](docs/development.md#pre-tag-version-consistency).
+Release maintainers: follow the [pre-tag version consistency procedure](development/releasing.md#pre-tag-version-consistency).
 
 ## License
 

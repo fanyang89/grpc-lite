@@ -1,3 +1,8 @@
+---
+title: Zig API
+description: Channels, streaming, servers, TLS, and typed protobuf adapters.
+---
+
 # Zig API
 
 The public Zig transport is raw-byte based. Applications may use protobuf wire bytes
@@ -42,8 +47,8 @@ Channel serializes access to the allocator passed to `Channel.init`.
 
 ## Unary Admission
 
-For allocator ownership, exclusions, lifecycle test coverage and measured baselines, see
-[Resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence).
+For allocator ownership, admission budgets and accounting exclusions, see
+[Resource limits](resource-limits.md).
 
 Channels default to `unary_admission.max_calls = 4096` and
 `unary_admission.max_request_bytes = 64 * 1024 * 1024`. Both must be nonzero.
@@ -259,7 +264,7 @@ admission permits one retained stream with **4103 bytes** of configured buffer
 capacity. The source also sets one reactor, one connection, one concurrent RPC,
 header and unary-admission budgets, write watermarks, and preface/idle timeouts.
 These are explicit queue/admission limits, **not a total heap bound**; see
-[Resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence).
+[Resource limits](resource-limits.md).
 
 ## Server
 
@@ -421,9 +426,9 @@ are separate gauges, not a deduplicated memory total. Excluded costs include spa
 capacity, decoder/metadata/HPACK storage, compression temporaries, TLS workspace, kernel
 buffers, allocator overhead/caches, and application copies. Admission reservations are
 configured/logical budgets rather than allocated bytes; queue charges are not allocation
-sizes. See the [resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence)
-for the historical baseline and its explicitly outstanding validation matrix. These APIs
-do not supply missing baseline time series or close those lifecycle/race coverage gaps.
+sizes. See the [resource limits](resource-limits.md)
+for ownership and accounting boundaries. Collect application and process measurements
+alongside snapshots when diagnosing memory growth.
 
 ## TLS
 

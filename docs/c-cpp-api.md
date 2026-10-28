@@ -1,3 +1,8 @@
+---
+title: C and C++ APIs
+description: Stable C ABI, release bundles, CMake integration, and the synchronous C++ facade.
+---
+
 # C and C++ APIs
 
 grpc-lite provides a stable C ABI, a low-level C++ RAII API in `grpc_lite::*`, and a
@@ -37,23 +42,14 @@ outlive dependent handles. The API provides:
 - event-driven server registration and retained cross-thread calls
 - metadata, bounded backpressure, cancellation observation, and graceful drain
 
-### Released C ABI Regression
+### Released C ABI compatibility
 
-Run `mise run test-c-abi` to check the current installed native shared library
-against **v0.5.0, C ABI 1.6**, the selected released baseline. This is grpc-lite's
+The selected released regression baseline is **v0.5.0, C ABI 1.6**. This is grpc-lite's
 own C ABI, **not grpc-core or grpcpp ABI compatibility**. The baseline is the
 latest non-prerelease selected when this check was introduced; it does not move
 automatically when a new release appears.
 
-`tests/consumer/abi/baseline/provenance.json` records the release URL, publication
-time, immutable source commit, upstream header SHA-256, and snapshot SHA-256.
-The vendored header removes only comments and blank lines; it preserves every
-declaration and initializer. Validation needs no baseline download, Git tag, old
-Zig compiler, or old library build. This is an old-header/current-library test,
-not execution of a downloaded release asset.
-
-The check uses the host GCC-compatible C compiler (`CC`, default `cc`), Python 3,
-and binutils `nm`/`readelf` to verify:
+The old-header/current-library regression checks:
 
 - All 56 baseline functions remain exported by the ELF shared library, with
   unchanged public function signatures and callback/field types.
@@ -65,33 +61,14 @@ and binutils `nm`/`readelf` to verify:
   6, the current header and runtime versions agree, and the SONAME remains
   `libgrpc_lite.so.1`. Product release numbers are separate from ABI versions.
 
-A separate C consumer is compiled with **only the frozen baseline header** and
-linked dynamically to the freshly built `ReleaseSafe` library. It runs unary and
-event-driven streaming round trips, callback invocation, retained server calls,
-deadlines, and ordered teardown using every combination of these old option
-prefixes (byte sizes on supported Linux x86_64/ARM64):
+Accepted old option extents (byte sizes on supported Linux x86_64/ARM64):
 
 | Options | Accepted old extents |
 | --- | --- |
 | Channel | 40 (through jitter), 48 (logger), 56 (response header limit / full baseline) |
 | Server | 56 (buffers), 64 (logger), 72 (connections), 80 (preface timeout), 88 (idle timeout), 100 (stream limit), 104 (full baseline including padding) |
 
-Each option allocation is placed immediately before an inaccessible page, rounded
-only for alignment, so reads of missing whole fields fail rather than silently
-reading a current-sized stack object. Missing resource-limit fields must still
-permit valid calls with finite library defaults. Existing Zig parser tests check
-the exact default values and per-field validation in more detail.
-
-The same task runs deliberate incompatible header/shared-library fixtures:
-removed exports, signature/callback changes, layout/type changes, changed enum
-values, ABI major/minor violations, and a wrong SONAME must fail. An appended
-Channel option is a passing control. The task is part of `mise run check` and
-the existing required core CI jobs on native Linux x86_64 and ARM64. Runtime
-execution requires io_uring permission; failure is not skipped.
-
-Baseline updates require an explicit released-version selection and review of
-the provenance, snapshot, declaration inventory, extension rules, and consumer.
-Do not refresh the snapshot from the working header to make an ABI failure pass.
+Missing resource-limit fields use finite library defaults.
 This focused check does not prove every behavior, compiler/platform ABI, or
 compatibility of the C++ facade; normal transport and interop tests still apply.
 
@@ -111,8 +88,8 @@ the stream with `INTERNAL_ERROR`, or closes the connection if reset submission f
 
 ## Managed Channels
 
-See [Resource accounting and lifecycle evidence](development.md#resource-accounting-and-lifecycle-evidence)
-for quota ownership, wrapper allocations, existing coverage gaps and bounded measurements.
+See [Resource limits](resource-limits.md)
+for quota ownership, wrapper allocations and memory accounting boundaries.
 
 `grpc_lite_channel_create_managed` creates a durable Channel. Set
 `allow_initial_offline` to return before the first connection succeeds. A managed Channel
@@ -288,7 +265,7 @@ nor reservations measure or bound heap use or RSS; queue charges are not allocat
 sizes or a deduplicated memory total. Spare capacity, decoder/metadata/HPACK storage, compression temporaries, TLS
 workspace, kernel buffers, allocator overhead/caches, and application copies are
 excluded. These APIs do not close the outstanding validation gaps in the
-[resource accounting evidence](development.md#resource-accounting-and-lifecycle-evidence).
+[resource limits](resource-limits.md).
 
 ## CMake Source Build
 

@@ -1,0 +1,16 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "compatibility",
+    "---APIs---",
+    "zig-api",
+    "c-cpp-api",
+    "---Operations---",
+    "resource-limits",
+    "capacity-tuning",
+    "profiling",
+    "---Upgrading---",
+    "upgrading"
+  ]
+}

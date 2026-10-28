@@ -1,4 +1,9 @@
-# Development
+# Development baseline archive
+
+This is a historical snapshot of the development notes collected through October
+2026. Commit IDs, pending checks, issue assignments, and measurements below describe
+their original work sessions, not the current project status. For maintained workflows,
+see [Development](README.md); for current usage, see [user documentation](../docs/index.md).
 
 ## Toolchain
 
@@ -446,16 +451,16 @@ operations are messages on persistent streams. `repeated` is intentionally compr
 ## Resource accounting and lifecycle evidence
 
 For worked admission calculations, a measured tuning procedure and dependency-aware
-snapshot diagnosis, see the [capacity-tuning and overload guide](capacity-tuning.md).
+snapshot diagnosis, see the [capacity-tuning and overload guide](../docs/capacity-tuning.md).
 It consumes the evidence here without changing the baseline or provisional tolerances.
 
 This inventory for [issue #43](https://github.com/fanyang89/grpc-lite/issues/43)
 was checked against `25643b1` (2026-10-23). It describes existing behavior, not new
-limits. API contracts remain in [Zig](zig-api.md#unary-admission) and
-[C/C++](c-cpp-api.md#managed-channels).
+limits. API contracts remain in [Zig](../docs/zig-api.md#unary-admission) and
+[C/C++](../docs/c-cpp-api.md#managed-channels).
 
 For the subsequent Zig Channel/Server operational snapshot fields, sampling rules and
-exclusions, see [Operational snapshots](zig-api.md#operational-snapshots). Their addition
+exclusions, see [Operational snapshots](../docs/zig-api.md#operational-snapshots). Their addition
 does not change this historical baseline or complete the validation gaps below.
 
 ### Accounting boundaries
@@ -503,7 +508,7 @@ Ownership outside those budgets matters:
   callback and protobuf copies outside transport accounting; application executors own
   their workers/queues. See [C unary/open/destroy](../src/c_api.zig#L450),
   [C++ client stream](../include/grpc_lite/cpp/client_stream.hpp) and
-  [executor lifetime](c-cpp-api.md#generated-services).
+  [executor lifetime](../docs/c-cpp-api.md#generated-services).
 - nghttp2, libxev, c-ares, TLS state, libc allocator caches, application-retained results,
   thread stacks and OS socket buffers are not summed by admission snapshots. Allocation
   release need not immediately reduce RSS; no process-wide heap ceiling is promised.

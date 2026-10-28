@@ -1,3 +1,8 @@
+---
+title: Public API and upgrades
+description: Compatibility boundaries, supported APIs, and upgrade migration steps.
+---
+
 # Public API and Upgrade Guide
 
 ## Compatibility boundaries
@@ -15,8 +20,8 @@ source-compatible**. An intentional source break must update this guide with its
 migration, the relevant API guide, and the affected consumers in the same change.
 Do not quietly weaken a fixture to accommodate an accidental break. The separate
 C ABI major/minor and SONAME rules still apply; a product version is not an ABI
-version. See [the released C ABI regression](c-cpp-api.md#released-c-abi-regression)
-for the frozen baseline, provenance, and explicitly supported option prefixes.
+version. See [released C ABI compatibility](c-cpp-api.md#released-c-abi-compatibility)
+for the selected baseline and supported option prefixes.
 
 ## Supported surface inventory
 
@@ -57,7 +62,7 @@ selected dependency/toolchain; generated output is not committed.
 `grpc_lite_gperftools` is separately opt-in. Its allocator/capability flags,
 CPU/heap profiler controls and tcmalloc property/release/sampling operations
 require the corresponding build options; it is not part of the raw import.
-See [profiling setup](development.md).
+See [profiling setup](profiling.md).
 
 ### Installed C and C++ headers
 
@@ -135,39 +140,12 @@ Runtime must be initialized before threads and outlive dependent handles. Stop
 admission, join loops/callers, then destroy owners with exclusive access. See the
 [Zig](zig-api.md) and [C/C++](c-cpp-api.md) guides for detailed errors and bounds.
 
-## Regression fixtures and limits
+## Validate an application upgrade
 
-```bash
-mise run test-consumer
-mise run test-consumer-cpp
-mise run test-c-abi
-```
+Rebuild your application against matching headers and runtime, regenerate typed C++
+service glue, and exercise the RPC shapes, cancellation, deadlines and teardown paths
+you use. Include overload and recovery under representative traffic.
 
-- `tests/public_api_test.zig` checks root type exports and option/snapshot defaults
-  in normal Debug/ReleaseSafe core CI.
-- `tests/consumer/raw` is copied outside the checkout and imports a package
-  archive through a fresh Zig package cache. The existing raw consumer task now
-  **runs** unary, async unary, raw duplex streaming, half-close, copied send input,
-  owned result lifetime, retained-call clone/terminal errors, and admission release
-  checks in Debug and ReleaseSafe, plus a TLS-enabled build. It retains existing
-  sanitizer compile checks, optional profiling checks, and assertions that raw
-  consumers do not resolve zig-protobuf/grpc-proto. These sanitizer configurations
-  compile; the task does not claim to execute the new fixture under TSan/UBSan.
-- `tests/consumer/cpp` is copied outside the source tree by the existing C++
-  task. Its CMake build uses only the installed prefix and external Protobuf,
-  compiles each supported header as the first include, and regenerates a tiny
-  service. It runs unary and every streaming client shape against a raw server,
-  UNIMPLEMENTED status, low-level move/error/callback-copy behavior, quota
-  rejection, and reservation release. Generated synchronous server override
-  signatures are compiled; their runtime/executor behavior remains covered by
-  the existing `grpcpp_generated_server_test.cc`, not this small consumer.
-- Both package tasks include tracked worktree changes and untracked non-ignored
-  files, so local runs validate pending edits rather than silently testing HEAD.
-  They join the existing package-consumer CI job and `mise run check`; C++ checks
-  stay active even with CMake `Release`/`NDEBUG`. Runtime watchdogs fail on hangs.
-- The released C ABI fixture remains separate: it tests frozen old headers against
-  the current library, not C++ ABI or Zig compiler compatibility. Typed Zig
-  adapters/codegen are tested by the existing repository suites; these raw-only
-  package fixtures do not claim independent typed-Zig package coverage, exhaustive
-  API/overload coverage, all platform/compiler combinations, or a released C++
-  binary baseline.
+The project tests package consumers and a selected released C ABI baseline. These
+checks do not guarantee every application behavior, compiler/platform combination,
+C++ binary compatibility or Zig compiler compatibility.
