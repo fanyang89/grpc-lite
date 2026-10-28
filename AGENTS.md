@@ -48,7 +48,7 @@ mise run gen-grpcpp
 - `libxev` owns socket and event-loop integration.
 - gRPC payloads remain raw protobuf wire bytes.
 - Generated protobuf sources live under `.zig-cache` and are not committed.
-- The native Zig transport supports raw unary and full-duplex streaming over cleartext or TLS IPv4.
+- The native Zig transport supports raw unary and full-duplex streaming over cleartext or TLS IPv4, plus basic IPv6 literal-address transport (extended TLS verification pending).
 - The insecure Linux x86_64 and ARM64 transpiled-C release bundle supports cleartext transport only.
 - c-ares resolves client hostnames to IPv4 candidates on the libxev loop.
 
@@ -85,7 +85,7 @@ authoritative: change it before implementing a feature with a different decision
 | Transpiled-C release bundle TLS | Out of scope | The insecure Linux x86_64 and ARM64 bundles remain cleartext-only until TLS is separately selected |
 | mTLS | Selected | Native Zig TLS only: optional client PEM identity and server-required client verification with explicit trusted CAs; no identity authorization or dynamic rotation |
 | DNS | Selected | c-ares on Linux io_uring; client IPv4 hostnames only |
-| IPv6 | Out of scope | No AAAA, Happy Eyeballs, or IPv6 listeners |
+| IPv6 | Selected | Basic literal-address client/server transport; IPv6 listeners use IPV6_V6ONLY=1. AAAA and cross-interface/TLS/release validation are follow-up tasks; Happy Eyeballs, zone IDs, and dual-family Server listeners remain out of scope |
 | Reflection and health services | Out of scope | Not part of the lite profile |
 | Interceptors and middleware | Out of scope | Keep the core API small |
 | Connection recovery and backoff | Selected | Channels reconnect without replaying RPCs |
