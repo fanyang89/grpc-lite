@@ -1,5 +1,10 @@
 const std = @import("std");
 
+pub fn enableIpv6Only(fd: std.posix.fd_t) !void {
+    const enabled: c_int = 1;
+    try std.posix.setsockopt(fd, std.posix.IPPROTO.IPV6, std.posix.IPV6.V6ONLY, std.mem.asBytes(&enabled));
+}
+
 pub fn enableTcpNoDelay(fd: std.posix.fd_t) !void {
     const enabled: c_int = 1;
     try std.posix.setsockopt(
