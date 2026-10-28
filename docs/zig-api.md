@@ -74,7 +74,7 @@ thread-safe snapshot of `retained_calls`, `retained_request_bytes`, and the satu
 
 C/C++ channels use the same default limits and receive gRPC `RESOURCE_EXHAUSTED` on
 quota rejection. ABI 1.7 exposes configuration and snapshots through C and C++; see
-[Managed Channels](c-cpp-api.md#managed-channels). Streaming uses the separate capacity reservation described below.
+[Managed Channels](c-cpp-reference.md#managed-channels). Streaming uses the separate capacity reservation described below.
 
 ## Unary Calls
 
@@ -138,7 +138,7 @@ transport write buffers are not included. Unary admission remains independent.
 C/C++ share these defaults. A rejected open returns C `WOULD_BLOCK`
 (or `grpc_lite::ErrorCode::WouldBlock`); the grpcpp facade maps that failure to
 `RESOURCE_EXHAUSTED`. ABI 1.8 exposes `max_streams`, `max_stream_buffer_bytes`, and
-stream admission snapshots through C/C++; see [Managed Channels](c-cpp-api.md#managed-channels).
+stream admission snapshots through C/C++; see [Managed Channels](c-cpp-reference.md#managed-channels).
 
 ## Raw Streaming
 
@@ -334,7 +334,7 @@ See `examples/echo_server.zig` and `examples/echo_client.zig` for complete progr
 caller-owned values without allocating or invoking callbacks. The root aliases are
 `grpc.ChannelOperationalStats` (`grpc.channel.OperationalStats`) and
 `grpc.ServerOperationalStats` (`grpc.server.OperationalStats`). No snapshot needs
-`deinit`; it contains no borrowed mutable storage. [C getters and thin C++ wrappers](c-cpp-api.md#operational-snapshots)
+`deinit`; it contains no borrowed mutable storage. [C getters and thin C++ wrappers](c-cpp-reference.md#operational-snapshots)
 expose the same metrics starting with ABI 1.9, with flat admission fields. Existing
 C/C++ admission options, snapshot layouts, getters, and minimum sizes are unchanged.
 
