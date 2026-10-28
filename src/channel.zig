@@ -454,7 +454,7 @@ pub const Channel = struct {
         );
         fast_clock.warmup(syncIo());
         const parsed = try parseTarget(target);
-        const literal_address = std.Io.net.IpAddress.parseIp4(parsed.host, parsed.port) catch null;
+        const literal_address = std.Io.net.IpAddress.parse(parsed.host, parsed.port) catch null;
         if (literal_address == null) {
             const runtime = options.runtime orelse return error.RuntimeRequired;
             if (!runtime.isInitialized()) return error.RuntimeNotInitialized;
@@ -3980,8 +3980,15 @@ fn copyMetadata(destination: *metadata.Metadata, source: *const metadata.Metadat
 
 fn parseTarget(target: []const u8) !struct { host: []const u8, port: u16 } {
     const separator = std.mem.lastIndexOfScalar(u8, target, ':') orelse return error.InvalidTarget;
-    const host = target[0..separator];
-    if (host.len == 0 or std.mem.indexOfScalar(u8, host, ':') != null) return error.InvalidTarget;
+    var host = target[0..separator];
+    if (host.len == 0) return error.InvalidTarget;
+    if (host[0] == '[') {
+        if (host.len < 3 or host[host.len - 1] != ']') return error.InvalidTarget;
+        host = host[1 .. host.len - 1];
+        _ = std.Io.net.IpAddress.parseIp6(host, 0) catch return error.InvalidTarget;
+    } else if (std.mem.indexOfAny(u8, host, ":[]%") != null) {
+        return error.InvalidTarget;
+    }
     const port = std.fmt.parseInt(u16, target[separator + 1 ..], 10) catch return error.InvalidTarget;
     if (port == 0) return error.InvalidTarget;
     return .{ .host = host, .port = port };
@@ -6528,7 +6535,23 @@ test "target parsing" {
     try std.testing.expectEqualStrings("127.0.0.1", target.host);
     try std.testing.expectEqual(@as(u16, 50051), target.port);
     try std.testing.expectError(error.InvalidTarget, parseTarget("localhost"));
-    try std.testing.expectError(error.InvalidTarget, parseTarget("[::1]:50051"));
+    const ipv6 = try parseTarget("[::1]:50051");
+    try std.testing.expectEqualStrings("::1", ipv6.host);
+    try std.testing.expectEqual(@as(u16, 50051), ipv6.port);
+    const full = try parseTarget("[2001:db8:1234:5678:90ab:cdef:1234:5678]:65535");
+    try std.testing.expectEqualStrings("2001:db8:1234:5678:90ab:cdef:1234:5678", full.host);
+    try std.testing.expectEqual(@as(u16, 65535), full.port);
+    const hostname = try parseTarget("localhost:80");
+    try std.testing.expectEqualStrings("localhost", hostname.host);
+    _ = try parseTarget("[::ffff:127.0.0.1]:80");
+    for ([_][]const u8{
+        "::1:50051",         "[::1]",          "[::1:50051",    "::1]:50051",
+        "[localhost]:80",    "[127.0.0.1]:80", "[]:80",         "[:::]:80",
+        "[fe80::1%eth0]:80", "[fe80::1%1]:80", "[::1]:0",       "[::1]:65536",
+        "[::1]:",            "[::1]:abc",      "[::1]extra:80",
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidTarget, parseTarget(invalid));
+    }
 }
 
 test "outbound metadata rejects invalid application values before queuing" {
@@ -6954,6 +6977,90 @@ test "channel and server exchange gzip-compressed unary messages" {
     );
     defer limited.deinit();
     try std.testing.expectEqual(status.Code.resource_exhausted, limited.status.code);
+}
+
+test "IPv6 literals bypass DNS and carry unary and bidirectional messages" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const Handler = struct {
+        fn unary(_: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+
+        fn onStart(_: ?*anyopaque, _: stream.ServerStream, _: *service.ServerContext) !void {}
+
+        fn onMessage(_: ?*anyopaque, server_stream: stream.ServerStream, _: *service.ServerContext, payload: []const u8, _: Compression) !stream.ReceiveAction {
+            try server_stream.send(payload, .{});
+            return .continue_receiving;
+        }
+
+        fn onRemoteEnd(_: ?*anyopaque, server_stream: stream.ServerStream, _: *service.ServerContext) !void {
+            try server_stream.finish(.ok);
+        }
+    };
+    const Ipv6ClientState = struct {
+        messages: std.atomic.Value(usize) = .init(0),
+        done: std.atomic.Value(bool) = .init(false),
+        ok: std.atomic.Value(bool) = .init(false),
+
+        fn onMessage(context: ?*anyopaque, _: stream.ClientStream, payload: []const u8, _: Compression) stream.ReceiveAction {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (std.mem.eql(u8, payload, "ipv6")) _ = self.messages.fetchAdd(1, .monotonic);
+            return .continue_receiving;
+        }
+
+        fn onTerminal(context: ?*anyopaque, _: stream.ClientStream, result: status.Status, _: *const metadata.Metadata) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.ok.store(result.isOk(), .release);
+            self.done.store(true, .release);
+        }
+    };
+    for ([_][]const u8{ "::1", "::" }) |host| {
+        var handler: Handler = .{};
+        var test_server = try server.Server.init(std.testing.allocator, .{ .host = host, .reactor_count = 2 });
+        defer test_server.deinit();
+        try test_server.registerUnary("/test.Ipv6/Unary", service.UnaryHandler.bind(Handler, &handler, Handler.unary));
+        try test_server.registerStream("/test.Ipv6/Bidi", .{
+            .on_start = Handler.onStart,
+            .on_message = Handler.onMessage,
+            .on_remote_end = Handler.onRemoteEnd,
+        });
+        try test_server.start();
+        var buffer: [32]u8 = undefined;
+        const target = try std.fmt.bufPrint(&buffer, "[::1]:{d}", .{try test_server.port()});
+        var channel = try Channel.init(std.testing.allocator, target, .{});
+        defer channel.deinit();
+        try std.testing.expect(channel.impl.literal_address.? == .ip6);
+        try std.testing.expectEqualStrings("::1", channel.impl.host);
+        try std.testing.expectEqualStrings(target, channel.impl.authority);
+        var result = try channel.callUnary(std.testing.allocator, "/test.Ipv6/Unary", "ipv6", .{});
+        defer result.deinit();
+        try std.testing.expect(result.status.isOk());
+        try std.testing.expectEqualStrings("ipv6", result.payload);
+
+        var state: Ipv6ClientState = .{};
+        var client_stream = try channel.openStream("/test.Ipv6/Bidi", .{}, .{
+            .context = &state,
+            .on_message = Ipv6ClientState.onMessage,
+            .on_terminal = Ipv6ClientState.onTerminal,
+        });
+        defer client_stream.deinit();
+        try client_stream.send("ipv6", .{});
+        // Receive before half-close to verify independent full-duplex flow.
+        const deadline = nowNs() +| 5 * std.time.ns_per_s;
+        while (state.messages.load(.acquire) == 0) {
+            if (nowNs() >= deadline) return error.StreamTimeout;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        try client_stream.send("ipv6", .{});
+        try client_stream.closeSend();
+        while (!state.done.load(.acquire)) {
+            if (nowNs() >= deadline) return error.StreamTimeout;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(state.ok.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), state.messages.load(.acquire));
+    }
 }
 
 test "channel resolves an IPv4 hostname with c-ares" {

@@ -214,6 +214,7 @@ pub const TlsOptions = struct {
 };
 
 pub const Options = struct {
+    /// IPv4 or unbracketed IPv6 literal; IPv6 listeners are IPv6-only. No zone IDs.
     host: []const u8 = "127.0.0.1",
     port: u16 = 0,
     reactor_count: usize = 1,
@@ -231,6 +232,7 @@ pub const Options = struct {
 };
 
 pub const LocalAddress = struct {
+    /// Unbracketed address, borrowed for the Server lifetime.
     host: []const u8,
     port: u16,
 };
@@ -783,7 +785,7 @@ const Impl = struct {
     deadline_timer_target_ns: ?u64 = null,
     drain_started: bool = false,
     clock: deadline.Clock = undefined,
-    local_host: [15]u8 = undefined,
+    local_host: [45]u8 = undefined,
     local_host_len: usize = 0,
     local_port: u16 = 0,
     tls_config: ?*tls_record.Config = null,
@@ -2365,19 +2367,25 @@ fn setupLoop(server: *Impl) StartupError!void {
         if (server.listener_initialized) closeFd(server.listener.fd);
     }
 
-    const address = std.Io.net.IpAddress.parseIp4(server.host, server.configured_port) catch return error.InvalidAddress;
+    const address = std.Io.net.IpAddress.parse(server.host, server.configured_port) catch return error.InvalidAddress;
+    if (server.host.len > server.local_host.len) return error.InvalidAddress;
     server.listener = xev.TCP.init(address) catch return error.ListenerInitializationFailed;
     server.listener_initialized = true;
+    if (address == .ip6) socket_options.enableIpv6Only(server.listener.fd) catch return error.ListenerInitializationFailed;
     if (server.reuse_port) socket_options.enableReusePort(server.listener.fd) catch return error.ListenerInitializationFailed;
     server.listener.bind(address) catch return error.BindFailed;
     server.listener.listen(128) catch return error.ListenFailed;
 
-    var local_address: std.posix.sockaddr.in = undefined;
-    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    var local_address: std.posix.sockaddr.storage = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
     if (std.posix.errno(std.posix.system.getsockname(server.listener.fd, @ptrCast(&local_address), &address_length)) != .SUCCESS) return error.AddressQueryFailed;
     @memcpy(server.local_host[0..server.host.len], server.host);
     server.local_host_len = server.host.len;
-    server.local_port = std.mem.bigToNative(u16, local_address.port);
+    server.local_port = std.mem.bigToNative(u16, switch (local_address.family) {
+        std.posix.AF.INET => @as(*const std.posix.sockaddr.in, @ptrCast(&local_address)).port,
+        std.posix.AF.INET6 => @as(*const std.posix.sockaddr.in6, @ptrCast(&local_address)).port,
+        else => return error.AddressQueryFailed,
+    });
     if (comptime builtin.is_test) {
         if (server.test_fail_startup) return error.AsyncInitializationFailed;
     }
@@ -6136,6 +6144,57 @@ test "server validates registration and has deterministic lifecycle" {
     try std.testing.expectEqual(address.port, try server.port());
     server.shutdown();
     server.wait();
+}
+
+test "IPv6 listeners bind ephemeral ports across reactors and enforce IPv6-only" {
+    for ([_][]const u8{ "::1", "::", "0000:0000:0000:0000:0000:0000:0000:0001" }) |host| {
+        for ([_]usize{ 1, 2 }) |reactor_count| {
+            var server = try Server.init(std.testing.allocator, .{ .host = host, .reactor_count = reactor_count });
+            defer server.deinit();
+            try server.start();
+            const address = try server.localAddress();
+            try std.testing.expectEqualStrings(host, address.host);
+            try std.testing.expect(address.port != 0);
+            for (server.coordinator.reactors) |reactor| {
+                try std.testing.expectEqual(address.port, reactor.local_port);
+                try std.testing.expectEqualStrings(host, reactor.local_host[0..reactor.local_host_len]);
+                var enabled: c_int = 0;
+                var length: std.posix.socklen_t = @sizeOf(c_int);
+                try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(
+                    reactor.listener.fd,
+                    std.posix.IPPROTO.IPV6,
+                    std.posix.IPV6.V6ONLY,
+                    @ptrCast(&enabled),
+                    &length,
+                )));
+                try std.testing.expectEqual(@as(c_int, 1), enabled);
+            }
+            server.shutdown();
+            server.wait();
+            var fixed = try Server.init(std.testing.allocator, .{
+                .host = host,
+                .port = address.port,
+                .reactor_count = reactor_count,
+            });
+            defer fixed.deinit();
+            try fixed.start();
+            try std.testing.expectEqual(address.port, try fixed.port());
+        }
+    }
+}
+
+test "IPv6 listener failures clean up startup resources" {
+    for ([_][]const u8{ "[::1]", "fe80::1%1", "fe80::1%eth0", ":::" }) |host| {
+        var invalid = try Server.init(std.testing.allocator, .{ .host = host });
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidAddress, invalid.start());
+    }
+    var server = try Server.init(std.testing.allocator, .{ .host = "::1" });
+    defer server.deinit();
+    try server.start();
+    var conflicting = try Server.init(std.testing.allocator, .{ .host = "::1", .port = try server.port() });
+    defer conflicting.deinit();
+    try std.testing.expectError(error.BindFailed, conflicting.start());
 }
 
 test "server rejects zero reactors" {

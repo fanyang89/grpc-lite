@@ -102,7 +102,13 @@ official grpc-go peers and public HTTP/2 framing suites on x86_64 and arm64.
 | Official Protobuf C++ runtime | Optional external typed-code dependency |
 | General Abseil compatibility | Out of scope |
 | Native Zig mTLS client identities and required server-side client verification | Optional |
-| IPv6, retries, reflection, xDS | Out of scope |
+| Native Zig IPv6 literal-address transport | Basic support; AAAA and extended validation pending |
+| Happy Eyeballs, IPv6 zone IDs, dual-family Server listeners | Out of scope |
+| Retries, reflection, xDS | Out of scope |
+
+For IPv6, use a bracketed Channel target such as `[::1]:50051` and an unbracketed
+Server `host` such as `::1` or `::`. IPv6 listeners explicitly use `IPV6_V6ONLY=1`.
+DNS remains IPv4-only; IPv6 TLS, C/C++ and release-bundle validation are follow-up work.
 
 See [the official interoperability profile](tests/official/README.md) for current cases
 and results. grpc-lite does not provide grpc-core ABI compatibility or the full grpcpp
