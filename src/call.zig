@@ -4,8 +4,11 @@ const metadata = @import("metadata.zig");
 const status = @import("status.zig");
 
 pub const default_max_message_size = 4 * 1024 * 1024;
+pub const Cancellation = @import("cancellation.zig").Cancellation;
 
 pub const Options = struct {
+    /// Optional single-use cancellation source, borrowed only during submission.
+    cancellation: ?*Cancellation = null,
     metadata: []const metadata.Entry = &.{},
     timeout_ns: ?u64 = null,
     max_response_size: usize = default_max_message_size,

@@ -90,6 +90,7 @@ pub const stream = @import("stream.zig");
 pub const xev = @import("xev");
 
 pub const CallOptions = call.Options;
+pub const Cancellation = call.Cancellation;
 pub const CallResult = call.Result;
 pub const AsyncCallResult = call.AsyncResult;
 pub const UnaryCallCallbacks = call.Callbacks;

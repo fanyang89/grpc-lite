@@ -741,6 +741,7 @@ const TestObserver = if (builtin.is_test) struct {
 } else struct {};
 
 const Impl = struct {
+    unary_cancel_pending: std.atomic.Value(bool) = .init(false),
     unary_admission: UnaryAdmission = .{},
     backing_allocator: std.mem.Allocator,
     serialized_allocator: *SerializedAllocator,
@@ -849,6 +850,7 @@ const Impl = struct {
         defer self.mutex.unlock(syncIo());
         if (self.state != .running) return false;
         try self.pending.append(self.allocator, operation);
+        if (unaryCancelled(operation)) self.unary_cancel_pending.store(true, .release);
         if (receiving_http2_impl != self) {
             if (self.notifyAdmission()) |_| {} else |_| {
                 _ = self.pending.pop();
@@ -1208,6 +1210,7 @@ const OperationOwner = union(enum) {
 };
 
 const Operation = struct {
+    cancellation: ?*call.Cancellation.State = null,
     impl: *Impl,
     path: []u8,
     request_frame: []u8,
@@ -1300,6 +1303,10 @@ const Operation = struct {
             if (!isRequestMetadata(entry.key)) return error.InvalidMetadataKey;
             try operation.request_metadata.append(entry.key, entry.value);
         }
+        if (options.cancellation) |source| {
+            try source.state.bind(impl, notifyUnaryCancellation);
+            operation.cancellation = source.state;
+        }
         return operation;
     }
 
@@ -1316,6 +1323,10 @@ const Operation = struct {
     }
 
     fn deinit(self: *Operation) void {
+        if (self.cancellation) |source| {
+            source.detach();
+            source.release();
+        }
         std.debug.assert(self.deadline_heap_index == null);
         std.debug.assert(!self.waiting_queued);
         std.debug.assert(self.waiting_prev == null);
@@ -1362,6 +1373,7 @@ const Operation = struct {
 
     fn finish(self: *Operation) void {
         std.debug.assert(!self.finished);
+        if (self.cancellation) |source| source.detach();
         self.finished = true;
         self.endOperationalPending();
         if (self.operational_active) {
@@ -2076,6 +2088,11 @@ fn processPending(impl: *Impl) void {
         }
     }
 
+    processUnaryCancellations(impl) catch {
+        handleTransportFailure(impl, "unary cancellation failed");
+        return;
+    };
+
     if (impl.connection_state != .active) {
         scheduleDeadlineTimer(impl);
         return;
@@ -2083,6 +2100,12 @@ fn processPending(impl: *Impl) void {
 
     var now: ?u64 = null;
     while (popWaitingOperation(impl)) |operation| {
+        if (unaryCancelled(operation)) {
+            removeOperationDeadline(impl, operation);
+            operation.setStaticOutcome(.cancelled, "call cancelled");
+            operation.finish();
+            continue;
+        }
         if (operation.deadline_ns) |deadline| {
             const current = cachedNow(&now);
             if (deadline <= current) {
@@ -3363,6 +3386,41 @@ fn submitCancellationReset(impl: *Impl, stream_id: i32) c_int {
         if (impl.test_observer.fail_cancellation_reset.swap(false, .monotonic)) return c.NGHTTP2_ERR_NOMEM;
     }
     return c.nghttp2_submit_rst_stream(impl.session, c.NGHTTP2_FLAG_NONE, stream_id, c.NGHTTP2_CANCEL);
+}
+
+fn notifyUnaryCancellation(context: *anyopaque) void {
+    const impl: *Impl = @ptrCast(@alignCast(context));
+    impl.unary_cancel_pending.store(true, .release);
+    impl.async_handle.notify() catch {};
+}
+
+fn unaryCancelled(operation: *Operation) bool {
+    return if (operation.cancellation) |source| source.cancelled.load(.acquire) else false;
+}
+
+fn processUnaryCancellations(impl: *Impl) !void {
+    // Only scan retained work when a source has requested cancellation.
+    if (!impl.unary_cancel_pending.swap(false, .acq_rel)) return;
+    var waiting = impl.waiting_operation_head;
+    while (waiting) |operation| {
+        waiting = operation.waiting_next;
+        if (!unaryCancelled(operation)) continue;
+        std.debug.assert(removeWaitingOperation(impl, operation));
+        removeOperationDeadline(impl, operation);
+        operation.setStaticOutcome(.cancelled, "call cancelled");
+        operation.finish();
+    }
+    var operations = impl.operations.valueIterator();
+    var flush_needed = false;
+    while (operations.next()) |entry| {
+        const operation = entry.*;
+        if (operation.outcome_set or !unaryCancelled(operation)) continue;
+        removeOperationDeadline(impl, operation);
+        operation.setStaticOutcome(.cancelled, "call cancelled");
+        if (submitCancellationReset(impl, operation.stream_id) != 0) return error.UnaryCancellationFailed;
+        flush_needed = true;
+    }
+    if (flush_needed) try flush(impl);
 }
 
 fn expireDeadlines(impl: *Impl, now: u64) !void {
@@ -5340,6 +5398,189 @@ test "waiting unary deadline removes ownership before completion" {
     try std.testing.expect(impl.waiting_operation_tail == null);
     try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
     operation.deinit();
+}
+
+test "unary cancellation removes queued work and rejects source reuse" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.async_handle = try xev.Async.init();
+    defer impl.async_handle.deinit();
+    defer impl.deadline_heap.deinit(impl.allocator);
+    var source = try call.Cancellation.init(std.testing.allocator);
+    defer source.deinit();
+    const operation = try Operation.init(&impl, "/test.Cancel/Waiting", "", .{ .cancellation = &source });
+    defer operation.deinit();
+    try std.testing.expectError(error.CancellationAlreadyUsed, Operation.init(&impl, "/test.Cancel/Waiting", "", .{ .cancellation = &source }));
+    appendWaitingOperation(&impl, operation);
+    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = operation }, 100);
+    source.cancel();
+    source.cancel();
+    try processUnaryCancellations(&impl);
+    try std.testing.expect(operation.done);
+    try std.testing.expectEqual(status.Code.cancelled, operation.response_code);
+    try std.testing.expect(impl.waiting_operation_head == null);
+    try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+    try expireDeadlines(&impl, 100);
+    try std.testing.expectEqual(status.Code.cancelled, operation.response_code);
+}
+
+test "raw unary cancellation supports blocking and async calls without closing the connection" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const Handler = struct {
+        entered: std.Io.Semaphore = .{},
+        release: std.Io.Semaphore = .{},
+
+        fn handle(self: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            if (std.mem.eql(u8, request, "blocked")) {
+                self.entered.post(std.testing.io);
+                self.release.waitUncancelable(std.testing.io);
+            }
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    const Completion = struct {
+        done: std.Io.Semaphore = .{},
+        code: status.Code = .unknown,
+        count: usize = 0,
+
+        fn complete(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.code = result.status.code;
+            self.count += 1;
+            self.done.post(std.testing.io);
+        }
+
+        fn run(self: *@This(), channel: *Channel, source: *call.Cancellation) void {
+            var result = channel.callUnary(std.testing.allocator, "/test.Cancel/Unary", "blocked", .{
+                .cancellation = source,
+                .timeout_ns = 5 * std.time.ns_per_s,
+            }) catch {
+                self.done.post(std.testing.io);
+                return;
+            };
+            defer result.deinit();
+            self.code = result.status.code;
+            self.count += 1;
+            self.done.post(std.testing.io);
+        }
+    };
+    var handler: Handler = .{};
+    var test_server = try server.Server.init(std.testing.allocator, .{});
+    defer test_server.deinit();
+    try test_server.registerUnary("/test.Cancel/Unary", service.UnaryHandler.bind(Handler, &handler, Handler.handle));
+    try test_server.start();
+    var target_buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try test_server.port()});
+    var channel = try Channel.init(std.testing.allocator, target, .{});
+    var channel_alive = true;
+    defer if (channel_alive) channel.deinit();
+
+    var pre = try call.Cancellation.init(std.testing.allocator);
+    defer pre.deinit();
+    pre.cancel();
+    var cancelled = try channel.callUnary(std.testing.allocator, "/test.Cancel/Unary", "blocked", .{ .cancellation = &pre });
+    defer cancelled.deinit();
+    try std.testing.expectEqual(status.Code.cancelled, cancelled.status.code);
+
+    for ([_]bool{ false, true }) |asynchronous| {
+        var source = try call.Cancellation.init(std.testing.allocator);
+        defer source.deinit();
+        var completion: Completion = .{};
+        var thread: ?std.Thread = null;
+        if (asynchronous) {
+            try channel.callUnaryAsync("/test.Cancel/Unary", "blocked", .{
+                .cancellation = &source,
+                .timeout_ns = 5 * std.time.ns_per_s,
+            }, .{ .context = &completion, .on_complete = Completion.complete });
+        } else {
+            thread = try std.Thread.spawn(.{}, Completion.run, .{ &completion, &channel, &source });
+        }
+        handler.entered.waitUncancelable(std.testing.io);
+        var other: Completion = .{};
+        try channel.callUnaryAsync("/test.Cancel/Unary", "healthy", .{}, .{
+            .context = &other,
+            .on_complete = Completion.complete,
+        });
+        source.cancel();
+        source.cancel();
+        completion.done.waitUncancelable(std.testing.io);
+        handler.release.post(std.testing.io);
+        if (thread) |worker| worker.join();
+        other.done.waitUncancelable(std.testing.io);
+        try std.testing.expectEqual(status.Code.ok, other.code);
+        try std.testing.expectEqual(status.Code.cancelled, completion.code);
+        var healthy = try channel.callUnary(std.testing.allocator, "/test.Cancel/Unary", "healthy", .{});
+        defer healthy.deinit();
+        try std.testing.expectEqualStrings("healthy", healthy.payload);
+        try std.testing.expectEqual(@as(usize, 1), completion.count);
+        try std.testing.expectEqual(@as(usize, 0), channel.unaryAdmissionStats().retained_calls);
+    }
+    var completed_source = try call.Cancellation.init(std.testing.allocator);
+    defer completed_source.deinit();
+    var healthy = try channel.callUnary(std.testing.allocator, "/test.Cancel/Unary", "healthy", .{ .cancellation = &completed_source });
+    defer healthy.deinit();
+    try std.testing.expectEqual(status.Code.ok, healthy.status.code);
+    // Race cancellation against normal responses; either terminal may win.
+    for (0..32) |_| {
+        var source = try call.Cancellation.init(std.testing.allocator);
+        defer source.deinit();
+        var completion: Completion = .{};
+        try channel.callUnaryAsync("/test.Cancel/Unary", "healthy", .{ .cancellation = &source }, .{
+            .context = &completion,
+            .on_complete = Completion.complete,
+        });
+        const canceller = try std.Thread.spawn(.{}, call.Cancellation.cancel, .{&source});
+        completion.done.waitUncancelable(std.testing.io);
+        canceller.join();
+        try std.testing.expect(completion.code == .ok or completion.code == .cancelled);
+        try std.testing.expectEqual(@as(usize, 1), completion.count);
+    }
+    try std.testing.expectEqual(@as(usize, 1), channel.impl.connect_count.load(.monotonic));
+    // The call owns its state even when the application drops the source early.
+    var dropped_source = try call.Cancellation.init(std.testing.allocator);
+    var shutdown_completion: Completion = .{};
+    try channel.callUnaryAsync("/test.Cancel/Unary", "blocked", .{ .cancellation = &dropped_source }, .{
+        .context = &shutdown_completion,
+        .on_complete = Completion.complete,
+    });
+    dropped_source.deinit();
+    handler.entered.waitUncancelable(std.testing.io);
+    channel.deinit();
+    channel_alive = false;
+    handler.release.post(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), shutdown_completion.count);
+    completed_source.cancel();
+}
+
+test "unary cancellation reset failure preserves cancellation outcome" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.async_handle = try xev.Async.init();
+    defer impl.async_handle.deinit();
+    defer impl.operations.deinit(impl.allocator);
+    defer impl.deadline_heap.deinit(impl.allocator);
+    try initializeSession(&impl);
+    var source = try call.Cancellation.init(std.testing.allocator);
+    defer source.deinit();
+    const operation = try Operation.init(&impl, "/test.Cancel/ResetFailure", "", .{ .cancellation = &source });
+    defer {
+        c.nghttp2_session_del(impl.session);
+        impl.session = null;
+        operation.deinit();
+    }
+    try deadlineHeapInsertOrUpdate(&impl, .{ .operation = operation }, 100);
+    try submitOperation(&impl, operation);
+    impl.test_observer.fail_cancellation_reset.store(true, .monotonic);
+    source.cancel();
+    try std.testing.expectError(error.UnaryCancellationFailed, processUnaryCancellations(&impl));
+    try std.testing.expectEqual(status.Code.cancelled, operation.response_code);
+    try std.testing.expectEqual(@as(usize, 0), impl.deadline_heap.items.len);
+    _ = impl.operations.remove(operation.stream_id);
 }
 
 test "pre-submit stream deadline removes loop ownership" {
