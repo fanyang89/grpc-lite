@@ -26,7 +26,11 @@ wire bytes, explicit allocators, deterministic teardown, and bounded backpressur
 
 ### Zig
 
-Add grpc-lite to `build.zig.zon`, then import its public module:
+Follow the [Zig quickstart](docs/zig-quickstart.md) to add grpc-lite with
+`zig fetch --save`, configure your application's `build.zig`, define a `.proto`,
+and build a typed client/server with `zig build`.
+
+For applications that already handle protobuf wire bytes, import the raw module:
 
 ```zig
 const grpc_lite = b.dependency("grpc_lite", .{

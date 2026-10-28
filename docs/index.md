@@ -17,51 +17,21 @@ sockets and the event loop.
   facade. Release-generated C bundles build with CMake without Zig on Linux x86_64
   and ARM64; these bundles support cleartext transport only.
 
-## Build from source
-
-Install [mise](https://mise.jdx.dev/), then run:
-
-```sh
-git clone https://github.com/fanyang89/grpc-lite.git
-cd grpc-lite
-mise install
-mise run bootstrap
-mise run build
-mise run test
-```
-
-See the [Zig guide](zig-api.md) and [C/C++ build instructions](c-cpp-api.md#cmake-source-build)
-for integration options, or the [examples](../examples) for runnable clients and servers.
-
 ## Integrate with Zig
 
-Add grpc-lite to your `build.zig.zon` dependencies, then import the raw module:
+Use grpc-lite as a dependency of **your application**. The
+[Zig quickstart](zig-quickstart.md) walks through:
 
-```zig
-const grpc_lite = b.dependency("grpc_lite", .{
-    .target = target,
-    .optimize = optimize,
-    .protobuf = false,
-});
-exe.root_module.addImport("grpc_lite", grpc_lite.module("grpc_lite"));
-```
+1. Adding the package with `zig fetch --save` and wiring it into `build.zig`.
+2. Defining messages and a service in a `.proto` file.
+3. Generating Zig code as part of your application's build.
+4. Implementing a typed server and calling it with a typed client.
 
-The raw API works with protobuf wire bytes:
+Build and run with `zig build` and `zig build run`. You do not need a grpc-lite
+checkout or its maintainer tasks. If your application already handles protobuf wire
+bytes, the [raw Zig API](zig-api.md) is also available without protobuf code generation.
 
-```zig
-const grpc = @import("grpc_lite");
-
-var channel = try grpc.Channel.init(allocator, "127.0.0.1:50051", .{});
-defer channel.deinit();
-
-var result = try channel.callUnary(
-    allocator,
-    "/demo.EchoService/Echo",
-    protobuf_wire_bytes,
-    .{},
-);
-defer result.deinit();
-```
+For C/C++, follow the [C/C++ integration guide](c-cpp-api.md).
 
 ## Next steps
 

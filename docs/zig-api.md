@@ -5,6 +5,10 @@ description: Channels, streaming, servers, TLS, and typed protobuf adapters.
 
 # Zig API
 
+New applications should start with the [Zig quickstart](zig-quickstart.md): package
+installation, build integration, `.proto` generation, and a runnable typed client/server.
+This page is the API reference.
+
 The public Zig transport is raw-byte based. Applications may use protobuf wire bytes
 directly or opt into the shared zig-protobuf runtime and typed adapters.
 
