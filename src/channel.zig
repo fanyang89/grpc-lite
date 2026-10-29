@@ -435,6 +435,10 @@ pub const Channel = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, target: []const u8, options: ChannelOptions) !Channel {
+        return initConfigured(allocator, target, options, if (builtin.is_test) null else {});
+    }
+
+    fn initConfigured(allocator: std.mem.Allocator, target: []const u8, options: ChannelOptions, setup: if (builtin.is_test) ?*const fn (*Impl) anyerror!void else void) !Channel {
         if (options.stream_admission.max_streams == 0 or options.stream_admission.max_buffer_bytes == 0)
             return error.InvalidStreamAdmissionLimits;
         if (options.unary_admission.max_calls == 0 or options.unary_admission.max_request_bytes == 0)
@@ -525,6 +529,10 @@ pub const Channel = struct {
         impl.user_agent = user_agent;
         impl.async_handle = async_handle;
         impl.deadline_timer = deadline_timer;
+        if (comptime builtin.is_test) {
+            if (setup) |configure| try configure(impl);
+        }
+        errdefer if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
         impl.thread = try std.Thread.spawn(.{}, runLoop, .{impl});
 
         impl.mutex.lockUncancelable(syncIo());
@@ -546,7 +554,6 @@ pub const Channel = struct {
             std.debug.assert(impl.deadline_heap_index == null);
             std.debug.assert(impl.reconnect_heap_index == null);
             impl.deadline_heap.deinit(impl.allocator);
-            if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
             return error.ConnectionFailed;
         }
 
@@ -721,6 +728,7 @@ const ConnectionState = enum { resolving, connecting, handshaking, active, drain
 const ResolveState = enum { idle, pending, ready, failed, cancelled };
 
 const TestObserver = if (builtin.is_test) struct {
+    fail_socket_init: bool = false,
     // Per-channel one-shot faults; dormant unless a test arms them.
     fail_admission_notify: std.atomic.Value(bool) = .init(false),
     fail_cancellation_reset: std.atomic.Value(bool) = .init(false),
@@ -1841,24 +1849,33 @@ fn runLoop(impl: *Impl) void {
 }
 
 fn startConnection(impl: *Impl) !void {
-    const address = impl.literal_address orelse address: {
-        switch (impl.resolve_state) {
-            .idle => {
-                impl.resolve_state = .pending;
-                impl.connection_state = .resolving;
-                try impl.resolver.resolve(impl.host, impl.port, impl, onResolved);
-                return;
-            },
-            .pending => return,
-            .ready => {},
-            .failed, .cancelled => return error.ConnectionFailed,
-        }
-        if (impl.next_address >= impl.resolved_addresses.len) return error.ConnectionFailed;
-        const candidate = impl.resolved_addresses[impl.next_address];
-        impl.next_address += 1;
-        break :address candidate;
+    const tcp = while (true) {
+        const address = impl.literal_address orelse address: {
+            switch (impl.resolve_state) {
+                .idle => {
+                    impl.resolve_state = .pending;
+                    impl.connection_state = .resolving;
+                    try impl.resolver.resolve(impl.host, impl.port, impl, onResolved);
+                    return;
+                },
+                .pending => return,
+                .ready => {},
+                .failed, .cancelled => return error.ConnectionFailed,
+            }
+            if (impl.next_address >= impl.resolved_addresses.len) return error.ConnectionFailed;
+            const candidate = impl.resolved_addresses[impl.next_address];
+            impl.next_address += 1;
+            break :address candidate;
+        };
+        const socket = initCandidateSocket(impl, address) catch |err| {
+            // A host may resolve to a family unavailable on this machine.
+            // Try remaining candidates before abandoning this resolution round.
+            if (impl.literal_address != null or impl.next_address >= impl.resolved_addresses.len) return err;
+            continue;
+        };
+        break .{ .socket = socket, .address = address };
     };
-    impl.tcp = try xev.TCP.init(address);
+    impl.tcp = tcp.socket;
     impl.tcp_initialized = true;
     impl.close_submitted = false;
     impl.close_completed = false;
@@ -1880,8 +1897,18 @@ fn startConnection(impl: *Impl) !void {
     }
     impl.connect_active = true;
     impl.recordTcpConnectAttempt();
-    impl.tcp.connect(&impl.loop, &impl.connect_completion, address, Impl, impl, onConnect);
+    impl.tcp.connect(&impl.loop, &impl.connect_completion, tcp.address, Impl, impl, onConnect);
     observeTestIo(impl);
+}
+
+fn initCandidateSocket(impl: *Impl, address: std.Io.net.IpAddress) !xev.TCP {
+    if (comptime builtin.is_test) {
+        if (impl.test_observer.fail_socket_init) {
+            impl.test_observer.fail_socket_init = false;
+            return error.AddressFamilyNotSupported;
+        }
+    }
+    return xev.TCP.init(address);
 }
 
 fn onResolved(context: ?*anyopaque, result: cares_adapter.ResolveResult) void {
@@ -7060,6 +7087,138 @@ test "IPv6 literals bypass DNS and carry unary and bidirectional messages" {
         }
         try std.testing.expect(state.ok.load(.acquire));
         try std.testing.expectEqual(@as(usize, 2), state.messages.load(.acquire));
+    }
+}
+
+const TestCandidates = if (builtin.is_test) struct {
+    fn ipv6(impl: *Impl) !void {
+        impl.resolved_addresses = try impl.allocator.dupe(std.Io.net.IpAddress, &.{
+            try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0),
+            try std.Io.net.IpAddress.parseIp6("::1", impl.port),
+        });
+        impl.resolve_state = .ready;
+    }
+
+    fn ipv4(impl: *Impl) !void {
+        impl.resolved_addresses = try impl.allocator.dupe(std.Io.net.IpAddress, &.{
+            try std.Io.net.IpAddress.parseIp6("::1", 0),
+            try std.Io.net.IpAddress.parseIp4("127.0.0.1", impl.port),
+        });
+        impl.resolve_state = .ready;
+    }
+
+    fn unavailableFamily(impl: *Impl) !void {
+        try ipv4(impl);
+        impl.test_observer.fail_socket_init = true;
+    }
+
+    fn allFailed(impl: *Impl) !void {
+        try ipv6(impl);
+        impl.resolved_addresses[1].ip6.port = 0;
+    }
+
+    fn paused(impl: *Impl) !void {
+        try ipv6(impl);
+        impl.test_observer.connect_requested.store(true, .release);
+    }
+} else struct {};
+
+test "mixed DNS candidates fall back after connect and socket creation failures" {
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const Handler = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn handle(self: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    var runtime = try Runtime.init();
+    defer runtime.deinit();
+    for (0..3) |scenario| {
+        var handler: Handler = .{};
+        var test_server = try server.Server.init(std.testing.allocator, .{ .host = if (scenario == 0) "::1" else "127.0.0.1" });
+        defer test_server.deinit();
+        try test_server.registerUnary("/test.Dns/Fallback", service.UnaryHandler.bind(Handler, &handler, Handler.handle));
+        try test_server.start();
+        var buffer: [64]u8 = undefined;
+        const target = try std.fmt.bufPrint(&buffer, "candidates.invalid:{d}", .{try test_server.port()});
+        var channel = try Channel.initConfigured(std.testing.allocator, target, .{ .runtime = &runtime }, switch (scenario) {
+            0 => TestCandidates.ipv6,
+            1 => TestCandidates.ipv4,
+            else => TestCandidates.unavailableFamily,
+        });
+        defer channel.deinit();
+        var result = try channel.callUnary(std.testing.allocator, "/test.Dns/Fallback", "once", .{ .timeout_ns = 5 * std.time.ns_per_s });
+        defer result.deinit();
+        try std.testing.expect(result.status.isOk());
+        try std.testing.expectEqualStrings("once", result.payload);
+        try std.testing.expectEqual(@as(usize, 1), handler.calls.load(.acquire));
+        try std.testing.expectEqual(@as(u64, if (scenario == 2) 0 else 1), channel.operationalStats().reconnect_attempts);
+        channel.shutdown();
+        channel.wait();
+        try std.testing.expect(!channel.impl.tcp_initialized);
+        try std.testing.expectEqual(@as(usize, 0), channel.impl.writes.count());
+        try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
+    }
+    try std.testing.expectError(error.ConnectionFailed, Channel.initConfigured(
+        std.testing.allocator,
+        "candidates.invalid:12345",
+        .{ .runtime = &runtime },
+        TestCandidates.allFailed,
+    ));
+}
+
+test "mixed candidate switching drains shutdown and expired unary calls" {
+    const Capture = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        code: status.Code = .unknown,
+        count: usize = 0,
+        fn terminal(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.code = result.status.code;
+            self.count += 1;
+            self.done.store(true, .release);
+        }
+    };
+    const server = @import("server.zig");
+    var runtime = try Runtime.init();
+    defer runtime.deinit();
+    for (0..2) |scenario| {
+        var test_server = try server.Server.init(std.testing.allocator, .{ .host = "::1" });
+        defer test_server.deinit();
+        try test_server.start();
+        var buffer: [64]u8 = undefined;
+        const target = try std.fmt.bufPrint(&buffer, "candidates.invalid:{d}", .{try test_server.port()});
+        var channel = try Channel.initConfigured(std.testing.allocator, target, .{
+            .runtime = &runtime,
+            .reconnect = .{ .allow_initial_offline = true },
+        }, TestCandidates.paused);
+        defer channel.deinit();
+        var released = false;
+        defer if (!released) channel.impl.test_observer.connect_release.post(std.testing.io);
+        try std.testing.expect(waitForTestFlag(&channel.impl.test_observer.connect_observed, 5 * std.time.ns_per_s));
+        channel.impl.test_observer.connect_observed_sem.waitUncancelable(std.testing.io);
+        var capture: Capture = .{};
+        try channel.callUnaryAsync("/test.Dns/Unsent", "request", .{
+            .timeout_ns = if (scenario == 1) 1 else std.time.ns_per_hour,
+        }, .{ .context = &capture, .on_complete = Capture.terminal });
+        if (scenario == 0) channel.shutdown();
+        channel.impl.test_observer.connect_release.post(std.testing.io);
+        released = true;
+        try std.testing.expect(waitForTestFlag(&capture.done, 5 * std.time.ns_per_s));
+        channel.shutdown();
+        channel.wait();
+        try std.testing.expectEqual(@as(usize, 1), capture.count);
+        try std.testing.expectEqual(@as(status.Code, switch (scenario) {
+            0 => .unavailable,
+            else => .deadline_exceeded,
+        }), capture.code);
+        try std.testing.expect(!channel.impl.connect_active);
+        try std.testing.expect(!channel.impl.connect_cancel_submitted);
+        try std.testing.expect(!channel.impl.tcp_initialized);
+        try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
+        try std.testing.expectEqual(@as(usize, 0), channel.impl.streams.count());
     }
 }
 
