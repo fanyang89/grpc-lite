@@ -1,4 +1,5 @@
 const std = @import("std");
+const connect_race = @import("connect_race.zig");
 const builtin = @import("builtin");
 const build_options = @import("grpc_lite_options");
 const c = @import("c.zig").api;
@@ -728,6 +729,8 @@ const ConnectionState = enum { resolving, connecting, handshaking, active, drain
 const ResolveState = enum { idle, pending, ready, failed, cancelled };
 
 const TestObserver = if (builtin.is_test) struct {
+    stall_first_candidate: bool = false,
+    race_started: std.atomic.Value(bool) = .init(false),
     fail_socket_init: bool = false,
     // Per-channel one-shot faults; dormant unless a test arms them.
     fail_admission_notify: std.atomic.Value(bool) = .init(false),
@@ -831,6 +834,8 @@ const Impl = struct {
     resolve_state: ResolveState = .idle,
     resolved_addresses: []std.Io.net.IpAddress = &.{},
     next_address: usize = 0,
+    race_ready: bool = false,
+    connect_race: ?*connect_race.Race = null,
     connection_generation: std.atomic.Value(usize) = .init(0),
     // Loop-owned attempt classification must not depend on the wrapping I/O generation.
     tcp_attempt: enum { none, initial, subsequent } = .none,
@@ -1849,6 +1854,16 @@ fn runLoop(impl: *Impl) void {
 }
 
 fn startConnection(impl: *Impl) !void {
+    if (impl.race_ready) {
+        impl.race_ready = false;
+        impl.connection_state = .connecting;
+        impl.next_address = impl.resolved_addresses.len;
+        const race = try connect_race.Race.create(impl.allocator, &impl.loop, impl.resolved_addresses, impl, onRaceComplete, onRaceAttempt);
+        impl.connect_race = race;
+        if (comptime builtin.is_test) race.stall_first = impl.test_observer.stall_first_candidate;
+        race.start();
+        return;
+    }
     const tcp = while (true) {
         const address = impl.literal_address orelse address: {
             switch (impl.resolve_state) {
@@ -1875,7 +1890,18 @@ fn startConnection(impl: *Impl) !void {
         };
         break .{ .socket = socket, .address = address };
     };
-    impl.tcp = tcp.socket;
+    prepareConnection(impl, tcp.socket) catch {
+        beginStop(impl, "connection setup failed");
+        return;
+    };
+    impl.connect_active = true;
+    impl.recordTcpConnectAttempt();
+    impl.tcp.connect(&impl.loop, &impl.connect_completion, tcp.address, Impl, impl, onConnect);
+    observeTestIo(impl);
+}
+
+fn prepareConnection(impl: *Impl, tcp: xev.TCP) !void {
+    impl.tcp = tcp;
     impl.tcp_initialized = true;
     impl.close_submitted = false;
     impl.close_completed = false;
@@ -1883,22 +1909,44 @@ fn startConnection(impl: *Impl) !void {
     impl.connection_state = .connecting;
     _ = impl.connection_generation.fetchAdd(1, .monotonic);
 
-    initializeSession(impl) catch {
-        beginStop(impl, "connection setup failed");
-        return;
-    };
+    try initializeSession(impl);
     if (comptime build_options.tls) {
         if (impl.tls_config) |config| {
-            impl.tls_session = tls_record.Session.create(impl.allocator, config, impl.host) catch {
-                beginStop(impl, "TLS setup failed");
-                return;
-            };
+            impl.tls_session = try tls_record.Session.create(impl.allocator, config, impl.host);
         }
     }
-    impl.connect_active = true;
+}
+
+fn onRaceAttempt(context: ?*anyopaque) void {
+    const impl: *Impl = @ptrCast(@alignCast(context.?));
     impl.recordTcpConnectAttempt();
-    impl.tcp.connect(&impl.loop, &impl.connect_completion, tcp.address, Impl, impl, onConnect);
-    observeTestIo(impl);
+    if (comptime builtin.is_test) impl.test_observer.race_started.store(true, .release);
+}
+
+fn onRaceComplete(context: ?*anyopaque, result: connect_race.Result) void {
+    const impl: *Impl = @ptrCast(@alignCast(context.?));
+    impl.connect_race = null;
+    switch (result) {
+        .connected => |winner| {
+            // Keep the other candidates available for the existing sequential
+            // fallback if TLS rejects the TCP winner. No RPC has been sent yet.
+            for (impl.resolved_addresses, 0..) |address, index| {
+                if (std.meta.eql(address, winner.address)) {
+                    std.mem.copyBackwards(std.Io.net.IpAddress, impl.resolved_addresses[1 .. index + 1], impl.resolved_addresses[0..index]);
+                    impl.resolved_addresses[0] = winner.address;
+                    impl.next_address = 1;
+                    break;
+                }
+            }
+            prepareConnection(impl, winner.tcp) catch {
+                beginStop(impl, "connection setup failed");
+                return;
+            };
+            _ = onConnect(impl, &impl.loop, &impl.connect_completion, winner.tcp, {});
+        },
+        .failed => scheduleReconnect(impl, "connection failed"),
+        .cancelled => submitCloseIfReady(impl, &impl.loop),
+    }
 }
 
 fn initCandidateSocket(impl: *Impl, address: std.Io.net.IpAddress) !xev.TCP {
@@ -1919,6 +1967,7 @@ fn onResolved(context: ?*anyopaque, result: cares_adapter.ResolveResult) void {
             impl.resolved_addresses = addresses;
             impl.next_address = 0;
             impl.resolve_state = .ready;
+            impl.race_ready = true;
         },
         .failed => impl.resolve_state = .failed,
         .cancelled => impl.resolve_state = .cancelled,
@@ -1944,6 +1993,7 @@ fn clearResolvedAddresses(impl: *Impl) void {
     impl.resolved_addresses = &.{};
     impl.next_address = 0;
     impl.resolve_state = .idle;
+    impl.race_ready = false;
 }
 
 fn initializeSession(impl: *Impl) !void {
@@ -3649,6 +3699,7 @@ fn failConnectionCandidate(impl: *Impl, reason: []const u8) void {
 }
 
 fn submitCloseIfReady(impl: *Impl, loop: *xev.Loop) void {
+    if (impl.connect_race != null) return;
     if (!impl.tcp_initialized) {
         if (impl.stopping_on_loop and
             !impl.connect_active and
@@ -3736,6 +3787,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     clearTlsHandshakeDeadline(impl);
     clearReconnectDeadline(impl);
     if (impl.resolver_initialized) impl.resolver.shutdown();
+    if (impl.connect_race) |race| race.cancel();
     impl.mutex.lockUncancelable(syncIo());
     impl.accepting_streams = false;
     if (impl.state == .starting) {
@@ -7091,6 +7143,22 @@ test "IPv6 literals bypass DNS and carry unary and bidirectional messages" {
 }
 
 const TestCandidates = if (builtin.is_test) struct {
+    fn racingIpv6(impl: *Impl) !void {
+        try ipv6(impl);
+        impl.race_ready = true;
+        impl.test_observer.stall_first_candidate = true;
+    }
+
+    fn racingIpv4(impl: *Impl) !void {
+        try ipv4(impl);
+        impl.race_ready = true;
+        impl.test_observer.stall_first_candidate = true;
+    }
+
+    fn racingOffline(impl: *Impl) !void {
+        try racingIpv6(impl);
+        impl.resolved_addresses[1].ip6.port = 0;
+    }
     fn ipv6(impl: *Impl) !void {
         impl.resolved_addresses = try impl.allocator.dupe(std.Io.net.IpAddress, &.{
             try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0),
@@ -7135,9 +7203,9 @@ test "mixed DNS candidates fall back after connect and socket creation failures"
     };
     var runtime = try Runtime.init();
     defer runtime.deinit();
-    for (0..3) |scenario| {
+    for (0..5) |scenario| {
         var handler: Handler = .{};
-        var test_server = try server.Server.init(std.testing.allocator, .{ .host = if (scenario == 0) "::1" else "127.0.0.1" });
+        var test_server = try server.Server.init(std.testing.allocator, .{ .host = if (scenario == 0 or scenario == 3) "::1" else "127.0.0.1" });
         defer test_server.deinit();
         try test_server.registerUnary("/test.Dns/Fallback", service.UnaryHandler.bind(Handler, &handler, Handler.handle));
         try test_server.start();
@@ -7146,6 +7214,8 @@ test "mixed DNS candidates fall back after connect and socket creation failures"
         var channel = try Channel.initConfigured(std.testing.allocator, target, .{ .runtime = &runtime }, switch (scenario) {
             0 => TestCandidates.ipv6,
             1 => TestCandidates.ipv4,
+            3 => TestCandidates.racingIpv6,
+            4 => TestCandidates.racingIpv4,
             else => TestCandidates.unavailableFamily,
         });
         defer channel.deinit();
@@ -7220,6 +7290,38 @@ test "mixed candidate switching drains shutdown and expired unary calls" {
         try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
         try std.testing.expectEqual(@as(usize, 0), channel.impl.streams.count());
     }
+}
+
+test "shutdown drains racing connects after a pending unary deadline" {
+    const Capture = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        code: status.Code = .unknown,
+        fn complete(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.code = result.status.code;
+            self.done.store(true, .release);
+        }
+    };
+    var runtime = try Runtime.init();
+    defer runtime.deinit();
+    var channel = try Channel.initConfigured(std.testing.allocator, "race.invalid:12345", .{
+        .runtime = &runtime,
+        .reconnect = .{ .allow_initial_offline = true },
+    }, TestCandidates.racingOffline);
+    defer channel.deinit();
+    try std.testing.expect(waitForTestFlag(&channel.impl.test_observer.race_started, 5 * std.time.ns_per_s));
+    var capture: Capture = .{};
+    try channel.callUnaryAsync("/test.Dns/Unsent", "request", .{ .timeout_ns = 1 }, .{
+        .context = &capture,
+        .on_complete = Capture.complete,
+    });
+    try std.testing.expect(waitForTestFlag(&capture.done, 5 * std.time.ns_per_s));
+    try std.testing.expectEqual(status.Code.deadline_exceeded, capture.code);
+    channel.shutdown();
+    channel.wait();
+    try std.testing.expect(channel.impl.connect_race == null);
+    try std.testing.expect(!channel.impl.tcp_initialized);
+    try std.testing.expectEqual(@as(usize, 0), channel.impl.deadline_heap.items.len);
 }
 
 test "channel resolves an IPv4 hostname with c-ares" {
@@ -9049,6 +9151,57 @@ test "TLS unary verifies DNS and IPv6 IP SANs and rejects a missing IPv6 SAN" {
         try std.testing.expect(result.status.isOk());
         try std.testing.expectEqualStrings("secure", result.payload);
     }
+}
+
+test "TLS failure of the racing TCP winner falls back without replay" {
+    if (!build_options.tls) return error.SkipZigTest;
+    const server = @import("server.zig");
+    const service = @import("service.zig");
+    const certificate = @embedFile("testdata/localhost-cert.pem");
+    const Handler = struct {
+        calls: usize = 0,
+        fn handle(self: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            self.calls += 1;
+            return service.UnaryResponse.ok(allocator, request);
+        }
+        fn configure(impl: *Impl) !void {
+            try TestCandidates.ipv6(impl);
+            impl.resolved_addresses[0].ip4.port = impl.port;
+            impl.race_ready = true;
+        }
+    };
+    // A reachable cleartext endpoint wins TCP, but cannot satisfy TLS.
+    var incompatible = try server.Server.init(std.testing.allocator, .{ .host = "127.0.0.1" });
+    defer incompatible.deinit();
+    try incompatible.start();
+    var handler: Handler = .{};
+    var compatible = try server.Server.init(std.testing.allocator, .{
+        .host = "::1",
+        .port = try incompatible.port(),
+        .tls = .{ .certificate_chain_pem = certificate, .private_key_pem = @embedFile("testdata/localhost-key.pem") },
+    });
+    defer compatible.deinit();
+    try compatible.registerUnary("/test.Tls/Fallback", service.UnaryHandler.bind(Handler, &handler, Handler.handle));
+    try compatible.start();
+    var runtime = try Runtime.init();
+    defer runtime.deinit();
+    var buffer: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&buffer, "localhost:{d}", .{try compatible.port()});
+    var channel = try Channel.initConfigured(std.testing.allocator, target, .{
+        .runtime = &runtime,
+        .tls = .{ .ca_certificates_pem = certificate, .handshake_timeout_ns = std.time.ns_per_s },
+    }, Handler.configure);
+    defer channel.deinit();
+    var result = try channel.callUnary(std.testing.allocator, "/test.Tls/Fallback", "once", .{ .timeout_ns = 5 * std.time.ns_per_s });
+    defer result.deinit();
+    try std.testing.expect(result.status.isOk());
+    try std.testing.expectEqualStrings("once", result.payload);
+    channel.shutdown();
+    channel.wait();
+    compatible.shutdown();
+    compatible.wait();
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    try std.testing.expectEqual(@as(u64, 1), channel.operationalStats().reconnect_attempts);
 }
 
 test "channel and server exchange a unary call over mutual TLS" {
