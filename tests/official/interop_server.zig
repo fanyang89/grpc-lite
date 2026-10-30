@@ -3,6 +3,7 @@ const grpc = @import("grpc_lite");
 const testing = @import("grpc_testing");
 
 const Config = struct {
+    host: []const u8 = "127.0.0.1",
     port: u16 = 10000,
     use_tls: bool = false,
     streaming_soak: bool = false,
@@ -486,7 +487,7 @@ pub fn main(init: std.process.Init) !void {
     service.report_stream_stats = config.streaming_soak;
     defer service.deinit();
     var server = try grpc.Server.init(init.gpa, .{
-        .host = "127.0.0.1",
+        .host = config.host,
         .port = config.port,
         .tls = if (certificate) |cert| .{
             .certificate_chain_pem = cert,
@@ -548,7 +549,10 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     try server.start();
-    std.debug.print("grpc-lite interop server listening on 127.0.0.1:{d}\n", .{try server.port()});
+    const ipv6 = std.mem.indexOfScalar(u8, config.host, ':') != null;
+    std.debug.print("grpc-lite interop server listening on {s}{s}{s}:{d}\n", .{
+        if (ipv6) "[" else "", config.host, if (ipv6) "]" else "", try server.port(),
+    });
     server.wait();
 }
 
@@ -557,7 +561,9 @@ fn parseArgs(args: []const []const u8) !Config {
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.startsWith(u8, arg, "--port=")) {
+        if (std.mem.startsWith(u8, arg, "--host=")) {
+            config.host = arg["--host=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--port=")) {
             config.port = try std.fmt.parseInt(u16, arg["--port=".len..], 10);
         } else if (std.mem.eql(u8, arg, "--port")) {
             index += 1;

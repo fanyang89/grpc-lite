@@ -175,8 +175,12 @@ int main(void) {
       END_OF(grpc_lite_channel_options, jitter_percent),
       END_OF(grpc_lite_channel_options, logger),
       sizeof(grpc_lite_channel_options)};
-  for (size_t s = 0; s < sizeof(server_sizes) / sizeof(server_sizes[0]); ++s) {
+  const size_t size_count = sizeof(server_sizes) / sizeof(server_sizes[0]);
+  for (size_t scenario = 0; scenario < 2 * size_count; ++scenario) {
+    const size_t s = scenario % size_count;
+    const int ipv6 = scenario >= size_count;
     grpc_lite_server_options options = GRPC_LITE_SERVER_OPTIONS_INIT;
+    options.host = bytes(ipv6 ? "::1" : "127.0.0.1");
     struct prefix storage = copy_prefix(&options, server_sizes[s]);
     grpc_lite_server *server = NULL;
     assert(grpc_lite_server_create(storage.data, &server) == GRPC_LITE_OK);
@@ -192,7 +196,7 @@ int main(void) {
     uint32_t port = 0;
     assert(grpc_lite_server_port(server, &port) == GRPC_LITE_OK);
     char target[32];
-    const int size = snprintf(target, sizeof(target), "127.0.0.1:%u", (unsigned)port);
+    const int size = snprintf(target, sizeof(target), ipv6 ? "[::1]:%u" : "127.0.0.1:%u", (unsigned)port);
     assert(size > 0 && (size_t)size < sizeof(target));
     for (size_t c = 0; c < sizeof(channel_sizes) / sizeof(channel_sizes[0]); ++c) {
       grpc_lite_channel_options channel_options = GRPC_LITE_CHANNEL_OPTIONS_INIT;
@@ -211,6 +215,6 @@ int main(void) {
     grpc_lite_server_destroy(server);
   }
   grpc_lite_runtime_destroy(runtime);
-  puts("Released-header C consumer passed: 7 server prefixes x 3 channel prefixes, unary + streaming");
+  puts("Released-header C consumer passed: IPv4 + IPv6, 7 server prefixes x 3 channel prefixes, unary + streaming");
   return 0;
 }

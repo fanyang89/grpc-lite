@@ -55,8 +55,9 @@ pub fn main(init: std.process.Init) !void {
         } else null,
     };
 
-    const target = try std.fmt.allocPrint(init.gpa, "{s}:{d}", .{
-        config.server_host,
+    const ipv6 = std.mem.indexOfScalar(u8, config.server_host, ':') != null;
+    const target = try std.fmt.allocPrint(init.gpa, "{s}{s}{s}:{d}", .{
+        if (ipv6) "[" else "", config.server_host, if (ipv6) "]" else "",
         config.server_port,
     });
     defer init.gpa.free(target);
