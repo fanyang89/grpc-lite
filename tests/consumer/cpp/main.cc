@@ -49,11 +49,13 @@ void SetDeadline(grpc::ClientContext& context) {
   context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
 }
 
-int main() {
+void RunConsumer(bool ipv6) {
   grpc_lite::Runtime runtime;
   REQUIRE(grpc_lite::Runtime::Create(&runtime).ok());
   grpc_lite::Server server;
-  REQUIRE(grpc_lite::Server::Create({}, &server).ok());
+  grpc_lite::ServerOptions server_options;
+  server_options.host = ipv6 ? "::1" : "127.0.0.1";
+  REQUIRE(grpc_lite::Server::Create(server_options, &server).ok());
   // A raw server echoes protobuf wire bytes; each fixture sends one message.
   grpc_lite::ServerStreamCallbacks handlers;
   handlers.on_message = [](grpc_lite::ServerStream stream,
@@ -79,7 +81,7 @@ int main() {
   REQUIRE(server.Start().ok());
   std::uint32_t port = 0;
   REQUIRE(server.Port(&port).ok());
-  const std::string target = "127.0.0.1:" + std::to_string(port);
+  const std::string target = std::string(ipv6 ? "[::1]:" : "127.0.0.1:") + std::to_string(port);
   // Wait for the initial connection before issuing fail-fast fixture RPCs.
   grpc::ChannelArguments arguments;
   arguments.SetAllowInitialOffline(false);
@@ -200,5 +202,11 @@ int main() {
   REQUIRE(owned_payload == wire); // The callback copy survives owner destruction.
   server.ShutdownGracefully(UINT64_C(5000000000));
   server.Wait();
-  std::cout << "PASS public C++ consumer: unary, all streaming shapes, ownership, rejection\n";
+  std::cout << "PASS public C++ consumer " << (ipv6 ? "IPv6" : "IPv4")
+            << ": unary, all streaming shapes, ownership, rejection\n";
+}
+
+int main() {
+  RunConsumer(false);
+  RunConsumer(true);
 }

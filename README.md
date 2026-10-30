@@ -17,7 +17,7 @@ wire bytes, explicit allocators, deterministic teardown, and bounded backpressur
 | Transport | Runtime | Integration |
 | --- | --- | --- |
 | Unary and full-duplex streaming | Persistent multiplexed channels | Raw Zig and stable C APIs |
-| Cleartext HTTP/2 and optional native Zig TLS | IPv4 DNS through c-ares | Typed zig-protobuf adapters |
+| Cleartext HTTP/2 and optional native Zig TLS | A/AAAA DNS through c-ares | Typed zig-protobuf adapters |
 | Deadlines and cancellation | GOAWAY replacement and reconnect | Focused grpcpp-shaped C++ facade |
 | ASCII and binary metadata | Graceful server drain | CMake builds from release-generated C without Zig |
 | Per-message identity or gzip | Multi-reactor Linux servers | Generated C++ service glue |
@@ -102,13 +102,21 @@ official grpc-go peers and public HTTP/2 framing suites on x86_64 and arm64.
 | Official Protobuf C++ runtime | Optional external typed-code dependency |
 | General Abseil compatibility | Out of scope |
 | Native Zig mTLS client identities and required server-side client verification | Optional |
-| Native Zig IPv6 literal-address transport | Basic support; AAAA and extended validation pending |
+| Native Zig IPv6 literal-address and hostname transport | Supported; loopback TLS and C/C++ transport tests |
 | Happy Eyeballs, IPv6 zone IDs, dual-family Server listeners | Out of scope |
 | Retries, reflection, xDS | Out of scope |
 
 For IPv6, use a bracketed Channel target such as `[::1]:50051` and an unbracketed
 Server `host` such as `::1` or `::`. IPv6 listeners explicitly use `IPV6_V6ONLY=1`.
-DNS remains IPv4-only; IPv6 TLS, C/C++ and release-bundle validation are follow-up work.
+DNS supports A/AAAA records and attempts candidates sequentially in resolver order,
+without replaying RPCs. A stalled connection may delay fallback until the OS reports
+failure; Happy Eyeballs is not implemented. Automated IPv6 loopback coverage includes
+native TLS IP/DNS SAN verification and rejection, C/C++ consumers, cleartext bundle
+consumers, and bidirectional grpc-go interop (unary, streaming, large messages and
+cancellation). Bundle consumer CI runs on native Linux x86_64 and ARM64; a local
+`mise run check` validates only the host architecture. Cross-interface routing and
+non-loopback deployments need environment-specific validation. Release bundles
+remain cleartext-only.
 
 See [the official interoperability profile](tests/official/README.md) for current cases
 and results. grpc-lite does not provide grpc-core ABI compatibility or the full grpcpp

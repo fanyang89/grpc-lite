@@ -686,12 +686,17 @@ pub const Completion = struct {
                     .CONNREFUSED => error.ConnectionRefused,
                     .TIMEDOUT => error.TimedOut,
                     .HOSTUNREACH => error.HostUnreachable,
+                    .NETUNREACH => error.NetworkUnreachable,
                     else => |errno| posix.unexpectedErrno(errno),
                 },
             },
 
             .poll => .{
                 .poll = if (res >= 0) {} else switch (@as(posix.E, @fromBackingInt(@intCast(-res)))) {
+                    .CANCELED => error.Canceled,
+                    // An external owner (such as c-ares) may close the fd
+                    // before a queued poll reaches the kernel.
+                    .BADF => error.FileDescriptorInvalid,
                     else => |errno| posix.unexpectedErrno(errno),
                 },
             },
@@ -1074,15 +1079,18 @@ pub const ConnectError = error{
     Unexpected,
     ConnectionRefused,
     HostUnreachable,
+    NetworkUnreachable,
     TimedOut,
 };
 
 pub const PollError = error{
     Canceled,
+    FileDescriptorInvalid,
     Unexpected,
 };
 
 pub const ReadError = error{
+    FileDescriptorInvalid,
     EOF,
     Canceled,
     Unexpected,

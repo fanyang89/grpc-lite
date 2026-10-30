@@ -7,10 +7,11 @@ zig_server_port=${ZIG_TLS_SERVER_PORT:-0}
 go_server_port=${GO_TLS_SERVER_PORT:-0}
 certificate="$project_root/src/testdata/localhost-cert.pem"
 private_key="$project_root/src/testdata/localhost-key.pem"
-cases=(empty_unary large_unary client_streaming server_streaming ping_pong empty_stream)
+cases=(empty_unary large_unary client_streaming server_streaming ping_pong empty_stream cancel_after_begin cancel_after_first_response)
 peer_pid=
 peer_log=
 peer_port=
+peer_host=127.0.0.1
 
 stop_peer() {
   if [[ -n "$peer_pid" ]]; then
@@ -22,7 +23,7 @@ stop_peer() {
 
 read_peer_port() {
   local port
-  port=$(sed -nE 's/.*interop server listening on (127\.0\.0\.1|0\.0\.0\.0|\[::\]):([0-9]+)$/\2/p' "$peer_log" | tail -n 1)
+  port=$(sed -nE 's/.*interop server listening on (127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):([0-9]+)$/\2/p' "$peer_log" | tail -n 1)
   [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
   ((10#$port > 0 && 10#$port <= 65535)) || return 1
   printf '%s\n' "$port"
@@ -37,7 +38,7 @@ wait_for_peer() {
       cat "$peer_log" >&2
       return 1
     fi
-    if port=$(read_peer_port) && (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    if port=$(read_peer_port) && (exec 3<>"/dev/tcp/$peer_host/$port") 2>/dev/null; then
       peer_port=$port
       exec 3>&-
       exec 3<&-
@@ -75,48 +76,55 @@ main() {
     go build -mod=readonly -o "$work_dir/grpc-go-interop-client" google.golang.org/grpc/interop/client && \
     go build -mod=readonly -o "$work_dir/grpc-go-interop-server" google.golang.org/grpc/interop/server)
 
-  peer_log="$work_dir/grpc-lite-tls-server.log"
-  "$project_root/zig-out/bin/grpc-lite-interop-server" \
-    --port="$zig_server_port" \
-    --use_tls=true \
-    --tls_cert_file="$certificate" \
-    --tls_key_file="$private_key" >"$peer_log" 2>&1 &
-  peer_pid=$!
-  wait_for_peer
-  zig_server_port=$peer_port
-  for test_case in "${cases[@]}"; do
-    run_case 'grpc-go client -> grpc-lite TLS server' "$test_case" \
-      "$work_dir/grpc-go-interop-client" \
-      --server_host=127.0.0.1 \
-      --server_port="$zig_server_port" \
-      --server_host_override=localhost \
-      --test_case="$test_case" \
-      --use_tls=true \
-      --use_test_ca=true \
-      --ca_file="$certificate"
-  done
-  stop_peer
+  certificate="$project_root/src/testdata/ipv6-cert.pem"
+  for peer_host in 127.0.0.1 ::1; do
+    for tls_mode in true false; do
+      peer_log="$work_dir/grpc-lite-tls-server.log"
+      "$project_root/zig-out/bin/grpc-lite-interop-server" \
+        --port="$zig_server_port" \
+        --host="$peer_host" \
+        --use_tls="$tls_mode" \
+        --tls_cert_file="$certificate" \
+        --tls_key_file="$private_key" >"$peer_log" 2>&1 &
+      peer_pid=$!
+      wait_for_peer
+      zig_server_port=$peer_port
+      for test_case in "${cases[@]}"; do
+        run_case "grpc-go client -> grpc-lite server ($peer_host TLS=$tls_mode)" "$test_case" \
+          "$work_dir/grpc-go-interop-client" \
+          --server_host="$peer_host" \
+          --server_port="$zig_server_port" \
+          --server_host_override=localhost \
+          --test_case="$test_case" \
+          --use_tls="$tls_mode" \
+          --use_test_ca=true \
+          --ca_file="$certificate"
+      done
+      stop_peer
 
-  peer_log="$work_dir/grpc-go-tls-server.log"
-  GRPC_GO_LOG_SEVERITY_LEVEL=info "$work_dir/grpc-go-interop-server" \
-    --port="$go_server_port" \
-    --use_tls=true \
-    --tls_cert_file="$certificate" \
-    --tls_key_file="$private_key" >"$peer_log" 2>&1 &
-  peer_pid=$!
-  wait_for_peer
-  go_server_port=$peer_port
-  for test_case in "${cases[@]}"; do
-    run_case 'grpc-lite TLS client -> grpc-go server' "$test_case" \
-      "$project_root/zig-out/bin/grpc-lite-interop-client" \
-      --server_host=127.0.0.1 \
-      --server_port="$go_server_port" \
-      --test_case="$test_case" \
-      --use_tls=true \
-      --ca_file="$certificate"
+      peer_log="$work_dir/grpc-go-tls-server.log"
+      GRPC_GO_LOG_SEVERITY_LEVEL=info "$work_dir/grpc-go-interop-server" \
+        --port="$go_server_port" \
+        --use_tls="$tls_mode" \
+        --tls_cert_file="$certificate" \
+        --tls_key_file="$private_key" >"$peer_log" 2>&1 &
+      peer_pid=$!
+      wait_for_peer
+      go_server_port=$peer_port
+      for test_case in "${cases[@]}"; do
+        run_case "grpc-lite client -> grpc-go server ($peer_host TLS=$tls_mode)" "$test_case" \
+          "$project_root/zig-out/bin/grpc-lite-interop-client" \
+          --server_host="$peer_host" \
+          --server_port="$go_server_port" \
+          --test_case="$test_case" \
+          --use_tls="$tls_mode" \
+          --ca_file="$certificate"
+      done
+      stop_peer
+    done
   done
-  stop_peer
-
+  peer_host=127.0.0.1
+  certificate="$project_root/src/testdata/localhost-cert.pem"
   # Mutual TLS: distinct server and client trust roots, both RPC directions.
   mtls="$project_root/src/testdata/mtls"
   (cd "$project_root/tests/official" && go build -mod=readonly -o "$work_dir/mtls-peer" ./mtls_peer)

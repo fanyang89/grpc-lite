@@ -106,8 +106,8 @@ run_isolated() {
         -DGRPC_LITE_TRANSPILED_C_DIR="$bundle_dir" \
         -DGRPC_LITE_EXPECTED_VERSION="$version"
     cmake --build "$work_dir/build" --target \
-        c_consumer_shared c_consumer_static grpc_lite_protoc_gen \
-        grpcpp_generated_from_bundle
+        c_consumer_shared c_consumer_static c_transport_shared c_transport_static grpc_lite_protoc_gen \
+        grpcpp_generated_from_bundle cpp_transport
     ctest --test-dir "$work_dir/build" --output-on-failure
 }
 
@@ -193,6 +193,10 @@ if git -C "$project_root" archive HEAD | tar -tf - | grep -q '^transpiled/'; the
     exit 1
 fi
 git -C "$project_root" archive HEAD | tar -x -C "$package_source"
+git -C "$project_root" diff --binary HEAD >"$work_dir/worktree.patch"
+if [[ -s "$work_dir/worktree.patch" ]]; then
+    git -C "$package_source" apply --whitespace=nowarn "$work_dir/worktree.patch"
+fi
 tar -xzf "$work_dir/$archive_name" -C "$bundle_parent"
 bundle_dir="$bundle_parent/$root_name"
 cp -R "$package_source/tests/consumer/cmake_c/." "$consumer_source/"
