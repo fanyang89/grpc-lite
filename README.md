@@ -103,14 +103,19 @@ official grpc-go peers and public HTTP/2 framing suites on x86_64 and arm64.
 | General Abseil compatibility | Out of scope |
 | Native Zig mTLS client identities and required server-side client verification | Optional |
 | Native Zig IPv6 literal-address and hostname transport | Supported; loopback TLS and C/C++ transport tests |
-| Happy Eyeballs, IPv6 zone IDs, dual-family Server listeners | Out of scope |
+| Happy Eyeballs | Interleaved TCP attempts after A/AAAA resolution, staggered by 250 ms |
+| IPv6 zone IDs, dual-family Server listeners | Out of scope |
 | Retries, reflection, xDS | Out of scope |
 
 For IPv6, use a bracketed Channel target such as `[::1]:50051` and an unbracketed
 Server `host` such as `::1` or `::`. IPv6 listeners explicitly use `IPV6_V6ONLY=1`.
-DNS supports A/AAAA records and attempts candidates sequentially in resolver order,
-without replaying RPCs. A stalled connection may delay fallback until the OS reports
-failure; Happy Eyeballs is not implemented. Automated IPv6 loopback coverage includes
+DNS supports A/AAAA records. Once c-ares returns, Happy Eyeballs alternates address
+families (starting with the resolver's preferred family), preserving order within
+each family. TCP attempts start 250 ms apart, or sooner after a failure. The first
+successful TCP connection wins; losing attempts are cancelled and drained before
+TLS or RPC traffic begins. TLS failures retain sequential fallback to the other
+candidates, without replaying RPCs. Incremental DNS delivery and concurrent TLS
+handshakes are not implemented. Automated IPv6 loopback coverage includes
 native TLS IP/DNS SAN verification and rejection, C/C++ consumers, cleartext bundle
 consumers, and bidirectional grpc-go interop (unary, streaming, large messages and
 cancellation). Bundle consumer CI runs on native Linux x86_64 and ARM64; a local
