@@ -8985,11 +8985,10 @@ test "event-driven unary calls complete exactly once and release operations" {
     allocator_active = false;
 }
 
-test "channel and server exchange a unary call over TLS" {
+test "TLS unary verifies DNS and IPv6 IP SANs and rejects a missing IPv6 SAN" {
     if (!build_options.tls) return error.SkipZigTest;
     const server = @import("server.zig");
     const service = @import("service.zig");
-    const certificate = @embedFile("testdata/localhost-cert.pem");
     const private_key = @embedFile("testdata/localhost-key.pem");
 
     const Handler = struct {
@@ -9003,34 +9002,53 @@ test "channel and server exchange a unary call over TLS" {
         }
     };
 
-    var handler = Handler{};
-    var test_server = try server.Server.init(std.testing.allocator, .{
-        .tls = .{
-            .certificate_chain_pem = certificate,
-            .private_key_pem = private_key,
-        },
-    });
-    defer test_server.deinit();
-    try test_server.registerUnary(
-        "/test.Tls/Unary",
-        service.UnaryHandler.bind(Handler, &handler, Handler.handle),
-    );
-    try test_server.start();
+    for (0..4) |scenario| {
+        const certificate = if (scenario == 1 or scenario == 2)
+            @embedFile("testdata/ipv6-cert.pem")
+        else
+            @embedFile("testdata/localhost-cert.pem");
+        var handler = Handler{};
+        var test_server = try server.Server.init(std.testing.allocator, .{
+            .host = if (scenario == 0) "127.0.0.1" else "::1",
+            .tls = .{
+                .certificate_chain_pem = certificate,
+                .private_key_pem = private_key,
+            },
+        });
+        defer test_server.deinit();
+        try test_server.registerUnary(
+            "/test.Tls/Unary",
+            service.UnaryHandler.bind(Handler, &handler, Handler.handle),
+        );
+        try test_server.start();
 
-    var runtime = try Runtime.init();
-    defer runtime.deinit();
-    var target_buffer: [32]u8 = undefined;
-    const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
-    var channel = try Channel.init(std.testing.allocator, target, .{
-        .runtime = &runtime,
-        .tls = .{ .ca_certificates_pem = certificate },
-    });
-    defer channel.deinit();
+        var runtime = try Runtime.init();
+        defer runtime.deinit();
+        var target_buffer: [32]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buffer, "{s}:{d}", .{
+            if (scenario == 0 or scenario == 2) "localhost" else "[::1]",
+            try test_server.port(),
+        });
+        if (scenario == 3) {
+            try std.testing.expectError(error.ConnectionFailed, Channel.init(std.testing.allocator, target, .{
+                .runtime = &runtime,
+                .tls = .{ .ca_certificates_pem = certificate },
+            }));
+            continue;
+        }
+        var channel = try Channel.initConfigured(std.testing.allocator, target, .{
+            .runtime = &runtime,
+            .tls = .{ .ca_certificates_pem = certificate },
+        }, if (scenario == 2) TestCandidates.ipv6 else null);
+        defer channel.deinit();
+        try std.testing.expectEqualStrings(target, channel.impl.authority);
+        if (scenario == 1) try std.testing.expectEqualStrings("::1", channel.impl.host);
 
-    var result = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "secure", .{});
-    defer result.deinit();
-    try std.testing.expect(result.status.isOk());
-    try std.testing.expectEqualStrings("secure", result.payload);
+        var result = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", "secure", .{});
+        defer result.deinit();
+        try std.testing.expect(result.status.isOk());
+        try std.testing.expectEqualStrings("secure", result.payload);
+    }
 }
 
 test "channel and server exchange a unary call over mutual TLS" {
