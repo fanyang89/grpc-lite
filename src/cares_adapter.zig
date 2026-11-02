@@ -77,7 +77,7 @@ pub const Adapter = struct {
 
         var hints: c.ares_addrinfo_hints = std.mem.zeroes(c.ares_addrinfo_hints);
         hints.ai_flags = c.ARES_AI_NOSORT | c.ARES_AI_NUMERICSERV;
-        hints.ai_family = c.AF_INET;
+        hints.ai_family = c.AF_UNSPEC;
         hints.ai_socktype = c.SOCK_STREAM;
         hints.ai_protocol = c.IPPROTO_TCP;
         var service_buffer: [6]u8 = undefined;
@@ -331,25 +331,10 @@ pub const Adapter = struct {
             return;
         }
 
-        var count: usize = 0;
-        var node = result.?.nodes;
-        while (node != null) : (node = node.*.ai_next) {
-            if (node.*.ai_family == c.AF_INET) count += 1;
-        }
-        const addresses = self.allocator.alloc(std.Io.net.IpAddress, count) catch {
+        const addresses = copyAddresses(self.allocator, result.?.nodes, self.port) catch {
             callback(context, .failed);
             return;
         };
-        var index: usize = 0;
-        node = result.?.nodes;
-        while (node != null) : (node = node.*.ai_next) {
-            if (node.*.ai_family != c.AF_INET) continue;
-            const native: *const std.posix.sockaddr.in = @ptrCast(@alignCast(node.*.ai_addr));
-            var bytes: [4]u8 = undefined;
-            @memcpy(&bytes, std.mem.asBytes(&native.addr));
-            addresses[index] = .{ .ip4 = .{ .bytes = bytes, .port = self.port } };
-            index += 1;
-        }
         if (addresses.len == 0) {
             self.allocator.free(addresses);
             callback(context, .failed);
@@ -358,6 +343,46 @@ pub const Adapter = struct {
         }
     }
 };
+
+fn nodeAddress(node: *const c.ares_addrinfo_node, port: u16) !?std.Io.net.IpAddress {
+    switch (node.ai_family) {
+        c.AF_INET => {
+            if (node.ai_addr == null or node.ai_addrlen < @sizeOf(std.posix.sockaddr.in)) return error.InvalidAddress;
+            const native: *const std.posix.sockaddr.in = @ptrCast(@alignCast(node.ai_addr));
+            return .{ .ip4 = .{ .bytes = @bitCast(native.addr), .port = port } };
+        },
+        c.AF_INET6 => {
+            if (node.ai_addr == null or node.ai_addrlen < @sizeOf(std.posix.sockaddr.in6)) return error.InvalidAddress;
+            const native: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(node.ai_addr));
+            return .{ .ip6 = .{
+                .bytes = native.addr,
+                .port = port,
+                .flow = native.flowinfo,
+                .interface = .{ .index = native.scope_id },
+            } };
+        },
+        else => return null,
+    }
+}
+
+fn copyAddresses(allocator: std.mem.Allocator, first: [*c]c.ares_addrinfo_node, port: u16) ![]std.Io.net.IpAddress {
+    var count: usize = 0;
+    var node = first;
+    while (node != null) : (node = node.*.ai_next) {
+        if (try nodeAddress(node, port) != null) count += 1;
+    }
+    const addresses = try allocator.alloc(std.Io.net.IpAddress, count);
+    errdefer allocator.free(addresses);
+    var index: usize = 0;
+    node = first;
+    while (node != null) : (node = node.*.ai_next) {
+        if (try nodeAddress(node, port)) |address| {
+            addresses[index] = address;
+            index += 1;
+        }
+    }
+    return addresses;
+}
 
 test "resolves localhost without blocking the event loop" {
     const runtime = @import("runtime.zig").Runtime;
@@ -390,9 +415,155 @@ test "resolves localhost without blocking the event loop" {
         .addresses => |addresses| {
             defer std.testing.allocator.free(addresses);
             try std.testing.expect(addresses.len != 0);
-            try std.testing.expectEqual(@as(u16, 50051), addresses[0].getPort());
-            try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &addresses[0].ip4.bytes);
+            for (addresses) |address| {
+                try std.testing.expectEqual(@as(u16, 50051), address.getPort());
+                switch (address) {
+                    .ip4 => |ip| try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &ip.bytes),
+                    .ip6 => |ip| try std.testing.expectEqualSlices(u8, &std.Io.net.Ip6Address.loopback(50051).bytes, &ip.bytes),
+                }
+            }
         },
         else => return error.ResolveFailed,
     }
+}
+
+test "DNS resolves AAAA-only and mixed A AAAA records and rejects empty answers" {
+    const runtime = @import("runtime.zig").Runtime;
+    var global = try runtime.init();
+    defer global.deinit();
+    const Outcome = struct {
+        result: ?ResolveResult = null,
+        fn complete(context: ?*anyopaque, result: ResolveResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.result = result;
+        }
+    };
+    for (0..3) |scenario| {
+        var dns = try @import("test_dns.zig").Server.init(scenario == 1, scenario != 2);
+        defer dns.deinit();
+        try dns.start();
+        var loop = try xev.Loop.init(.{});
+        var adapter: Adapter = undefined;
+        try adapter.init(std.testing.allocator, &loop);
+        defer {
+            adapter.shutdown();
+            loop.run(.until_done) catch {};
+            loop.deinit();
+            adapter.deinitAfterLoop();
+        }
+        var buffer: [32]u8 = undefined;
+        const endpoint = try std.fmt.bufPrintSentinel(&buffer, "127.0.0.1:{d}", .{dns.port}, 0);
+        try std.testing.expectEqual(c.ARES_SUCCESS, c.ares_set_servers_ports_csv(adapter.channel, endpoint));
+        var outcome: Outcome = .{};
+        try adapter.resolve("ipv6-fixture.test.", 50051, &outcome, Outcome.complete);
+        try loop.run(.until_done);
+        try std.testing.expect(!dns.failed.load(.acquire));
+        try std.testing.expect(dns.queries4.load(.acquire) > 0);
+        try std.testing.expect(dns.queries6.load(.acquire) > 0);
+        const result = outcome.result orelse return error.MissingCallback;
+        if (scenario == 2) {
+            try std.testing.expect(result == .failed);
+            continue;
+        }
+        const addresses = switch (result) {
+            .addresses => |addresses| addresses,
+            else => return error.ResolveFailed,
+        };
+        defer std.testing.allocator.free(addresses);
+        try std.testing.expectEqual(@as(usize, if (scenario == 0) 1 else 2), addresses.len);
+        var saw4 = false;
+        var saw6 = false;
+        for (addresses) |address| {
+            try std.testing.expectEqual(@as(u16, 50051), address.getPort());
+            switch (address) {
+                .ip4 => |ip| {
+                    saw4 = true;
+                    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &ip.bytes);
+                },
+                .ip6 => |ip| {
+                    saw6 = true;
+                    try std.testing.expectEqualSlices(u8, &std.Io.net.Ip6Address.loopback(0).bytes, &ip.bytes);
+                },
+            }
+        }
+        try std.testing.expect(saw6);
+        try std.testing.expectEqual(scenario == 1, saw4);
+    }
+}
+
+test "dual-family DNS cancellation and shutdown complete exactly once" {
+    var runtime = try @import("runtime.zig").Runtime.init();
+    defer runtime.deinit();
+    const Outcome = struct {
+        count: usize = 0,
+        cancelled: bool = false,
+        fn complete(context: ?*anyopaque, result: ResolveResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.count += 1;
+            self.cancelled = result == .cancelled;
+            if (result == .addresses) std.testing.allocator.free(result.addresses);
+        }
+    };
+    for ([_]bool{ false, true }) |shutdown| {
+        // Bound but deliberately not serviced: cancellation must drain pending I/O.
+        var dns = try @import("test_dns.zig").Server.init(false, false);
+        defer dns.deinit();
+        var loop = try xev.Loop.init(.{});
+        var adapter: Adapter = undefined;
+        try adapter.init(std.testing.allocator, &loop);
+        defer {
+            adapter.shutdown();
+            loop.run(.until_done) catch {};
+            loop.deinit();
+            adapter.deinitAfterLoop();
+        }
+        var buffer: [32]u8 = undefined;
+        const endpoint = try std.fmt.bufPrintSentinel(&buffer, "127.0.0.1:{d}", .{dns.port}, 0);
+        try std.testing.expectEqual(c.ARES_SUCCESS, c.ares_set_servers_ports_csv(adapter.channel, endpoint));
+        var outcome: Outcome = .{};
+        try adapter.resolve("cancel-fixture.test.", 50051, &outcome, Outcome.complete);
+        try std.testing.expect(adapter.query_active);
+        if (shutdown) adapter.shutdown() else adapter.cancel();
+        try loop.run(.until_done);
+        try std.testing.expectEqual(@as(usize, 1), outcome.count);
+        try std.testing.expect(outcome.cancelled);
+        try std.testing.expect(!adapter.query_active);
+        try std.testing.expectEqual(@as(usize, 0), adapter.watches.count());
+    }
+}
+
+test "address conversion preserves resolver order IPv6 fields and allocation ownership" {
+    const Fixture = struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            var ip6: std.posix.sockaddr.in6 = .{
+                .addr = std.Io.net.Ip6Address.loopback(0).bytes,
+                .port = std.mem.nativeToBig(u16, 99),
+                .flowinfo = 123,
+                .scope_id = 7,
+            };
+            var ip4: std.posix.sockaddr.in = .{ .addr = @bitCast([4]u8{ 127, 0, 0, 1 }), .port = 0 };
+            var last = std.mem.zeroes(c.ares_addrinfo_node);
+            last.ai_family = c.AF_INET;
+            last.ai_addr = @ptrCast(&ip4);
+            last.ai_addrlen = @sizeOf(@TypeOf(ip4));
+            var ignored = std.mem.zeroes(c.ares_addrinfo_node);
+            ignored.ai_family = c.AF_UNSPEC;
+            ignored.ai_next = &last;
+            var first = std.mem.zeroes(c.ares_addrinfo_node);
+            first.ai_family = c.AF_INET6;
+            first.ai_addr = @ptrCast(&ip6);
+            first.ai_addrlen = @sizeOf(@TypeOf(ip6));
+            first.ai_next = &ignored;
+            const addresses = try copyAddresses(allocator, &first, 50051);
+            defer allocator.free(addresses);
+            try std.testing.expectEqual(@as(usize, 2), addresses.len);
+            try std.testing.expect(addresses[0] == .ip6 and addresses[1] == .ip4);
+            try std.testing.expectEqual(@as(u16, 50051), addresses[0].getPort());
+            try std.testing.expectEqual(@as(u32, 123), addresses[0].ip6.flow);
+            try std.testing.expectEqual(@as(u32, 7), addresses[0].ip6.interface.index);
+            last.ai_addrlen = 1;
+            try std.testing.expectError(error.InvalidAddress, copyAddresses(allocator, &first, 50051));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
 }

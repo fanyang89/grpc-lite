@@ -12,6 +12,7 @@ peer_log="$test_dir/peer.log"
 
 for line in \
   'grpc-lite interop server listening on 127.0.0.1:12345' \
+  'grpc-lite interop server listening on [::1]:12345' \
   'mTLS interop server listening on 127.0.0.1:12345' \
   '2026/10/13 00:00:00 INFO: [interop] interop server listening on [::]:12345' \
   '2026/10/13 00:00:00 INFO: [interop] interop server listening on 0.0.0.0:12345'; do
