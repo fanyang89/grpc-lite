@@ -6,6 +6,7 @@ const options = @import("consumer_options");
 const wire = "\x08\x01";
 const unary_method = "/consumer.Echo/Unary";
 const stream_method = "/consumer.Echo/Stream";
+const task_stream_method = "/consumer.Echo/TaskStream";
 
 const Handler = struct {
     retained: ?grpc.ServerCall = null,
@@ -101,6 +102,14 @@ pub fn main(init: std.process.Init) !void {
         .on_message = Handler.message,
         .on_remote_end = Handler.end,
     });
+    const TaskEcho = struct {
+        fn start(_: ?*anyopaque, _: grpc.ServerStream, _: *grpc.ServerContext) !void {}
+    };
+    try server.registerStream(task_stream_method, .{
+        .on_start = TaskEcho.start,
+        .on_message = Handler.message,
+        .on_remote_end = Handler.end,
+    });
     try server.start();
     var target_buffer: [32]u8 = undefined;
     const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try server.port()});
@@ -113,6 +122,17 @@ pub fn main(init: std.process.Init) !void {
         defer task_result.deinit();
         try std.testing.expect(task_result.status.isOk());
         try std.testing.expectEqualStrings(wire, task_result.payload);
+        var task_stream = try task_client.openStream(allocator, task_stream_method, .{});
+        defer task_stream.deinit();
+        try task_stream.send(wire, .{});
+        try task_stream.closeSend();
+        var task_message = (try task_stream.receive(allocator)).?;
+        defer task_message.deinit();
+        try std.testing.expectEqualStrings(wire, task_message.payload);
+        try std.testing.expect(try task_stream.receive(allocator) == null);
+        var task_status = try task_stream.finish(allocator);
+        defer task_status.deinit();
+        try std.testing.expect(task_status.status.isOk());
     }
     var channel = try grpc.Channel.init(allocator, target, .{ .stream_admission = .{ .max_streams = 1 } });
     var channel_owned = true;

@@ -64,7 +64,7 @@ description = "Run all tests with ReleaseSafe optimization"
 run = "zig build test -Doptimize=ReleaseSafe --summary all"
 
 [tasks.test-async]
-description = "Run raw and typed unary integration tests with zio"
+description = "Run raw and typed unary/streaming integration tests with zio"
 run = "zig build test-async -Dzio=true --summary all --test-timeout 30s"
 
 [tasks.coverage]

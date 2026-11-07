@@ -27,6 +27,12 @@ Default streaming capacities are 8 MiB in each direction, so the byte budget per
 application-retained stream reservations. The backing allocator must outlive the last
 stream handle. Failed construction rolls reservations back.
 
+The optional `grpc_lite_async` streaming adapter also retains one application-side
+decoded-message slot (at most `max_message_size` payload bytes) and copied metadata.
+This is additional to transport capacities and excluded from transport admission
+and occupancy counters. It pauses delivery until the slot is consumed; returned
+owned messages are separately managed caller storage. See [task-friendly clients](zig-async.md#buffers-allocation-and-ownership).
+
 See [Zig admission](zig-api.md#unary-admission) and
 [C/C++ managed channels](c-cpp-reference.md#managed-channels) for configuration and errors.
 

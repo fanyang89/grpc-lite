@@ -9,7 +9,7 @@ New applications should start with the [Zig quickstart](zig-quickstart.md): pack
 installation, build integration, `.proto` generation, and a runnable typed client/server.
 This page is the API reference.
 
-For sequential-style asynchronous unary calls with zio and `std.Io`, see
+For sequential-style asynchronous unary and streaming calls with zio and `std.Io`, see
 [Task-friendly Zig clients](zig-async.md).
 
 The public Zig transport is raw-byte based. Applications may use protobuf wire bytes

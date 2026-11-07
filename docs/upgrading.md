@@ -49,10 +49,13 @@ grpc-lite logging/event-loop guarantees. Framing/message helpers and
 application transport APIs. Other private Zig modules, C bindings, reactor state,
 allocator internals, and files imported directly from `src/` are excluded.
 
-`grpc_lite_async.Client` is an optional owning task-friendly unary client using
+`grpc_lite_async.Client` is an optional owning task-friendly client using
 `std.Io`. `Channel.initIo` and `Channel.callUnaryIo` expose its lifecycle and RPC
 waiting behavior to existing Channel owners. With `.protobuf = true`,
-`grpc_lite_protobuf_async` exports `ServiceClient` and `TypedResult`. These additions
+`grpc_lite_protobuf_async` exports `ServiceClient` and `TypedResult`. Raw streaming
+uses `grpc_lite_async.Stream`, `StreamMessage`, and `StreamResult`; typed streaming
+adds `ClientStream(Request, Response)`, `StreamMessage(Response)`, and `StreamResult`
+in `grpc_lite_protobuf_async`. These additions
 follow the same Zig source API contract; see [Task-friendly Zig clients](zig-async.md)
 for cancellation, runtime lifetime, and result ownership.
 

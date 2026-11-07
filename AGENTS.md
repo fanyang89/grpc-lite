@@ -75,6 +75,7 @@ authoritative: change it before implementing a feature with a different decision
 | Status codes and Unicode status messages | Required | Preserve percent-encoded UTF-8 bytes |
 | Deadlines | Required | Explicit handle cancellation is streaming-only; task-based unary calls also propagate std.Io cancellation |
 | Task-friendly Zig unary clients | Selected | Optional raw and typed std.Io adapters; zio is the first validated runtime; connection and teardown waits suspend through the supplied Io |
+| Task-friendly Zig streaming clients | Selected | Raw and typed std.Io send/receive waits, independent reader/writer tasks, half-close and cancellation; one bounded application-side receive slot per stream in addition to transport capacities |
 | Per-message compression | Selected | Only `identity` and `gzip` |
 | GOAWAY connection replacement | Selected | New calls use a new connection; no RPC retry |
 | Graceful server drain | Selected | Stop admission, send GOAWAY, wait with timeout |

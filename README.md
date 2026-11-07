@@ -113,7 +113,7 @@ CompletionQueue, callback/reactor, generic service, or policy stack.
 Read the [documentation site](https://fanyang89.github.io/grpc-lite/).
 
 - [Zig API](docs/zig-api.md): runtime, channels, streaming, servers, TLS, and protobuf
-- [Task-friendly Zig clients](docs/zig-async.md): unary calls, concurrency, and cancellation with std.Io and zio
+- [Task-friendly Zig clients](docs/zig-async.md): unary/streaming calls, concurrency, and cancellation with std.Io and zio
 - [C and C++ APIs](docs/c-cpp-api.md): stable ABI, source builds, grpcpp facade, and codegen
 - [Upgrading](docs/upgrading.md): supported surfaces, compatibility boundaries, and consumer fixtures
 - [Capacity tuning](docs/capacity-tuning.md): resource budgets and overload diagnosis
