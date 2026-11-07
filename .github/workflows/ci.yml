@@ -114,6 +114,8 @@ jobs:
 
       - name: Build and run raw public API package consumer
         run: mise run test-consumer
+      - name: Build and run typed task package consumer
+        run: mise run test-consumer-async
       - name: Install protobuf C++ tools
         run: |
           sudo apt-get update

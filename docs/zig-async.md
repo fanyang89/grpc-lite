@@ -487,6 +487,7 @@ cardinality. Unary/streaming registration mismatches are rejected at compile tim
 
 ```sh
 mise run test-async
+mise run test-consumer-async
 mise run interop-async
 mise run interop-async-tls
 zig build test-async -Dzio=true -Doptimize=ReleaseSafe --test-timeout 30s
@@ -501,6 +502,18 @@ retained-call admission, graceful drain, and joined teardown. Lifecycle tests al
 cover GOAWAY with active unary/duplex calls, task cancellation during drain,
 immediate shutdown and drain-timeout escalation, same-port server restart, and
 offline queued-call cancellation/deadlines without replay.
+
+`test-consumer-async` builds a source archive from the checkout and installs it
+into an independent application with an isolated dependency cache. It compiles
+the standalone `build.zig` shown above, generates the Echo protobuf module, and
+runs the typed example in Debug and ReleaseSafe. CI runs this check alongside the
+raw package consumer.
+
+By default, protoc is left uncached to cover first-use lazy dependency resolution.
+If Zig cannot download its GitHub release in your environment, set
+`GRPC_LITE_PROTOC_ARCHIVE=/path/to/protoc.zip` to a downloaded host archive. The
+script verifies it against zig-protobuf's pinned package hash before use; this
+override skips the uncached protoc fetch check.
 
 `interop-async` validates task clients and servers against pinned grpc-go peers,
 each on one zio executor. It adds wire-level coverage for unary and all streaming

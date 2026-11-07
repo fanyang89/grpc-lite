@@ -663,7 +663,12 @@ fn addCppCodegenSupport(
     host_target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     transpile_c: bool,
-) CppCodegenSupport {
+) ?CppCodegenSupport {
+    // A missing lazy dependency schedules a fetch and another configuration pass.
+    const protoc_dependency = host_protobuf_dependency.builder.lazyDependency(
+        protocDependencyName(),
+        .{},
+    ) orelse return null;
     const host_protobuf = host_protobuf_dependency.module("protobuf");
     const plugin_schema_files = b.addWriteFiles();
     const plugin_schema_root = plugin_schema_files.add("root.zig",
@@ -715,10 +720,6 @@ fn addCppCodegenSupport(
     });
     test_step.dependOn(&b.addRunArtifact(grpc_lite_cpp_plugin_tests).step);
 
-    const protoc_dependency = host_protobuf_dependency.builder.lazyDependency(
-        protocDependencyName(),
-        .{},
-    ) orelse @panic("protoc dependency is unavailable");
     const generate_grpcpp = std.Build.Step.Run.create(b, "run protoc for C++ service glue");
     generate_grpcpp.addFileArg(protoc_dependency.path(if (builtin.os.tag == .windows)
         "bin/protoc.exe"
