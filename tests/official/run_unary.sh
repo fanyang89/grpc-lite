@@ -15,10 +15,14 @@ case "$server_mode" in
   callback)
     server_binary=grpc-lite-interop-server
     server_description='grpc-lite server'
+    client_binary=grpc-lite-interop-client
+    client_description='grpc-lite client'
     ;;
   task)
     server_binary=grpc-lite-task-interop-server
     server_description='grpc-lite task server (one zio executor)'
+    client_binary=grpc-lite-task-interop-client
+    client_description='grpc-lite task client (one zio executor)'
     work_dir="$work_dir/task"
     case_runner=(/usr/bin/timeout --kill-after=2s "${INTEROP_CASE_TIMEOUT_SECONDS:-30}s")
     ;;
@@ -122,7 +126,7 @@ mkdir -p "$work_dir"
 
 printf '%s\n' 'Building grpc-lite interop binaries...'
 if [[ "$server_mode" == task ]]; then
-  (cd "$project_root" && zig build task-interop-server -Dzio=true)
+  (cd "$project_root" && zig build task-interop-server task-interop-client -Dzio=true)
 else
   (cd "$project_root" && zig build)
 fi
@@ -208,29 +212,26 @@ if [[ "$server_mode" == task ]]; then
 fi
 stop_peer
 
-if [[ "$server_mode" == task ]]; then
-  printf '%s\n' 'All task-server unary, streaming, metadata/status, lifecycle, gzip, and soak interop cases passed.'
-  exit 0
-fi
-
-peer_log="$work_dir/grpc-lite-cpp-server.log"
-"$work_dir/cpp-build/grpc-lite-cpp-interop-server" \
-  --port="$cpp_server_port" --use_tls=false >"$peer_log" 2>&1 &
-peer_pid=$!
-wait_for_peer "$cpp_server_port"
-for test_case in "${streaming_cases[@]}"; do
-  run_case 'grpc-go client -> generated C++ server' "$test_case" \
-    "$work_dir/grpc-go-interop-client" \
+if [[ "$server_mode" == callback ]]; then
+  peer_log="$work_dir/grpc-lite-cpp-server.log"
+  "$work_dir/cpp-build/grpc-lite-cpp-interop-server" \
+    --port="$cpp_server_port" --use_tls=false >"$peer_log" 2>&1 &
+  peer_pid=$!
+  wait_for_peer "$cpp_server_port"
+  for test_case in "${streaming_cases[@]}"; do
+    run_case 'grpc-go client -> generated C++ server' "$test_case" \
+      "$work_dir/grpc-go-interop-client" \
+      --server_host=127.0.0.1 \
+      --server_port="$cpp_server_port" \
+      --test_case="$test_case" \
+      --use_tls=false
+  done
+  run_case 'grpc-go client -> generated C++ server' 'half_duplex' \
+    "$work_dir/grpc-go-half-duplex-client" \
     --server_host=127.0.0.1 \
-    --server_port="$cpp_server_port" \
-    --test_case="$test_case" \
-    --use_tls=false
-done
-run_case 'grpc-go client -> generated C++ server' 'half_duplex' \
-  "$work_dir/grpc-go-half-duplex-client" \
-  --server_host=127.0.0.1 \
-  --server_port="$cpp_server_port"
-stop_peer
+    --server_port="$cpp_server_port"
+  stop_peer
+fi
 
 peer_log="$work_dir/grpc-go-server.log"
 "$work_dir/grpc-go-interop-server" \
@@ -238,32 +239,32 @@ peer_log="$work_dir/grpc-go-server.log"
 peer_pid=$!
 wait_for_peer "$go_server_port"
 for test_case in "${official_cases[@]}"; do
-  run_case 'grpc-lite client -> grpc-go server' "$test_case" \
-    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+  run_case "$client_description -> grpc-go server" "$test_case" \
+    "$project_root/zig-out/bin/$client_binary" \
     --server_host=127.0.0.1 \
     --server_port="$go_server_port" \
     --test_case="$test_case" \
     --use_tls=false
 done
 for test_case in "${streaming_cases[@]}"; do
-  run_case 'grpc-lite client -> grpc-go server' "$test_case" \
-    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+  run_case "$client_description -> grpc-go server" "$test_case" \
+    "$project_root/zig-out/bin/$client_binary" \
     --server_host=127.0.0.1 \
     --server_port="$go_server_port" \
     --test_case="$test_case" \
     --use_tls=false
 done
 for test_case in "${stream_lifecycle_cases[@]}"; do
-  run_case 'grpc-lite client -> grpc-go server' "$test_case" \
-    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+  run_case "$client_description -> grpc-go server" "$test_case" \
+    "$project_root/zig-out/bin/$client_binary" \
     --server_host=127.0.0.1 \
     --server_port="$go_server_port" \
     --test_case="$test_case" \
     --use_tls=false
 done
 for test_case in "${soak_cases[@]}"; do
-  run_case 'grpc-lite client -> grpc-go server' "$test_case" \
-    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+  run_case "$client_description -> grpc-go server" "$test_case" \
+    "$project_root/zig-out/bin/$client_binary" \
     --server_host=127.0.0.1 \
     --server_port="$go_server_port" \
     --test_case="$test_case" \
@@ -272,14 +273,23 @@ for test_case in "${soak_cases[@]}"; do
     --soak_overall_timeout_seconds="$soak_overall_timeout_seconds" \
     --use_tls=false
 done
-for test_case in "${streaming_cases[@]}"; do
-  run_case 'generated C++ client -> grpc-go server' "$test_case" \
-    "$work_dir/cpp-build/grpc-lite-cpp-interop-client" \
-    --server_host=127.0.0.1 \
-    --server_port="$go_server_port" \
-    --test_case="$test_case" \
-    --use_tls=false
-done
+if [[ "$server_mode" == task ]]; then
+  for test_case in half_duplex concurrent_duplex task_cancellation; do
+    run_case "$client_description -> grpc-go server" "$test_case" \
+      "$project_root/zig-out/bin/$client_binary" \
+      --server_host=127.0.0.1 --server_port="$go_server_port" \
+      --test_case="$test_case" --use_tls=false
+  done
+else
+  for test_case in "${streaming_cases[@]}"; do
+    run_case 'generated C++ client -> grpc-go server' "$test_case" \
+      "$work_dir/cpp-build/grpc-lite-cpp-interop-client" \
+      --server_host=127.0.0.1 \
+      --server_port="$go_server_port" \
+      --test_case="$test_case" \
+      --use_tls=false
+  done
+fi
 stop_peer
 
 peer_log="$work_dir/grpc-go-gzip-server.log"
@@ -287,14 +297,19 @@ peer_log="$work_dir/grpc-go-gzip-server.log"
 peer_pid=$!
 wait_for_peer "$go_server_port"
 for test_case in "${compression_cases[@]}"; do
-  run_case 'grpc-lite client -> grpc-go gzip server' "$test_case" \
-    "$project_root/zig-out/bin/grpc-lite-interop-client" \
+  run_case "$client_description -> grpc-go gzip server" "$test_case" \
+    "$project_root/zig-out/bin/$client_binary" \
     --server_host=127.0.0.1 \
     --server_port="$go_server_port" \
     --test_case="$test_case" \
     --use_tls=false
 done
 stop_peer
+
+if [[ "$server_mode" == task ]]; then
+  printf '%s\n' 'All bidirectional task unary, streaming, metadata/status, lifecycle, gzip, and soak interop cases passed.'
+  exit 0
+fi
 
 printf '%s\n' "All 10 bidirectional unary runs passed."
 printf '%s\n' "All 8 raw bidirectional streaming runs passed."

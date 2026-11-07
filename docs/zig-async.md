@@ -379,8 +379,8 @@ allocation failure cleanup. Server coverage includes suspended-handler isolation
 all streaming cardinalities, cancellation of ordinary Io waits, task launch failure,
 retained-call admission, graceful drain, and joined teardown.
 
-`interop-async` runs pinned grpc-go clients against the task server on one zio
-executor. It adds wire-level coverage for unary and all streaming cardinalities,
-metadata/status, mixed identity/gzip messages, cancellation, delayed responses,
-and independent progress during handler waits. See the
+`interop-async` validates task clients and servers against pinned grpc-go peers,
+each on one zio executor. It adds wire-level coverage for unary and all streaming
+cardinalities, metadata/status, gzip, cancellation, delayed responses, concurrent
+duplex reader/writer tasks, and independent RPC progress during task waits. See the
 [official interop matrix](../tests/official/README.md#task-handler-interoperability).

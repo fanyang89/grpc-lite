@@ -41,6 +41,7 @@ handling before starting interoperability cases.
 | grpc-lite client to grpc-go server | `rpc_soak`, `channel_soak` | Pass with the official default configuration |
 | grpc-go client to zio task server | Required cleartext unary/streaming profile, half-duplex, cancellation/deadline, metadata/status, gzip, and soak | Pass with one zio executor |
 | dedicated grpc-go tests to zio task server | Compressed input, mixed identity/gzip output, handler wait isolation, cancellation, and response intervals | Pass |
+| zio task client to grpc-go servers | Unary, all streaming cardinalities, metadata/status, cancellation/deadline, unary gzip, soak, concurrent duplex, and task cancellation | Pass with one zio executor |
 
 The HTTP/2 framing tool deliberately treats every `TestSoon*` failure as non-fatal.
 `run_http2.sh` runs its cleartext framing and TLS profile modes, then validates six
@@ -79,10 +80,10 @@ with `bash src/testdata/mtls/generate.sh` (OpenSSL required). Never deploy these
 
 ## Task-handler interoperability
 
-`mise run interop-async` selects the task-server mode of `run_unary.sh`
-(`INTEROP_SERVER_MODE=task`). It builds `grpc-lite-task-interop-server` with
-`-Dzio=true` and uses the pinned grpc-go clients against raw unary and typed
-streaming task handlers on **one executor**. It covers 23 interop cases, including
+`mise run interop-async` selects the bidirectional task mode of `run_unary.sh`
+(`INTEROP_SERVER_MODE=task`). It builds `grpc-lite-task-interop-server` and
+`grpc-lite-task-interop-client` with `-Dzio=true`; each uses **one executor**.
+The server direction covers 23 interop cases, including
 `custom_metadata`, `status_code_and_message`, and the existing gzip negotiation
 checks, then runs four dedicated grpc-go tests in `task_server`.
 
@@ -93,8 +94,17 @@ The task fixture honors `ResponseParameters.interval_us` with `Io.sleep`.
 Half-duplex response specifications are bounded to 4096 entries; response payloads
 are allocated only when sent.
 
+The reverse direction runs 21 task-client cases against the pinned official grpc-go
+server and dedicated unary gzip peer. It covers raw/typed unary, all typed streaming
+cardinalities, metadata, status messages, cancellation/deadlines, and both soak modes.
+`concurrent_duplex` exchanges 64 large messages using independent reader/writer tasks,
+a 4 KiB stream window, and bounded buffers, while another unary RPC progresses.
+`task_cancellation` cancels a suspended receive through `Future.cancel`, verifies
+`error.Canceled` and the RPC's cancelled status, then checks a sibling RPC on the same
+connection. The client shares argument validation and soak budgets with the raw fixture.
+
 Task logs and Go binaries live under `.zig-cache/official/task`. Individual harness
 commands have a 30-second timeout, configurable via `INTEROP_CASE_TIMEOUT_SECONDS`;
 increase it when increasing the existing `SOAK_*` settings. The dedicated Go tests
-have their own 25-second suite timeout. This task-server suite exercises cleartext
-server behavior; the callback/C++ and TLS matrices retain their separate entry points.
+have their own 25-second suite timeout. This suite exercises cleartext clients and
+servers; the callback/C++ and TLS matrices retain their separate entry points.

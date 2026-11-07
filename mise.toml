@@ -153,7 +153,7 @@ description = "Run official grpc-go and generated C++ interoperability tests"
 run = "tests/official/run_unary.sh"
 
 [tasks.interop-async]
-description = "Run grpc-go interoperability against one-executor zio task handlers"
+description = "Run bidirectional grpc-go interoperability with one-executor zio task clients and handlers"
 run = "INTEROP_SERVER_MODE=task tests/official/run_unary.sh"
 
 [tasks.soak-streaming]

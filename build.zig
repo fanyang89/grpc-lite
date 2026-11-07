@@ -1022,6 +1022,15 @@ fn addProtobufSupport(
         const install_task_server = b.addInstallArtifact(task_server, .{});
         b.getInstallStep().dependOn(&install_task_server.step);
         b.step("task-interop-server", "Build the zio task-based official interop server").dependOn(&install_task_server.step);
+        const task_client = addExample(b, "grpc-lite-task-interop-client", "tests/official/task_interop_client.zig", grpc_lite);
+        task_client.root_module.addImport("grpc_lite_async", grpc_lite_async);
+        task_client.root_module.addImport("grpc_lite_protobuf_async", protobuf_async);
+        task_client.root_module.addImport("grpc_testing", interop_proto);
+        task_client.root_module.addImport("zio", zio_module);
+        task_client.step.dependOn(generate_interop_proto.step);
+        const install_task_client = b.addInstallArtifact(task_client, .{});
+        b.getInstallStep().dependOn(&install_task_client.step);
+        b.step("task-interop-client", "Build the zio task-based official interop client").dependOn(&install_task_client.step);
     }
 
     const benchmark_server = addExample(
