@@ -24,6 +24,7 @@ zig build test-async -Dzio=true --summary all --test-timeout 30s
 zig build test-async -Dzio=true -Doptimize=ReleaseSafe --summary all --test-timeout 30s
 
 tests/consumer/run_raw.sh
+bash tests/consumer/run_typed_async.sh
 tests/consumer/run_cpp.sh
 
 TSAN_OPTIONS=halt_on_error=1:exitcode=66 \
@@ -48,7 +49,9 @@ zig build test -Dgperftools=false -Dtcmalloc=true --summary all
 
 scripts/interop.sh
 tests/official/run_unary.sh
+INTEROP_SERVER_MODE=task tests/official/run_unary.sh
 tests/official/run_tls.sh
+INTEROP_SERVER_MODE=task tests/official/run_tls.sh
 tests/official/run_http2.sh
 python3 -B -m unittest discover -s tests/official -p test_http2_edge_runner.py
 tests/official/run_http2_edge.sh
