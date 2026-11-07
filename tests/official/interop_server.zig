@@ -42,7 +42,7 @@ const StreamState = struct {
     }
 };
 
-const Service = struct {
+pub const Service = struct {
     allocator: std.mem.Allocator,
     report_stream_stats: bool = false,
     streams: std.AutoHashMapUnmanaged(*anyopaque, *StreamState) = .empty,
@@ -58,7 +58,7 @@ const Service = struct {
         self.* = undefined;
     }
 
-    fn emptyCall(
+    pub fn emptyCall(
         _: *@This(),
         allocator: std.mem.Allocator,
         _: *grpc.ServerContext,
@@ -75,7 +75,7 @@ const Service = struct {
         return grpc.UnaryResponse.ok(allocator, "");
     }
 
-    fn unaryCall(
+    pub fn unaryCall(
         _: *@This(),
         allocator: std.mem.Allocator,
         context: *grpc.ServerContext,
@@ -552,7 +552,7 @@ pub fn main(init: std.process.Init) !void {
     server.wait();
 }
 
-fn parseArgs(args: []const []const u8) !Config {
+pub fn parseArgs(args: []const []const u8) !Config {
     var config: Config = .{};
     var index: usize = 1;
     while (index < args.len) : (index += 1) {

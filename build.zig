@@ -1012,6 +1012,18 @@ fn addProtobufSupport(
     streaming_soak_peer.dependOn(&install_interop_server.step);
     b.installArtifact(interop_client);
 
+    if (zio) |zio_module| {
+        const task_server = addExample(b, "grpc-lite-task-interop-server", "tests/official/task_interop_server.zig", grpc_lite);
+        task_server.root_module.addImport("grpc_lite_async", grpc_lite_async);
+        task_server.root_module.addImport("grpc_lite_protobuf_async", protobuf_async);
+        task_server.root_module.addImport("grpc_testing", interop_proto);
+        task_server.root_module.addImport("zio", zio_module);
+        task_server.step.dependOn(generate_interop_proto.step);
+        const install_task_server = b.addInstallArtifact(task_server, .{});
+        b.getInstallStep().dependOn(&install_task_server.step);
+        b.step("task-interop-server", "Build the zio task-based official interop server").dependOn(&install_task_server.step);
+    }
+
     const benchmark_server = addExample(
         b,
         "grpc-lite-benchmark-server",

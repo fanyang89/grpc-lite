@@ -152,6 +152,10 @@ run = "scripts/interop.sh"
 description = "Run official grpc-go and generated C++ interoperability tests"
 run = "tests/official/run_unary.sh"
 
+[tasks.interop-async]
+description = "Run grpc-go interoperability against one-executor zio task handlers"
+run = "INTEROP_SERVER_MODE=task tests/official/run_unary.sh"
+
 [tasks.soak-streaming]
 description = "Run bounded native cleartext streaming soak (STREAMING_SOAK_MODE=smoke or extended)"
 run = "bash tests/official/run_streaming_soak.sh"

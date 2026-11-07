@@ -316,6 +316,9 @@ jobs:
       - name: Run official insecure interop
         run: mise run interop-official
 
+      - name: Run task-server interop with zio
+        run: mise run interop-async
+
       - name: Run official TLS interop
         if: matrix.arch == 'x64'
         run: mise run interop-tls

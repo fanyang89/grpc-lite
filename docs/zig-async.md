@@ -368,6 +368,7 @@ cardinality. Unary/streaming registration mismatches are rejected at compile tim
 
 ```sh
 mise run test-async
+mise run interop-async
 zig build test-async -Dzio=true -Doptimize=ReleaseSafe --test-timeout 30s
 ```
 
@@ -377,3 +378,9 @@ shutdown completion, cancellation races, retained quota release, and raw/typed
 allocation failure cleanup. Server coverage includes suspended-handler isolation,
 all streaming cardinalities, cancellation of ordinary Io waits, task launch failure,
 retained-call admission, graceful drain, and joined teardown.
+
+`interop-async` runs pinned grpc-go clients against the task server on one zio
+executor. It adds wire-level coverage for unary and all streaming cardinalities,
+metadata/status, mixed identity/gzip messages, cancellation, delayed responses,
+and independent progress during handler waits. See the
+[official interop matrix](../tests/official/README.md#task-handler-interoperability).

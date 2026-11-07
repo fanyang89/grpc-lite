@@ -9,6 +9,21 @@ cpp_server_port=${CPP_SERVER_PORT:-$((go_server_port + 1))}
 soak_iterations=${SOAK_ITERATIONS:-10}
 soak_max_failures=${SOAK_MAX_FAILURES:-0}
 soak_overall_timeout_seconds=${SOAK_OVERALL_TIMEOUT_SECONDS:-10}
+server_mode=${INTEROP_SERVER_MODE:-callback}
+case_runner=()
+case "$server_mode" in
+  callback)
+    server_binary=grpc-lite-interop-server
+    server_description='grpc-lite server'
+    ;;
+  task)
+    server_binary=grpc-lite-task-interop-server
+    server_description='grpc-lite task server (one zio executor)'
+    work_dir="$work_dir/task"
+    case_runner=(/usr/bin/timeout --kill-after=2s "${INTEROP_CASE_TIMEOUT_SECONDS:-30}s")
+    ;;
+  *) printf 'invalid INTEROP_SERVER_MODE: %s\n' "$server_mode" >&2; exit 2 ;;
+esac
 official_cases=(
   empty_unary
   large_unary
@@ -43,6 +58,9 @@ grpc_go_gzip_cases=(
   gzip_expectation_error
   unsupported_request_encoding
 )
+if [[ "$server_mode" == task ]]; then
+  official_cases+=(custom_metadata status_code_and_message)
+fi
 
 peer_pid=
 peer_log=
@@ -90,7 +108,7 @@ run_case() {
   local test_case=$2
   shift 2
   printf '[ RUN  ] %-24s %s\n' "$test_case" "$direction"
-  if "$@"; then
+  if "${case_runner[@]}" "$@"; then
     printf '[ PASS ] %-24s %s\n' "$test_case" "$direction"
   else
     printf '[ FAIL ] %-24s %s\n' "$test_case" "$direction" >&2
@@ -103,7 +121,11 @@ run_case() {
 mkdir -p "$work_dir"
 
 printf '%s\n' 'Building grpc-lite interop binaries...'
-(cd "$project_root" && zig build)
+if [[ "$server_mode" == task ]]; then
+  (cd "$project_root" && zig build task-interop-server -Dzio=true)
+else
+  (cd "$project_root" && zig build)
+fi
 
 printf '%s\n' 'Building grpc-go v1.82.1 interop binaries...'
 (cd "$project_root/tests/official" && \
@@ -113,26 +135,28 @@ printf '%s\n' 'Building grpc-go v1.82.1 interop binaries...'
   go build -mod=readonly -o "$work_dir/grpc-go-gzip-client" ./gzip_client && \
   go build -mod=readonly -o "$work_dir/grpc-go-gzip-server" ./gzip_server)
 
-printf '%s\n' 'Building generated C++ interop binaries...'
-rm -rf "$work_dir/cpp-proto-stage" "$work_dir/cpp-build"
-(cd "$project_root" && \
-  zig build install-cpp-interop-protos --prefix "$work_dir/cpp-proto-stage")
-cmake \
-  -S "$project_root/tests/official/cpp" \
-  -B "$work_dir/cpp-build" \
-  -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH="$project_root/zig-out" \
-  -DGRPC_LITE_INTEROP_PROTO_ROOT="$work_dir/cpp-proto-stage/share/grpc-lite/interop-proto"
-cmake --build "$work_dir/cpp-build"
+if [[ "$server_mode" == callback ]]; then
+  printf '%s\n' 'Building generated C++ interop binaries...'
+  rm -rf "$work_dir/cpp-proto-stage" "$work_dir/cpp-build"
+  (cd "$project_root" && \
+    zig build install-cpp-interop-protos --prefix "$work_dir/cpp-proto-stage")
+  cmake \
+    -S "$project_root/tests/official/cpp" \
+    -B "$work_dir/cpp-build" \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="$project_root/zig-out" \
+    -DGRPC_LITE_INTEROP_PROTO_ROOT="$work_dir/cpp-proto-stage/share/grpc-lite/interop-proto"
+  cmake --build "$work_dir/cpp-build"
+fi
 
 peer_log="$work_dir/grpc-lite-server.log"
-"$project_root/zig-out/bin/grpc-lite-interop-server" \
+"$project_root/zig-out/bin/$server_binary" \
   --port="$zig_server_port" --use_tls=false >"$peer_log" 2>&1 &
 peer_pid=$!
 wait_for_peer "$zig_server_port"
 for test_case in "${official_cases[@]}"; do
-  run_case 'grpc-go client -> grpc-lite server' "$test_case" \
+  run_case "grpc-go client -> $server_description" "$test_case" \
     "$work_dir/grpc-go-interop-client" \
     --server_host=127.0.0.1 \
     --server_port="$zig_server_port" \
@@ -140,19 +164,19 @@ for test_case in "${official_cases[@]}"; do
     --use_tls=false
 done
 for test_case in "${streaming_cases[@]}"; do
-  run_case 'grpc-go client -> grpc-lite server' "$test_case" \
+  run_case "grpc-go client -> $server_description" "$test_case" \
     "$work_dir/grpc-go-interop-client" \
     --server_host=127.0.0.1 \
     --server_port="$zig_server_port" \
     --test_case="$test_case" \
     --use_tls=false
 done
-run_case 'grpc-go client -> grpc-lite server' 'half_duplex' \
+run_case "grpc-go client -> $server_description" 'half_duplex' \
   "$work_dir/grpc-go-half-duplex-client" \
   --server_host=127.0.0.1 \
   --server_port="$zig_server_port"
 for test_case in "${stream_lifecycle_cases[@]}"; do
-  run_case 'grpc-go client -> grpc-lite server' "$test_case" \
+  run_case "grpc-go client -> $server_description" "$test_case" \
     "$work_dir/grpc-go-interop-client" \
     --server_host=127.0.0.1 \
     --server_port="$zig_server_port" \
@@ -160,14 +184,14 @@ for test_case in "${stream_lifecycle_cases[@]}"; do
     --use_tls=false
 done
 for test_case in "${grpc_go_gzip_cases[@]}"; do
-  run_case 'grpc-go gzip client -> grpc-lite server' "$test_case" \
+  run_case "grpc-go gzip client -> $server_description" "$test_case" \
     "$work_dir/grpc-go-gzip-client" \
     --server_host=127.0.0.1 \
     --server_port="$zig_server_port" \
     --test_case="$test_case"
 done
 for test_case in "${soak_cases[@]}"; do
-  run_case 'grpc-go client -> grpc-lite server' "$test_case" \
+  run_case "grpc-go client -> $server_description" "$test_case" \
     "$work_dir/grpc-go-interop-client" \
     --server_host=127.0.0.1 \
     --server_port="$zig_server_port" \
@@ -177,7 +201,17 @@ for test_case in "${soak_cases[@]}"; do
     --soak_overall_timeout_seconds="$soak_overall_timeout_seconds" \
     --use_tls=false
 done
+if [[ "$server_mode" == task ]]; then
+  run_case "grpc-go tests -> $server_description" task_runtime \
+    env GRPC_LITE_TASK_SERVER_ADDRESS="127.0.0.1:$zig_server_port" \
+    go -C "$project_root/tests/official" test -mod=readonly -count=1 -timeout=25s -v ./task_server
+fi
 stop_peer
+
+if [[ "$server_mode" == task ]]; then
+  printf '%s\n' 'All task-server unary, streaming, metadata/status, lifecycle, gzip, and soak interop cases passed.'
+  exit 0
+fi
 
 peer_log="$work_dir/grpc-lite-cpp-server.log"
 "$work_dir/cpp-build/grpc-lite-cpp-interop-server" \
