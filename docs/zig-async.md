@@ -17,6 +17,13 @@ applications own their runtime. Other `std.Io` implementations must support
 cross-thread futex wakeups and the same cancellation/lifetime contract. Server
 adapters also require concurrent task/group submission from transport threads.
 
+Keep Zig's default debug I/O when using these adapters. `SafeAllocator` captures
+stack traces during allocation/free, including under transport locks. Overriding
+`std_options_debug_io` with `zio.debug_io` can suspend a task while it holds a
+debug-info lock; another task can then block the executor on a transport lock
+whose owner is waiting for that debug-info lock. Allocators used by the transport
+must not suspend tasks. RPC and application I/O still use the supplied runtime.
+
 ## Build integration
 
 Add zio to your application's dependencies:
@@ -369,6 +376,7 @@ cardinality. Unary/streaming registration mismatches are rejected at compile tim
 ```sh
 mise run test-async
 mise run interop-async
+mise run interop-async-tls
 zig build test-async -Dzio=true -Doptimize=ReleaseSafe --test-timeout 30s
 ```
 
@@ -384,3 +392,7 @@ each on one zio executor. It adds wire-level coverage for unary and all streamin
 cardinalities, metadata/status, gzip, cancellation, delayed responses, concurrent
 duplex reader/writer tasks, and independent RPC progress during task waits. See the
 [official interop matrix](../tests/official/README.md#task-handler-interoperability).
+
+`interop-async-tls` validates the task fixtures over native TLS and mTLS, including
+concurrent duplex traffic, suspended-receive cancellation, and client-certificate
+acceptance/rejection. It uses the same single-executor configuration.

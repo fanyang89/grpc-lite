@@ -7,7 +7,6 @@ const testing = @import("grpc_testing");
 const zio = @import("zio");
 const callback_peer = @import("interop_server.zig");
 
-pub const std_options_debug_io = zio.debug_io;
 const OutputCall = pb.ServerCall(testing.StreamingOutputCallRequest, testing.StreamingOutputCallResponse);
 const InputCall = pb.ServerCall(testing.StreamingInputCallRequest, testing.StreamingInputCallResponse);
 

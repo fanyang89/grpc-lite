@@ -165,6 +165,11 @@ description = "Run TLS unary and streaming interoperability against grpc-go"
 depends = ["prepare-tls-deps"]
 run = "tests/official/run_tls.sh"
 
+[tasks.interop-async-tls]
+description = "Run TLS and mTLS grpc-go interoperability with one-executor zio task clients and handlers"
+depends = ["prepare-tls-deps"]
+run = "INTEROP_SERVER_MODE=task tests/official/run_tls.sh"
+
 [tasks.interop-http2]
 description = "Run the official gRPC HTTP/2 framing suite"
 run = "tests/official/run_http2.sh"

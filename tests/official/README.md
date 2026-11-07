@@ -6,6 +6,7 @@ The official test dependencies are pinned in `go.mod`, `build.zig.zon`, and
 ```bash
 mise run interop-official
 mise run interop-async
+mise run interop-async-tls
 mise run interop-http2
 mise run interop-http2-edge
 ```
@@ -42,6 +43,9 @@ handling before starting interoperability cases.
 | grpc-go client to zio task server | Required cleartext unary/streaming profile, half-duplex, cancellation/deadline, metadata/status, gzip, and soak | Pass with one zio executor |
 | dedicated grpc-go tests to zio task server | Compressed input, mixed identity/gzip output, handler wait isolation, cancellation, and response intervals | Pass |
 | zio task client to grpc-go servers | Unary, all streaming cardinalities, metadata/status, cancellation/deadline, unary gzip, soak, concurrent duplex, and task cancellation | Pass with one zio executor |
+| grpc-go client to zio task TLS server | Unary/streaming, metadata/status, cancellation/deadline | Pass with one zio executor |
+| zio task TLS and mTLS client to grpc-go servers | Unary, all streaming cardinalities, metadata/status, cancellation/deadline, concurrent duplex, and task cancellation | Pass with one zio executor |
+| grpc-go client to zio task mTLS server | Valid client identity; rejection of missing, untrusted, and expired identities | Pass |
 
 The HTTP/2 framing tool deliberately treats every `TestSoon*` failure as non-fatal.
 `run_http2.sh` runs its cleartext framing and TLS profile modes, then validates six
@@ -108,3 +112,17 @@ commands have a 30-second timeout, configurable via `INTEROP_CASE_TIMEOUT_SECOND
 increase it when increasing the existing `SOAK_*` settings. The dedicated Go tests
 have their own 25-second suite timeout. This suite exercises cleartext clients and
 servers; the callback/C++ and TLS matrices retain their separate entry points.
+
+### Task TLS and mutual TLS
+
+`mise run interop-async-tls` selects task mode in `run_tls.sh` and builds both
+fixtures with `-Dzio=true -Dtls=true`. It runs 14 grpc-go-to-task-server TLS cases,
+17 task-client-to-grpc-go TLS cases, and the same 17 client cases over mTLS.
+The task mTLS server additionally accepts a valid client identity and rejects
+missing, untrusted, and expired identities, for 52 checks in total.
+
+Both task fixtures use one executor. The suite reuses kernel-assigned ports,
+readiness-log checks, and test credentials from the callback TLS harness. Logs
+and Go binaries live under `.zig-cache/official/task-tls`; RPC commands use the
+same `INTEROP_CASE_TIMEOUT_SECONDS` setting as cleartext task interop.
+CI runs this suite on Linux x86_64 alongside the existing callback TLS suite.

@@ -4,8 +4,6 @@ const zio = @import("zio");
 const grpc = @import("grpc_lite");
 const rpc = @import("grpc_lite_async");
 
-pub const std_options_debug_io = zio.debug_io;
-
 fn echo(client: *rpc.Client, allocator: std.mem.Allocator) !void {
     // demo.EchoRequest { message: "hello" }, encoded as protobuf wire bytes.
     var result = try client.callUnary(allocator, "/demo.EchoService/Echo", "\x0a\x05hello", .{

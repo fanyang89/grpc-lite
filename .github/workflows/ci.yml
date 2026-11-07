@@ -323,6 +323,10 @@ jobs:
         if: matrix.arch == 'x64'
         run: mise run interop-tls
 
+      - name: Run task TLS and mTLS interop with zio
+        if: matrix.arch == 'x64'
+        run: mise run interop-async-tls
+
       - name: Run official HTTP/2 framing report
         run: mise run interop-http2
 

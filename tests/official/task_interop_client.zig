@@ -7,7 +7,6 @@ const testing = @import("grpc_testing");
 const zio = @import("zio");
 const peer = @import("interop_client.zig");
 
-pub const std_options_debug_io = zio.debug_io;
 const TypedClient = pb.ServiceClient(testing.TestService(void, anyerror));
 const OutputStream = pb.ClientStream(testing.StreamingOutputCallRequest, testing.StreamingOutputCallResponse);
 const timeout_ns = 10 * std.time.ns_per_s;
