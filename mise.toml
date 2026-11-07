@@ -63,13 +63,17 @@ run = "zig build test-streaming-lifecycle -Dprotobuf=false --summary all"
 description = "Run all tests with ReleaseSafe optimization"
 run = "zig build test -Doptimize=ReleaseSafe --summary all"
 
+[tasks.test-async]
+description = "Run raw and typed unary integration tests with zio"
+run = "zig build test-async -Dzio=true --summary all --test-timeout 30s"
+
 [tasks.coverage]
 description = "Generate core Zig coverage with kcov"
 run = "tools/coverage.sh"
 
 [tasks.test-tsan]
 description = "Run all tests with ThreadSanitizer"
-run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
+run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dzio=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
 
 [tasks.test-ubsan]
 description = "Run all tests with C undefined behavior detection"

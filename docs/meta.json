@@ -6,6 +6,7 @@
     "compatibility",
     "---APIs---",
     "zig-api",
+    "zig-async",
     "c-cpp-api",
     "c-cpp-reference",
     "---Operations---",

@@ -1,5 +1,6 @@
 const std = @import("std");
 const grpc = @import("grpc_lite");
+const rpc = @import("grpc_lite_async");
 const options = @import("consumer_options");
 
 const wire = "\x08\x01";
@@ -103,6 +104,16 @@ pub fn main(init: std.process.Init) !void {
     try server.start();
     var target_buffer: [32]u8 = undefined;
     const target = try std.fmt.bufPrint(&target_buffer, "127.0.0.1:{d}", .{try server.port()});
+    {
+        // The optional adapter is also usable with std.Io.Threaded; importing it
+        // must not resolve zio or protobuf for a raw package consumer.
+        var task_client = try rpc.Client.init(allocator, init.io, target, .{});
+        defer task_client.deinit();
+        var task_result = try task_client.callUnary(allocator, unary_method, wire, .{});
+        defer task_result.deinit();
+        try std.testing.expect(task_result.status.isOk());
+        try std.testing.expectEqualStrings(wire, task_result.payload);
+    }
     var channel = try grpc.Channel.init(allocator, target, .{ .stream_admission = .{ .max_streams = 1 } });
     var channel_owned = true;
     defer if (channel_owned) channel.deinit();

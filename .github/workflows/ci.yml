@@ -86,6 +86,9 @@ jobs:
       - name: Test
         run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
 
+      - name: Test task-friendly unary clients with zio
+        run: zig build test-async -Dzio=true -Doptimize=${{ matrix.optimize }} --summary all --test-timeout 30s
+
       - name: Check released C ABI baseline and old-header consumer
         if: matrix.optimize == 'ReleaseSafe'
         run: mise run test-c-abi

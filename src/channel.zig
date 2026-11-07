@@ -435,6 +435,17 @@ pub const Channel = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, target: []const u8, options: ChannelOptions) !Channel {
+        return initWithIo(allocator, null, target, options);
+    }
+
+    /// Uses `io` to suspend while connecting and during teardown. The I/O runtime
+    /// must outlive the channel and support wakeups from foreign OS threads.
+    pub fn initIo(allocator: std.mem.Allocator, io: std.Io, target: []const u8, options: ChannelOptions) !Channel {
+        try io.checkCancel();
+        return initWithIo(allocator, io, target, options);
+    }
+
+    fn initWithIo(allocator: std.mem.Allocator, io: ?std.Io, target: []const u8, options: ChannelOptions) !Channel {
         if (options.stream_admission.max_streams == 0 or options.stream_admission.max_buffer_bytes == 0)
             return error.InvalidStreamAdmissionLimits;
         if (options.unary_admission.max_calls == 0 or options.unary_admission.max_request_bytes == 0)
@@ -467,6 +478,7 @@ pub const Channel = struct {
         serialized_allocator.stream_admission.limits = options.stream_admission;
 
         impl.* = .{
+            .lifecycle_io = io,
             .unary_admission = .{ .limits = options.unary_admission },
             .backing_allocator = allocator,
             .serialized_allocator = serialized_allocator,
@@ -527,11 +539,22 @@ pub const Channel = struct {
         impl.deadline_timer = deadline_timer;
         impl.thread = try std.Thread.spawn(.{}, runLoop, .{impl});
 
+        var canceled = false;
+        if (io) |task_io| {
+            impl.startup_event.wait(task_io) catch {
+                canceled = true;
+                impl.mutex.lockUncancelable(syncIo());
+                if (impl.state == .starting or impl.state == .running) impl.state = .stopping;
+                impl.mutex.unlock(syncIo());
+                impl.async_handle.notify() catch {};
+            };
+        }
         impl.mutex.lockUncancelable(syncIo());
         while (impl.state == .starting) impl.condition.waitUncancelable(syncIo(), &impl.mutex);
         const running = impl.state == .running;
         impl.mutex.unlock(syncIo());
         if (!running) {
+            if (io) |task_io| impl.stopped_event.waitUncancelable(task_io);
             impl.thread.?.join();
             impl.thread = null;
             impl.pending.deinit(impl.allocator);
@@ -547,7 +570,7 @@ pub const Channel = struct {
             std.debug.assert(impl.reconnect_heap_index == null);
             impl.deadline_heap.deinit(impl.allocator);
             if (impl.resolved_addresses.len != 0) impl.allocator.free(impl.resolved_addresses);
-            return error.ConnectionFailed;
+            return if (canceled) error.Canceled else error.ConnectionFailed;
         }
 
         return .{ .impl = impl };
@@ -572,16 +595,42 @@ pub const Channel = struct {
         if (!queued) operation.finish();
         operation.wait();
 
-        var result = try call.Result.initWithCompression(
-            allocator,
-            .init(operation.response_code, operation.response_message),
-            if (operation.response_payload) |payload| payload else &.{},
-            operation.response_compression,
-        );
-        errdefer result.deinit();
-        try copyMetadata(&result.initial_metadata, &operation.initial_metadata);
-        try copyMetadata(&result.trailing_metadata, &operation.trailing_metadata);
-        return result;
+        return operation.copyResult(allocator);
+    }
+
+    /// Suspends the calling task through `io`. Cancellation resets only this RPC
+    /// and waits for transport completion before releasing its retained storage.
+    /// Result allocations happen on the calling task, never in a callback.
+    pub fn callUnaryIo(
+        self: *Channel,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        full_method_path: []const u8,
+        request: []const u8,
+        options: call.Options,
+    ) !call.Result {
+        try io.checkCancel();
+        if (!isValidMethodPath(full_method_path)) return error.InvalidMethodPath;
+        if (options.max_response_size > std.math.maxInt(u32)) return error.InvalidMaxResponseSize;
+        const operation = try Operation.init(self.impl, full_method_path, request, options);
+        defer operation.deinit();
+        operation.owner = .{ .io = io };
+        const queued = try self.impl.enqueue(operation);
+        if (!queued) {
+            operation.setStaticOutcome(.unavailable, "channel is unavailable");
+            operation.finish();
+        }
+        operation.completion_event.wait(io) catch {
+            operation.cancel_requested.store(true, .release);
+            self.impl.unary_cancel_pending.store(true, .release);
+            self.impl.async_handle.notify() catch {};
+            operation.completion_event.waitUncancelable(io);
+            operation.synchronizeCompletion();
+            return error.Canceled;
+        };
+        operation.synchronizeCompletion();
+        try io.checkCancel();
+        return operation.copyResult(allocator);
     }
 
     /// Starts an event-driven raw unary call and copies all inputs before return.
@@ -671,6 +720,7 @@ pub const Channel = struct {
     /// Waits for the channel event loop after shutdown.
     pub fn wait(self: *Channel) void {
         const impl = self.impl;
+        if (impl.lifecycle_io) |io| impl.stopped_event.waitUncancelable(io);
         impl.mutex.lockUncancelable(syncIo());
         const thread = impl.thread;
         impl.thread = null;
@@ -741,6 +791,10 @@ const TestObserver = if (builtin.is_test) struct {
 } else struct {};
 
 const Impl = struct {
+    lifecycle_io: ?std.Io = null,
+    startup_event: std.Io.Event = .unset,
+    stopped_event: std.Io.Event = .unset,
+    unary_cancel_pending: std.atomic.Value(bool) = .init(false),
     unary_admission: UnaryAdmission = .{},
     backing_allocator: std.mem.Allocator,
     serialized_allocator: *SerializedAllocator,
@@ -877,6 +931,7 @@ const Impl = struct {
     fn signalStartup(self: *Impl, succeeded: bool) void {
         self.mutex.lockUncancelable(syncIo());
         if (self.state == .starting) self.state = if (succeeded) .running else .stopping;
+        if (self.lifecycle_io) |io| self.startup_event.set(io);
         self.condition.broadcast(syncIo());
         self.mutex.unlock(syncIo());
     }
@@ -884,6 +939,10 @@ const Impl = struct {
     fn markStopped(self: *Impl) void {
         self.mutex.lockUncancelable(syncIo());
         self.state = .stopped;
+        if (self.lifecycle_io) |io| {
+            self.startup_event.set(io);
+            self.stopped_event.set(io);
+        }
         self.condition.broadcast(syncIo());
         self.mutex.unlock(syncIo());
     }
@@ -1205,6 +1264,7 @@ const HeaderKind = enum { none, response, trailers };
 const OperationOwner = union(enum) {
     blocking,
     callback: call.Callbacks,
+    io: std.Io,
 };
 
 const Operation = struct {
@@ -1231,6 +1291,9 @@ const Operation = struct {
     operational_active: bool = false,
     operational_pending: bool = false,
     owner: OperationOwner = .blocking,
+    completion_event: std.Io.Event = .unset,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
+    cancel_submitted: bool = false,
     outcome_set: bool = false,
     deadline_expired: bool = false,
     response_code: status.Code = .unknown,
@@ -1369,6 +1432,11 @@ const Operation = struct {
             self.impl.serialized_allocator.operational.terminal("active_unary_calls", self.response_code);
         }
         switch (self.owner) {
+            .io => |io| {
+                self.mutex.lockUncancelable(syncIo());
+                self.completion_event.set(io);
+                self.mutex.unlock(syncIo());
+            },
             .blocking => {
                 self.mutex.lockUncancelable(syncIo());
                 self.done = true;
@@ -1392,6 +1460,26 @@ const Operation = struct {
         self.mutex.lockUncancelable(syncIo());
         while (!self.done) self.condition.waitUncancelable(syncIo(), &self.mutex);
         self.mutex.unlock(syncIo());
+    }
+
+    fn synchronizeCompletion(self: *Operation) void {
+        // An event may wake the task before the signaling thread has returned
+        // from futexWake. Keep both the event and its I/O runtime alive until then.
+        self.mutex.lockUncancelable(syncIo());
+        self.mutex.unlock(syncIo());
+    }
+
+    fn copyResult(self: *Operation, allocator: std.mem.Allocator) !call.Result {
+        var result = try call.Result.initWithCompression(
+            allocator,
+            .init(self.response_code, self.response_message),
+            if (self.response_payload) |payload| payload else &.{},
+            self.response_compression,
+        );
+        errdefer result.deinit();
+        try copyMetadata(&result.initial_metadata, &self.initial_metadata);
+        try copyMetadata(&result.trailing_metadata, &self.trailing_metadata);
+        return result;
     }
 
     fn resetHeaderBlock(self: *Operation, kind: HeaderKind) void {
@@ -2033,6 +2121,12 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
         beginStop(impl, "channel closed");
         return .disarm;
     }
+    if (impl.unary_cancel_pending.swap(false, .acq_rel)) {
+        cancelUnaryOperations(impl) catch {
+            beginStop(impl, "unary cancellation failed");
+            return .disarm;
+        };
+    }
     processStreamWakes(impl);
     processPending(impl);
     switch (impl.connection_state) {
@@ -2056,6 +2150,31 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
     return .rearm;
 }
 
+fn cancelUnaryOperations(impl: *Impl) !void {
+    var waiting = impl.waiting_operation_head;
+    while (waiting) |operation| {
+        waiting = operation.waiting_next;
+        if (!operation.cancel_requested.load(.acquire)) continue;
+        std.debug.assert(removeWaitingOperation(impl, operation));
+        removeOperationDeadline(impl, operation);
+        operation.setStaticOutcome(.cancelled, "call cancelled");
+        operation.finish();
+    }
+    var flush_needed = false;
+    var iterator = impl.operations.valueIterator();
+    while (iterator.next()) |entry| {
+        const operation = entry.*;
+        if (!operation.cancel_requested.load(.acquire) or operation.cancel_submitted) continue;
+        operation.cancel_submitted = true;
+        removeOperationDeadline(impl, operation);
+        operation.setStaticOutcome(.cancelled, "call cancelled");
+        if (submitCancellationReset(impl, operation.stream_id) != 0) return error.UnaryCancellationFailed;
+        flush_needed = true;
+    }
+    // Flushing may close streams and invalidate the operations iterator.
+    if (flush_needed and impl.connected) try flush(impl);
+}
+
 fn processPending(impl: *Impl) void {
     var pending: std.ArrayList(*Operation) = .empty;
     impl.mutex.lockUncancelable(syncIo());
@@ -2065,6 +2184,11 @@ fn processPending(impl: *Impl) void {
 
     for (pending.items, 0..) |operation, index| {
         pending.items[index] = undefined;
+        if (operation.cancel_requested.load(.acquire)) {
+            operation.setStaticOutcome(.cancelled, "call cancelled");
+            operation.finish();
+            continue;
+        }
         appendWaitingOperation(impl, operation);
         if (operation.deadline_ns) |deadline| {
             deadlineHeapInsertOrUpdate(impl, .{ .operation = operation }, deadline) catch {
@@ -3714,6 +3838,7 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
     if (impl.state == .starting) {
         impl.state = .stopping;
         impl.condition.broadcast(syncIo());
+        if (impl.lifecycle_io) |io| impl.startup_event.set(io);
     } else if (impl.state == .running) {
         impl.state = .stopping;
     }
