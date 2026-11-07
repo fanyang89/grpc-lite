@@ -189,7 +189,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const async_test_step = b.step("test-async", "Run task-friendly RPC tests (enable zio with -Dzio=true)");
     if (zio) |zio_module| {
-        for ([_][]const u8{ "async_client", "async_stream", "async_server" }) |name| {
+        for ([_][]const u8{ "async_client", "async_stream", "async_server", "async_lifecycle" }) |name| {
             const async_tests = b.addTest(.{
                 .name = name,
                 .root_module = b.createModule(.{

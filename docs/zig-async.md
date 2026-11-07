@@ -115,6 +115,33 @@ transport allocator or be shared unsafely between tasks. Allocation, compression
 short internal locks, and initial clock calibration are synchronous work; the
 adapter specifically makes transport waits task-friendly.
 
+### Connection recovery
+
+Enable recovery from connection loss through the underlying Channel options:
+
+```zig
+var client = try rpc.Client.init(allocator, io, target, .{
+    .reconnect = .{ .allow_initial_offline = true },
+});
+defer client.deinit();
+```
+
+`allow_initial_offline` allows initialization while the peer is unavailable.
+Unary calls waiting for a connection suspend and retain their original deadline;
+task cancellation removes queued work. Give these calls a `timeout_ns` to bound
+waiting. Calls already submitted to a lost connection fail rather than replay.
+
+GOAWAY preserves accepted RPCs while the connection drains. Replacement starts
+after those RPCs finish; later unary work waits for the replacement connection.
+`openStream` returns `error.ChannelUnavailable` while no connection accepts new
+streams. Applications decide when to open a new stream after recovery; a terminal
+stream never resumes or replays its messages. Its owned status remains available
+through `finish`, and its admission reservation is released by `deinit`.
+
+`client.channel.operationalStats()` exposes pending unary calls and reconnect
+counters. `client.shutdown()` is permanent for that client; server restart and
+Channel recovery do not undo an explicit client shutdown.
+
 ## Typed unary calls
 
 Enable `.protobuf = true` in the grpc-lite dependency and add:
@@ -385,7 +412,10 @@ flow-controlled sends, slow readers, half-close, metadata/compression, deadline 
 shutdown completion, cancellation races, retained quota release, and raw/typed
 allocation failure cleanup. Server coverage includes suspended-handler isolation,
 all streaming cardinalities, cancellation of ordinary Io waits, task launch failure,
-retained-call admission, graceful drain, and joined teardown.
+retained-call admission, graceful drain, and joined teardown. Lifecycle tests also
+cover GOAWAY with active unary/duplex calls, task cancellation during drain,
+immediate shutdown and drain-timeout escalation, same-port server restart, and
+offline queued-call cancellation/deadlines without replay.
 
 `interop-async` validates task clients and servers against pinned grpc-go peers,
 each on one zio executor. It adds wire-level coverage for unary and all streaming
