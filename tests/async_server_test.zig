@@ -106,16 +106,26 @@ test "duplex server reader and writer tasks progress through bounded flow contro
         const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(executors) });
         defer runtime.deinit();
         const io = runtime.io();
+        var warmup_handler: Unary = .{};
         var server = try rpc.Server.init(allocator, io, .{ .transport = .{
             .initial_stream_window_size = 1024,
             .stream_limits = .{ .max_message_size = 512, .max_inbound_buffer_size = 4096, .max_outbound_buffer_size = 1024 },
         } });
         defer server.deinit();
+        try server.registerUnary("/test.Task/Ready", rpc.UnaryHandler.bind(Unary, &warmup_handler, Unary.invoke));
         try server.registerStream(method, .{ .invoke_fn = Duplex.invoke });
         try server.start();
         var buffer: [32]u8 = undefined;
         var client = try rpc.Client.init(allocator, io, try targetFor(&server, &buffer), .{ .initial_stream_window_size = 1024 });
         defer client.deinit();
+        // Exchange SETTINGS before testing the negotiated 1 KiB window. Before
+        // that exchange, HTTP/2 permits a 65,535-byte initial burst, which can
+        // exceed this test's intentionally small 4 KiB inbound buffer.
+        {
+            var ready = try client.callUnary(allocator, "/test.Task/Ready", "ready", .{ .timeout_ns = std.time.ns_per_s * 5 });
+            defer ready.deinit();
+            try std.testing.expectEqual(grpc.StatusCode.ok, ready.status.code);
+        }
         var stream = try client.openStream(allocator, method, .{
             .limits = .{ .max_message_size = 512, .max_inbound_buffer_size = 4096, .max_outbound_buffer_size = 1024 },
         });
@@ -123,7 +133,15 @@ test "duplex server reader and writer tasks progress through bounded flow contro
         var writer = try io.concurrent(Duplex.clientWrite, .{&stream});
         defer writer.cancel(io) catch {};
         var count: usize = 0;
-        while (try stream.receive(allocator)) |value| {
+        while (stream.receive(allocator) catch |err| {
+            if (err != error.RpcFailed) return err;
+            var failure = try stream.finish(allocator);
+            defer failure.deinit();
+            std.debug.print("duplex receive failed with {d} executors after {d} messages: {s}, status={s}: {s}\n", .{
+                executors, count, @errorName(err), @tagName(failure.status.code), failure.status.message,
+            });
+            return err;
+        }) |value| {
             var message = value;
             defer message.deinit();
             try std.testing.expectEqualStrings(&Duplex.payload, message.payload);
