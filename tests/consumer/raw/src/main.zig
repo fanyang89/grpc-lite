@@ -133,6 +133,29 @@ pub fn main(init: std.process.Init) !void {
         var task_status = try task_stream.finish(allocator);
         defer task_status.deinit();
         try std.testing.expect(task_status.status.isOk());
+        const TaskHandler = struct {
+            fn invoke(_: ?*anyopaque, call: *rpc.ServerCall) !void {
+                while (try call.receive(std.heap.page_allocator)) |value| {
+                    var request = value;
+                    defer request.deinit();
+                    try call.io().sleep(.fromMilliseconds(1), .awake);
+                    try call.send(request.payload, .{});
+                }
+                try call.finish(.ok, &.{});
+            }
+        };
+        var task_server = try rpc.Server.init(allocator, init.io, .{});
+        defer task_server.deinit();
+        try task_server.registerStream(task_stream_method, .{ .invoke_fn = TaskHandler.invoke });
+        try task_server.start();
+        var task_target_buffer: [32]u8 = undefined;
+        const task_target = try std.fmt.bufPrint(&task_target_buffer, "127.0.0.1:{d}", .{try task_server.port()});
+        var peer = try rpc.Client.init(allocator, init.io, task_target, .{});
+        defer peer.deinit();
+        var task_reply = try peer.callUnary(allocator, task_stream_method, wire, .{});
+        defer task_reply.deinit();
+        try std.testing.expect(task_reply.status.isOk());
+        try std.testing.expectEqualStrings(wire, task_reply.payload);
     }
     var channel = try grpc.Channel.init(allocator, target, .{ .stream_admission = .{ .max_streams = 1 } });
     var channel_owned = true;

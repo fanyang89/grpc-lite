@@ -145,3 +145,105 @@ test "typed streaming decode failures cancel the stream without leaking response
     defer result.deinit();
     try std.testing.expectEqual(grpc.StatusCode.cancelled, result.status.code);
 }
+
+const TaskService = struct {
+    const Call = async_pb.ServerCall(demo.EchoRequest, demo.EchoReply);
+
+    fn unary(_: *TaskService, allocator: std.mem.Allocator, io: std.Io, ctx: *grpc.ServerContext, request: demo.EchoRequest) !demo.EchoReply {
+        try io.sleep(.fromMilliseconds(1), .awake);
+        if (std.mem.eql(u8, request.message, "reject")) return error.Rejected;
+        try ctx.addTrailingMetadata("x-task", "typed");
+        return .{ .message = try std.mem.concat(allocator, u8, &.{ "task:", request.message }) };
+    }
+
+    fn map(err: anyerror) grpc.Status {
+        return .init(if (err == error.Rejected) .invalid_argument else .internal, "typed handler rejected");
+    }
+
+    fn serverStream(_: *TaskService, call: *Call) !void {
+        var request = (try call.receive(std.testing.allocator)).?;
+        defer request.deinit();
+        try std.testing.expect(try call.receive(std.testing.allocator) == null);
+        for (0..3) |_| {
+            try call.io().sleep(.fromMilliseconds(1), .awake);
+            try call.send(std.testing.allocator, .{ .message = request.value.message }, .{});
+        }
+        try call.finish(.ok, &.{});
+    }
+
+    fn clientStream(_: *TaskService, call: *Call) !void {
+        var count: usize = 0;
+        while (try call.receive(std.testing.allocator)) |value| {
+            var request = value;
+            request.deinit();
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), count);
+        try call.send(std.testing.allocator, .{ .message = "three" }, .{});
+        try call.finish(.ok, &.{});
+    }
+
+    fn chat(_: *TaskService, call: *Call) !void {
+        try call.sendInitialMetadata(&.{.{ .key = "x-task", .value = "typed" }}, .gzip);
+        while (try call.receive(std.testing.allocator)) |value| {
+            var request = value;
+            defer request.deinit();
+            try call.io().sleep(.fromMilliseconds(1), .awake);
+            try call.send(std.testing.allocator, .{ .message = request.value.message }, .{ .compression = .gzip });
+        }
+        try call.finish(.ok, &.{});
+    }
+};
+
+test "typed task server handles unary and all streaming cardinalities" {
+    const allocator = std.testing.allocator;
+    const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+    var handler: TaskService = .{};
+    var server = try rpc.Server.init(allocator, runtime.io(), .{});
+    defer server.deinit();
+    var unary_service = async_pb.ServiceServer(Service).init(&server);
+    try unary_service.registerUnary("Echo", &handler, TaskService.unary, .{ .map_error = TaskService.map });
+    var stream_service = async_pb.ServiceServer(StreamingService).init(&server);
+    try stream_service.registerStream("ServerEcho", &handler, TaskService.serverStream);
+    try stream_service.registerStream("ClientEcho", &handler, TaskService.clientStream);
+    try stream_service.registerStream("Chat", &handler, TaskService.chat);
+    try server.start();
+    var buffer: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&buffer, "127.0.0.1:{d}", .{try server.port()});
+    var client = try rpc.Client.init(allocator, runtime.io(), target, .{});
+    defer client.deinit();
+    var unary = async_pb.ServiceClient(Service).init(&client);
+    var response = try unary.callUnary(allocator, "Echo", .{ .message = "hello" }, .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("task:hello", response.response.?.message);
+    try std.testing.expectEqualStrings("typed", response.raw.trailing_metadata.getFirst("x-task").?);
+    var rejected = try unary.callUnary(allocator, "Echo", .{ .message = "reject" }, .{});
+    defer rejected.deinit();
+    try std.testing.expectEqual(grpc.StatusCode.invalid_argument, rejected.raw.status.code);
+
+    var typed = async_pb.ServiceClient(StreamingService).init(&client);
+    inline for (.{ "ServerEcho", "ClientEcho", "Chat" }) |method| {
+        var stream = try typed.openStream(allocator, method, .{});
+        defer stream.deinit();
+        const count: usize = if (comptime std.mem.eql(u8, method, "ServerEcho")) 1 else 3;
+        for (0..count) |_| try stream.send(allocator, .{ .message = "hello" }, .{});
+        try stream.closeSend();
+        var received: usize = 0;
+        while (try stream.receive(allocator)) |value| {
+            var message = value;
+            defer message.deinit();
+            try std.testing.expectEqualStrings(if (comptime std.mem.eql(u8, method, "ClientEcho")) "three" else "hello", message.value.message);
+            received += 1;
+        }
+        try std.testing.expectEqual(@as(usize, if (comptime std.mem.eql(u8, method, "ClientEcho")) 1 else 3), received);
+        var result = try stream.finish(allocator);
+        defer result.deinit();
+        try std.testing.expect(result.status.isOk());
+    }
+    inline for (.{ pb.methodPath(Service, "Echo"), pb.methodPath(StreamingService, "Chat") }) |path| {
+        var malformed = try client.callUnary(allocator, path, "\x0a\x05x", .{});
+        defer malformed.deinit();
+        try std.testing.expectEqual(grpc.StatusCode.invalid_argument, malformed.status.code);
+    }
+}

@@ -187,9 +187,9 @@ pub fn build(b: *std.Build) void {
     grpc_lite.addImport("xev", xev);
     grpc_lite.addImport("nanozlog", nanozlog_dependency.module("nanozlog"));
     const test_step = b.step("test", "Run unit tests");
-    const async_test_step = b.step("test-async", "Run task-friendly client tests (enable zio with -Dzio=true)");
+    const async_test_step = b.step("test-async", "Run task-friendly RPC tests (enable zio with -Dzio=true)");
     if (zio) |zio_module| {
-        for ([_][]const u8{ "async_client", "async_stream" }) |name| {
+        for ([_][]const u8{ "async_client", "async_stream", "async_server" }) |name| {
             const async_tests = b.addTest(.{
                 .name = name,
                 .root_module = b.createModule(.{
@@ -209,11 +209,17 @@ pub fn build(b: *std.Build) void {
             test_step.dependOn(&run.step);
         }
 
-        for ([_][]const u8{ "unary", "stream" }) |name| {
+        const task_examples = [_]struct { name: []const u8, artifact: []const u8, source: []const u8 }{
+            .{ .name = "unary", .artifact = "zio-unary-client", .source = "examples/zio_unary_client.zig" },
+            .{ .name = "stream", .artifact = "zio-stream-client", .source = "examples/zio_stream_client.zig" },
+            .{ .name = "server", .artifact = "zio-server", .source = "examples/zio_server.zig" },
+        };
+        for (task_examples) |example_source| {
+            const name = example_source.name;
             const example = b.addExecutable(.{
-                .name = b.fmt("zio-{s}-client", .{name}),
+                .name = example_source.artifact,
                 .root_module = b.createModule(.{
-                    .root_source_file = b.path(b.fmt("examples/zio_{s}_client.zig", .{name})),
+                    .root_source_file = b.path(example_source.source),
                     .target = target,
                     .optimize = optimize,
                     .imports = &.{
@@ -225,7 +231,7 @@ pub fn build(b: *std.Build) void {
             });
             b.installArtifact(example);
             const run_example = b.addRunArtifact(example);
-            b.step(b.fmt("run-zio-{s}", .{name}), b.fmt("Run the zio {s} client example", .{name})).dependOn(&run_example.step);
+            b.step(b.fmt("run-zio-{s}", .{name}), b.fmt("Run the zio {s} example", .{name})).dependOn(&run_example.step);
         }
     } else {
         async_test_step.dependOn(&b.addFail("test-async requires -Dzio=true").step);

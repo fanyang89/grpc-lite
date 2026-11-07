@@ -1,4 +1,4 @@
-//! Task-friendly client. The supplied std.Io controls waiting and cancellation.
+//! Task-friendly RPC adapters. The supplied std.Io controls waiting and cancellation.
 const std = @import("std");
 const grpc = @import("grpc_lite");
 const streaming = @import("async_stream.zig");
@@ -6,6 +6,12 @@ const streaming = @import("async_stream.zig");
 pub const Stream = streaming.Stream;
 pub const StreamMessage = streaming.Message;
 pub const StreamResult = streaming.Result;
+const server = @import("async_server.zig");
+pub const Server = server.Server;
+pub const ServerOptions = server.Options;
+pub const ServerCall = server.Call;
+pub const ServerHandler = server.Handler;
+pub const UnaryHandler = server.UnaryHandler;
 
 /// Owning client. Join unary caller tasks before deinit. Streams have independent
 /// ownership. The I/O runtime and allocators must outlive their clients/streams.

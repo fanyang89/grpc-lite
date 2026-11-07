@@ -328,6 +328,17 @@ pub const Server = struct {
     coordinator: *Coordinator,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !Server {
+        return initWithIo(allocator, null, options);
+    }
+
+    /// Uses the supplied runtime for startup and shutdown waits. The runtime must
+    /// outlive the server and support wakeups from transport threads.
+    pub fn initIo(allocator: std.mem.Allocator, io: std.Io, options: Options) !Server {
+        try io.checkCancel();
+        return initWithIo(allocator, io, options);
+    }
+
+    fn initWithIo(allocator: std.mem.Allocator, io: ?std.Io, options: Options) !Server {
         if (options.reactor_count == 0) return error.InvalidReactorCount;
         if (options.max_connections == 0) return error.InvalidMaxConnections;
         if (options.max_concurrent_streams_per_connection == 0) return error.InvalidMaxConcurrentStreams;
@@ -365,6 +376,7 @@ pub const Server = struct {
         errdefer for (reactors[0..initialized]) |reactor| destroyImpl(reactor);
         while (initialized < reactors.len) : (initialized += 1) {
             reactors[initialized] = try initImpl(serialized_allocator.allocator(), coordinator, options);
+            reactors[initialized].lifecycle_io = io;
         }
 
         return .{ .impl = reactors[0], .coordinator = coordinator };
@@ -722,6 +734,9 @@ const StartupError = error{
 };
 
 const Impl = struct {
+    lifecycle_io: ?std.Io = null,
+    startup_event: std.Io.Event = .unset,
+    stopped_event: std.Io.Event = .unset,
     operational_stats: ReactorOperationalStats = .{},
     // Shared storage may be touched by application and reactor threads.
     shared_allocator: std.mem.Allocator,
@@ -818,6 +833,7 @@ const Impl = struct {
             .immediate => .stopping,
         };
         self.condition.broadcast(self.io());
+        if (self.lifecycle_io) |task_io| self.startup_event.set(task_io);
         const should_shutdown = result == null and self.shutdown_request != .none;
         self.unlock();
         if (should_shutdown) self.notifyShutdown();
@@ -981,6 +997,7 @@ fn startReactor(coordinator: *Coordinator, reactor: *Impl, index: usize) !void {
 }
 
 fn waitForReactorStartup(reactor: *Impl) StartupError!void {
+    if (reactor.lifecycle_io) |io| reactor.startup_event.waitUncancelable(io);
     reactor.lock();
     defer reactor.unlock();
     while (reactor.state == .starting) reactor.waitForSignal();
@@ -1016,7 +1033,10 @@ fn waitForReactor(impl: *Impl) void {
     const thread = impl.thread;
     impl.thread = null;
     impl.unlock();
-    if (thread) |running_thread| running_thread.join();
+    if (thread) |running_thread| {
+        if (impl.lifecycle_io) |io| impl.stopped_event.waitUncancelable(io);
+        running_thread.join();
+    }
 }
 
 fn rollbackStart(coordinator: *Coordinator) void {
@@ -2315,6 +2335,7 @@ const CleartextWriteBatch = struct {
 };
 
 fn runLoop(server: *Impl) void {
+    defer if (server.lifecycle_io) |io| server.stopped_event.set(io);
     server.local_allocator_state.enterLoop();
     defer server.local_allocator_state.leaveLoop();
     const setup_result = setupLoop(server);

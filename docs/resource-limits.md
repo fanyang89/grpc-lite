@@ -58,6 +58,15 @@ destruction. Transport stream admission ends separately from application-retaine
 `ServerCall` ownership. Release every retained server call before destroying the Server.
 Active RPCs are exempt from the idle timeout; use RPC deadlines for stalled work.
 
+The optional task server has a separate `grpc_lite_async.ServerOptions.max_calls`
+budget (default 1024) across reactors. It includes calls whose handlers are still
+unwinding after transport termination; excess calls receive `RESOURCE_EXHAUSTED`.
+`activeCalls()` reports this retained count. Each admitted call adds one decoded
+inbound message slot, capped at `transport.stream_limits.max_message_size`, and a
+request-metadata snapshot outside transport counters. Unary handlers also retain
+their request until return. Task stacks, returned messages, typed arenas, and
+application allocations are not covered by this count budget.
+
 ## Memory and ownership
 
 Admission excludes allocator overhead, spare container capacity, metadata/HPACK,

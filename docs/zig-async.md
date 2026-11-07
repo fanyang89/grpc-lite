@@ -1,19 +1,21 @@
 ---
-title: Task-friendly Zig clients
-description: Unary and streaming calls, structured concurrency, and cancellation with std.Io and zio.
+title: Task-friendly Zig RPCs
+description: Unary and streaming clients and server handlers with std.Io and zio.
 ---
 
-# Task-friendly Zig clients
+# Task-friendly Zig RPCs
 
-`grpc_lite_async` provides an owning `Client` whose connection, RPC, and
-teardown waits use a supplied `std.Io`. With zio, these waits suspend the current
-task so other tasks on the executor can run. The transport still uses its own
-libxev thread and the existing unary admission limits.
+`grpc_lite_async` provides owning `Client` and `Server` adapters whose network
+waits use a supplied `std.Io`. With zio, these waits suspend the current task so
+other tasks on the executor can run. Server handlers run as runtime tasks and may
+also suspend in ordinary Io operations. The transport still uses its own libxev
+threads and transport resource limits.
 
 The first supported integration is Zig 0.17 with zio commit
 `c5716c4698a7a25be4390812804638e9fb37cdd0`. The adapter itself does not import zio;
 applications own their runtime. Other `std.Io` implementations must support
-cross-thread futex wakeups and the same cancellation/lifetime contract.
+cross-thread futex wakeups and the same cancellation/lifetime contract. Server
+adapters also require concurrent task/group submission from transport threads.
 
 ## Build integration
 
@@ -234,6 +236,134 @@ arena. Encoding and decoding run on the calling task. A decoding failure cancels
 both directions, since the consumed wire message cannot be retried or silently
 skipped. `openStream` rejects unary method names at compile time.
 
+## Task-based servers
+
+`grpc_lite_async.Server` owns a raw server and a structured group of handler tasks.
+Register methods before `start`, using `registerUnary` or `registerStream`:
+
+```zig
+fn echo(_: ?*anyopaque, call: *rpc.ServerCall) !void {
+    while (try call.receive(std.heap.page_allocator)) |value| {
+        var request = value;
+        defer request.deinit();
+        try call.io().sleep(.fromMilliseconds(10), .awake);
+        try call.send(request.payload, .{});
+    }
+    try call.finish(.ok, &.{});
+}
+
+// The allocator must be thread-safe; the runtime outlives the server.
+var server = try rpc.Server.init(allocator, io, .{
+    .transport = .{ .port = 50051 },
+    .max_calls = 128,
+});
+defer server.deinit();
+try server.registerStream("/example.Echo/Chat", .{ .invoke_fn = echo });
+try server.start();
+// Run application work, then request shutdown before waiting.
+server.shutdownGracefully(std.time.ns_per_s);
+server.wait();
+```
+
+Run the self-contained single-executor server/client example:
+
+```sh
+zig build run-zio-server -Dzio=true
+```
+
+### Handler APIs
+
+Raw unary handlers receive `(context, allocator, io, *grpc.ServerContext,
+request_bytes)` and return an owned `grpc.UnaryResponse`. The adapter waits for
+exactly one request and client half-close, invokes the handler, sends response
+metadata and an OK payload, then finishes with its status and trailers. The adapter
+deinitializes the response. `rpc.UnaryHandler.bind(T, context, function)` adapts a
+typed context pointer. Missing or multiple requests produce `invalid_argument`;
+`transport.max_request_size` and the transport streaming message limit both apply.
+
+Streaming handlers receive a borrowed `*rpc.ServerCall`; use
+`rpc.ServerHandler.bind(T, context, function)` for a typed application context.
+
+| Operation | Behavior |
+| --- | --- |
+| `io()` | Runtime used by this call, including cancellation of ordinary Io waits. |
+| `context()` | Read-only request metadata/deadline snapshot, valid until handler return. Per-message compression is on each received message. |
+| `receive(allocator)` | Owned raw message, or `null` after client half-close; allocation failure preserves the slot for retry. |
+| `sendInitialMetadata(entries, compression)` | Explicit initial metadata and response compression, before sending responses. |
+| `send(bytes, options)` | Queues a copied response, suspending on outbound backpressure. Defaults to empty initial metadata and identity if headers were not sent explicitly. |
+| `finish(status, trailers)` | Queues final status after pending responses; does not wait for network delivery. |
+| `abort()` | Allocation-free local termination using an INTERNAL_ERROR stream reset. |
+
+One reader and one writer may run concurrently. Initial metadata, send, and finish
+are writer operations; overlapping operations return `ConcurrentSend` or
+`ConcurrentReceive`. Join child tasks before returning and do not retain the borrowed
+call. Returning without finishing produces `internal`; unhandled allocation errors
+produce `resource_exhausted`, cancellation errors produce `cancelled`, and other
+handler errors produce `internal`. If a final response cannot be allocated/queued,
+the adapter aborts the stream. Explicit non-OK statuses use `finish`.
+
+### Cancellation, shutdown, and limits
+
+Each admitted call has a supervisor task and a handler task. Terminal notification
+(peer cancellation, deadline, shutdown, transport failure, or completed response)
+cancels and joins the handler. This interrupts ordinary cancelable Io operations,
+including sleep or external I/O, not just RPC send/receive. After finishing a call,
+return promptly; post-finish work may be cancelled. Tasks must cooperate with
+cancellation, and handlers must join any children in deferred cleanup.
+
+`shutdown` requests immediate transport shutdown; `shutdownGracefully(timeout_ns)`
+stops new admission and drains within the timeout. `wait` suspends uncancelably
+until transport completion and joins handler cleanup. `deinit` requests shutdown,
+waits, then frees transport and adapter storage. Startup waits also suspend
+uncancelably once started. Lifecycle operations require exclusive access and must
+run outside handlers. Destroy the server before its allocator, runtime, or handler
+contexts. Shared handler state must support concurrent invocations.
+
+`ServerOptions.max_calls` defaults to 1024 and bounds retained calls across all
+reactors, including handlers still unwinding after transport termination. Excess
+calls receive `resource_exhausted`. `activeCalls()` snapshots this retained count.
+Each call also retains one decoded inbound message (at most
+`transport.stream_limits.max_message_size`) and copied request metadata, in addition
+to transport buffers. Received messages are independently owned caller storage;
+unary handling retains its request until the handler returns. Task stacks, typed
+arenas, response storage, and application work are outside this count budget.
+
+### Typed server methods
+
+`grpc_lite_protobuf_async.ServiceServer(Service)` borrows the task server and
+derives wire paths and message types from generated service declarations:
+
+```zig
+fn echoTyped(
+    _: *App,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    ctx: *grpc.ServerContext,
+    request: demo.EchoRequest,
+) !demo.EchoReply {
+    try io.sleep(.fromMilliseconds(1), .awake);
+    try ctx.addTrailingMetadata("x-handler", "task");
+    return .{ .message = try arena.dupe(u8, request.message) };
+}
+
+var service = pb_async.ServiceServer(EchoApi).init(&server);
+try service.registerUnary("Echo", &app, echoTyped, .{});
+```
+
+The unary handler's supplied allocator is an arena: allocate response fields there
+and do not manually deinitialize the response. Request/response storage lasts only
+through the invocation and encoding. The optional compile-time
+`.map_error = fn (anyerror) grpc.Status` maps application errors; cancellation and
+allocation errors retain their standard mappings.
+
+For streaming, use `service.registerStream("Chat", &app, chat)` where `chat` takes
+`(*App, *pb_async.ServerCall(Request, Response))`. The typed call exposes the same
+operations as the raw call, with `receive(allocator)` returning an owned
+`StreamMessage(Request)` and `send(allocator, response, options)` encoding a response.
+Decode failures terminate the RPC (`invalid_argument`, or `resource_exhausted` for
+OOM); they cannot silently skip requests. Applications follow the method's message
+cardinality. Unary/streaming registration mismatches are rejected at compile time.
+
 ## Validation
 
 ```sh
@@ -244,4 +374,6 @@ zig build test-async -Dzio=true -Doptimize=ReleaseSafe --test-timeout 30s
 The suite checks single-/multi-executor progress, independent cancellation,
 flow-controlled sends, slow readers, half-close, metadata/compression, deadline and
 shutdown completion, cancellation races, retained quota release, and raw/typed
-allocation failure cleanup.
+allocation failure cleanup. Server coverage includes suspended-handler isolation,
+all streaming cardinalities, cancellation of ordinary Io waits, task launch failure,
+retained-call admission, graceful drain, and joined teardown.

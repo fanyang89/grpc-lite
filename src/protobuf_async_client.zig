@@ -7,6 +7,133 @@ const protobuf = @import("grpc_lite_protobuf");
 pub const TypedResult = protobuf.TypedResult;
 pub const StreamResult = rpc.StreamResult;
 
+pub const UnaryServerOptions = struct {
+    map_error: ?*const fn (anyerror) grpc.Status = null,
+};
+
+/// Borrows a raw server. Method names and message types come from the generated
+/// service; handlers receive Io explicitly rather than a synchronous vtable.
+pub fn ServiceServer(comptime Service: type) type {
+    return struct {
+        server: *rpc.Server,
+
+        pub fn init(server: *rpc.Server) @This() {
+            return .{ .server = server };
+        }
+
+        /// function(context, arena_allocator, io, server_context, request) returns
+        /// the generated Response. Request and response storage is call-scoped;
+        /// use the supplied arena for response allocations, without deinit.
+        pub fn registerUnary(self: *@This(), comptime method: []const u8, context: anytype, comptime function: anytype, comptime options: UnaryServerOptions) !void {
+            comptime if (protobuf.methodKind(Service, method) != .unary) {
+                @compileError("expected a unary protobuf method: " ++ method);
+            };
+            const Context = @TypeOf(context);
+            const Request = protobuf.RequestType(Service, method);
+            const Response = protobuf.ResponseType(Service, method);
+            try self.server.registerUnary(protobuf.methodPath(Service, method), .{
+                .context = context,
+                .invoke_fn = struct {
+                    fn invoke(raw: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, ctx: *grpc.ServerContext, bytes: []const u8) !grpc.UnaryResponse {
+                        const userdata: Context = @ptrCast(@alignCast(raw.?));
+                        var arena: std.heap.ArenaAllocator = .init(allocator);
+                        defer arena.deinit();
+                        var reader: std.Io.Reader = .fixed(bytes);
+                        const request = Request.decode(&reader, arena.allocator()) catch |err| {
+                            if (err == error.OutOfMemory) return err;
+                            return grpc.UnaryResponse.fail(allocator, .init(.invalid_argument, "invalid protobuf request"));
+                        };
+                        const response: Response = function(userdata, arena.allocator(), io, ctx, request) catch |err| {
+                            if (err == error.Canceled or err == error.OutOfMemory) return err;
+                            const status = if (options.map_error) |mapper| mapper(err) else grpc.Status.init(.internal, "task handler failed");
+                            return grpc.UnaryResponse.fail(allocator, status);
+                        };
+                        var writer: std.Io.Writer.Allocating = .init(allocator);
+                        defer writer.deinit();
+                        response.encode(&writer.writer, arena.allocator()) catch |err| switch (err) {
+                            error.WriteFailed => return error.OutOfMemory,
+                            else => return err,
+                        };
+                        return grpc.UnaryResponse.ok(allocator, writer.written());
+                    }
+                }.invoke,
+            });
+        }
+
+        /// function(context, *ServerCall(Request, Response)) runs in a task and
+        /// must finish the response and join any child tasks before returning.
+        pub fn registerStream(self: *@This(), comptime method: []const u8, context: anytype, comptime function: anytype) !void {
+            comptime if (protobuf.methodKind(Service, method) == .unary) {
+                @compileError("expected a streaming protobuf method: " ++ method);
+            };
+            const Context = @TypeOf(context);
+            const TypedCall = ServerCall(protobuf.RequestType(Service, method), protobuf.ResponseType(Service, method));
+            try self.server.registerStream(protobuf.methodPath(Service, method), .{
+                .context = context,
+                .invoke_fn = struct {
+                    fn invoke(raw: ?*anyopaque, call: *rpc.ServerCall) !void {
+                        const userdata: Context = @ptrCast(@alignCast(raw.?));
+                        var typed: TypedCall = .{ .raw = call };
+                        try function(userdata, &typed);
+                    }
+                }.invoke,
+            });
+        }
+    };
+}
+
+/// Borrowed typed server view, valid only inside the handler and its joined tasks.
+pub fn ServerCall(comptime Request: type, comptime Response: type) type {
+    return struct {
+        raw: *rpc.ServerCall,
+
+        pub fn io(self: *const @This()) std.Io {
+            return self.raw.io();
+        }
+
+        pub fn context(self: *const @This()) *const grpc.ServerContext {
+            return self.raw.context();
+        }
+
+        pub fn receive(self: *@This(), allocator: std.mem.Allocator) !?StreamMessage(Request) {
+            var message = (try self.raw.receive(allocator)) orelse return null;
+            defer message.deinit();
+            var arena: std.heap.ArenaAllocator = .init(allocator);
+            errdefer arena.deinit();
+            var reader: std.Io.Reader = .fixed(message.payload);
+            const value = Request.decode(&reader, arena.allocator()) catch |err| {
+                // The wire message was consumed. End the RPC rather than allow
+                // callers to continue after silently losing a request.
+                self.raw.finish(.init(if (err == error.OutOfMemory) .resource_exhausted else .invalid_argument, "protobuf request decode failed"), &.{}) catch self.raw.abort();
+                return err;
+            };
+            return .{ .value = value, .compression = message.compression, .arena = arena };
+        }
+
+        pub fn send(self: *@This(), allocator: std.mem.Allocator, response: Response, options: grpc.StreamSendOptions) !void {
+            var writer: std.Io.Writer.Allocating = .init(allocator);
+            defer writer.deinit();
+            response.encode(&writer.writer, allocator) catch |err| switch (err) {
+                error.WriteFailed => return error.OutOfMemory,
+                else => return err,
+            };
+            try self.raw.send(writer.written(), options);
+        }
+
+        pub fn sendInitialMetadata(self: *@This(), entries: []const grpc.MetadataEntry, compression: grpc.Compression) !void {
+            try self.raw.sendInitialMetadata(entries, compression);
+        }
+
+        pub fn finish(self: *@This(), status: grpc.Status, trailers: []const grpc.MetadataEntry) !void {
+            try self.raw.finish(status, trailers);
+        }
+
+        pub fn abort(self: *@This()) void {
+            self.raw.abort();
+        }
+    };
+}
+
 /// A decoded streaming message, owned independently of the stream.
 pub fn StreamMessage(comptime Response: type) type {
     return struct {
