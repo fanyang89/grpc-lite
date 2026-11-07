@@ -89,6 +89,9 @@ jobs:
       - name: Test task-friendly clients and servers with zio
         run: zig build test-async -Dzio=true -Doptimize=${{ matrix.optimize }} --summary all --test-timeout 30s
 
+      - name: Run typed task RPC example
+        run: zig build run-zio-typed -Dzio=true -Doptimize=${{ matrix.optimize }}
+
       - name: Check released C ABI baseline and old-header consumer
         if: matrix.optimize == 'ReleaseSafe'
         run: mise run test-c-abi

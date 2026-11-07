@@ -49,6 +49,91 @@ exe.root_module.addImport("zio", zio.module("zio"));
 do not need that option to import the adapter. Raw consumers still avoid protobuf
 and code-generation dependencies.
 
+### Runnable typed example
+
+From a checkout, run:
+
+```sh
+mise run example-zio-typed
+# Equivalent:
+zig build run-zio-typed -Dzio=true
+```
+
+[`examples/zio_typed.zig`](../examples/zio_typed.zig) starts a server and client on
+one executor, using the generated services in [`proto/echo.proto`](../proto/echo.proto).
+It demonstrates unary replies and application-error mapping, three server-streamed
+replies, client-stream aggregation, and duplex reader/writer tasks with gzip replies.
+It uses bounded stream buffers, joins child tasks before releasing streams, and
+drains the server before releasing the runtime. No separate server process is needed.
+
+To use the same program in a standalone application, run `zig init`, add the
+pinned zio dependency above, and add the current grpc-lite checkout to the
+`.dependencies` table in `build.zig.zon`:
+
+```zig
+.grpc_lite = .{ .path = "../grpc-lite" },
+```
+
+The path is relative to your application's build root. For an archive dependency,
+use `zig fetch --save=grpc_lite <source-archive-url>`
+with a revision containing the task adapters. Copy the example to `src/main.zig`
+and copy `proto/echo.proto` into your project. Add `"proto"` to the `.paths` list
+in `build.zig.zon` so source packages retain the schema. Use this `build.zig`:
+
+```zig
+const std = @import("std");
+const grpc_build = @import("grpc_lite");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const grpc = b.dependency("grpc_lite", .{
+        .target = target,
+        .optimize = optimize,
+        .protobuf = true,
+    });
+    const zio = b.dependency("zio", .{ .target = target, .optimize = optimize });
+    const generated = grpc_build.createProtocStep(grpc, target, optimize, .{
+        .source_files = &.{b.path("proto/echo.proto")},
+        .include_directories = &.{b.path("proto")},
+        .destination_directory = b.path(".zig-cache/echo-proto"),
+    }) orelse return;
+    const proto = b.createModule(.{
+        .root_source_file = b.path(".zig-cache/echo-proto/demo.pb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{
+            .name = "protobuf",
+            .module = grpc.module("grpc_lite_protobuf_runtime"),
+        }},
+    });
+    const exe = b.addExecutable(.{
+        .name = "typed-task-echo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "grpc_lite", .module = grpc.module("grpc_lite") },
+                .{ .name = "grpc_lite_async", .module = grpc.module("grpc_lite_async") },
+                .{ .name = "grpc_lite_protobuf_async", .module = grpc.module("grpc_lite_protobuf_async") },
+                .{ .name = "demo_proto", .module = proto },
+                .{ .name = "zio", .module = zio.module("zio") },
+            },
+        }),
+    });
+    exe.step.dependOn(generated.step);
+    b.installArtifact(exe);
+    const run = b.addRunArtifact(exe);
+    b.step("run", "Run typed task RPCs").dependOn(&run.step);
+}
+```
+
+Run `zig build run` in that application. The application owns its zio dependency;
+it does not pass `.zio = true` to grpc-lite. Keep generated protobuf files under
+`.zig-cache`. The raw transport, task adapters, and generated protobuf runtime
+remain separate imports.
+
 ## Unary calls
 
 ```zig

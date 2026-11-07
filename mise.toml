@@ -67,6 +67,10 @@ run = "zig build test -Doptimize=ReleaseSafe --summary all"
 description = "Run raw and typed task client/server integration tests with zio"
 run = "zig build test-async -Dzio=true --summary all --test-timeout 30s"
 
+[tasks.example-zio-typed]
+description = "Run a self-contained typed unary and streaming example on one zio executor"
+run = "zig build run-zio-typed -Dzio=true"
+
 [tasks.coverage]
 description = "Generate core Zig coverage with kcov"
 run = "tools/coverage.sh"

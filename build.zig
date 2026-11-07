@@ -871,6 +871,16 @@ fn addProtobufSupport(
         const run = b.addRunArtifact(tests);
         async_test_step.dependOn(&run.step);
         test_step.dependOn(&run.step);
+
+        const example = addExample(b, "zio-typed", "examples/zio_typed.zig", grpc_lite);
+        example.root_module.addImport("grpc_lite_async", grpc_lite_async);
+        example.root_module.addImport("grpc_lite_protobuf_async", protobuf_async);
+        example.root_module.addImport("demo_proto", demo_proto);
+        example.root_module.addImport("zio", zio_module);
+        example.step.dependOn(generate_proto.step);
+        b.installArtifact(example);
+        const run_example = b.addRunArtifact(example);
+        b.step("run-zio-typed", "Run typed unary and streaming RPCs on one zio executor").dependOn(&run_example.step);
     }
 
     const protobuf_test_module = b.createModule(.{

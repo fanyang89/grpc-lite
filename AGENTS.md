@@ -39,6 +39,7 @@ mise run bench-client
 mise run bench-server
 mise run gen-proto
 mise run gen-grpcpp
+mise run example-zio-typed
 ```
 
 ## Architecture
