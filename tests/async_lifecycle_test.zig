@@ -153,7 +153,6 @@ test "task GOAWAY drain preserves accepted calls and reconnects without replay" 
     }
     try std.testing.expectEqual(@as(usize, 0), server.activeCalls());
     try std.testing.expectEqual(@as(usize, 0), service.cancelled_handlers.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), client.channel.streamAdmissionStats().retained_streams);
 
     var replacement: Service = .{};
     var restarted = try replacement.start(io, port);
@@ -161,6 +160,10 @@ test "task GOAWAY drain preserves accepted calls and reconnects without replay" 
     try expectRecovered(&client, &replacement);
     try std.testing.expectEqual(@as(usize, 1), service.unary_calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), service.stream_calls.load(.acquire));
+    // Terminal callbacks and handle release can precede transport retirement.
+    client.shutdown();
+    client.channel.wait();
+    try std.testing.expectEqual(@as(usize, 0), client.channel.streamAdmissionStats().retained_streams);
 }
 
 test "task shutdown and drain expiry join suspended handlers before channel recovery" {
@@ -206,6 +209,11 @@ test "task shutdown and drain expiry join suspended handlers before channel reco
         var restarted = try replacement.start(io, port);
         defer restarted.deinit();
         try expectRecovered(&client, &replacement);
+        // Join the replacement stream's transport release before measuring the
+        // reservation still held by the old application-owned stream.
+        client.shutdown();
+        client.channel.wait();
+        try std.testing.expectEqual(@as(usize, 1), client.channel.streamAdmissionStats().retained_streams);
         // An old owning stream keeps its terminal status across reconnection and
         // holds admission only until destruction, independently of new calls.
         var result = try old_stream.finish(allocator);
