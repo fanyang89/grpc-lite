@@ -54,11 +54,11 @@ prefetch_native_packages() {
         'N-V-__8AAHSUBAA_Vn8NXM2L9F21QFvrTIxbH9yvxs5cO-lY' \
         'cpucycles.tar.gz'
     prefetch_url_package \
-        'https://github.com/wyzdwdz/nanozlog/archive/a1ad3d52aec355c2dba7568fe18ec440937d4f81.tar.gz' \
+        'https://codeload.github.com/wyzdwdz/nanozlog/tar.gz/a1ad3d52aec355c2dba7568fe18ec440937d4f81' \
         'nanozlog-0.1.0-5UtdH6f6AAACQMkivAT4xIQtfBDFG3JACCJRpnY5Up3P' \
         'nanozlog.tar.gz'
     prefetch_url_package \
-        'https://github.com/rockorager/zeit/archive/refs/tags/v0.10.0.tar.gz' \
+        'https://codeload.github.com/rockorager/zeit/tar.gz/refs/tags/v0.10.0' \
         'zeit-0.10.0-5I6bkxS-AgAaI3lI3RsXsWnPw7sMCqJKoFnSB8_QRAoo' \
         'zeit.tar.gz'
 }
