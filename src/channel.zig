@@ -2132,12 +2132,10 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
         beginStop(impl, "channel closed");
         return .disarm;
     }
-    if (impl.unary_cancel_pending.swap(false, .acq_rel)) {
-        cancelUnaryOperations(impl) catch {
-            beginStop(impl, "unary cancellation failed");
-            return .disarm;
-        };
-    }
+    processUnaryCancellations(impl) catch {
+        beginStop(impl, "unary cancellation failed");
+        return .disarm;
+    };
     processStreamWakes(impl);
     processPending(impl);
     switch (impl.connection_state) {
@@ -2161,31 +2159,6 @@ fn onAsync(impl_: ?*Impl, _: *xev.Loop, _: *xev.Completion, result: xev.Async.Wa
     return .rearm;
 }
 
-fn cancelUnaryOperations(impl: *Impl) !void {
-    var waiting = impl.waiting_operation_head;
-    while (waiting) |operation| {
-        waiting = operation.waiting_next;
-        if (!operation.cancel_requested.load(.acquire)) continue;
-        std.debug.assert(removeWaitingOperation(impl, operation));
-        removeOperationDeadline(impl, operation);
-        operation.setStaticOutcome(.cancelled, "call cancelled");
-        operation.finish();
-    }
-    var flush_needed = false;
-    var iterator = impl.operations.valueIterator();
-    while (iterator.next()) |entry| {
-        const operation = entry.*;
-        if (!operation.cancel_requested.load(.acquire) or operation.cancel_submitted) continue;
-        operation.cancel_submitted = true;
-        removeOperationDeadline(impl, operation);
-        operation.setStaticOutcome(.cancelled, "call cancelled");
-        if (submitCancellationReset(impl, operation.stream_id) != 0) return error.UnaryCancellationFailed;
-        flush_needed = true;
-    }
-    // Flushing may close streams and invalidate the operations iterator.
-    if (flush_needed and impl.connected) try flush(impl);
-}
-
 fn processPending(impl: *Impl) void {
     var pending: std.ArrayList(*Operation) = .empty;
     impl.mutex.lockUncancelable(syncIo());
@@ -2195,7 +2168,7 @@ fn processPending(impl: *Impl) void {
 
     for (pending.items, 0..) |operation, index| {
         pending.items[index] = undefined;
-        if (operation.cancel_requested.load(.acquire)) {
+        if (unaryCancelled(operation)) {
             operation.setStaticOutcome(.cancelled, "call cancelled");
             operation.finish();
             continue;
@@ -3518,6 +3491,7 @@ fn notifyUnaryCancellation(context: *anyopaque) void {
 }
 
 fn unaryCancelled(operation: *Operation) bool {
+    if (operation.cancel_requested.load(.acquire)) return true;
     return if (operation.cancellation) |source| source.cancelled.load(.acquire) else false;
 }
 
@@ -3537,13 +3511,15 @@ fn processUnaryCancellations(impl: *Impl) !void {
     var flush_needed = false;
     while (operations.next()) |entry| {
         const operation = entry.*;
-        if (operation.outcome_set or !unaryCancelled(operation)) continue;
+        if (operation.outcome_set or operation.cancel_submitted or !unaryCancelled(operation)) continue;
+        operation.cancel_submitted = true;
         removeOperationDeadline(impl, operation);
         operation.setStaticOutcome(.cancelled, "call cancelled");
         if (submitCancellationReset(impl, operation.stream_id) != 0) return error.UnaryCancellationFailed;
         flush_needed = true;
     }
-    if (flush_needed) try flush(impl);
+    // Flushing may close streams and invalidate the operations iterator.
+    if (flush_needed and impl.connected) try flush(impl);
 }
 
 fn expireDeadlines(impl: *Impl, now: u64) !void {
