@@ -1,0 +1,59 @@
+name: Prepare dependencies
+
+on:
+  workflow_call:
+    inputs:
+      validation-ref:
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.validation-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install mise tools
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          version: 2026.7.14
+
+      - name: Cache pinned source archives
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .zig-cache/dependencies
+          # The closure includes all lazy dependencies, including both Linux
+          # protoc architectures. Only sources, never compiled objects, are shared.
+          key: zig-dependencies-v1-${{ runner.os }}-${{ hashFiles('mise.toml', '**/build.zig.zon', 'tools/prepare_dependencies.py') }}
+
+      - name: Download and verify the complete dependency closure
+        run: |
+          python3 tests/prepare_dependencies_test.py
+          mise run prepare-dependencies
+
+      - name: Verify an offline build with optional integrations
+        shell: bash
+        run: |
+          mkdir -p .zig-cache/offline-global/p
+          cp .zig-cache/dependencies/p/*.tar.gz .zig-cache/offline-global/p/
+          sudo unshare --net -- runuser -u "$(id -un)" -- env \
+            "PATH=$PATH" \
+            "ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-cache/offline-global" \
+            zig build -Dzio=true -Dtls=true -Dgperftools=true
+
+      - name: Publish verified dependencies
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zig-dependencies
+          path: .zig-cache/dependencies
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3

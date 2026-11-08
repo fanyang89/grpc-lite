@@ -28,7 +28,7 @@ prefetch_url_package \
 
 # Normally leave protoc uncached to exercise lazy dependency resolution. An
 # explicit local archive supports environments where Zig's HTTP fetch fails.
-if [[ -n "${GRPC_LITE_PROTOC_ARCHIVE:-}" ]]; then
+if [[ -n "${GRPC_LITE_PROTOC_ARCHIVE:-}" || -n "${GRPC_LITE_DEPENDENCY_CACHE:-}" ]]; then
     case $(uname -m) in
         x86_64) protoc_arch=x86_64 ;;
         aarch64|arm64) protoc_arch=aarch_64 ;;
@@ -46,10 +46,14 @@ if entry is None:
 print(re.search(r'\.hash\s*=\s*"([^"]+)"', entry[1])[1])
 PY
     )
-    actual_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zig fetch "$GRPC_LITE_PROTOC_ARCHIVE")
-    if [[ "$actual_hash" != "$protoc_hash" ]]; then
-        printf 'protoc package hash mismatch: expected %s, got %s\n' "$protoc_hash" "$actual_hash" >&2
-        exit 1
+    if [[ -n "${GRPC_LITE_DEPENDENCY_CACHE:-}" ]]; then
+        prefetch_prepared_package "$protoc_hash"
+    else
+        actual_hash=$(ZIG_GLOBAL_CACHE_DIR="$global_cache" zig fetch "$GRPC_LITE_PROTOC_ARCHIVE")
+        if [[ "$actual_hash" != "$protoc_hash" ]]; then
+            printf 'protoc package hash mismatch: expected %s, got %s\n' "$protoc_hash" "$actual_hash" >&2
+            exit 1
+        fi
     fi
 fi
 

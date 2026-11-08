@@ -2,10 +2,23 @@
 # Shared package preparation for isolated Zig consumers. The caller supplies
 # project_root, work_dir, archive, and global_cache and owns cleanup.
 
+# Import only requested packages so lazy integrations stay absent until tested.
+prefetch_prepared_package() {
+    local expected_hash=$1
+    cp "$GRPC_LITE_DEPENDENCY_CACHE/p/$expected_hash.tar.gz" "$global_cache/p/"
+    mkdir -p "$global_cache/p/$expected_hash"
+    tar --extract --gzip --file "$global_cache/p/$expected_hash.tar.gz" \
+        --strip-components=1 --directory "$global_cache/p/$expected_hash"
+}
+
 prefetch_url_package() {
     local url=$1
     local expected_hash=$2
     local archive_name=$3
+    if [[ -n "${GRPC_LITE_DEPENDENCY_CACHE:-}" ]]; then
+        prefetch_prepared_package "$expected_hash"
+        return
+    fi
     local dependency_archive="$work_dir/$archive_name"
     local package_dir="$global_cache/p/$expected_hash"
 
@@ -26,6 +39,10 @@ prefetch_zigfetch_url_package() {
     local url=$1
     local expected_hash=$2
     local archive_name=$3
+    if [[ -n "${GRPC_LITE_DEPENDENCY_CACHE:-}" ]]; then
+        prefetch_prepared_package "$expected_hash"
+        return
+    fi
     local output
     local actual_hash
 

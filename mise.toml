@@ -11,6 +11,10 @@ actionlint = "1.7.12"
 description = "Fetch build dependencies"
 run = "zig build --fetch=needed"
 
+[tasks.prepare-dependencies]
+description = "Download and verify all pinned Zig dependencies, including lazy and transitive packages"
+run = "python3 tools/prepare_dependencies.py"
+
 [tasks.docs-dev]
 description = "Run the Fumadocs site (Node.js 22; first run npm --prefix website ci)"
 run = "npm --prefix website run dev"

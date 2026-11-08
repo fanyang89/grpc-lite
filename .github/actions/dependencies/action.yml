@@ -1,0 +1,15 @@
+name: Restore verified dependencies
+description: Reuse this workflow's verified dependency closure without upstream downloads
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: zig-dependencies
+        path: .zig-cache/dependencies
+    - shell: bash
+      run: |
+        echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-cache/dependencies" >> "$GITHUB_ENV"
+        echo "GRPC_LITE_DEPENDENCY_CACHE=$GITHUB_WORKSPACE/.zig-cache/dependencies" >> "$GITHUB_ENV"
+        echo "GRPC_LITE_CARES_ARCHIVE=$GITHUB_WORKSPACE/.zig-cache/dependencies/N-V-__8AAC2bMACCSbPXjtm12IrwNq-6EO8zPfR2QQy9a53e.tar.gz" >> "$GITHUB_ENV"
+        echo "GRPC_LITE_NGHTTP2_ARCHIVE=$GITHUB_WORKSPACE/.zig-cache/dependencies/N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX.tar.gz" >> "$GITHUB_ENV"
