@@ -409,7 +409,16 @@ pub const Loop = struct {
                 v.flags,
             ),
 
-            .close => |v| sqe.prep_close(v.fd),
+            .close => |v| {
+                // TSan intercepts socket creation but cannot observe IORING_OP_CLOSE.
+                // Complete a NOP first, then use intercepted close on the loop thread
+                // so a reused fd does not retain the previous socket's shadow state.
+                if (builtin.sanitize_thread) {
+                    sqe.prep_nop();
+                } else {
+                    sqe.prep_close(v.fd);
+                }
+            },
 
             .connect => |*v| sqe.prep_connect(
                 v.socket,
@@ -674,8 +683,14 @@ pub const Completion = struct {
                 },
             },
 
-            .close => .{
-                .close = if (res >= 0) {} else switch (@as(posix.E, @fromBackingInt(@intCast(-res)))) {
+            .close => |op| .{
+                .close = if (res >= 0) closed: {
+                    if (builtin.sanitize_thread) {
+                        const errno = posix.errno(std.c.close(op.fd));
+                        if (errno != .SUCCESS) break :closed posix.unexpectedErrno(errno);
+                    }
+                    break :closed {};
+                } else switch (@as(posix.E, @fromBackingInt(@intCast(-res)))) {
                     else => |errno| posix.unexpectedErrno(errno),
                 },
             },
