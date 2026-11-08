@@ -1269,6 +1269,7 @@ const OperationOwner = union(enum) {
 };
 
 const Operation = struct {
+    references: std.atomic.Value(usize) = .init(1),
     cancellation: ?*call.Cancellation.State = null,
     impl: *Impl,
     path: []u8,
@@ -1385,6 +1386,7 @@ const Operation = struct {
     }
 
     fn deinit(self: *Operation) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
         if (self.cancellation) |source| {
             source.detach();
             source.release();
@@ -1524,6 +1526,10 @@ const Operation = struct {
     }
 
     fn finalize(self: *Operation, stream_error: u32) void {
+        if (self.finished) {
+            self.deinit();
+            return;
+        }
         if (self.outcome_set) {
             self.finish();
             return;
@@ -3044,6 +3050,7 @@ fn onBeginHeaders(_: ?*c.nghttp2_session, received_frame: ?*const c.nghttp2_fram
     };
     const impl: *Impl = @ptrCast(@alignCast(user_data.?));
     if (impl.operations.get(native_frame.*.hd.stream_id)) |operation| {
+        if (operation.finished) return 0;
         operation.resetHeaderBlock(kind);
         if (kind == .response) operation.saw_response_headers = true;
     } else if (impl.streams.get(native_frame.*.hd.stream_id)) |client_stream| {
@@ -3110,6 +3117,7 @@ fn accountResponseHeader(
     value_length: usize,
 ) ?c_int {
     if (impl.operations.get(stream_id)) |operation| {
+        if (operation.finished) return 0;
         if (operation.response_headers_too_large) return 0;
         if (!accountResponseHeaderField(
             &operation.response_header_list_size,
@@ -3157,6 +3165,7 @@ fn onHeader(
     const name = name_pointer[0..name_length];
     const value = value_pointer[0..value_length];
     if (impl.operations.get(stream_id)) |operation| {
+        if (operation.finished) return 0;
         if (std.mem.eql(u8, name, ":status")) {
             operation.http_status = std.fmt.parseInt(u16, value, 10) catch null;
         } else if (std.mem.eql(u8, name, "content-type")) {
@@ -3228,7 +3237,7 @@ fn onDataChunk(
 ) callconv(.c) c_int {
     const impl: *Impl = @ptrCast(@alignCast(user_data.?));
     if (impl.operations.get(stream_id)) |operation| {
-        if (operation.response_headers_too_large) {
+        if (operation.finished or operation.response_headers_too_large) {
             if (c.nghttp2_session_consume_connection(session, data_length) != 0) {
                 return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             }
@@ -3319,6 +3328,7 @@ fn onFrameReceived(session: ?*c.nghttp2_session, received_frame: ?*const c.nghtt
     if (native_frame.*.hd.type == c.NGHTTP2_HEADERS) {
         const end_stream = native_frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
         if (impl.operations.get(native_frame.*.hd.stream_id)) |operation| {
+            if (operation.finished) return 0;
             const valid_header_block = operation.finishHeaderBlock(end_stream) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             if ((!valid_header_block or operation.response_metadata_invalid) and !operation.outcome_set) {
                 operation.setOutcome(
@@ -3516,6 +3526,10 @@ fn processUnaryCancellations(impl: *Impl) !void {
         removeOperationDeadline(impl, operation);
         operation.setStaticOutcome(.cancelled, "call cancelled");
         if (submitCancellationReset(impl, operation.stream_id) != 0) return error.UnaryCancellationFailed;
+        // Keep the data provider alive until stream retirement, but deliver the
+        // terminal result without waiting for socket write capacity.
+        _ = operation.references.fetchAdd(1, .monotonic);
+        operation.finish();
         flush_needed = true;
     }
     // Flushing may close streams and invalidate the operations iterator.
@@ -3632,6 +3646,10 @@ fn handleTransportFailure(impl: *Impl, reason: []const u8) void {
         const operation = entry.value_ptr.*;
         std.debug.assert(impl.operations.remove(entry.key_ptr.*));
         removeOperationDeadline(impl, operation);
+        if (operation.finished) {
+            operation.deinit();
+            continue;
+        }
         operation.setOutcome(.unavailable, reason) catch {};
         operation.finish();
     }
@@ -3902,6 +3920,10 @@ fn beginStop(impl: *Impl, reason: []const u8) void {
         const operation = entry.value_ptr.*;
         std.debug.assert(impl.operations.remove(stream_id));
         removeOperationDeadline(impl, operation);
+        if (operation.finished) {
+            operation.deinit();
+            continue;
+        }
         operation.setOutcome(.unavailable, reason) catch {};
         operation.finish();
     }
@@ -5706,6 +5728,61 @@ test "raw unary cancellation supports blocking and async calls without closing t
     handler.release.post(std.testing.io);
     try std.testing.expectEqual(@as(usize, 1), shutdown_completion.count);
     completed_source.cancel();
+}
+
+test "unary cancellation completes under write backpressure before stream retirement" {
+    const Completion = struct {
+        count: usize = 0,
+        code: status.Code = .unknown,
+
+        fn complete(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.count += 1;
+            self.code = result.status.code;
+        }
+    };
+    for ([_]bool{ false, true }) |asynchronous| {
+        var host = [_:0]u8{'x'};
+        var serialized_allocator: SerializedAllocator = undefined;
+        var impl: Impl = undefined;
+        initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+        impl.async_handle = try xev.Async.init();
+        defer impl.async_handle.deinit();
+        defer impl.operations.deinit(impl.allocator);
+        defer impl.deadline_heap.deinit(impl.allocator);
+        try initializeSession(&impl);
+        defer c.nghttp2_session_del(impl.session);
+        impl.connected = true;
+        impl.queued_write_bytes = impl.write_high_watermark_bytes;
+        var source = try call.Cancellation.init(std.testing.allocator);
+        defer source.deinit();
+        var completion: Completion = .{};
+        const operation = try Operation.init(&impl, "/test.Cancel/Backpressure", "request", .{ .cancellation = &source });
+        if (asynchronous) operation.owner = .{ .callback = .{ .context = &completion, .on_complete = Completion.complete } };
+        try submitOperation(&impl, operation);
+        const stream_id = operation.stream_id;
+        source.cancel();
+        try processUnaryCancellations(&impl);
+        try std.testing.expect(operation.finished);
+        try std.testing.expectEqual(status.Code.cancelled, operation.response_code);
+        if (asynchronous) {
+            try std.testing.expectEqual(@as(usize, 1), completion.count);
+            try std.testing.expectEqual(status.Code.cancelled, completion.code);
+        } else {
+            try std.testing.expect(operation.done);
+            operation.deinit();
+        }
+        // Completion releases caller ownership, but the native data provider
+        // remains valid until reset delivery or connection teardown retires it.
+        try std.testing.expectEqualStrings("request", operation.request_frame[5..]);
+        try std.testing.expectEqual(@as(usize, 1), impl.operations.count());
+        try std.testing.expectEqual(@as(usize, 1), impl.unary_admission.stats.retained_calls);
+        try processUnaryCancellations(&impl);
+        try std.testing.expectEqual(@as(c_int, 0), onStreamClose(impl.session, stream_id, c.NGHTTP2_CANCEL, &impl));
+        try std.testing.expectEqual(@as(usize, 0), impl.operations.count());
+        try std.testing.expectEqual(@as(usize, 0), impl.unary_admission.stats.retained_calls);
+        if (asynchronous) try std.testing.expectEqual(@as(usize, 1), completion.count);
+    }
 }
 
 test "unary cancellation reset failure preserves cancellation outcome" {

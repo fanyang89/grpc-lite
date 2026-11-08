@@ -49,7 +49,11 @@ cancellation.cancel(); // May also be called from another thread.
 
 `cancel()` is idempotent and does not wait for completion. Cancellation before
 submission prevents sending the request; in-flight cancellation resets only that
-HTTP/2 stream. The transport loop arbitrates cancellation, deadlines, and responses:
+HTTP/2 stream.
+Cancellation completion does not wait for socket write capacity. The transport retains
+the request and its admission reservation until the stream retires, even after the
+application receives the cancelled result.
+The transport loop arbitrates cancellation, deadlines, and responses:
 the first committed terminal outcome wins. Accepted async calls still invoke
 `on_complete` exactly once; cancellation after completion is harmless, including
 after Channel teardown. Cancellation does not roll back server-side effects or
