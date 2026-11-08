@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
             null,
     };
     const enable_tls = b.option(bool, "tls", "Enable TLS transport support through mbedTLS") orelse false;
+    const enable_zio = b.option(bool, "zio", "Build zio examples and integration tests") orelse false;
     const enable_protobuf = b.option(
         bool,
         "protobuf",
@@ -68,6 +69,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zio = if (enable_zio)
+        (b.lazyDependency("zio", .{ .target = target, .optimize = optimize }) orelse return).module("zio")
+    else
+        null;
+    if (zio) |module| applySanitizers(module, sanitizers);
     const protobuf_dependency = if (enable_protobuf)
         b.lazyDependency("protobuf", .{
             .target = target,
@@ -106,6 +112,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     applySanitizers(grpc_lite, sanitizers);
+    const grpc_lite_async = b.addModule("grpc_lite_async", .{
+        .root_source_file = b.path("src/async_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite }},
+    });
+    applySanitizers(grpc_lite_async, sanitizers);
     const grpc_lite_gperftools = if (enable_gperftools or enable_tcmalloc) blk: {
         const options = b.addOptions();
         options.addOption(bool, "cpu_profiler", enable_gperftools);
@@ -174,6 +187,55 @@ pub fn build(b: *std.Build) void {
     grpc_lite.addImport("xev", xev);
     grpc_lite.addImport("nanozlog", nanozlog_dependency.module("nanozlog"));
     const test_step = b.step("test", "Run unit tests");
+    const async_test_step = b.step("test-async", "Run task-friendly RPC tests (enable zio with -Dzio=true)");
+    if (zio) |zio_module| {
+        for ([_][]const u8{ "async_client", "async_stream", "async_server", "async_lifecycle" }) |name| {
+            const async_tests = b.addTest(.{
+                .name = name,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.fmt("tests/{s}_test.zig", .{name})),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "grpc_lite", .module = grpc_lite },
+                        .{ .name = "grpc_lite_async", .module = grpc_lite_async },
+                        .{ .name = "zio", .module = zio_module },
+                    },
+                }),
+            });
+            applySanitizers(async_tests.root_module, sanitizers);
+            const run = b.addRunArtifact(async_tests);
+            async_test_step.dependOn(&run.step);
+            test_step.dependOn(&run.step);
+        }
+
+        const task_examples = [_]struct { name: []const u8, artifact: []const u8, source: []const u8 }{
+            .{ .name = "unary", .artifact = "zio-unary-client", .source = "examples/zio_unary_client.zig" },
+            .{ .name = "stream", .artifact = "zio-stream-client", .source = "examples/zio_stream_client.zig" },
+            .{ .name = "server", .artifact = "zio-server", .source = "examples/zio_server.zig" },
+        };
+        for (task_examples) |example_source| {
+            const name = example_source.name;
+            const example = b.addExecutable(.{
+                .name = example_source.artifact,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(example_source.source),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "grpc_lite", .module = grpc_lite },
+                        .{ .name = "grpc_lite_async", .module = grpc_lite_async },
+                        .{ .name = "zio", .module = zio_module },
+                    },
+                }),
+            });
+            b.installArtifact(example);
+            const run_example = b.addRunArtifact(example);
+            b.step(b.fmt("run-zio-{s}", .{name}), b.fmt("Run the zio {s} example", .{name})).dependOn(&run_example.step);
+        }
+    } else {
+        async_test_step.dependOn(&b.addFail("test-async requires -Dzio=true").step);
+    }
     const cpp_codegen = if (host_protobuf_dependency) |dependency|
         addCppCodegenSupport(b, dependency, test_step, host_target, optimize, transpile_c)
     else
@@ -579,6 +641,9 @@ pub fn build(b: *std.Build) void {
         grpc_proto_dependency.?,
         protobuf.?,
         grpc_lite,
+        grpc_lite_async,
+        zio,
+        async_test_step,
         test_step,
         target,
         optimize,
@@ -598,7 +663,12 @@ fn addCppCodegenSupport(
     host_target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     transpile_c: bool,
-) CppCodegenSupport {
+) ?CppCodegenSupport {
+    // A missing lazy dependency schedules a fetch and another configuration pass.
+    const protoc_dependency = host_protobuf_dependency.builder.lazyDependency(
+        protocDependencyName(),
+        .{},
+    ) orelse return null;
     const host_protobuf = host_protobuf_dependency.module("protobuf");
     const plugin_schema_files = b.addWriteFiles();
     const plugin_schema_root = plugin_schema_files.add("root.zig",
@@ -650,10 +720,6 @@ fn addCppCodegenSupport(
     });
     test_step.dependOn(&b.addRunArtifact(grpc_lite_cpp_plugin_tests).step);
 
-    const protoc_dependency = host_protobuf_dependency.builder.lazyDependency(
-        protocDependencyName(),
-        .{},
-    ) orelse @panic("protoc dependency is unavailable");
     const generate_grpcpp = std.Build.Step.Run.create(b, "run protoc for C++ service glue");
     generate_grpcpp.addFileArg(protoc_dependency.path(if (builtin.os.tag == .windows)
         "bin/protoc.exe"
@@ -697,6 +763,9 @@ fn addProtobufSupport(
     grpc_proto_dependency: *std.Build.Dependency,
     protobuf: *std.Build.Module,
     grpc_lite: *std.Build.Module,
+    grpc_lite_async: *std.Build.Module,
+    zio: ?*std.Build.Module,
+    async_test_step: *std.Build.Step,
     test_step: *std.Build.Step,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -770,6 +839,50 @@ fn addProtobufSupport(
         },
     });
     applySanitizers(grpc_lite_protobuf, sanitizers);
+    const protobuf_async = b.addModule("grpc_lite_protobuf_async", .{
+        .root_source_file = b.path("src/protobuf_async_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "grpc_lite", .module = grpc_lite },
+            .{ .name = "grpc_lite_async", .module = grpc_lite_async },
+            .{ .name = "grpc_lite_protobuf", .module = grpc_lite_protobuf },
+        },
+    });
+    applySanitizers(protobuf_async, sanitizers);
+    if (zio) |zio_module| {
+        const tests = b.addTest(.{
+            .name = "protobuf-async-client",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/protobuf_async_client_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "grpc_lite", .module = grpc_lite },
+                    .{ .name = "grpc_lite_async", .module = grpc_lite_async },
+                    .{ .name = "grpc_lite_protobuf", .module = grpc_lite_protobuf },
+                    .{ .name = "grpc_lite_protobuf_async", .module = protobuf_async },
+                    .{ .name = "demo_proto", .module = demo_proto },
+                    .{ .name = "zio", .module = zio_module },
+                },
+            }),
+        });
+        applySanitizers(tests.root_module, sanitizers);
+        tests.step.dependOn(generate_proto.step);
+        const run = b.addRunArtifact(tests);
+        async_test_step.dependOn(&run.step);
+        test_step.dependOn(&run.step);
+
+        const example = addExample(b, "zio-typed", "examples/zio_typed.zig", grpc_lite);
+        example.root_module.addImport("grpc_lite_async", grpc_lite_async);
+        example.root_module.addImport("grpc_lite_protobuf_async", protobuf_async);
+        example.root_module.addImport("demo_proto", demo_proto);
+        example.root_module.addImport("zio", zio_module);
+        example.step.dependOn(generate_proto.step);
+        b.installArtifact(example);
+        const run_example = b.addRunArtifact(example);
+        b.step("run-zio-typed", "Run typed unary and streaming RPCs on one zio executor").dependOn(&run_example.step);
+    }
 
     const protobuf_test_module = b.createModule(.{
         .root_source_file = b.path("tests/protobuf_codegen_test.zig"),
@@ -909,6 +1022,27 @@ fn addProtobufSupport(
     const streaming_soak_peer = b.step("streaming-soak-peer", "Build the native official peer for streaming soak");
     streaming_soak_peer.dependOn(&install_interop_server.step);
     b.installArtifact(interop_client);
+
+    if (zio) |zio_module| {
+        const task_server = addExample(b, "grpc-lite-task-interop-server", "tests/official/task_interop_server.zig", grpc_lite);
+        task_server.root_module.addImport("grpc_lite_async", grpc_lite_async);
+        task_server.root_module.addImport("grpc_lite_protobuf_async", protobuf_async);
+        task_server.root_module.addImport("grpc_testing", interop_proto);
+        task_server.root_module.addImport("zio", zio_module);
+        task_server.step.dependOn(generate_interop_proto.step);
+        const install_task_server = b.addInstallArtifact(task_server, .{});
+        b.getInstallStep().dependOn(&install_task_server.step);
+        b.step("task-interop-server", "Build the zio task-based official interop server").dependOn(&install_task_server.step);
+        const task_client = addExample(b, "grpc-lite-task-interop-client", "tests/official/task_interop_client.zig", grpc_lite);
+        task_client.root_module.addImport("grpc_lite_async", grpc_lite_async);
+        task_client.root_module.addImport("grpc_lite_protobuf_async", protobuf_async);
+        task_client.root_module.addImport("grpc_testing", interop_proto);
+        task_client.root_module.addImport("zio", zio_module);
+        task_client.step.dependOn(generate_interop_proto.step);
+        const install_task_client = b.addInstallArtifact(task_client, .{});
+        b.getInstallStep().dependOn(&install_task_client.step);
+        b.step("task-interop-client", "Build the zio task-based official interop client").dependOn(&install_task_client.step);
+    }
 
     const benchmark_server = addExample(
         b,

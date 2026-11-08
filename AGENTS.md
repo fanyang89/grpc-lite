@@ -19,6 +19,7 @@ mise run test-release-safe
 mise run test-tsan
 mise run test-ubsan
 mise run test-consumer
+mise run test-consumer-async
 mise run test-consumer-cpp
 mise run prepare-gperftools
 mise run build-gperftools
@@ -28,7 +29,9 @@ mise run ci-lint
 mise run check
 mise run interop
 mise run interop-official
+mise run interop-async
 mise run interop-tls
+mise run interop-async-tls
 mise run interop-http2
 mise run interop-http2-edge
 mise run bench
@@ -37,6 +40,7 @@ mise run bench-client
 mise run bench-server
 mise run gen-proto
 mise run gen-grpcpp
+mise run example-zio-typed
 ```
 
 ## Architecture
@@ -73,7 +77,10 @@ authoritative: change it before implementing a feature with a different decision
 | Large messages and HTTP/2 flow control | Required | Include padding and max-stream tests |
 | ASCII and binary metadata | Required | Emit padded base64; accept padded, unpadded, and comma-joined `-bin` values |
 | Status codes and Unicode status messages | Required | Preserve percent-encoded UTF-8 bytes |
-| Deadlines | Required | Explicit public cancellation is streaming-only |
+| Deadlines | Required | Explicit handle cancellation is streaming-only; task-based unary calls also propagate std.Io cancellation |
+| Task-friendly Zig unary clients | Selected | Optional raw and typed std.Io adapters; zio is the first validated runtime; connection and teardown waits suspend through the supplied Io |
+| Task-friendly Zig streaming clients | Selected | Raw and typed std.Io send/receive waits, independent reader/writer tasks, half-close and cancellation; one bounded application-side receive slot per stream in addition to transport capacities |
+| Task-friendly Zig server handlers | Selected | Optional raw and typed unary/streaming handlers on std.Io tasks; bounded retained calls and one inbound message slot per call; terminal events cancel and join handler tasks before server teardown |
 | Per-message compression | Selected | Only `identity` and `gzip` |
 | GOAWAY connection replacement | Selected | New calls use a new connection; no RPC retry |
 | Graceful server drain | Selected | Stop admission, send GOAWAY, wait with timeout |

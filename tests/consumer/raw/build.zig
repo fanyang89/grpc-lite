@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "grpc_lite", .module = grpc_lite.module("grpc_lite") }},
     });
     const consumer_options = b.addOptions();
+    root_module.addImport("grpc_lite_async", grpc_lite.module("grpc_lite_async"));
     consumer_options.addOption(bool, "tls", enable_tls);
     root_module.addOptions("consumer_options", consumer_options);
     if (enable_gperftools) {

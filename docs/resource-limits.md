@@ -27,6 +27,12 @@ Default streaming capacities are 8 MiB in each direction, so the byte budget per
 application-retained stream reservations. The backing allocator must outlive the last
 stream handle. Failed construction rolls reservations back.
 
+The optional `grpc_lite_async` streaming adapter also retains one application-side
+decoded-message slot (at most `max_message_size` payload bytes) and copied metadata.
+This is additional to transport capacities and excluded from transport admission
+and occupancy counters. It pauses delivery until the slot is consumed; returned
+owned messages are separately managed caller storage. See [task-friendly clients](zig-async.md#buffers-allocation-and-ownership).
+
 See [Zig admission](zig-api.md#unary-admission) and
 [C/C++ managed channels](c-cpp-reference.md#managed-channels) for configuration and errors.
 
@@ -51,6 +57,15 @@ Server connection slots remain occupied through asynchronous closing and final
 destruction. Transport stream admission ends separately from application-retained
 `ServerCall` ownership. Release every retained server call before destroying the Server.
 Active RPCs are exempt from the idle timeout; use RPC deadlines for stalled work.
+
+The optional task server has a separate `grpc_lite_async.ServerOptions.max_calls`
+budget (default 1024) across reactors. It includes calls whose handlers are still
+unwinding after transport termination; excess calls receive `RESOURCE_EXHAUSTED`.
+`activeCalls()` reports this retained count. Each admitted call adds one decoded
+inbound message slot, capped at `transport.stream_limits.max_message_size`, and a
+request-metadata snapshot outside transport counters. Unary handlers also retain
+their request until return. Task stacks, returned messages, typed arenas, and
+application allocations are not covered by this count budget.
 
 ## Memory and ownership
 

@@ -9,6 +9,9 @@ New applications should start with the [Zig quickstart](zig-quickstart.md): pack
 installation, build integration, `.proto` generation, and a runnable typed client/server.
 This page is the API reference.
 
+For sequential-style unary/streaming clients and server handlers with zio and `std.Io`, see
+[Task-friendly Zig RPCs](zig-async.md).
+
 The public Zig transport is raw-byte based. Applications may use protobuf wire bytes
 directly or opt into the shared zig-protobuf runtime and typed adapters.
 
@@ -66,7 +69,7 @@ and raw metadata key/value lengths. It is a logical request budget, **not** a to
 heap or wire-byte limit: response storage, compression workspace, allocator overhead,
 and streaming calls are excluded. Set both limits for the deployment's capacity.
 
-Both unary entry points return `error.UnaryAdmissionRejected` immediately on quota
+All unary entry points return `error.UnaryAdmissionRejected` immediately on quota
 exhaustion; rejected async calls never invoke the completion callback. Allocation or
 validation failures roll back reservations. `channel.unaryAdmissionStats()` returns a
 thread-safe snapshot of `retained_calls`, `retained_request_bytes`, and the saturating

@@ -8,6 +8,30 @@ go_server_port=${GO_TLS_SERVER_PORT:-0}
 certificate="$project_root/src/testdata/localhost-cert.pem"
 private_key="$project_root/src/testdata/localhost-key.pem"
 cases=(empty_unary large_unary client_streaming server_streaming ping_pong empty_stream)
+server_mode=${INTEROP_SERVER_MODE:-callback}
+case_runner=()
+case "$server_mode" in
+  callback)
+    server_binary=grpc-lite-interop-server
+    client_binary=grpc-lite-interop-client
+    peer_description=grpc-lite
+    ;;
+  task)
+    server_binary=grpc-lite-task-interop-server
+    client_binary=grpc-lite-task-interop-client
+    peer_description='grpc-lite task (one zio executor)'
+    work_dir="$work_dir/task-tls"
+    case_runner=(/usr/bin/timeout --kill-after=2s "${INTEROP_CASE_TIMEOUT_SECONDS:-30}s")
+    cases+=(special_status_message unimplemented_method unimplemented_service
+      custom_metadata status_code_and_message cancel_after_begin
+      cancel_after_first_response timeout_on_sleeping_server)
+    ;;
+  *) printf 'invalid INTEROP_SERVER_MODE: %s\n' "$server_mode" >&2; exit 2 ;;
+esac
+client_cases=("${cases[@]}")
+if [[ "$server_mode" == task ]]; then
+  client_cases+=(half_duplex concurrent_duplex task_cancellation)
+fi
 peer_pid=
 peer_log=
 peer_port=
@@ -55,7 +79,7 @@ run_case() {
   local test_case=$2
   shift 2
   printf '[ RUN  ] %-24s %s\n' "$test_case" "$direction"
-  if "$@"; then
+  if "${case_runner[@]}" "$@"; then
     printf '[ PASS ] %-24s %s\n' "$test_case" "$direction"
   else
     printf '[ FAIL ] %-24s %s\n' "$test_case" "$direction" >&2
@@ -70,13 +94,17 @@ main() {
   trap 'exit 143' TERM
   bash "$project_root/tests/official/run_tls_test.sh"
   mkdir -p "$work_dir"
-  zig build -Dtls=true
+  if [[ "$server_mode" == task ]]; then
+    (cd "$project_root" && zig build task-interop-server task-interop-client -Dzio=true -Dtls=true)
+  else
+    (cd "$project_root" && zig build -Dtls=true)
+  fi
   (cd "$project_root/tests/official" && \
     go build -mod=readonly -o "$work_dir/grpc-go-interop-client" google.golang.org/grpc/interop/client && \
     go build -mod=readonly -o "$work_dir/grpc-go-interop-server" google.golang.org/grpc/interop/server)
 
   peer_log="$work_dir/grpc-lite-tls-server.log"
-  "$project_root/zig-out/bin/grpc-lite-interop-server" \
+  "$project_root/zig-out/bin/$server_binary" \
     --port="$zig_server_port" \
     --use_tls=true \
     --tls_cert_file="$certificate" \
@@ -85,7 +113,7 @@ main() {
   wait_for_peer
   zig_server_port=$peer_port
   for test_case in "${cases[@]}"; do
-    run_case 'grpc-go client -> grpc-lite TLS server' "$test_case" \
+    run_case "grpc-go client -> $peer_description TLS server" "$test_case" \
       "$work_dir/grpc-go-interop-client" \
       --server_host=127.0.0.1 \
       --server_port="$zig_server_port" \
@@ -106,9 +134,9 @@ main() {
   peer_pid=$!
   wait_for_peer
   go_server_port=$peer_port
-  for test_case in "${cases[@]}"; do
-    run_case 'grpc-lite TLS client -> grpc-go server' "$test_case" \
-      "$project_root/zig-out/bin/grpc-lite-interop-client" \
+  for test_case in "${client_cases[@]}"; do
+    run_case "$peer_description TLS client -> grpc-go server" "$test_case" \
+      "$project_root/zig-out/bin/$client_binary" \
       --server_host=127.0.0.1 \
       --server_port="$go_server_port" \
       --test_case="$test_case" \
@@ -121,14 +149,14 @@ main() {
   mtls="$project_root/src/testdata/mtls"
   (cd "$project_root/tests/official" && go build -mod=readonly -o "$work_dir/mtls-peer" ./mtls_peer)
   peer_log="$work_dir/grpc-lite-mtls-server.log"
-  "$project_root/zig-out/bin/grpc-lite-interop-server" \
+  "$project_root/zig-out/bin/$server_binary" \
     --port="${ZIG_TLS_SERVER_PORT:-0}" --use_tls=true \
     --tls_cert_file="$certificate" --tls_key_file="$private_key" \
     --client_ca_file="$mtls/ca.pem" >"$peer_log" 2>&1 &
   peer_pid=$!
   wait_for_peer
   zig_server_port=$peer_port
-  run_case 'grpc-go client -> grpc-lite mTLS server' empty_unary \
+  run_case "grpc-go client -> $peer_description mTLS server" empty_unary \
     "$work_dir/mtls-peer" --address="localhost:$zig_server_port" \
     --ca="$certificate" --cert="$mtls/client.pem" --key="$mtls/client-key.pem"
   for identity in missing untrusted expired; do
@@ -150,14 +178,15 @@ main() {
   peer_pid=$!
   wait_for_peer
   go_server_port=$peer_port
-  for test_case in "${cases[@]}"; do
-    run_case 'grpc-lite mTLS client -> grpc-go server' "$test_case" \
-      "$project_root/zig-out/bin/grpc-lite-interop-client" \
+  for test_case in "${client_cases[@]}"; do
+    run_case "$peer_description mTLS client -> grpc-go server" "$test_case" \
+      "$project_root/zig-out/bin/$client_binary" \
       --server_host=127.0.0.1 --server_port="$go_server_port" \
       --test_case="$test_case" --use_tls=true --ca_file="$certificate" \
       --tls_cert_file="$mtls/client.pem" --tls_key_file="$mtls/client-key.pem"
   done
-
+  stop_peer
+  printf 'All %s TLS and mTLS interop cases passed.\n' "$server_mode"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

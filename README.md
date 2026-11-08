@@ -30,6 +30,13 @@ Follow the [Zig quickstart](docs/zig-quickstart.md) to add grpc-lite with
 `zig fetch --save`, configure your application's `build.zig`, define a `.proto`,
 and build a typed client/server with `zig build`.
 
+For sequential-looking asynchronous RPCs, see the [task API guide](docs/zig-async.md).
+Run the self-contained typed unary/streaming example from a checkout:
+
+```sh
+mise run example-zio-typed
+```
+
 For applications that already handle protobuf wire bytes, import the raw module:
 
 ```zig
@@ -113,6 +120,7 @@ CompletionQueue, callback/reactor, generic service, or policy stack.
 Read the [documentation site](https://fanyang89.github.io/grpc-lite/).
 
 - [Zig API](docs/zig-api.md): runtime, channels, streaming, servers, TLS, and protobuf
+- [Task-friendly Zig RPCs](docs/zig-async.md): unary/streaming clients and server handlers with std.Io and zio
 - [C and C++ APIs](docs/c-cpp-api.md): stable ABI, source builds, grpcpp facade, and codegen
 - [Upgrading](docs/upgrading.md): supported surfaces, compatibility boundaries, and consumer fixtures
 - [Capacity tuning](docs/capacity-tuning.md): resource budgets and overload diagnosis

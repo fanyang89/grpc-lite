@@ -5,6 +5,11 @@
     .fingerprint = 0xa8480adad018cc05,
     .dependencies = .{
         .libxev = .{ .path = "vendor/libxev" },
+        .zio = .{
+            .url = "https://codeload.github.com/lalinsky/zio/tar.gz/c5716c4698a7a25be4390812804638e9fb37cdd0",
+            .hash = "zio-0.19.0-xHbVVAbeLgAuWEhoWtYJBuh7fO9e6_EIUFT-SasjLG-a",
+            .lazy = true,
+        },
         .nghttp2 = .{
             .url = "https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99",
             .hash = "N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX",

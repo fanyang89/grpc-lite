@@ -63,13 +63,21 @@ run = "zig build test-streaming-lifecycle -Dprotobuf=false --summary all"
 description = "Run all tests with ReleaseSafe optimization"
 run = "zig build test -Doptimize=ReleaseSafe --summary all"
 
+[tasks.test-async]
+description = "Run raw and typed task client/server integration tests with zio"
+run = "zig build test-async -Dzio=true --summary all --test-timeout 30s"
+
+[tasks.example-zio-typed]
+description = "Run a self-contained typed unary and streaming example on one zio executor"
+run = "zig build run-zio-typed -Dzio=true"
+
 [tasks.coverage]
 description = "Generate core Zig coverage with kcov"
 run = "tools/coverage.sh"
 
 [tasks.test-tsan]
 description = "Run all tests with ThreadSanitizer"
-run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
+run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dzio=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
 
 [tasks.test-ubsan]
 description = "Run all tests with C undefined behavior detection"
@@ -98,6 +106,10 @@ run = "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Dtls=tru
 [tasks.test-consumer]
 description = "Build and run raw public API consumers from the package archive"
 run = "tests/consumer/run_raw.sh"
+
+[tasks.test-consumer-async]
+description = "Build and run the typed task tutorial from an isolated package archive"
+run = "bash tests/consumer/run_typed_async.sh"
 
 [tasks.test-consumer-cpp]
 description = "Check installed headers and run unary/streaming C++ package consumers"
@@ -148,6 +160,10 @@ run = "scripts/interop.sh"
 description = "Run official grpc-go and generated C++ interoperability tests"
 run = "tests/official/run_unary.sh"
 
+[tasks.interop-async]
+description = "Run bidirectional grpc-go interoperability with one-executor zio task clients and handlers"
+run = "INTEROP_SERVER_MODE=task tests/official/run_unary.sh"
+
 [tasks.soak-streaming]
 description = "Run bounded native cleartext streaming soak (STREAMING_SOAK_MODE=smoke or extended)"
 run = "bash tests/official/run_streaming_soak.sh"
@@ -156,6 +172,11 @@ run = "bash tests/official/run_streaming_soak.sh"
 description = "Run TLS unary and streaming interoperability against grpc-go"
 depends = ["prepare-tls-deps"]
 run = "tests/official/run_tls.sh"
+
+[tasks.interop-async-tls]
+description = "Run TLS and mTLS grpc-go interoperability with one-executor zio task clients and handlers"
+depends = ["prepare-tls-deps"]
+run = "INTEROP_SERVER_MODE=task tests/official/run_tls.sh"
 
 [tasks.interop-http2]
 description = "Run the official gRPC HTTP/2 framing suite"

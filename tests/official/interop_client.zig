@@ -11,7 +11,7 @@ const streaming_response_sizes = [_]usize{ 31415, 9, 2653, 58979 };
 const zero_streaming_body = @as([streaming_request_sizes[streaming_request_sizes.len - 1]]u8, @splat(0));
 const special_status_message = "\t\ntest with whitespace\r\nand Unicode BMP \xE2\x98\xBA and non-BMP \xF0\x9F\x98\x88\t\n";
 
-const Config = struct {
+pub const Config = struct {
     server_host: []const u8 = "127.0.0.1",
     server_port: u16 = 10000,
     test_case: []const u8 = "large_unary",
@@ -168,18 +168,18 @@ fn channelSoakIteration(
     return null;
 }
 
-fn soakDeadline(io: std.Io, timeout_seconds: u64) i96 {
+pub fn soakDeadline(io: std.Io, timeout_seconds: u64) i96 {
     return std.Io.Clock.awake.now(io).nanoseconds +|
         @as(i96, timeout_seconds) * std.time.ns_per_s;
 }
 
-fn checkSoakDeadline(io: std.Io, deadline: i96) !void {
+pub fn checkSoakDeadline(io: std.Io, deadline: i96) !void {
     if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) {
         return error.SoakOverallTimeout;
     }
 }
 
-fn soakRpcTimeout(io: std.Io, deadline: i96) !u64 {
+pub fn soakRpcTimeout(io: std.Io, deadline: i96) !u64 {
     return remainingSoakRpcTimeout(std.Io.Clock.awake.now(io).nanoseconds, deadline);
 }
 
@@ -188,7 +188,7 @@ fn remainingSoakRpcTimeout(now: i96, deadline: i96) !u64 {
     return @intCast(@min(deadline -| now, @as(i96, max_rpc_timeout_ns)));
 }
 
-fn handleSoakFailure(
+pub fn handleSoakFailure(
     failures: *usize,
     max_failures: usize,
     iteration: usize,
@@ -898,7 +898,7 @@ fn expectStatus(result: *const grpc.CallResult, code: grpc.StatusCode, message: 
     }
 }
 
-fn parseArgs(args: []const []const u8) !Config {
+pub fn parseArgs(args: []const []const u8) !Config {
     var config: Config = .{};
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
