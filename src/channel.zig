@@ -5526,6 +5526,59 @@ test "unary cancellation removes queued work and rejects source reuse" {
     try std.testing.expectEqual(status.Code.cancelled, operation.response_code);
 }
 
+test "draining unary cancellation survives a scan before pending transfer" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    impl.state = .running;
+    impl.connection_state = .draining;
+    impl.async_handle = try xev.Async.init();
+    defer impl.async_handle.deinit();
+    defer impl.pending.deinit(impl.allocator);
+    var source = try call.Cancellation.init(std.testing.allocator);
+    defer source.deinit();
+    const operation = try Operation.init(&impl, "/test.Cancel/Pending", "", .{ .cancellation = &source });
+    defer {
+        _ = removeWaitingOperation(&impl, operation);
+        operation.deinit();
+    }
+    const unaffected = try Operation.init(&impl, "/test.Cancel/Unaffected", "", .{});
+    defer unaffected.deinit();
+    appendWaitingOperation(&impl, unaffected);
+    defer _ = removeWaitingOperation(&impl, unaffected);
+
+    // Reproduce the interleaving without scheduler timing: the loop takes its
+    // current batch, then a producer enqueues cancelled work before the scan.
+    var batch: std.ArrayList(*Operation) = .empty;
+    defer batch.deinit(impl.allocator);
+    impl.mutex.lockUncancelable(syncIo());
+    std.mem.swap(std.ArrayList(*Operation), &batch, &impl.pending);
+    impl.mutex.unlock(syncIo());
+    source.cancel();
+    try std.testing.expect(try impl.enqueue(operation));
+    try std.testing.expectEqual(@as(usize, 0), batch.items.len);
+    try std.testing.expect(impl.unary_cancel_pending.load(.acquire));
+    try processUnaryCancellations(&impl);
+    try std.testing.expect(!impl.unary_cancel_pending.load(.acquire));
+    try std.testing.expect(!operation.done);
+    try std.testing.expect(operation.deadline_ns == null);
+
+    // The next transfer must notice cancellation even though the wake flag is
+    // clear and draining prevents request submission or deadline-based progress.
+    processPending(&impl);
+    try std.testing.expect(operation.done);
+    try std.testing.expectEqual(status.Code.cancelled, operation.response_code);
+    try std.testing.expect(!operation.waiting_queued);
+    try std.testing.expectEqual(@as(usize, 0), impl.pending.items.len);
+    try std.testing.expectEqual(ConnectionState.draining, impl.connection_state);
+    try std.testing.expect(!unaffected.done);
+    try std.testing.expect(impl.waiting_operation_head == unaffected);
+    try std.testing.expect(impl.waiting_operation_tail == unaffected);
+    processPending(&impl);
+    try std.testing.expectEqual(status.Code.cancelled, operation.response_code);
+}
+
 test "raw unary cancellation supports blocking and async calls without closing the connection" {
     const server = @import("server.zig");
     const service = @import("service.zig");
