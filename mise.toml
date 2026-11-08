@@ -77,7 +77,7 @@ run = "tools/coverage.sh"
 
 [tasks.test-tsan]
 description = "Run all tests with ThreadSanitizer"
-run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dzio=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
+run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66:suppressions=$PWD/tools/tsan.supp zig build test -Dzio=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
 
 [tasks.test-ubsan]
 description = "Run all tests with C undefined behavior detection"
@@ -96,7 +96,7 @@ run = "zig build test -Dtls=true -Doptimize=ReleaseSafe --summary all"
 [tasks.test-tls-tsan]
 description = "Run TLS tests with ThreadSanitizer"
 depends = ["prepare-tls-deps"]
-run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test -Dtls=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
+run = "TSAN_OPTIONS=halt_on_error=1:exitcode=66:suppressions=$PWD/tools/tsan.supp zig build test -Dtls=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s"
 
 [tasks.test-tls-ubsan]
 description = "Run TLS tests with C undefined behavior detection"

@@ -27,7 +27,7 @@ tests/consumer/run_raw.sh
 bash tests/consumer/run_typed_async.sh
 tests/consumer/run_cpp.sh
 
-TSAN_OPTIONS=halt_on_error=1:exitcode=66 \
+TSAN_OPTIONS="halt_on_error=1:exitcode=66:suppressions=$project_root/tools/tsan.supp" \
     zig build test -Dzio=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe \
     -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
@@ -36,7 +36,7 @@ UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 .mise/tasks/prepare-tls-deps
 zig build test -Dtls=true --summary all
 zig build test -Dtls=true -Doptimize=ReleaseSafe --summary all
-TSAN_OPTIONS=halt_on_error=1:exitcode=66 \
+TSAN_OPTIONS="halt_on_error=1:exitcode=66:suppressions=$project_root/tools/tsan.supp" \
     zig build test -Dtls=true -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe \
     -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
