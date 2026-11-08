@@ -1209,7 +1209,8 @@ fn addNativeDependencies(
         .nghttp2_archive = build_nghttp2.path(b, "lib/libnghttp2.a"),
         .nghttp2_include = build_nghttp2.path(b, "lib/includes"),
         .cares_archive = build_cares.path(b, "lib/libcares.a"),
-        .cares_include = build_cares.path(b, "include"),
+        // CMake generates ares_build.h in the build root, not include/.
+        .cares_include = build_cares,
         .mbedtls_archive = if (build_mbedtls) |output| output.path(b, "libmbedtls_combined.a") else null,
         .gperftools_archive = if (build_gperftools) |output| output.path(b, "libgrpc_lite_gperftools.a") else null,
         .gperftools_force_link = if (build_gperftools) |output| output.path(b, "gperftools_force_link.o") else null,

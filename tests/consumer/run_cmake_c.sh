@@ -27,7 +27,7 @@ run_isolated() {
         -DGRPC_LITE_NGHTTP2_URL="file://$nghttp2_archive"
         -DGRPC_LITE_NGHTTP2_URL_HASH=SHA256=3f042e5284ad349f837b65dd5be953b34c007a05259119092dbe6ebeaa73d306
         -DGRPC_LITE_CARES_URL="file://$cares_archive"
-        -DGRPC_LITE_CARES_URL_HASH=SHA256=c222b6d681096f9444d2c4863d2c1174019e27cacca0a4a5c114d36dd7d7bf78)
+        -DGRPC_LITE_CARES_URL_HASH=SHA256=ddf8be8b179ef6ff656e7413da93cf0f3038c627aca29ce9aae30f66e5b32bc1)
 
     if cmake -S "$package_source" -B "$work_dir/negative-missing" \
         "${common[@]}" >"$work_dir/negative-missing.log" 2>&1; then
@@ -76,7 +76,7 @@ run_isolated() {
         -DGRPC_LITE_TRANSPILED_C_DIR="$bundle_dir" \
         -DGRPC_LITE_NGHTTP2_URL=https://example.invalid/nghttp2.tar.gz \
         -DGRPC_LITE_CARES_URL="file://$cares_archive" \
-        -DGRPC_LITE_CARES_URL_HASH=SHA256=c222b6d681096f9444d2c4863d2c1174019e27cacca0a4a5c114d36dd7d7bf78 \
+        -DGRPC_LITE_CARES_URL_HASH=SHA256=ddf8be8b179ef6ff656e7413da93cf0f3038c627aca29ce9aae30f66e5b32bc1 \
         >"$work_dir/negative-remote-override.log" 2>&1; then
         printf '%s\n' 'CMake unexpectedly preferred a remote nghttp2 URL in NO_NETWORK mode' >&2
         exit 1
@@ -235,13 +235,13 @@ PY
     fi
 }
 nghttp2_archive=${GRPC_LITE_NGHTTP2_ARCHIVE:-"$cache_dir/nghttp2-68cb6900.tar.gz"}
-cares_archive=${GRPC_LITE_CARES_ARCHIVE:-"$cache_dir/c-ares-1.34.8.tar.gz"}
+cares_archive=${GRPC_LITE_CARES_ARCHIVE:-"$cache_dir/c-ares-1.34.8-source.tar.gz"}
 download_and_verify "$nghttp2_archive" \
     'https://codeload.github.com/nghttp2/nghttp2/tar.gz/68cb6900fde14c77f0cd7add0e094a862960eb99' \
     '3f042e5284ad349f837b65dd5be953b34c007a05259119092dbe6ebeaa73d306'
 download_and_verify "$cares_archive" \
-    'https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz' \
-    'c222b6d681096f9444d2c4863d2c1174019e27cacca0a4a5c114d36dd7d7bf78'
+    'https://codeload.github.com/c-ares/c-ares/tar.gz/refs/tags/v1.34.8' \
+    'ddf8be8b179ef6ff656e7413da93cf0f3038c627aca29ce9aae30f66e5b32bc1'
 
 isolated_args=(--isolated "$work_dir" "$package_source" "$consumer_source" "$bundle_dir"
     "$mismatch_bundle" "$nghttp2_archive" "$cares_archive" "$version")

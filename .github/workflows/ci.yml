@@ -21,6 +21,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dependencies:
+    uses: ./.github/workflows/dependencies.yml
+    with:
+      validation-ref: ${{ inputs.validation-ref || github.sha }}
+
   workflow-lint:
     name: Workflow lint
     runs-on: ubuntu-24.04
@@ -49,6 +54,7 @@ jobs:
           mise run test-release-version
 
   core-test:
+    needs: dependencies
     name: Core (${{ matrix.arch }}, ${{ matrix.optimize }})
     strategy:
       fail-fast: false
@@ -80,6 +86,9 @@ jobs:
         with:
           version: 2026.7.14
 
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
@@ -97,6 +106,7 @@ jobs:
         run: mise run test-c-abi
 
   package-consumer:
+    needs: dependencies
     name: Package consumer
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -112,6 +122,9 @@ jobs:
         with:
           version: 2026.7.14
 
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
+
       - name: Build and run raw public API package consumer
         run: mise run test-consumer
       - name: Build and run typed task package consumer
@@ -126,6 +139,7 @@ jobs:
         run: mise run test-consumer-cpp
 
   generated-c-bundle:
+    needs: dependencies
     name: Generated C bundle
     strategy:
       fail-fast: false
@@ -153,6 +167,9 @@ jobs:
         with:
           version: 2026.7.14
 
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
+
       - name: Build reproducible bundle
         run: mise run check-transpiled-c
 
@@ -167,7 +184,7 @@ jobs:
 
   generated-c-consumer:
     name: Generated C bundle consumer — no Zig/no network
-    needs: generated-c-bundle
+    needs: [dependencies, generated-c-bundle]
     strategy:
       fail-fast: false
       matrix:
@@ -189,6 +206,9 @@ jobs:
           ref: ${{ inputs.validation-ref || github.sha }}
           persist-credentials: false
 
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
+
       - name: Verify no-Zig container host
         run: |
           test -z "$(command -v zig || true)"
@@ -209,6 +229,7 @@ jobs:
             "${archives[0]}" "${archives[0]}.sha256"
 
   tls-test:
+    needs: dependencies
     name: TLS
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -224,6 +245,9 @@ jobs:
         with:
           version: 2026.7.14
 
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
+
       - name: Run TLS tests
         run: mise run test-tls
 
@@ -237,6 +261,7 @@ jobs:
         run: UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Dtls=true -Dsanitize-thread=false -Dsanitize-c=true --summary all
 
   gperftools:
+    needs: dependencies
     name: Gperftools
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -252,10 +277,14 @@ jobs:
         with:
           version: 2026.7.14
 
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
+
       - name: Run gperftools tests
         run: mise run test-gperftools
 
   sanitizer:
+    needs: dependencies
     name: Sanitizer (${{ matrix.name }})
     strategy:
       fail-fast: false
@@ -279,10 +308,14 @@ jobs:
         with:
           version: 2026.7.14
 
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
+
       - name: Run sanitizer tests
         run: mise run ${{ matrix.task }}
 
   interop:
+    needs: dependencies
     name: Interop (${{ matrix.arch }})
     strategy:
       fail-fast: false
@@ -307,6 +340,9 @@ jobs:
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
           version: 2026.7.14
+
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
 
       - name: Run grpcurl interop
         run: mise run interop
@@ -353,6 +389,7 @@ jobs:
     name: Required
     if: always()
     needs:
+      - dependencies
       - workflow-lint
       - core-test
       - generated-c-bundle
@@ -367,6 +404,7 @@ jobs:
     steps:
       - name: Verify required jobs
         env:
+          DEPENDENCIES_RESULT: ${{ needs.dependencies.result }}
           WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
           CORE_TEST_RESULT: ${{ needs.core-test.result }}
           GENERATED_C_BUNDLE_RESULT: ${{ needs.generated-c-bundle.result }}
@@ -377,6 +415,7 @@ jobs:
           TLS_TEST_RESULT: ${{ needs.tls-test.result }}
           INTEROP_RESULT: ${{ needs.interop.result }}
         run: |
+          test "$DEPENDENCIES_RESULT" = success
           test "$WORKFLOW_LINT_RESULT" = success
           test "$CORE_TEST_RESULT" = success
           test "$GENERATED_C_BUNDLE_RESULT" = success

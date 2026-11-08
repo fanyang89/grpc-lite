@@ -2,6 +2,11 @@
 #MISE description="Prepare the pinned gperftools fork for Zig builds"
 set -euo pipefail
 
+if [[ -n "${GRPC_LITE_DEPENDENCY_CACHE:-}" ]]; then
+  test -f "$GRPC_LITE_DEPENDENCY_CACHE/p/N-V-__8AAGKVkABvsDVHhSU8seHKvtJ8Q23b9Y0OMiFVWt-y.tar.gz"
+  exit 0
+fi
+
 url=https://codeload.github.com/fanyang89/gperftools/tar.gz/1a01cd2cf8f7000845d343fa8e0bbac70378858b
 expected_hash=N-V-__8AAGKVkABvsDVHhSU8seHKvtJ8Q23b9Y0OMiFVWt-y
 

@@ -158,8 +158,8 @@ if(NOT TARGET c-ares::cares)
   else()
     _grpc_lite_declare_archive(
       grpc_lite_cares
-      "https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz"
-      "SHA256=c222b6d681096f9444d2c4863d2c1174019e27cacca0a4a5c114d36dd7d7bf78")
+      "https://codeload.github.com/c-ares/c-ares/tar.gz/refs/tags/v1.34.8"
+      "SHA256=ddf8be8b179ef6ff656e7413da93cf0f3038c627aca29ce9aae30f66e5b32bc1")
   endif()
   FetchContent_MakeAvailable(grpc_lite_cares)
 endif()

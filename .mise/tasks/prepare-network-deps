@@ -2,6 +2,11 @@
 #MISE description="Prepare the pinned c-ares package"
 set -euo pipefail
 
+if [[ -n "${GRPC_LITE_DEPENDENCY_CACHE:-}" ]]; then
+  test -f "$GRPC_LITE_DEPENDENCY_CACHE/p/N-V-__8AAC2bMACCSbPXjtm12IrwNq-6EO8zPfR2QQy9a53e.tar.gz"
+  exit 0
+fi
+
 cache_root=${ZIG_GLOBAL_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig}
 package_cache="$cache_root/p"
 mkdir -p "$package_cache"
@@ -33,5 +38,5 @@ prepare() {
 
 prepare \
   c-ares \
-  'https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz' \
-  'N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp'
+  'https://codeload.github.com/c-ares/c-ares/tar.gz/refs/tags/v1.34.8' \
+  'N-V-__8AAC2bMACCSbPXjtm12IrwNq-6EO8zPfR2QQy9a53e'

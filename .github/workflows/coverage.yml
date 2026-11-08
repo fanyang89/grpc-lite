@@ -16,7 +16,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dependencies:
+    uses: ./.github/workflows/dependencies.yml
+
   coverage:
+    needs: dependencies
     name: Core Zig coverage
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -33,6 +37,9 @@ jobs:
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
           version: 2026.7.14
+
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
 
       - name: Pull kcov image
         run: docker pull "$KCOV_IMAGE"

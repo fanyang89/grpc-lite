@@ -2,10 +2,23 @@
 # Shared package preparation for isolated Zig consumers. The caller supplies
 # project_root, work_dir, archive, and global_cache and owns cleanup.
 
+# Import only requested packages so lazy integrations stay absent until tested.
+prefetch_prepared_package() {
+    local expected_hash=$1
+    cp "$GRPC_LITE_DEPENDENCY_CACHE/p/$expected_hash.tar.gz" "$global_cache/p/"
+    mkdir -p "$global_cache/p/$expected_hash"
+    tar --extract --gzip --file "$global_cache/p/$expected_hash.tar.gz" \
+        --strip-components=1 --directory "$global_cache/p/$expected_hash"
+}
+
 prefetch_url_package() {
     local url=$1
     local expected_hash=$2
     local archive_name=$3
+    if [[ -n "${GRPC_LITE_DEPENDENCY_CACHE:-}" ]]; then
+        prefetch_prepared_package "$expected_hash"
+        return
+    fi
     local dependency_archive="$work_dir/$archive_name"
     local package_dir="$global_cache/p/$expected_hash"
 
@@ -26,6 +39,10 @@ prefetch_zigfetch_url_package() {
     local url=$1
     local expected_hash=$2
     local archive_name=$3
+    if [[ -n "${GRPC_LITE_DEPENDENCY_CACHE:-}" ]]; then
+        prefetch_prepared_package "$expected_hash"
+        return
+    fi
     local output
     local actual_hash
 
@@ -46,19 +63,19 @@ prefetch_native_packages() {
         'N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX' \
         'nghttp2.tar.gz'
     prefetch_url_package \
-        'https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz' \
-        'N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp' \
+        'https://codeload.github.com/c-ares/c-ares/tar.gz/refs/tags/v1.34.8' \
+        'N-V-__8AAC2bMACCSbPXjtm12IrwNq-6EO8zPfR2QQy9a53e' \
         'cares.tar.gz'
     prefetch_zigfetch_url_package \
         'https://cpucycles.cr.yp.to/libcpucycles-20260625.tar.gz' \
         'N-V-__8AAHSUBAA_Vn8NXM2L9F21QFvrTIxbH9yvxs5cO-lY' \
         'cpucycles.tar.gz'
     prefetch_url_package \
-        'https://github.com/wyzdwdz/nanozlog/archive/a1ad3d52aec355c2dba7568fe18ec440937d4f81.tar.gz' \
+        'https://codeload.github.com/wyzdwdz/nanozlog/tar.gz/a1ad3d52aec355c2dba7568fe18ec440937d4f81' \
         'nanozlog-0.1.0-5UtdH6f6AAACQMkivAT4xIQtfBDFG3JACCJRpnY5Up3P' \
         'nanozlog.tar.gz'
     prefetch_url_package \
-        'https://github.com/rockorager/zeit/archive/refs/tags/v0.10.0.tar.gz' \
+        'https://codeload.github.com/rockorager/zeit/tar.gz/refs/tags/v0.10.0' \
         'zeit-0.10.0-5I6bkxS-AgAaI3lI3RsXsWnPw7sMCqJKoFnSB8_QRAoo' \
         'zeit.tar.gz'
 }

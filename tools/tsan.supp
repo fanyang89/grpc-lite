@@ -1,0 +1,6 @@
+# Zig's io_uring_setup syscall and libxev's IORING_OP_CLOSE bypass TSan's
+# libc FD interceptors. When a ring reuses a closed socket's descriptor,
+# its intercepted mmap64 can race with stale socket-creation metadata.
+# Suppress only reports containing the ring's submission-queue mapping
+# initialization, not socket operations or application lifecycle code.
+race:os.linux.IoUring.SubmissionQueue.init

@@ -9,6 +9,9 @@ on:
       - "build.zig.zon"
       - "mise.toml"
       - ".github/workflows/soak.yml"
+      - ".github/workflows/dependencies.yml"
+      - ".github/actions/dependencies/**"
+      - "tools/prepare_dependencies.py"
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -43,7 +46,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  dependencies:
+    uses: ./.github/workflows/dependencies.yml
+
   soak:
+    needs: dependencies
     if: github.event_name != 'pull_request'
     name: Official unary soak (x64)
     runs-on: ubuntu-24.04
@@ -62,6 +69,9 @@ jobs:
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
           version: 2026.7.14
+
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
 
       - name: Install Protobuf C++ tools
         run: |
@@ -84,6 +94,7 @@ jobs:
           retention-days: 14
 
   streaming-soak:
+    needs: dependencies
     name: Native cleartext streaming soak (x64)
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -100,6 +111,9 @@ jobs:
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
           version: 2026.7.14
+
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
 
       - name: Run streaming soak
         run: mise run soak-streaming
