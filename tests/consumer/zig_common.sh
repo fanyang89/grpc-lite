@@ -46,8 +46,8 @@ prefetch_native_packages() {
         'N-V-__8AAPOqVwAHvwAVJJjhhX72DyDtjWw--9WUZf3-uKRX' \
         'nghttp2.tar.gz'
     prefetch_url_package \
-        'https://github.com/c-ares/c-ares/releases/download/v1.34.8/c-ares-1.34.8.tar.gz' \
-        'N-V-__8AADDhTgDOiesa_sidmxGBzfPdF3OWU2HXS2GNZmVp' \
+        'https://codeload.github.com/c-ares/c-ares/tar.gz/refs/tags/v1.34.8' \
+        'N-V-__8AAC2bMACCSbPXjtm12IrwNq-6EO8zPfR2QQy9a53e' \
         'cares.tar.gz'
     prefetch_zigfetch_url_package \
         'https://cpucycles.cr.yp.to/libcpucycles-20260625.tar.gz' \
