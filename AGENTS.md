@@ -77,7 +77,7 @@ authoritative: change it before implementing a feature with a different decision
 | Large messages and HTTP/2 flow control | Required | Include padding and max-stream tests |
 | ASCII and binary metadata | Required | Emit padded base64; accept padded, unpadded, and comma-joined `-bin` values |
 | Status codes and Unicode status messages | Required | Preserve percent-encoded UTF-8 bytes |
-| Deadlines | Required | Explicit handle cancellation is streaming-only; task-based unary calls also propagate std.Io cancellation |
+| Deadlines | Required | Explicit public cancellation supports raw Zig unary and streaming calls; task-based unary calls also propagate std.Io cancellation |
 | Task-friendly Zig unary clients | Selected | Optional raw and typed std.Io adapters; zio is the first validated runtime; connection and teardown waits suspend through the supplied Io |
 | Task-friendly Zig streaming clients | Selected | Raw and typed std.Io send/receive waits, independent reader/writer tasks, half-close and cancellation; one bounded application-side receive slot per stream in addition to transport capacities |
 | Task-friendly Zig server handlers | Selected | Optional raw and typed unary/streaming handlers on std.Io tasks; bounded retained calls and one inbound message slot per call; terminal events cancel and join handler tasks before server teardown |
@@ -111,7 +111,7 @@ Raw streaming APIs are planned as all-event-driven while implementation is ongoi
 
 - Application callbacks run on transport loop threads and must not block.
 - Half-close ends only the local send direction. Explicit cancellation terminates both
-  directions and is exposed only for streaming calls.
+  directions. Raw Zig unary calls support an optional single-use cancellation object.
 - `ServerStream` is callback-borrowed; retained cross-thread server work uses an owning
   `ServerCall` and releases it before Server teardown.
 - Public objects use explicit allocators, clear ownership, and deterministic `deinit`.
