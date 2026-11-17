@@ -1734,17 +1734,22 @@ const Connection = struct {
                 if (try self.finishTlsWrite(result)) continue;
                 return;
             }
-            // Buffered ciphertext is already committed to this flush's write budget.
-            if (!canFlushWritesWithPending(
+            var plaintext: std.ArrayList(u8) = .empty;
+            defer plaintext.deinit(self.allocator());
+            // Coalesce ready HTTP/2 chunks without waiting for another loop turn.
+            while (!self.closing and plaintext.items.len < 16 * 1024 and canFlushWritesWithPending(
                 self.queued_write_bytes,
-                tls_session.pendingCiphertextBytes(),
+                tls_session.pendingCiphertextBytes() + plaintext.items.len,
                 self.server.write_high_watermark_bytes,
-            )) break;
-            var data: [*c]const u8 = null;
-            const length = c.nghttp2_session_mem_send2(self.session, &data);
-            if (length < 0) return error.NativeFailure;
-            if (length == 0) break;
-            self.tls_plaintext = try self.allocator().dupe(u8, data[0..@intCast(length)]);
+            )) {
+                var data: [*c]const u8 = null;
+                const length = c.nghttp2_session_mem_send2(self.session, &data);
+                if (length < 0) return error.NativeFailure;
+                if (length == 0) break;
+                try plaintext.appendSlice(self.allocator(), data[0..@intCast(length)]);
+            }
+            if (plaintext.items.len == 0) break;
+            self.tls_plaintext = try plaintext.toOwnedSlice(self.allocator());
         }
         if (!self.closing) try self.drainTlsCiphertext();
     }

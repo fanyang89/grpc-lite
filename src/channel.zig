@@ -2808,17 +2808,22 @@ fn flushTls(impl: *Impl) !void {
             if (try finishTlsWrite(impl, result)) continue;
             return;
         }
-        // Buffered ciphertext is already committed to this flush's write budget.
-        if (!canFlushWritesWithPending(
+        var plaintext: std.ArrayList(u8) = .empty;
+        defer plaintext.deinit(impl.allocator);
+        // Coalesce ready HTTP/2 chunks without waiting for another loop turn.
+        while (!impl.stopping_on_loop and plaintext.items.len < 16 * 1024 and canFlushWritesWithPending(
             impl.queued_write_bytes,
-            tls_session.pendingCiphertextBytes(),
+            tls_session.pendingCiphertextBytes() + plaintext.items.len,
             impl.write_high_watermark_bytes,
-        )) break;
-        var data: [*c]const u8 = null;
-        const length = c.nghttp2_session_mem_send2(impl.session, &data);
-        if (length < 0) return error.NativeFailure;
-        if (length == 0) break;
-        impl.tls_plaintext = try impl.allocator.dupe(u8, data[0..@intCast(length)]);
+        )) {
+            var data: [*c]const u8 = null;
+            const length = c.nghttp2_session_mem_send2(impl.session, &data);
+            if (length < 0) return error.NativeFailure;
+            if (length == 0) break;
+            try plaintext.appendSlice(impl.allocator, data[0..@intCast(length)]);
+        }
+        if (plaintext.items.len == 0) break;
+        impl.tls_plaintext = try plaintext.toOwnedSlice(impl.allocator);
     }
     if (!impl.stopping_on_loop) try drainTlsCiphertext(impl);
 }
@@ -9369,6 +9374,51 @@ test "channel and server exchange a unary call over TLS" {
         defer response.deinit();
         try std.testing.expect(response.status.isOk());
         try std.testing.expectEqualSlices(u8, payload[0..size], response.payload);
+    }
+
+    const Completion = struct {
+        channel: *Channel,
+        payload: []const u8,
+        calls: usize = 0,
+        valid: bool = true,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn onComplete(context: ?*anyopaque, response: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            self.valid = self.valid and response.status.isOk() and
+                std.mem.eql(u8, self.payload, response.payload);
+            if (self.calls < 3 and self.valid) {
+                self.channel.callUnaryAsync("/test.Tls/Unary", self.payload, .{
+                    .timeout_ns = 5 * std.time.ns_per_s,
+                }, .{ .context = self, .on_complete = onComplete }) catch {
+                    self.valid = false;
+                    self.done.store(true, .release);
+                };
+                return;
+            }
+            self.done.store(true, .release);
+        }
+    };
+    var completions: [32]Completion = undefined;
+    // Keep callback storage alive through teardown, including assertion failures.
+    defer {
+        channel.shutdown();
+        channel.wait();
+    }
+    for (&completions, 0..) |*completion, index| {
+        const sizes = [_]usize{ 0, 1, 1024, 16 * 1024 + 1, 64 * 1024 };
+        completion.* = .{ .channel = &channel, .payload = payload[0..sizes[index % sizes.len]] };
+    }
+    for (&completions) |*completion| {
+        try channel.callUnaryAsync("/test.Tls/Unary", completion.payload, .{
+            .timeout_ns = 5 * std.time.ns_per_s,
+        }, .{ .context = completion, .on_complete = Completion.onComplete });
+    }
+    for (&completions) |*completion| {
+        try std.testing.expect(waitForTestFlag(&completion.done, 5 * std.time.ns_per_s));
+        try std.testing.expect(completion.valid);
+        try std.testing.expectEqual(@as(usize, 3), completion.calls);
     }
 }
 
