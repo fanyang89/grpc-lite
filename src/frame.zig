@@ -163,6 +163,14 @@ pub fn decodeUnaryWithCompression(
     max_message_size: usize,
     compression: Compression,
 ) ![]u8 {
+    // Complete identity messages need only the caller-owned payload allocation.
+    if (bytes.len >= header_size and bytes[0] == 0) {
+        const length = std.mem.readInt(u32, bytes[1..5], .big);
+        if (length == bytes.len - header_size) {
+            if (length > max_message_size) return error.MessageTooLarge;
+            return allocator.dupe(u8, bytes[header_size..]);
+        }
+    }
     var decoder = Decoder.initWithCompression(allocator, max_message_size, compression);
     defer decoder.deinit();
 
@@ -426,6 +434,38 @@ test "unary decoding rejects truncated and repeated messages" {
         error.ExpectedUnaryMessage,
         decodeUnary(std.testing.allocator, combined, 1024),
     );
+}
+
+test "complete identity unary decoding allocates only its owned payload" {
+    var encoded = [_]u8{ 0, 0, 0, 0, 3, 'a', 0, 'b' };
+    var storage: [3]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const decoded = try decodeUnaryWithCompression(fixed.allocator(), &encoded, 3, .gzip);
+    defer fixed.allocator().free(decoded);
+    encoded[5] = 'z';
+    try std.testing.expectEqualSlices(u8, "a\x00b", decoded);
+    try std.testing.expectError(error.MessageTooLarge, decodeUnary(std.testing.allocator, &encoded, 2));
+
+    var empty_storage: [0]u8 = .{};
+    var empty_fixed = std.heap.FixedBufferAllocator.init(&empty_storage);
+    const empty = try decodeUnary(empty_fixed.allocator(), &.{ 0, 0, 0, 0, 0 }, 0);
+    defer empty_fixed.allocator().free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "unary fast path preserves malformed and trailing frame errors" {
+    const Case = struct { bytes: []const u8, expected: anyerror };
+    for ([_]Case{
+        .{ .bytes = &.{}, .expected = error.TruncatedFrame },
+        .{ .bytes = &.{ 0, 0, 0, 0 }, .expected = error.TruncatedFrame },
+        .{ .bytes = &.{ 0, 0, 0, 0, 2, 'a' }, .expected = error.TruncatedFrame },
+        .{ .bytes = &.{ 2, 0, 0, 0, 0 }, .expected = error.InvalidCompressedFlag },
+        .{ .bytes = &.{ 1, 0, 0, 0, 0 }, .expected = error.CompressionMismatch },
+        .{ .bytes = &.{ 0, 0, 0, 0, 1, 'a', 0 }, .expected = error.TruncatedFrame },
+        .{ .bytes = &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .expected = error.ExpectedUnaryMessage },
+    }) |case| {
+        try std.testing.expectError(case.expected, decodeUnary(std.testing.allocator, case.bytes, 1024));
+    }
 }
 
 test "gzip decoding rejects corrupted checksum and uncompressed size" {
