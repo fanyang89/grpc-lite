@@ -1717,7 +1717,7 @@ const Connection = struct {
     fn flushTls(self: *Connection) !void {
         const tls_session = self.tls_session.?;
         while (!self.closing) {
-            try self.drainTlsCiphertext();
+            if (tls_session.ciphertext().len >= socket_write_batch_target) try self.drainTlsCiphertext();
             if (tls_session.hasPendingWrite()) {
                 const result = try tls_session.continueWrite();
                 if (try self.finishTlsWrite(result)) continue;
@@ -1734,13 +1734,19 @@ const Connection = struct {
                 if (try self.finishTlsWrite(result)) continue;
                 return;
             }
-            if (!canFlushWrites(self.queued_write_bytes, self.server.write_high_watermark_bytes)) return;
+            // Buffered ciphertext is already committed to this flush's write budget.
+            if (!canFlushWritesWithPending(
+                self.queued_write_bytes,
+                tls_session.ciphertext().len,
+                self.server.write_high_watermark_bytes,
+            )) break;
             var data: [*c]const u8 = null;
             const length = c.nghttp2_session_mem_send2(self.session, &data);
             if (length < 0) return error.NativeFailure;
-            if (length == 0) return;
+            if (length == 0) break;
             self.tls_plaintext = try self.allocator().dupe(u8, data[0..@intCast(length)]);
         }
+        if (!self.closing) try self.drainTlsCiphertext();
     }
 
     fn flushIdleGoAway(self: *Connection) !bool {
@@ -1760,7 +1766,6 @@ const Connection = struct {
         switch (result) {
             .bytes => |count| {
                 self.tls_plaintext_offset += count;
-                try self.drainTlsCiphertext();
                 return true;
             },
             .want_write => {

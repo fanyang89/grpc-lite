@@ -53,6 +53,12 @@ Receive pause defers flow-control credit. Inbound overflow fails the RPC with
 `RESOURCE_EXHAUSTED`. Message limits and buffer capacities must be configured together;
 each stream capacity must be at least `max_message_size + 5`.
 
+Native TLS batches ciphertext in its existing 64 KiB output queue. A flush drains
+the batch when full, when TLS needs I/O, or when no more HTTP/2 output can be
+admitted; small tails do not wait for a timer. Write high-watermark admission
+counts both queued socket bytes and buffered ciphertext before taking another
+HTTP/2 chunk. An already admitted chunk may still overshoot the watermark.
+
 Server connection slots remain occupied through asynchronous closing and final
 destruction. Transport stream admission ends separately from application-retained
 `ServerCall` ownership. Release every retained server call before destroying the Server.
