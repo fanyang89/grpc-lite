@@ -10,7 +10,7 @@ cxx=$6
 zig_exe=$7
 target_triple=$8
 force_link_source=$(realpath "$9")
-mbedtls_config_header=$(realpath "${10}")
+wolfssl_patch=$(realpath "${10}")
 sanitize_thread=${11}
 sanitize_c=${12}
 enable_gperftools=${13}
@@ -71,40 +71,33 @@ case "$library" in
             -DCARES_BUILD_TOOLS=OFF \
             -DCARES_THREADS=ON
         ;;
-    mbedtls)
+    wolfssl)
+        # Upstream CMake may remove generated headers from its source directory.
         source_copy="$build_dir/source"
         mkdir -p "$source_copy"
         cp -a "$source_dir/." "$source_copy"
-        touch \
-            "$source_copy/library/error.c" \
-            "$source_copy/library/version_features.c" \
-            "$source_copy/library/ssl_debug_helpers_generated.c" \
-            "$source_copy/library/psa_crypto_driver_wrappers.h" \
-            "$source_copy/library/psa_crypto_driver_wrappers_no_static.c"
-        case "$build_type" in
-            Debug) make_cflags=(-O0 -g) ;;
-            RelWithDebInfo) make_cflags=(-O2 -g) ;;
-            *) make_cflags=(-O2) ;;
+        patch --batch --forward --fuzz=0 -d "$source_copy" -p1 < "$wolfssl_patch"
+        common_options[1]="$source_copy"
+        acceleration=()
+        case "$target_triple" in
+            x86_64-*)
+                acceleration=(-DWOLFSSL_AESNI=yes -DWOLFSSL_INTEL_ASM=yes)
+                ;;
         esac
-        mbedtls_config_dir=$(dirname "$mbedtls_config_header")
-        make -C "$source_copy/library" -j "$(getconf _NPROCESSORS_ONLN)" \
-            -o error.c \
-            -o version_features.c \
-            -o ssl_debug_helpers_generated.c \
-            -o psa_crypto_driver_wrappers.h \
-            -o psa_crypto_driver_wrappers_no_static.c \
-            CC="$cc" \
-            AR="$zig_exe ar" \
-            AR_DASH= \
-            CFLAGS="${make_cflags[*]} ${c_flags[*]} -I$mbedtls_config_dir -DMBEDTLS_USER_CONFIG_FILE=\\\"mbedtls_user_config.h\\\""
-        archive="$build_dir/libmbedtls_combined.a"
-        {
-            printf 'CREATE %s\n' "$archive"
-            printf 'ADDLIB %s/library/libmbedtls.a\n' "$source_copy"
-            printf 'ADDLIB %s/library/libmbedx509.a\n' "$source_copy"
-            printf 'ADDLIB %s/library/libmbedcrypto.a\n' "$source_copy"
-            printf 'SAVE\nEND\n'
-        } | "$zig_exe" ar -M
+        CC="$cc" ASM="$cc" cmake "${common_options[@]}" \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            "-DCMAKE_SYSTEM_PROCESSOR=${target_triple%%-*}" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DWOLFSSL_EXAMPLES=no \
+            -DWOLFSSL_CRYPT_TESTS=no \
+            -DWOLFSSL_ALPN=yes \
+            -DWOLFSSL_SNI=yes \
+            -DWOLFSSL_IP_ALT_NAME=yes \
+            -DWOLFSSL_TLS13=yes \
+            -DWOLFSSL_MLKEM=no \
+            -DWOLFSSL_SYS_CA_CERTS=no \
+            "${acceleration[@]}"
+        cmake --build "$build_dir" --target wolfssl
         exit 0
         ;;
     gperftools)

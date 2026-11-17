@@ -90,7 +90,7 @@ Typed generated C++ services keep the official Protobuf runtime as an explicit e
 dependency; the raw transport and grpcpp-shaped facade do not require Protobuf or
 Abseil. See [the C and C++ API guide](docs/c-cpp-api.md) for extraction, offline CMake,
 and code-generation details. The native Zig build supports Linux x86_64 and arm64, with
-TLS available through an optional mbedTLS build.
+TLS available through an optional wolfSSL build.
 
 ## Compatibility
 
@@ -144,4 +144,9 @@ Release maintainers: follow the [pre-tag version consistency procedure](developm
 
 ## License
 
-[MIT](LICENSE)
+Copyright (c) 2026 grpc-lite contributors.
+
+grpc-lite is licensed under the GNU General Public License, version 3 or later
+([GPL-3.0-or-later](LICENSE)). The optional TLS backend uses wolfSSL under its
+GPL-3.0-or-later license. Third-party components retain their own licenses.
+The [original MIT notice](LICENSE-MIT) is retained for previously MIT-licensed code.

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-#MISE description="Prepare the pinned optional mbedTLS package"
+#MISE description="Prepare the pinned optional wolfSSL package"
 set -euo pipefail
 
 if [[ -n "${GRPC_LITE_DEPENDENCY_CACHE:-}" ]]; then
-  test -f "$GRPC_LITE_DEPENDENCY_CACHE/p/N-V-__8AAI1FmQLj92go7nR7_J6kwr-7uYyuitngGqydvWkd.tar.gz"
+  test -f "$GRPC_LITE_DEPENDENCY_CACHE/p/N-V-__8AAM2AGgrmA8dlFOS4GWaTOEXwdZvSYXeSgZpe09he.tar.gz"
   exit 0
 fi
 
-url='https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/mbedtls-3.6.6'
-hash='N-V-__8AAI1FmQLj92go7nR7_J6kwr-7uYyuitngGqydvWkd'
+url='https://codeload.github.com/wolfSSL/wolfssl/tar.gz/3c5eead44904df64e6a5a1f4ebdce377d35a849a'
+hash='N-V-__8AAM2AGgrmA8dlFOS4GWaTOEXwdZvSYXeSgZpe09he'
 cache_dir="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/p"
 mkdir -p "$cache_dir"
 
@@ -16,7 +16,7 @@ if [[ ! -d "$cache_dir/$hash" ]]; then
   output=$(zigfetch "$url" 2>&1)
   actual_hash=${output##*$'\n'}
   if [[ "$actual_hash" != "$hash" ]]; then
-    printf 'mbedTLS hash mismatch: expected %s, got %s\n' "$hash" "$actual_hash" >&2
+    printf 'wolfSSL hash mismatch: expected %s, got %s\n' "$hash" "$actual_hash" >&2
     exit 1
   fi
 fi

@@ -439,16 +439,25 @@ alongside snapshots when diagnosing memory growth.
 
 ## TLS
 
-TLS is an optional mbedTLS 3.6.6 dependency:
+TLS is an optional wolfSSL 5.9.4 dependency, pinned by commit and Zig package hash:
 
 ```bash
 mise run prepare-tls-deps
 zig build -Dtls=true
 ```
 
+The dependency builds from source with CMake/Ninja and `patch`, using position-independent code.
+The build applies `tools/wolfssl.patch` to a private source copy to complete
+upstream's x86_64 AES-NI/Intel assembly configuration and atomically publish the
+AES/ChaCha20/Poly1305 CPU dispatch caches; wolfSSL dispatches acceleration
+according to CPU support at runtime. Other architectures use the portable implementation.
+
 Downstream packages pass `.tls = true` to the grpc-lite dependency. Clients trust only
-the supplied PEM CA bundle; system roots are not searched. Hostname verification and SNI
-use the Channel target. TLS 1.2 or newer and ALPN `h2` are mandatory. TLS 1.2 is limited
+the supplied PEM CA bundle; system roots are not searched. DNS verification and SNI
+use the Channel target. IPv4 targets require a matching IP SAN and omit SNI.
+wolfSSL accepts fully qualified DNS names or `localhost`; use a fully qualified
+name instead of a bare service name for TLS connections.
+TLS 1.2 or newer and ALPN `h2` are mandatory. TLS 1.2 is limited
 to ECDHE AEAD suites, while TLS 1.3 uses its AES-GCM and ChaCha20-Poly1305 suites, matching
 the HTTP/2 cipher profile. The default handshake timeout is ten seconds.
 

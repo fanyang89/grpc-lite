@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
         else
             null,
     };
-    const enable_tls = b.option(bool, "tls", "Enable TLS transport support through mbedTLS") orelse false;
+    const enable_tls = b.option(bool, "tls", "Enable TLS transport support through wolfSSL") orelse false;
     const enable_zio = b.option(bool, "zio", "Build zio examples and integration tests") orelse false;
     const enable_protobuf = b.option(
         bool,
@@ -137,15 +137,15 @@ pub fn build(b: *std.Build) void {
         b.lazyDependency("gperftools", .{}) orelse return
     else
         null;
-    const mbedtls_dependency = if (enable_tls)
-        b.lazyDependency("mbedtls", .{}) orelse return
+    const wolfssl_dependency = if (enable_tls)
+        b.lazyDependency("wolfssl", .{}) orelse return
     else
         null;
     const native = addNativeDependencies(
         b,
         nghttp2_dependency.path(""),
         cares_dependency.path(""),
-        if (mbedtls_dependency) |dependency| dependency.path("") else null,
+        if (wolfssl_dependency) |dependency| dependency.path("") else null,
         if (gperftools_dependency) |dependency| dependency.path("") else null,
         target,
         optimize,
@@ -173,17 +173,15 @@ pub fn build(b: *std.Build) void {
     grpc_lite.addIncludePath(native.cares_include);
     grpc_lite.addObjectFile(native.cares_archive);
     addCpuCycles(b, grpc_lite, cpucycles_dependency, target);
-    if (mbedtls_dependency) |dependency| {
-        grpc_lite.addIncludePath(dependency.path("include"));
-        grpc_lite.addIncludePath(b.path("tools"));
-        grpc_lite.addObjectFile(native.mbedtls_archive.?);
+    if (wolfssl_dependency) |dependency| {
+        grpc_lite.addIncludePath(native.wolfssl_include.?);
+        grpc_lite.addIncludePath(dependency.path(""));
+        grpc_lite.addObjectFile(native.wolfssl_archive.?);
+        addCBindings(b, grpc_lite, "wolfssl_bindings", "#include <wolfssl/options.h>\n#include <wolfssl/ssl.h>\n#include <wolfssl/error-ssl.h>\n", target);
     }
     addCBindings(b, grpc_lite, "nghttp2_bindings", "#define _FORTIFY_SOURCE 0\n#include <nghttp2/nghttp2.h>\n", target);
     addCBindings(b, grpc_lite, "cares_bindings", "#define CARES_STATICLIB 1\n#include <ares.h>\n", target);
     addCBindings(b, grpc_lite, "cpucycles_bindings", "#include <cpucycles.h>\n#include <stdio.h>\n", target);
-    if (enable_tls) addCBindings(b, grpc_lite, "mbedtls_bindings", "#define MBEDTLS_USER_CONFIG_FILE \"mbedtls_user_config.h\"\n" ++
-        "#include <psa/crypto.h>\n#include <mbedtls/ctr_drbg.h>\n#include <mbedtls/entropy.h>\n" ++
-        "#include <mbedtls/error.h>\n#include <mbedtls/pk.h>\n#include <mbedtls/ssl.h>\n#include <mbedtls/x509_crt.h>\n", target);
     grpc_lite.addImport("xev", xev);
     grpc_lite.addImport("nanozlog", nanozlog_dependency.module("nanozlog"));
     const test_step = b.step("test", "Run unit tests");
@@ -337,7 +335,7 @@ pub fn build(b: *std.Build) void {
     package_static_library.addArg(b.graph.zig_exe);
     package_static_library.addFileArg(native.nghttp2_archive);
     package_static_library.addFileArg(native.cares_archive);
-    if (native.mbedtls_archive) |archive| package_static_library.addFileArg(archive);
+    if (native.wolfssl_archive) |archive| package_static_library.addFileArg(archive);
     if (native.gperftools_archive) |archive| package_static_library.addFileArg(archive);
     const install_library = b.addInstallFileWithDir(
         packaged_static_library,
@@ -1093,7 +1091,8 @@ const NativeDependencies = struct {
     nghttp2_include: std.Build.LazyPath,
     cares_archive: std.Build.LazyPath,
     cares_include: std.Build.LazyPath,
-    mbedtls_archive: ?std.Build.LazyPath,
+    wolfssl_archive: ?std.Build.LazyPath,
+    wolfssl_include: ?std.Build.LazyPath,
     gperftools_archive: ?std.Build.LazyPath,
     gperftools_force_link: ?std.Build.LazyPath,
 };
@@ -1132,7 +1131,7 @@ fn addNativeDependencies(
     b: *std.Build,
     nghttp2_source_dir: std.Build.LazyPath,
     cares_source_dir: std.Build.LazyPath,
-    mbedtls_source_dir: ?std.Build.LazyPath,
+    wolfssl_source_dir: ?std.Build.LazyPath,
     gperftools_source_dir: ?std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -1140,7 +1139,7 @@ fn addNativeDependencies(
     enable_gperftools: bool,
     enable_tcmalloc: bool,
 ) NativeDependencies {
-    const target_triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
+    const target_triple = target.result.zigTriple(b.allocator) catch @panic("OOM");
     const cc = b.fmt("{s} cc -target {s}", .{ b.graph.zig_exe, target_triple });
     const cxx = b.fmt("{s} c++ -target {s}", .{ b.graph.zig_exe, target_triple });
     const cmake_build_type = switch (optimize) {
@@ -1173,10 +1172,10 @@ fn addNativeDependencies(
         false,
         false,
     );
-    const build_mbedtls = if (mbedtls_source_dir) |source_dir|
+    const build_wolfssl = if (wolfssl_source_dir) |source_dir|
         addNativeBuild(
             b,
-            "mbedtls",
+            "wolfssl",
             source_dir,
             cmake_build_type,
             cc,
@@ -1211,7 +1210,8 @@ fn addNativeDependencies(
         .cares_archive = build_cares.path(b, "lib/libcares.a"),
         // CMake generates ares_build.h in the build root, not include/.
         .cares_include = build_cares,
-        .mbedtls_archive = if (build_mbedtls) |output| output.path(b, "libmbedtls_combined.a") else null,
+        .wolfssl_archive = if (build_wolfssl) |output| output.path(b, "libwolfssl.a") else null,
+        .wolfssl_include = build_wolfssl,
         .gperftools_archive = if (build_gperftools) |output| output.path(b, "libgrpc_lite_gperftools.a") else null,
         .gperftools_force_link = if (build_gperftools) |output| output.path(b, "gperftools_force_link.o") else null,
     };
@@ -1242,7 +1242,7 @@ fn addNativeBuild(
         target_triple,
     });
     run.addFileArg(b.path("tools/gperftools_force_link.c"));
-    run.addFileArg(b.path("tools/mbedtls_user_config.h"));
+    run.addFileArg(b.path("tools/wolfssl.patch"));
     run.addArgs(&.{
         if (sanitizers.thread == true) "true" else "false",
         if (sanitizers.c == .full) "true" else "false",
