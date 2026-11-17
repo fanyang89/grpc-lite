@@ -1,3 +1,6 @@
+[env]
+ZIG_GLOBAL_CACHE_DIR = "{{ config_root }}/.zig-cache/dependencies"
+
 [tools]
 zig = "0.17.0"
 cmake = "4.3.4"
@@ -9,6 +12,7 @@ actionlint = "1.7.12"
 
 [tasks.bootstrap]
 description = "Fetch build dependencies"
+depends = ["prepare-dependencies"]
 run = "zig build --fetch=needed"
 
 [tasks.prepare-dependencies]
