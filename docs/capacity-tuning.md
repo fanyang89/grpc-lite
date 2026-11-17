@@ -39,6 +39,11 @@ mean powers of 1024. Unary and streaming admission are independent, per Channel.
   Construction, reconnect waiting, in-flight work and result copying/callback execution
   all retain the reservation. A callback starting a replacement call still occupies
   its old slot. A separately owned blocking `CallResult` may survive reservation release.
+  For an uncompressed unary request or response, the receive buffer reserves the
+  declared payload size plus five bytes when the complete message header arrives,
+  provided the payload fits the configured message limit. This storage can be
+  allocated before the body arrives; include it in the memory budget for incomplete
+  calls. Unary request admission charges do not account for response buffers.
 - **Streaming:** charge is configured inbound **plus** outbound capacity, independent
   of payload traffic: default `8 + 8 = 16 MiB`. Thus
   `min(1024, floor(1024 MiB / 16 MiB)) = 64` retained streams fit, even with empty queues.
