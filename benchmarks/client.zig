@@ -187,6 +187,7 @@ const TypedUnaryWorker = struct {
     channel: *grpc.Channel,
     timing: *Timing,
     payload: []const u8,
+    payload_hash: u64,
     compression: grpc.Compression,
     latency_capacity: usize,
     measurements: Measurements = .{},
@@ -227,7 +228,7 @@ const TypedUnaryWorker = struct {
         );
         defer result.deinit();
         return result.raw.status.isOk() and result.response != null and
-            validatePayload(result.response.?.message, self.payload);
+            validatePayload(result.response.?.message, self.payload.len, self.payload_hash);
     }
 };
 
@@ -235,6 +236,7 @@ const RawUnarySlot = struct {
     channel: *grpc.Channel,
     timing: *Timing,
     payload: []const u8,
+    payload_hash: u64,
     compression: grpc.Compression,
     latency_capacity: usize,
     current: Timestamp = .{ .started_ns = 0, .measured = false },
@@ -270,7 +272,7 @@ const RawUnarySlot = struct {
         const finished_ns = nowNs(self.timing.io);
         self.measurements.recordExchange(
             self.current.measured,
-            result.status.isOk() and validatePayload(result.payload, self.payload),
+            result.status.isOk() and validatePayload(result.payload, self.payload.len, self.payload_hash),
             finished_ns -| self.current.started_ns,
             self.latency_capacity,
         );
@@ -287,6 +289,7 @@ const StreamState = struct {
     timing: *Timing,
     transport: Transport,
     payload: []const u8,
+    payload_hash: u64,
     compression: grpc.Compression,
     pipeline: usize,
     timestamps: []Timestamp,
@@ -412,7 +415,7 @@ const StreamState = struct {
         const timestamp = self.timestamps[self.head];
         self.head = (self.head + 1) % self.timestamps.len;
         self.inflight -= 1;
-        const valid = validatePayload(response, self.payload);
+        const valid = validatePayload(response, self.payload.len, self.payload_hash);
         self.measurements.recordExchange(
             timestamp.measured,
             valid,
@@ -518,6 +521,7 @@ const ResultJson = struct {
     client_execution_model: []const u8,
     compression: []const u8,
     payload_pattern: []const u8,
+    payload_validation: []const u8 = "length-and-xxhash64",
     load_model: []const u8,
     operation_unit: []const u8,
     throughput_scope: []const u8,
@@ -619,6 +623,7 @@ fn runRawUnary(
     timing: *Timing,
 ) !Measurements {
     const slots = try init.gpa.alloc(RawUnarySlot, config.streams);
+    const payload_hash = std.hash.XxHash64.hash(0, payload);
     defer init.gpa.free(slots);
     var initialized: usize = 0;
     defer for (slots[0..initialized]) |*slot| {
@@ -631,6 +636,7 @@ fn runRawUnary(
             .channel = &channels[slot_index % channels.len],
             .timing = timing,
             .payload = payload,
+            .payload_hash = payload_hash,
             .compression = config.compression,
             .latency_capacity = latency_capacity,
             .measurements = .{ .sampling_seed = slot_index + 1 },
@@ -665,6 +671,7 @@ fn runTypedUnary(
     timing: *Timing,
 ) !Measurements {
     const workers = try init.gpa.alloc(TypedUnaryWorker, config.streams);
+    const payload_hash = std.hash.XxHash64.hash(0, payload);
     defer init.gpa.free(workers);
     const threads = try init.gpa.alloc(std.Thread, config.streams);
     defer init.gpa.free(threads);
@@ -681,6 +688,7 @@ fn runTypedUnary(
             .channel = &channels[worker_index % channels.len],
             .timing = timing,
             .payload = payload,
+            .payload_hash = payload_hash,
             .compression = config.compression,
             .latency_capacity = latency_capacity,
             .measurements = .{ .sampling_seed = worker_index + 1 },
@@ -748,6 +756,7 @@ fn runBidi(
     timing: *Timing,
 ) !Measurements {
     const states = try init.gpa.alloc(StreamState, config.streams);
+    const payload_hash = std.hash.XxHash64.hash(0, payload);
     defer init.gpa.free(states);
     var initialized: usize = 0;
     defer for (states[0..initialized]) |*state| state.deinit(init.gpa);
@@ -759,6 +768,7 @@ fn runBidi(
             .timing = timing,
             .transport = config.transport,
             .payload = payload,
+            .payload_hash = payload_hash,
             .compression = config.compression,
             .pipeline = config.pipeline,
             .timestamps = try init.gpa.alloc(Timestamp, config.pipeline),
@@ -888,8 +898,9 @@ fn nowNs(io: std.Io) u64 {
     return grpc.internal.fastNowNs(io);
 }
 
-fn validatePayload(response: []const u8, expected: []const u8) bool {
-    return std.mem.eql(u8, response, expected);
+fn validatePayload(response: []const u8, expected_len: usize, expected_hash: u64) bool {
+    // XXH64 avoids the vector-load regression in Zig 0.17's XXH3; this is a probabilistic benchmark check.
+    return response.len == expected_len and std.hash.XxHash64.hash(0, response) == expected_hash;
 }
 
 fn fillPayload(payload: []u8, pattern: PayloadPattern) void {
@@ -1315,6 +1326,30 @@ test "payload patterns are stable and distinct" {
     try std.testing.expect(!std.mem.eql(u8, &first, &repeated));
 }
 
+test "payload validation checks length and hash including empty and corrupted messages" {
+    const empty_hash = std.hash.XxHash64.hash(0, "");
+    try std.testing.expect(validatePayload("", 0, empty_hash));
+    try std.testing.expect(!validatePayload("", 1, std.hash.XxHash64.hash(0, "a")));
+    try std.testing.expect(!validatePayload("a", 0, empty_hash));
+
+    const expected = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(expected);
+    fillPayload(expected, .deterministic_random);
+    const response = try std.testing.allocator.dupe(u8, expected);
+    defer std.testing.allocator.free(response);
+
+    const expected_hash = std.hash.XxHash64.hash(0, expected);
+    try std.testing.expect(validatePayload(response, expected.len, expected_hash));
+    try std.testing.expect(validatePayload(response[1..], expected.len - 1, std.hash.XxHash64.hash(0, expected[1..])));
+    try std.testing.expect(!validatePayload(response[0 .. response.len - 1], expected.len, expected_hash));
+    try std.testing.expect(!validatePayload(response, expected.len - 1, expected_hash));
+    for ([_]usize{ 0, 1, 31, 32, 63, 64, response.len / 2, response.len - 1 }) |index| {
+        response[index] ^= 1;
+        try std.testing.expect(!validatePayload(response, expected.len, expected_hash));
+        response[index] ^= 1;
+    }
+}
+
 test "async unary slot accounting follows start eligibility through drain" {
     var measurements: Measurements = .{};
     defer measurements.deinit(std.testing.allocator);
@@ -1451,6 +1486,7 @@ test "result JSON has stable benchmark shape" {
         object.get("client_execution_model").?.string,
     );
     try std.testing.expect(object.contains("operations_per_second"));
+    try std.testing.expectEqualStrings("length-and-xxhash64", object.get("payload_validation").?.string);
     try std.testing.expectEqual(@as(i64, 1), object.get("server_reactor_count").?.integer);
     try std.testing.expect(object.contains("sampled_latency_count"));
     try std.testing.expect(object.contains("latency"));
