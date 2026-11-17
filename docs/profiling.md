@@ -41,6 +41,14 @@ Scenarios are `unary`, `bidi-ping-pong`, and `bidi-throughput`. Options include
 Use `mise run bench-server` and `mise run bench-client` for separately managed peers.
 Output is JSON; `--compact` emits one line.
 
+Responses are checked by length and XXH64 digest in all raw and typed scenarios.
+The expected digest is computed once before warmup; each response is hashed in full.
+JSON records this as `payload_validation: "length-and-xxhash64"`. This is a
+probabilistic integrity check, not byte-for-byte equality. Compare runs with the same
+validation method: validation consumes client CPU and can limit throughput.
+The harness uses `std.hash.XxHash64` to avoid the vector-load code-generation
+regression observed in Zig 0.17's `std.mem.eql` and `std.hash.XxHash3`.
+
 Measurements count completed exchanges after warmup, not send-queue admission.
 Bytes are application payload bytes, not HTTP/2 wire bytes. Unary operations are RPCs;
 bidirectional operations are messages on persistent streams. Typed unary also includes
