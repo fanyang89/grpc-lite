@@ -2755,8 +2755,10 @@ fn readRequestData(
 ) callconv(.c) c.nghttp2_ssize {
     const operation: *Operation = @ptrCast(@alignCast(source.?.*.ptr.?));
     const remaining = operation.request_frame[operation.request_offset..];
-    const length = @min(remaining.len, output_length);
+    var length = @min(remaining.len, output_length);
     if (operation.impl.tls_send_batch != null) {
+        // Leave room for the HTTP/2 header in a record-sized DATA frame.
+        length = @min(length, 16 * 1024 - 9);
         data_flags.?.* |= c.NGHTTP2_DATA_FLAG_NO_COPY;
     } else {
         @memcpy(output[0..length], remaining[0..length]);
@@ -5472,6 +5474,43 @@ fn expectDeadlineHeapConsistent(impl: *const Impl) !void {
             try std.testing.expect(impl.deadline_heap.items[(index - 1) / 2].expires_at_ns <= entry.expires_at_ns);
         }
     }
+}
+
+test "TLS unary request DATA fits records without losing bytes" {
+    var host = [_:0]u8{'x'};
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    var payload: [32 * 1024]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index ^ (index >> 8));
+    const operation = try Operation.init(&impl, "/test.Tls/Unary", &payload, .{});
+    defer operation.deinit();
+    var batch: std.ArrayList(u8) = .empty;
+    defer batch.deinit(impl.allocator);
+    impl.tls_send_batch = &batch;
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(std.testing.allocator);
+    var source: c.nghttp2_data_source = .{ .ptr = operation };
+    var outgoing = std.mem.zeroes(c.nghttp2_frame);
+    const header: [9]u8 = @splat(0);
+    var output: [16 * 1024]u8 = undefined;
+    var flags: u32 = 0;
+    while (flags & c.NGHTTP2_DATA_FLAG_EOF == 0) {
+        batch.clearRetainingCapacity();
+        const count = readRequestData(null, 1, &output, output.len, &flags, &source, null);
+        try std.testing.expect(count > 0);
+        try std.testing.expect(flags & c.NGHTTP2_DATA_FLAG_NO_COPY != 0);
+        try std.testing.expectEqual(c.NGHTTP2_ERR_PAUSE, sendRequestData(null, &outgoing, &header, @intCast(count), &source, null));
+        try std.testing.expect(batch.items.len <= 16 * 1024);
+        try received.appendSlice(std.testing.allocator, batch.items[header.len..]);
+    }
+    try std.testing.expectEqualSlices(u8, operation.request_frame, received.items);
+    impl.tls_send_batch = null;
+    operation.request_offset = 0;
+    flags = 0;
+    try std.testing.expectEqual(@as(c.nghttp2_ssize, output.len), readRequestData(null, 1, &output, output.len, &flags, &source, null));
+    try std.testing.expectEqual(@as(u32, 0), flags);
+    try std.testing.expectEqualSlices(u8, operation.request_frame[0..output.len], &output);
 }
 
 test "client deadline heap orders updates and mixed targets" {
@@ -9343,6 +9382,10 @@ test "event-driven unary calls complete exactly once and release operations" {
 
 test "channel and server exchange a unary call over TLS" {
     if (!build_options.tls) return error.SkipZigTest;
+    for ([_]usize{ 4096, 64 * 1024 }) |high| try testTlsUnaryBatches(high);
+}
+
+fn testTlsUnaryBatches(high: usize) !void {
     const server = @import("server.zig");
     const service = @import("service.zig");
     const certificate = @embedFile("testdata/localhost-cert.pem");
@@ -9364,8 +9407,8 @@ test "channel and server exchange a unary call over TLS" {
     defer std.testing.expectEqual(@as(usize, 0), transport_allocator.deinit()) catch @panic("test allocator leak");
     var handler = Handler{};
     var test_server = try server.Server.init(transport_allocator.allocator(), .{
-        .write_high_watermark_bytes = 4096,
-        .write_low_watermark_bytes = 2048,
+        .write_high_watermark_bytes = high,
+        .write_low_watermark_bytes = high / 2,
         .tls = .{
             .certificate_chain_pem = certificate,
             .private_key_pem = private_key,
@@ -9383,8 +9426,8 @@ test "channel and server exchange a unary call over TLS" {
     var target_buffer: [32]u8 = undefined;
     const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
     var channel = try Channel.init(transport_allocator.allocator(), target, .{
-        .write_high_watermark_bytes = 4096,
-        .write_low_watermark_bytes = 2048,
+        .write_high_watermark_bytes = high,
+        .write_low_watermark_bytes = high / 2,
         .runtime = &runtime,
         .tls = .{ .ca_certificates_pem = certificate },
     });
@@ -9396,10 +9439,10 @@ test "channel and server exchange a unary call over TLS" {
     try std.testing.expectEqualStrings("secure", result.payload);
 
     // Cross the TLS batch and write budget repeatedly, then flush a tiny tail.
-    const payload = try std.testing.allocator.alloc(u8, 256 * 1024);
+    const payload = try std.testing.allocator.alloc(u8, 1024 * 1024);
     defer std.testing.allocator.free(payload);
-    @memset(payload, 0x5a);
-    for ([_]usize{ payload.len, 0, 1, payload.len, 7 }) |size| {
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index ^ (index >> 8));
+    for ([_]usize{ payload.len, 0, 1, 16 * 1024 - 9, 16 * 1024, 16 * 1024 + 9, payload.len, 7 }) |size| {
         var response = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", payload[0..size], .{
             .timeout_ns = 5 * std.time.ns_per_s,
         });
