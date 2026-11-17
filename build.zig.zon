@@ -26,9 +26,9 @@
             .url = "https://codeload.github.com/wyzdwdz/nanozlog/tar.gz/a1ad3d52aec355c2dba7568fe18ec440937d4f81",
             .hash = "nanozlog-0.1.0-5UtdH6f6AAACQMkivAT4xIQtfBDFG3JACCJRpnY5Up3P",
         },
-        .mbedtls = .{
-            .url = "https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/mbedtls-3.6.6",
-            .hash = "N-V-__8AAI1FmQLj92go7nR7_J6kwr-7uYyuitngGqydvWkd",
+        .wolfssl = .{
+            .url = "https://codeload.github.com/wolfSSL/wolfssl/tar.gz/3c5eead44904df64e6a5a1f4ebdce377d35a849a",
+            .hash = "N-V-__8AAM2AGgrmA8dlFOS4GWaTOEXwdZvSYXeSgZpe09he",
             .lazy = true,
         },
         .protobuf = .{
@@ -61,6 +61,7 @@
         "tests",
         "proto",
         "LICENSE",
+        "LICENSE-MIT",
         "README.md",
     },
 }

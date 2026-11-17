@@ -1,0 +1,87 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2851,6 +2851,18 @@
+     list(APPEND WOLFSSL_DEFINITIONS "-DWOLFSSL_AARCH64_BUILD")
+ endif()
+ 
++# Intel source selectors already exist in cmake/functions.cmake, but their
++# configuration and the split x86_64 AES assembly are missing in 5.9.4.
++add_option("WOLFSSL_AESNI" "Enable runtime-dispatched AES-NI" "no" "yes;no")
++add_option("WOLFSSL_INTEL_ASM" "Enable runtime-dispatched Intel assembly" "no" "yes;no")
++if(WOLFSSL_AESNI)
++    list(APPEND WOLFSSL_DEFINITIONS "-DWOLFSSL_AESNI")
++    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -maes")
++endif()
++if(WOLFSSL_INTEL_ASM)
++    list(APPEND WOLFSSL_DEFINITIONS "-DUSE_INTEL_SPEEDUP")
++endif()
++
+ # SP math all
+ add_option("WOLFSSL_SP_MATH_ALL"
+     "Enable Single Precision math implementation for full algorithm suite (default: enabled)"
+@@ -4469,6 +4481,10 @@
+ 
+ add_library(wolfssl::wolfssl ALIAS wolfssl)
+ 
++if(WOLFSSL_AESNI AND WOLFSSL_X86_64_BUILD)
++    target_sources(wolfssl PRIVATE wolfcrypt/src/aes_x86_64_asm.S)
++endif()
++
+ if (NOT "$ENV{ARIA_DIR}" STREQUAL "")
+     message(STATUS "Found Environment variable ARIA_DIR=$ENV{ARIA_DIR}")
+     if(WOLFSSL_ARIA)
+--- a/cmake/options.h.in
++++ b/cmake/options.h.in
+@@ -408,4 +408,10 @@
+ #undef WOLFSSL_X86_64_BUILD
+ #cmakedefine WOLFSSL_X86_64_BUILD
++
++#undef WOLFSSL_AESNI
++#cmakedefine WOLFSSL_AESNI
++
++#undef USE_INTEL_SPEEDUP
++#cmakedefine USE_INTEL_SPEEDUP
+ #undef NO_DES3_TLS_SUITES
+ #cmakedefine NO_DES3_TLS_SUITES
+--- a/wolfcrypt/src/aes.c
++++ b/wolfcrypt/src/aes.c
+@@ -695,8 +695,3 @@
+-    /* Note that all write access to these static variables must be idempotent,
+-     * as arranged by Check_CPU_support_AES(), else they will be susceptible to
+-     * data races.  Don't use wolfSSL_Atomic_Uint here, to avoid atomic access
+-     * overhead on subsequent calls.
+-     */
+-    static int checkedAESNI = 0;
+-    static int haveAESNI = 0;
+-    static cpuid_flags_t intel_flags = WC_CPUID_INITIALIZER;
++    /* Publish the dispatch cache atomically across concurrent handshakes. */
++    static cpuid_flags_atomic_t intel_flags_cache = WC_CPUID_ATOMIC_INITIALIZER;
++    #define intel_flags WOLFSSL_ATOMIC_LOAD(intel_flags_cache)
+@@ -706,1 +701,1 @@
+-        cpuid_get_flags_ex(&intel_flags);
++        cpuid_get_flags_atomic(&intel_flags_cache);
+@@ -5897,5 +5892,1 @@
+-        if (checkedAESNI == 0) {
+-            haveAESNI = Check_CPU_support_AES();
+-            checkedAESNI = 1;
+-        }
+-        if (haveAESNI
++        if (Check_CPU_support_AES()
+--- a/wolfcrypt/src/chacha.c
++++ b/wolfcrypt/src/chacha.c
+@@ -111,1 +111,2 @@
+-    static cpuid_flags_t cpuidFlags = WC_CPUID_INITIALIZER;
++    static cpuid_flags_atomic_t cpuidFlagsCache = WC_CPUID_ATOMIC_INITIALIZER;
++    #define cpuidFlags WOLFSSL_ATOMIC_LOAD(cpuidFlagsCache)
+@@ -473,1 +474,1 @@
+-    cpuid_get_flags_ex(&cpuidFlags);
++    cpuid_get_flags_atomic(&cpuidFlagsCache);
+--- a/wolfcrypt/src/poly1305.c
++++ b/wolfcrypt/src/poly1305.c
+@@ -98,1 +98,2 @@
+-static cpuid_flags_t intel_flags = WC_CPUID_INITIALIZER;
++static cpuid_flags_atomic_t intel_flags_cache = WC_CPUID_ATOMIC_INITIALIZER;
++#define intel_flags WOLFSSL_ATOMIC_LOAD(intel_flags_cache)
+@@ -943,1 +944,1 @@
+-    cpuid_get_flags_ex(&intel_flags);
++    cpuid_get_flags_atomic(&intel_flags_cache);
