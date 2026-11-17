@@ -3785,9 +3785,11 @@ fn readResponseData(
     _: ?*anyopaque,
 ) callconv(.c) c.nghttp2_ssize {
     const stream: *Stream = @ptrCast(@alignCast(source.?.*.ptr.?));
-    const length = @min(stream.responseLength() - stream.response_offset, output_length);
+    var length = @min(stream.responseLength() - stream.response_offset, output_length);
     if (length != 0) {
         if (stream.connection.tls_send_batch != null) {
+            // Leave room for the HTTP/2 header in a record-sized DATA frame.
+            length = @min(length, 16 * 1024 - 9);
             data_flags.?.* |= c.NGHTTP2_DATA_FLAG_NO_COPY;
         } else {
             var written: usize = 0;
@@ -6063,6 +6065,49 @@ test "unary response ownership survives segmented header reads" {
         }
         try std.testing.expectEqual(@as(usize, 0), owner.end_index);
     }
+}
+
+test "TLS unary response DATA fits records without losing bytes" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection: Connection = .{ .server = server.impl };
+    var target = Stream.init(std.testing.allocator, &connection, 1);
+    defer target.deinit();
+    var payload: [32 * 1024]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index ^ (index >> 8));
+    var response = try service.UnaryResponse.ok(std.testing.allocator, &payload);
+    defer response.deinit();
+    try target.takeResponsePayload(&response);
+    target.trailer_submitted = true;
+    const expected = try frame.encode(std.testing.allocator, &payload);
+    defer std.testing.allocator.free(expected);
+    var batch: std.ArrayList(u8) = .empty;
+    defer batch.deinit(connection.allocator());
+    connection.tls_send_batch = &batch;
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(std.testing.allocator);
+    var source: c.nghttp2_data_source = .{ .ptr = &target };
+    var outgoing = std.mem.zeroes(c.nghttp2_frame);
+    const header: [9]u8 = @splat(0);
+    var output: [16 * 1024]u8 = undefined;
+    var flags: u32 = 0;
+    while (flags & c.NGHTTP2_DATA_FLAG_EOF == 0) {
+        batch.clearRetainingCapacity();
+        const count = readResponseData(null, 1, &output, output.len, &flags, &source, null);
+        try std.testing.expect(count > 0);
+        try std.testing.expect(flags & c.NGHTTP2_DATA_FLAG_NO_COPY != 0);
+        try std.testing.expectEqual(c.NGHTTP2_ERR_PAUSE, sendResponseData(null, &outgoing, &header, @intCast(count), &source, null));
+        try std.testing.expect(batch.items.len <= 16 * 1024);
+        try received.appendSlice(std.testing.allocator, batch.items[header.len..]);
+    }
+    try std.testing.expect(flags & c.NGHTTP2_DATA_FLAG_NO_END_STREAM != 0);
+    try std.testing.expectEqualSlices(u8, expected, received.items);
+    connection.tls_send_batch = null;
+    target.response_offset = 0;
+    flags = 0;
+    try std.testing.expectEqual(@as(c.nghttp2_ssize, output.len), readResponseData(null, 1, &output, output.len, &flags, &source, null));
+    try std.testing.expectEqual(@as(u32, 0), flags);
+    try std.testing.expectEqualSlices(u8, expected[0..output.len], &output);
 }
 
 test "TLS server buffered peer close at handshake completion preserves close cause" {
