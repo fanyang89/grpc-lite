@@ -3314,7 +3314,12 @@ fn onDataChunk(
         if (data_length > body_limit -| stream.request_body.items.len) {
             stream.request_too_large = true;
         } else {
-            stream.request_body.appendSlice(stream.allocator, data_pointer[0..data_length]) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            frame.appendUnaryData(
+                stream.allocator,
+                &stream.request_body,
+                data_pointer[0..data_length],
+                connection.server.max_request_size,
+            ) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
         }
     }
     if (c.nghttp2_session_consume_connection(session, data_length) != 0 or

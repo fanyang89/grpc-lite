@@ -3,6 +3,27 @@ const Compression = @import("compression.zig").Compression;
 
 pub const header_size = 5;
 
+/// Appends unary wire bytes, reserving a valid identity message's declared size
+/// once its header is complete. The caller must enforce its total wire-byte limit.
+pub fn appendUnaryData(
+    allocator: std.mem.Allocator,
+    buffer: *std.ArrayList(u8),
+    bytes: []const u8,
+    max_message_size: usize,
+) !void {
+    if (buffer.items.len < header_size and bytes.len >= header_size - buffer.items.len) {
+        var header: [header_size]u8 = undefined;
+        @memcpy(header[0..buffer.items.len], buffer.items);
+        @memcpy(header[buffer.items.len..], bytes[0 .. header_size - buffer.items.len]);
+        const length = std.mem.readInt(u32, header[1..5], .big);
+        if (header[0] == 0 and length <= max_message_size) {
+            const capacity = std.math.add(usize, length, header_size) catch 0;
+            try buffer.ensureTotalCapacityPrecise(allocator, capacity);
+        }
+    }
+    try buffer.appendSlice(allocator, bytes);
+}
+
 pub fn encode(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
     return encodeWithCompression(allocator, payload, .identity);
 }
@@ -227,6 +248,59 @@ test "frame round trips empty and binary payloads" {
         defer std.testing.allocator.free(decoded);
         try std.testing.expectEqualSlices(u8, payload, decoded);
     }
+}
+
+test "unary receive reservation handles every header split without payload growth" {
+    const header = [_]u8{ 0, 0, 0, 16, 0 };
+    const payload: [4096]u8 = @splat(0x5a);
+    for (0..header_size + 1) |split| {
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(std.testing.allocator);
+        try appendUnaryData(std.testing.allocator, &buffer, header[0..split], payload.len);
+        try appendUnaryData(std.testing.allocator, &buffer, header[split..], payload.len);
+        const capacity = buffer.capacity;
+        try std.testing.expect(capacity >= header_size + payload.len);
+        const pointer = buffer.items.ptr;
+        var offset: usize = 0;
+        while (offset < payload.len) : (offset += 128) {
+            try appendUnaryData(std.testing.allocator, &buffer, payload[offset..][0..128], payload.len);
+            try std.testing.expectEqual(capacity, buffer.capacity);
+            try std.testing.expectEqual(pointer, buffer.items.ptr);
+        }
+        try std.testing.expectEqualSlices(u8, &header, buffer.items[0..header_size]);
+        try std.testing.expectEqualSlices(u8, &payload, buffer.items[header_size..]);
+    }
+}
+
+test "unary receive reservation ignores compressed invalid and oversized headers" {
+    for ([_]u8{ 0, 1, 2 }) |flag| {
+        var storage: [1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(fixed.allocator());
+        // An oversized declaration must not reserve space even if it fits the wire limit.
+        try appendUnaryData(fixed.allocator(), &buffer, &.{ flag, 0, 0, 16, 0 }, 4095);
+        try std.testing.expectEqual(@as(usize, header_size), buffer.items.len);
+        try std.testing.expect(buffer.capacity <= storage.len);
+    }
+    for ([_]u8{ 1, 2 }) |flag| {
+        var storage: [1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(fixed.allocator());
+        try appendUnaryData(fixed.allocator(), &buffer, &.{ flag, 0, 0, 16, 0 }, 4096);
+        try std.testing.expect(buffer.capacity <= storage.len);
+    }
+}
+
+test "unary receive reservation propagates allocation failure without consuming input" {
+    var storage: [1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(fixed.allocator());
+    try appendUnaryData(fixed.allocator(), &buffer, &.{ 0, 0 }, 4096);
+    try std.testing.expectError(error.OutOfMemory, appendUnaryData(fixed.allocator(), &buffer, &.{ 0, 16, 0 }, 4096));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0 }, buffer.items);
 }
 
 test "frame round trips a multi-byte payload length" {
