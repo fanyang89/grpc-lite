@@ -2791,7 +2791,7 @@ fn flush(impl: *Impl) !void {
 fn flushTls(impl: *Impl) !void {
     const tls_session = impl.tls_session.?;
     while (!impl.stopping_on_loop) {
-        try drainTlsCiphertext(impl);
+        if (tls_session.ciphertext().len >= socket_write_batch_target) try drainTlsCiphertext(impl);
         if (tls_session.hasPendingWrite()) {
             const result = try tls_session.continueWrite();
             if (try finishTlsWrite(impl, result)) continue;
@@ -2808,20 +2808,25 @@ fn flushTls(impl: *Impl) !void {
             if (try finishTlsWrite(impl, result)) continue;
             return;
         }
-        if (!canFlushWrites(impl.queued_write_bytes, impl.write_high_watermark_bytes)) return;
+        // Buffered ciphertext is already committed to this flush's write budget.
+        if (!canFlushWritesWithPending(
+            impl.queued_write_bytes,
+            tls_session.ciphertext().len,
+            impl.write_high_watermark_bytes,
+        )) break;
         var data: [*c]const u8 = null;
         const length = c.nghttp2_session_mem_send2(impl.session, &data);
         if (length < 0) return error.NativeFailure;
-        if (length == 0) return;
+        if (length == 0) break;
         impl.tls_plaintext = try impl.allocator.dupe(u8, data[0..@intCast(length)]);
     }
+    if (!impl.stopping_on_loop) try drainTlsCiphertext(impl);
 }
 
 fn finishTlsWrite(impl: *Impl, result: tls_record.Result) !bool {
     switch (result) {
         .bytes => |count| {
             impl.tls_plaintext_offset += count;
-            try drainTlsCiphertext(impl);
             return true;
         },
         .want_write => {
@@ -9318,6 +9323,8 @@ test "channel and server exchange a unary call over TLS" {
 
     var handler = Handler{};
     var test_server = try server.Server.init(std.testing.allocator, .{
+        .write_high_watermark_bytes = 4096,
+        .write_low_watermark_bytes = 2048,
         .tls = .{
             .certificate_chain_pem = certificate,
             .private_key_pem = private_key,
@@ -9335,6 +9342,8 @@ test "channel and server exchange a unary call over TLS" {
     var target_buffer: [32]u8 = undefined;
     const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
     var channel = try Channel.init(std.testing.allocator, target, .{
+        .write_high_watermark_bytes = 4096,
+        .write_low_watermark_bytes = 2048,
         .runtime = &runtime,
         .tls = .{ .ca_certificates_pem = certificate },
     });
@@ -9344,6 +9353,19 @@ test "channel and server exchange a unary call over TLS" {
     defer result.deinit();
     try std.testing.expect(result.status.isOk());
     try std.testing.expectEqualStrings("secure", result.payload);
+
+    // Cross the TLS batch and write budget repeatedly, then flush a tiny tail.
+    const payload = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0x5a);
+    for ([_]usize{ payload.len, 0, 1, payload.len, 7 }) |size| {
+        var response = try channel.callUnary(std.testing.allocator, "/test.Tls/Unary", payload[0..size], .{
+            .timeout_ns = 5 * std.time.ns_per_s,
+        });
+        defer response.deinit();
+        try std.testing.expect(response.status.isOk());
+        try std.testing.expectEqualSlices(u8, payload[0..size], response.payload);
+    }
 }
 
 test "channel and server exchange a unary call over mutual TLS" {

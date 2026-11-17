@@ -457,6 +457,51 @@ test "client and server negotiate h2 and exchange plaintext" {
         else => return error.UnexpectedTlsResult,
     };
     try std.testing.expectEqualStrings(message, plaintext[0..read_length]);
+
+    // A full ciphertext batch may end mid-record; retry must not duplicate plaintext.
+    const Drain = struct {
+        fn run(source: *Session, destination: *Session, received: *usize) !void {
+            try transferCiphertext(source, destination);
+            var buffer: [4096]u8 = undefined;
+            while (true) {
+                switch (try destination.read(&buffer)) {
+                    .bytes => |count| {
+                        for (buffer[0..count]) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
+                        received.* += count;
+                    },
+                    .want_read => return,
+                    else => return error.UnexpectedTlsResult,
+                }
+            }
+        }
+    };
+    const payload: [8 * 1024]u8 = @splat(0x5a);
+    var received: usize = 0;
+    var blocked: usize = 0;
+    for (0..10) |_| {
+        var result = try client.beginWrite(&payload);
+        while (true) {
+            switch (result) {
+                .bytes => |count| {
+                    try std.testing.expectEqual(payload.len, count);
+                    break;
+                },
+                .want_write => {
+                    blocked += 1;
+                    try std.testing.expect(client.hasPendingWrite());
+                    try std.testing.expectEqual(queue_capacity, client.ciphertext().len);
+                    try Drain.run(client, server, &received);
+                    result = try client.continueWrite();
+                },
+                else => return error.UnexpectedTlsResult,
+            }
+        }
+    }
+    try std.testing.expect(blocked > 0);
+    try Drain.run(client, server, &received);
+    try std.testing.expectEqual(10 * payload.len, received);
+    try std.testing.expect(!client.hasPendingWrite());
+    try std.testing.expectEqual(@as(usize, 0), client.ciphertext().len);
 }
 
 test "client rejects a certificate for a different hostname" {
