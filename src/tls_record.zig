@@ -51,6 +51,7 @@ test "client and server negotiate h2 and exchange plaintext" {
     // A full ciphertext batch may end mid-record; retry must not duplicate plaintext.
     const Drain = struct {
         fn run(source: *Session, destination: *Session, received: *usize) !usize {
+            const pending = source.pendingCiphertextBytes();
             var queued: usize = 0;
             while (true) {
                 const bytes = source.ciphertext();
@@ -59,6 +60,7 @@ test "client and server negotiate h2 and exchange plaintext" {
                 queued += bytes.len;
                 source.consumeCiphertext(bytes.len);
             }
+            try std.testing.expectEqual(pending, queued);
             var buffer: [4096]u8 = undefined;
             while (true) {
                 switch (try destination.read(&buffer)) {
