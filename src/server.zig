@@ -3607,7 +3607,9 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
         submitFailure(session, stream, .unimplemented, "method not found");
         return;
     };
-    const request = frame.decodeUnaryWithCompression(
+    // request_body stays alive throughout the synchronous handler invocation.
+    const borrowed = frame.borrowIdentityUnary(stream.request_body.items, stream.connection.server.max_request_size);
+    const request = borrowed orelse frame.decodeUnaryWithCompression(
         stream.allocator,
         stream.request_body.items,
         stream.connection.server.max_request_size,
@@ -3619,7 +3621,7 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
         }
         return;
     };
-    defer stream.allocator.free(request);
+    defer if (borrowed == null) stream.allocator.free(request);
 
     var context = service.ServerContext.init(stream.allocator);
     defer context.deinit();
