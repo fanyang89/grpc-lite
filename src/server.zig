@@ -1647,6 +1647,7 @@ const Connection = struct {
     tls_handshake_needs_write: bool = false,
     tls_plaintext: ?[]u8 = null,
     tls_plaintext_offset: usize = 0,
+    tls_send_batch: ?*std.ArrayList(u8) = null,
     dirty_next: ?*Connection = null,
     dirty_queued: bool = false,
 
@@ -1670,6 +1671,7 @@ const Connection = struct {
         c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, onFrameReceived);
         c.nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, onFrameSent);
         c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, onStreamClose);
+        c.nghttp2_session_callbacks_set_send_data_callback(callbacks, sendResponseData);
         if (c.nghttp2_session_server_new2(&self.session, callbacks, self, options) != 0) return error.OutOfMemory;
         const settings = [_]c.nghttp2_settings_entry{
             .{
@@ -1736,6 +1738,8 @@ const Connection = struct {
             }
             var plaintext: std.ArrayList(u8) = .empty;
             defer plaintext.deinit(self.allocator());
+            self.tls_send_batch = &plaintext;
+            defer self.tls_send_batch = null;
             // Coalesce ready HTTP/2 chunks without waiting for another loop turn.
             while (!self.closing and plaintext.items.len < 16 * 1024 and canFlushWritesWithPending(
                 self.queued_write_bytes,
@@ -1743,9 +1747,13 @@ const Connection = struct {
                 self.server.write_high_watermark_bytes,
             )) {
                 var data: [*c]const u8 = null;
+                const previous_length = plaintext.items.len;
                 const length = c.nghttp2_session_mem_send2(self.session, &data);
                 if (length < 0) return error.NativeFailure;
-                if (length == 0) break;
+                if (length == 0) {
+                    if (plaintext.items.len == previous_length) break;
+                    continue;
+                }
                 try plaintext.appendSlice(self.allocator(), data[0..@intCast(length)]);
             }
             if (plaintext.items.len == 0) break;
@@ -3748,7 +3756,11 @@ fn readResponseData(
     const remaining = stream.response_body[stream.response_offset..];
     const length = @min(remaining.len, output_length);
     if (length != 0) {
-        @memcpy(output[0..length], remaining[0..length]);
+        if (stream.connection.tls_send_batch != null) {
+            data_flags.?.* |= c.NGHTTP2_DATA_FLAG_NO_COPY;
+        } else {
+            @memcpy(output[0..length], remaining[0..length]);
+        }
         stream.response_offset += length;
     }
     if (stream.response_offset == stream.response_body.len) {
@@ -3759,6 +3771,25 @@ fn readResponseData(
         }
     }
     return @intCast(length);
+}
+
+fn sendResponseData(
+    _: ?*c.nghttp2_session,
+    outgoing: ?*c.nghttp2_frame,
+    header: [*c]const u8,
+    length: usize,
+    source: ?*c.nghttp2_data_source,
+    _: ?*anyopaque,
+) callconv(.c) c_int {
+    const stream: *Stream = @ptrCast(@alignCast(source.?.*.ptr.?));
+    const batch = stream.connection.tls_send_batch orelse return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    // No outgoing padding callback is installed.
+    std.debug.assert(outgoing.?.data.padlen == 0);
+    batch.ensureUnusedCapacity(stream.connection.allocator(), 9 + length) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    batch.appendSliceAssumeCapacity(header[0..9]);
+    batch.appendSliceAssumeCapacity(stream.response_body[stream.response_offset - length .. stream.response_offset]);
+    // Recheck the batch target and write budget before asking for another frame.
+    return c.NGHTTP2_ERR_PAUSE;
 }
 
 fn readStreamingResponseData(

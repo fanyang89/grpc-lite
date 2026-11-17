@@ -828,6 +828,7 @@ const Impl = struct {
     tls_session: ?*tls_record.Session = null,
     tls_plaintext: ?[]u8 = null,
     tls_plaintext_offset: usize = 0,
+    tls_send_batch: ?*std.ArrayList(u8) = null,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
     state: State = .starting,
@@ -2044,6 +2045,7 @@ fn initializeSession(impl: *Impl) !void {
     c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, onDataChunk);
     c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, onFrameReceived);
     c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, onStreamClose);
+    c.nghttp2_session_callbacks_set_send_data_callback(callbacks, sendRequestData);
     if (c.nghttp2_session_client_new2(&impl.session, callbacks, impl, options) != 0) return error.OutOfMemory;
     const settings = [_]c.nghttp2_settings_entry{
         .{
@@ -2754,10 +2756,33 @@ fn readRequestData(
     const operation: *Operation = @ptrCast(@alignCast(source.?.*.ptr.?));
     const remaining = operation.request_frame[operation.request_offset..];
     const length = @min(remaining.len, output_length);
-    @memcpy(output[0..length], remaining[0..length]);
+    if (operation.impl.tls_send_batch != null) {
+        data_flags.?.* |= c.NGHTTP2_DATA_FLAG_NO_COPY;
+    } else {
+        @memcpy(output[0..length], remaining[0..length]);
+    }
     operation.request_offset += length;
     if (operation.request_offset == operation.request_frame.len) data_flags.?.* |= c.NGHTTP2_DATA_FLAG_EOF;
     return @intCast(length);
+}
+
+fn sendRequestData(
+    _: ?*c.nghttp2_session,
+    outgoing: ?*c.nghttp2_frame,
+    header: [*c]const u8,
+    length: usize,
+    source: ?*c.nghttp2_data_source,
+    _: ?*anyopaque,
+) callconv(.c) c_int {
+    const operation: *Operation = @ptrCast(@alignCast(source.?.*.ptr.?));
+    const batch = operation.impl.tls_send_batch orelse return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    // No outgoing padding callback is installed.
+    std.debug.assert(outgoing.?.data.padlen == 0);
+    batch.ensureUnusedCapacity(operation.impl.allocator, 9 + length) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+    batch.appendSliceAssumeCapacity(header[0..9]);
+    batch.appendSliceAssumeCapacity(operation.request_frame[operation.request_offset - length .. operation.request_offset]);
+    // Recheck the batch target and write budget before asking for another frame.
+    return c.NGHTTP2_ERR_PAUSE;
 }
 
 fn flush(impl: *Impl) !void {
@@ -2810,6 +2835,8 @@ fn flushTls(impl: *Impl) !void {
         }
         var plaintext: std.ArrayList(u8) = .empty;
         defer plaintext.deinit(impl.allocator);
+        impl.tls_send_batch = &plaintext;
+        defer impl.tls_send_batch = null;
         // Coalesce ready HTTP/2 chunks without waiting for another loop turn.
         while (!impl.stopping_on_loop and plaintext.items.len < 16 * 1024 and canFlushWritesWithPending(
             impl.queued_write_bytes,
@@ -2817,9 +2844,13 @@ fn flushTls(impl: *Impl) !void {
             impl.write_high_watermark_bytes,
         )) {
             var data: [*c]const u8 = null;
+            const previous_length = plaintext.items.len;
             const length = c.nghttp2_session_mem_send2(impl.session, &data);
             if (length < 0) return error.NativeFailure;
-            if (length == 0) break;
+            if (length == 0) {
+                if (plaintext.items.len == previous_length) break;
+                continue;
+            }
             try plaintext.appendSlice(impl.allocator, data[0..@intCast(length)]);
         }
         if (plaintext.items.len == 0) break;
@@ -9321,9 +9352,10 @@ test "channel and server exchange a unary call over TLS" {
         fn handle(
             _: *@This(),
             allocator: std.mem.Allocator,
-            _: *service.ServerContext,
+            context: *service.ServerContext,
             request: []const u8,
         ) !service.UnaryResponse {
+            context.setResponseCompression(context.request_compression);
             return service.UnaryResponse.ok(allocator, request);
         }
     };
@@ -9379,6 +9411,7 @@ test "channel and server exchange a unary call over TLS" {
     const Completion = struct {
         channel: *Channel,
         payload: []const u8,
+        compression: Compression,
         calls: usize = 0,
         valid: bool = true,
         done: std.atomic.Value(bool) = .init(false),
@@ -9387,10 +9420,12 @@ test "channel and server exchange a unary call over TLS" {
             const self: *@This() = @ptrCast(@alignCast(context.?));
             self.calls += 1;
             self.valid = self.valid and response.status.isOk() and
+                response.response_compression == self.compression and
                 std.mem.eql(u8, self.payload, response.payload);
             if (self.calls < 3 and self.valid) {
                 self.channel.callUnaryAsync("/test.Tls/Unary", self.payload, .{
                     .timeout_ns = 5 * std.time.ns_per_s,
+                    .request_compression = self.compression,
                 }, .{ .context = self, .on_complete = onComplete }) catch {
                     self.valid = false;
                     self.done.store(true, .release);
@@ -9408,11 +9443,16 @@ test "channel and server exchange a unary call over TLS" {
     }
     for (&completions, 0..) |*completion, index| {
         const sizes = [_]usize{ 0, 1, 1024, 16 * 1024 + 1, 64 * 1024 };
-        completion.* = .{ .channel = &channel, .payload = payload[0..sizes[index % sizes.len]] };
+        completion.* = .{
+            .channel = &channel,
+            .payload = payload[0..sizes[index % sizes.len]],
+            .compression = if (index % 2 == 0) .gzip else .identity,
+        };
     }
     for (&completions) |*completion| {
         try channel.callUnaryAsync("/test.Tls/Unary", completion.payload, .{
             .timeout_ns = 5 * std.time.ns_per_s,
+            .request_compression = completion.compression,
         }, .{ .context = completion, .on_complete = Completion.onComplete });
     }
     for (&completions) |*completion| {
