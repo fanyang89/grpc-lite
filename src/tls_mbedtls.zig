@@ -230,6 +230,10 @@ pub const Session = struct {
         self.transport_eof = true;
     }
 
+    pub fn pendingCiphertextBytes(self: *const Session) usize {
+        return self.outbound.readable().len;
+    }
+
     pub fn ciphertext(self: *const Session) []const u8 {
         return self.outbound.readable();
     }

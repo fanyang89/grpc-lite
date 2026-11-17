@@ -162,6 +162,10 @@ pub const Session = struct {
         _ = c.BIO_shutdown_wr(self.network);
     }
 
+    pub fn pendingCiphertextBytes(self: *const Session) usize {
+        return c.BIO_ctrl_pending(self.network);
+    }
+
     pub fn ciphertext(self: *const Session) []const u8 {
         var ptr: [*c]u8 = null;
         const n = c.BIO_nread0(self.network, &ptr);
