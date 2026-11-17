@@ -3,6 +3,15 @@ const Compression = @import("compression.zig").Compression;
 
 pub const header_size = 5;
 
+/// Borrows one complete, bounded identity payload. The caller must keep bytes
+/// alive and unchanged until the payload is no longer used. Null requires decoding.
+pub fn borrowIdentityUnary(bytes: []u8, max_message_size: usize) ?[]u8 {
+    if (bytes.len < header_size or bytes[0] != 0) return null;
+    const length = std.mem.readInt(u32, bytes[1..5], .big);
+    if (length != bytes.len - header_size or length > max_message_size) return null;
+    return bytes[header_size..];
+}
+
 /// Appends unary wire bytes, reserving a valid identity message's declared size
 /// once its header is complete. The caller must enforce its total wire-byte limit.
 pub fn appendUnaryData(
@@ -238,6 +247,26 @@ fn decompressGzip(
         return error.MalformedCompressedMessage;
     }
     return decompressed;
+}
+
+test "identity unary borrowing aliases only complete bounded identity frames" {
+    var bytes = [_]u8{ 0, 0, 0, 0, 3, 'a', 0, 'b' };
+    const payload = borrowIdentityUnary(&bytes, 3).?;
+    try std.testing.expectEqual(bytes[header_size..].ptr, payload.ptr);
+    try std.testing.expectEqualSlices(u8, "a\x00b", payload);
+    try std.testing.expect(borrowIdentityUnary(&bytes, 2) == null);
+    for (0..bytes.len) |length| {
+        try std.testing.expect(borrowIdentityUnary(bytes[0..length], 3) == null);
+    }
+    for ([_]u8{ 1, 2, 255 }) |flag| {
+        bytes[0] = flag;
+        try std.testing.expect(borrowIdentityUnary(&bytes, 3) == null);
+    }
+    var empty = [_]u8{ 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(@as(usize, 0), borrowIdentityUnary(&empty, 0).?.len);
+    var repeated = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expect(borrowIdentityUnary(&repeated, 3) == null);
+    try std.testing.expect(borrowIdentityUnary(repeated[0..6], 3) == null);
 }
 
 test "frame round trips empty and binary payloads" {

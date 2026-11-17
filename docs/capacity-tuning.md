@@ -44,6 +44,10 @@ mean powers of 1024. Unary and streaming admission are independent, per Channel.
   provided the payload fits the configured message limit. This storage can be
   allocated before the body arrives; include it in the memory budget for incomplete
   calls. Unary request admission charges do not account for response buffers.
+  Complete identity unary payloads borrow the receive buffer during server handler
+  and client completion callbacks, avoiding a separate decoded-payload allocation.
+  Blocking and task-based client results still copy into independently owned storage;
+  gzip decoding still allocates its decompressed payload.
 - **Streaming:** charge is configured inbound **plus** outbound capacity, independent
   of payload traffic: default `8 + 8 = 16 MiB`. Thus
   `min(1024, floor(1024 MiB / 16 MiB)) = 64` retained streams fit, even with empty queues.

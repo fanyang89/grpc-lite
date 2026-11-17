@@ -1303,6 +1303,7 @@ const Operation = struct {
     response_message: []u8 = &.{},
     response_message_owned: bool = false,
     response_payload: ?[]u8 = null,
+    response_payload_borrowed: bool = false,
     response_compression: Compression = .identity,
     response_encoding_invalid: bool = false,
     response_metadata_invalid: bool = false,
@@ -1401,7 +1402,9 @@ const Operation = struct {
         self.request_metadata.deinit();
         self.response_body.deinit(allocator);
         if (self.response_message_owned) allocator.free(self.response_message);
-        if (self.response_payload) |payload| allocator.free(payload);
+        if (!self.response_payload_borrowed) {
+            if (self.response_payload) |payload| allocator.free(payload);
+        }
         if (self.grpc_message) |value| allocator.free(value);
         if (self.block_grpc_message) |value| allocator.free(value);
         self.initial_metadata.deinit();
@@ -1569,7 +1572,9 @@ const Operation = struct {
             if (code != .ok) {
                 self.setOutcome(code, if (decoded_message) |value| value else "") catch {};
             } else {
-                const payload = frame.decodeUnaryWithCompression(
+                // response_body stays alive through callbacks and copyResult.
+                const borrowed = frame.borrowIdentityUnary(self.response_body.items, self.max_response_size);
+                const payload = borrowed orelse frame.decodeUnaryWithCompression(
                     self.impl.allocator,
                     self.response_body.items,
                     self.max_response_size,
@@ -1584,6 +1589,7 @@ const Operation = struct {
                     return;
                 };
                 self.response_payload = payload;
+                self.response_payload_borrowed = borrowed != null;
                 self.response_compression = if (self.response_body.items[0] == 1) .gzip else .identity;
                 self.setOutcome(.ok, if (decoded_message) |value| value else "") catch {};
             }
@@ -7033,6 +7039,58 @@ test "outbound metadata rejects invalid application values before queuing" {
         .{ .metadata = &.{.{ .key = "trace-bin", .value = "\x00\xff" }} },
     );
     binary.deinit();
+}
+
+test "unary finalized payload ownership survives result copying and callback completion" {
+    const Callback = struct {
+        expected: []const u8,
+        called: bool = false,
+
+        fn complete(context: ?*anyopaque, result: call.AsyncResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            std.testing.expect(result.status.isOk()) catch @panic("unexpected status");
+            std.testing.expectEqual(self.expected.ptr, result.payload.ptr) catch @panic("payload was copied");
+            std.testing.expectEqualStrings("response", result.payload) catch @panic("invalid payload");
+            self.called = true;
+        }
+    };
+    for ([_]Compression{ .identity, .gzip }) |compression| {
+        var host = [_:0]u8{'x'};
+        var serialized_allocator: SerializedAllocator = undefined;
+        var impl: Impl = undefined;
+        initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+        var result: call.Result = result: {
+            const operation = try Operation.init(&impl, "/test.Echo/Unary", "", .{});
+            defer operation.deinit();
+            const encoded = try frame.encodeWithCompression(impl.allocator, "response", compression);
+            defer impl.allocator.free(encoded);
+            try operation.response_body.appendSlice(impl.allocator, encoded);
+            operation.saw_response_headers = true;
+            operation.http_status = 200;
+            operation.content_type_grpc = true;
+            operation.grpc_status = 0;
+            operation.response_compression = compression;
+            var callback: Callback = .{ .expected = operation.response_body.items[frame.header_size..] };
+            if (compression == .identity) {
+                // Keep the test's reference while finalize releases the callback owner.
+                _ = operation.references.fetchAdd(1, .monotonic);
+                operation.owner = .{ .callback = .{ .context = &callback, .on_complete = Callback.complete } };
+            }
+            operation.finalize(c.NGHTTP2_NO_ERROR);
+            try std.testing.expect(operation.response_code == .ok);
+            try std.testing.expectEqual(compression == .identity, operation.response_payload_borrowed);
+            try std.testing.expectEqual(compression == .identity, callback.called);
+            const copied = try operation.copyResult(std.testing.allocator);
+            errdefer {
+                var cleanup = copied;
+                cleanup.deinit();
+            }
+            try std.testing.expect(copied.payload.ptr != operation.response_payload.?.ptr);
+            break :result copied;
+        };
+        defer result.deinit();
+        try std.testing.expectEqualStrings("response", result.payload);
+    }
 }
 
 test "malformed binary response metadata marks only the operation invalid" {
