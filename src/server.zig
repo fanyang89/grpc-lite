@@ -1200,6 +1200,8 @@ const Stream = struct {
     request_body: std.ArrayList(u8) = .empty,
     request_metadata: metadata.Metadata,
     response_body: []u8 = &.{},
+    response_body_allocator: ?std.mem.Allocator = null,
+    response_header: ?[frame.header_size]u8 = null,
     response_offset: usize = 0,
     trailing_metadata: metadata.Metadata,
     response_code: status.Code = .ok,
@@ -1251,7 +1253,8 @@ const Stream = struct {
         if (self.path) |path| self.allocator.free(path);
         self.request_body.deinit(self.allocator);
         self.request_metadata.deinit();
-        if (self.response_body.len != 0) self.allocator.free(self.response_body);
+        if (self.response_body.len != 0)
+            (self.response_body_allocator orelse self.allocator).free(self.response_body);
         if (self.response_message_allocator) |owner| owner.free(self.response_message);
         self.trailing_metadata.deinit();
         self.* = undefined;
@@ -1266,6 +1269,28 @@ const Stream = struct {
         self.response_code = response_status.code;
         self.response_message = owned_message;
         self.response_message_allocator = if (owned_message.len == 0) null else self.allocator;
+    }
+
+    /// Takes an identity response's payload without copying or changing its allocator.
+    fn takeResponsePayload(self: *Stream, response: *service.UnaryResponse) !void {
+        self.response_header = try frame.encodeHeader(response.payload.len, false);
+        self.response_body = response.payload;
+        self.response_body_allocator = response.allocator;
+        response.payload = &.{};
+    }
+
+    fn responseLength(self: *const Stream) usize {
+        return self.response_body.len + if (self.response_header != null) frame.header_size else @as(usize, 0);
+    }
+
+    fn responseSlices(self: *const Stream, offset: usize, length: usize) [2][]const u8 {
+        const header: []const u8 = if (self.response_header) |*value| value else &.{};
+        const header_offset = @min(offset, header.len);
+        const header_length = @min(length, header.len - header_offset);
+        return .{
+            header[header_offset..][0..header_length],
+            self.response_body[offset - header_offset ..][0 .. length - header_length],
+        };
     }
 
     fn setOwnedStatus(
@@ -3670,14 +3695,21 @@ fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
     };
 
     if (response.status.isOk()) {
-        stream.response_body = frame.encodeWithCompression(
-            stream.allocator,
-            response.payload,
-            stream.response_compression,
-        ) catch {
-            submitFailure(session, stream, .internal, "response allocation failed");
-            return;
-        };
+        if (stream.response_compression == .identity) {
+            stream.takeResponsePayload(&response) catch {
+                submitFailure(session, stream, .internal, "response message too large");
+                return;
+            };
+        } else {
+            stream.response_body = frame.encodeWithCompression(
+                stream.allocator,
+                response.payload,
+                stream.response_compression,
+            ) catch {
+                submitFailure(session, stream, .internal, "response allocation failed");
+                return;
+            };
+        }
     }
     stream.setStatus(response.status) catch {
         stream.connection.close();
@@ -3753,17 +3785,20 @@ fn readResponseData(
     _: ?*anyopaque,
 ) callconv(.c) c.nghttp2_ssize {
     const stream: *Stream = @ptrCast(@alignCast(source.?.*.ptr.?));
-    const remaining = stream.response_body[stream.response_offset..];
-    const length = @min(remaining.len, output_length);
+    const length = @min(stream.responseLength() - stream.response_offset, output_length);
     if (length != 0) {
         if (stream.connection.tls_send_batch != null) {
             data_flags.?.* |= c.NGHTTP2_DATA_FLAG_NO_COPY;
         } else {
-            @memcpy(output[0..length], remaining[0..length]);
+            var written: usize = 0;
+            for (stream.responseSlices(stream.response_offset, length)) |bytes| {
+                @memcpy(output[written..][0..bytes.len], bytes);
+                written += bytes.len;
+            }
         }
         stream.response_offset += length;
     }
-    if (stream.response_offset == stream.response_body.len) {
+    if (stream.response_offset == stream.responseLength()) {
         data_flags.?.* |= c.NGHTTP2_DATA_FLAG_EOF | c.NGHTTP2_DATA_FLAG_NO_END_STREAM;
         if (!stream.trailer_submitted) {
             stream.trailer_submitted = true;
@@ -3787,7 +3822,8 @@ fn sendResponseData(
     std.debug.assert(outgoing.?.data.padlen == 0);
     batch.ensureUnusedCapacity(stream.connection.allocator(), 9 + length) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     batch.appendSliceAssumeCapacity(header[0..9]);
-    batch.appendSliceAssumeCapacity(stream.response_body[stream.response_offset - length .. stream.response_offset]);
+    for (stream.responseSlices(stream.response_offset - length, length)) |bytes|
+        batch.appendSliceAssumeCapacity(bytes);
     // Recheck the batch target and write budget before asking for another frame.
     return c.NGHTTP2_ERR_PAUSE;
 }
@@ -5987,6 +6023,46 @@ test "malformed HTTP/2 settings close the connection promptly" {
     }
     try waitForAdmittedConnections(server.coordinator, 0);
     try std.testing.expectEqual(@as(u64, 2), server.operationalStats().close_protocol_local);
+}
+
+test "unary response ownership survives segmented header reads" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection: Connection = .{ .server = server.impl };
+    var storage: [128]u8 = undefined;
+    var owner = std.heap.FixedBufferAllocator.init(&storage);
+    for ([_][]const u8{ "", "payload" }) |payload| {
+        {
+            var target = Stream.init(std.testing.allocator, &connection, 1);
+            defer target.deinit();
+            var response = try service.UnaryResponse.ok(owner.allocator(), payload);
+            defer response.deinit();
+            const original = response.payload.ptr;
+            try target.takeResponsePayload(&response);
+            try std.testing.expectEqual(@as(usize, 0), response.payload.len);
+            try std.testing.expect(target.response_body.ptr == original);
+            const expected: []const u8 = if (payload.len == 0)
+                "\x00\x00\x00\x00\x00"
+            else
+                "\x00\x00\x00\x00\x07payload";
+            target.trailer_submitted = true;
+            var source: c.nghttp2_data_source = .{ .ptr = &target };
+            for (1..expected.len + 1) |chunk_size| {
+                target.response_offset = 0;
+                var actual: [32]u8 = undefined;
+                var received: usize = 0;
+                var flags: u32 = 0;
+                while (flags & c.NGHTTP2_DATA_FLAG_EOF == 0) {
+                    const count = readResponseData(null, 1, actual[received..].ptr, chunk_size, &flags, &source, null);
+                    try std.testing.expect(count > 0);
+                    received += @intCast(count);
+                }
+                try std.testing.expect(flags & c.NGHTTP2_DATA_FLAG_NO_END_STREAM != 0);
+                try std.testing.expectEqualSlices(u8, expected, actual[0..received]);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), owner.end_index);
+    }
 }
 
 test "TLS server buffered peer close at handshake completion preserves close cause" {

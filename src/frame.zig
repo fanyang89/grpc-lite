@@ -59,16 +59,18 @@ pub fn encodeWithCompression(
     return encodePayload(allocator, output.written(), true);
 }
 
-fn encodePayload(allocator: std.mem.Allocator, payload: []const u8, compressed: bool) ![]u8 {
-    if (payload.len > std.math.maxInt(u32)) return error.MessageTooLarge;
+pub fn encodeHeader(payload_length: usize, compressed: bool) ![header_size]u8 {
+    if (payload_length > std.math.maxInt(u32)) return error.MessageTooLarge;
+    var header: [header_size]u8 = undefined;
+    header[0] = @intFromBool(compressed);
+    std.mem.writeInt(u32, header[1..5], @intCast(payload_length), .big);
+    return header;
+}
 
+fn encodePayload(allocator: std.mem.Allocator, payload: []const u8, compressed: bool) ![]u8 {
+    const header = try encodeHeader(payload.len, compressed);
     const frame = try allocator.alloc(u8, header_size + payload.len);
-    frame[0] = @intFromBool(compressed);
-    const length: u32 = @intCast(payload.len);
-    frame[1] = @truncate(length >> 24);
-    frame[2] = @truncate(length >> 16);
-    frame[3] = @truncate(length >> 8);
-    frame[4] = @truncate(length);
+    @memcpy(frame[0..header_size], &header);
     @memcpy(frame[header_size..], payload);
     return frame;
 }
