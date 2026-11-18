@@ -3001,6 +3001,20 @@ fn receiveHttp2(impl: *Impl, input: []const u8) !void {
     if (impl.stopping_on_loop) return error.Http2ConnectionFailed;
 }
 
+fn needsWriteWake(impl: *Impl) bool {
+    if (impl.tls_handshake_needs_write) return true;
+    if (impl.queued_write_bytes >= impl.write_low_watermark_bytes) return false;
+    // Draining also needs the deferred callback to replace the connection.
+    if (impl.connection_state == .draining) return true;
+    if (impl.tls_plaintext != null) return true;
+    if (comptime build_options.tls) {
+        if (impl.tls_session) |session| {
+            if (session.hasPendingWrite() or session.ciphertext().len != 0) return true;
+        }
+    }
+    return impl.session != null and c.nghttp2_session_want_write(impl.session) != 0;
+}
+
 fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.WriteBuffer, result: xev.WriteError!usize) xev.CallbackAction {
     const write = write_.?;
     const impl = write.impl;
@@ -3020,7 +3034,7 @@ fn onWrite(write_: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.T
     if (write_succeeded and
         generation == impl.connection_generation.load(.monotonic) and
         impl.connected and
-        (impl.tls_handshake_needs_write or impl.queued_write_bytes < impl.write_low_watermark_bytes))
+        needsWriteWake(impl))
     {
         // WriteQueue schedules its next head after this callback returns.
         // Wake the async callback so queueWrite cannot reenter that ordering.
@@ -4607,6 +4621,37 @@ test "client write queue setup failure returns descriptor to owner pool" {
     try std.testing.expectEqual(@as(usize, 0), impl.writes.count());
     try std.testing.expectEqual(@as(usize, 0), impl.queued_write_bytes);
     try std.testing.expectEqual(@as(usize, 1), failing.deallocations);
+}
+
+test "client write wake skips exhausted output and preserves deferred progress" {
+    var serialized_allocator: SerializedAllocator = undefined;
+    var impl: Impl = undefined;
+    var host = [_:0]u8{'x'};
+    initTestImpl(&impl, &serialized_allocator, host[0..1 :0]);
+    try initializeSession(&impl);
+    defer c.nghttp2_session_del(impl.session);
+    impl.connection_state = .active;
+    try std.testing.expect(needsWriteWake(&impl));
+    var data: [*c]const u8 = null;
+    while (true) {
+        const length = c.nghttp2_session_mem_send2(impl.session, &data);
+        try std.testing.expect(length >= 0);
+        if (length == 0) break;
+    }
+    try std.testing.expect(!needsWriteWake(&impl));
+    impl.connection_state = .draining;
+    try std.testing.expect(needsWriteWake(&impl));
+    impl.connection_state = .active;
+    var plaintext = [_]u8{1};
+    impl.tls_plaintext = &plaintext;
+    try std.testing.expect(needsWriteWake(&impl));
+    impl.tls_plaintext = null;
+    try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_submit_ping(impl.session, 0, null));
+    try std.testing.expect(needsWriteWake(&impl));
+    impl.queued_write_bytes = impl.write_low_watermark_bytes;
+    try std.testing.expect(!needsWriteWake(&impl));
+    impl.tls_handshake_needs_write = true;
+    try std.testing.expect(needsWriteWake(&impl));
 }
 
 test "client write callback and discard each release once" {
