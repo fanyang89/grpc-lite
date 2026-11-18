@@ -9321,8 +9321,10 @@ test "channel and server exchange a unary call over TLS" {
         }
     };
 
+    var transport_allocator = @import("test_allocator.zig").init();
+    defer std.testing.expectEqual(@as(usize, 0), transport_allocator.deinit()) catch @panic("test allocator leak");
     var handler = Handler{};
-    var test_server = try server.Server.init(std.testing.allocator, .{
+    var test_server = try server.Server.init(transport_allocator.allocator(), .{
         .write_high_watermark_bytes = 4096,
         .write_low_watermark_bytes = 2048,
         .tls = .{
@@ -9341,7 +9343,7 @@ test "channel and server exchange a unary call over TLS" {
     defer runtime.deinit();
     var target_buffer: [32]u8 = undefined;
     const target = try std.fmt.bufPrint(&target_buffer, "localhost:{d}", .{try test_server.port()});
-    var channel = try Channel.init(std.testing.allocator, target, .{
+    var channel = try Channel.init(transport_allocator.allocator(), target, .{
         .write_high_watermark_bytes = 4096,
         .write_low_watermark_bytes = 2048,
         .runtime = &runtime,
