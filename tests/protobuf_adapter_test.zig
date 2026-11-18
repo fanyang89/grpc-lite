@@ -611,7 +611,6 @@ test "typed streaming client reports malformed protobuf responses" {
     );
     defer call.deinit();
     try call.send(std.testing.allocator, .{ .message = "request" }, .{});
-    try call.closeSend();
 
     const deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds +| 10 * std.time.ns_per_s;
     while (!state.done.load(.acquire)) {
