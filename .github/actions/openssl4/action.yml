@@ -1,0 +1,22 @@
+name: Prepare OpenSSL 4
+description: Build the pinned TLS test dependency on runners that ship OpenSSL 3
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        version=4.0.3
+        prefix="$RUNNER_TEMP/openssl4"
+        work=$(mktemp -d "$RUNNER_TEMP/build-openssl.XXXXXX")
+        cd "$work"
+        curl -fsSL --retry 3 -o source.tar.gz \
+          "https://github.com/openssl/openssl/releases/download/openssl-$version/openssl-$version.tar.gz"
+        echo '325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9  source.tar.gz' | sha256sum -c -
+        tar -xzf source.tar.gz
+        cd "openssl-$version"
+        ./Configure --prefix="$prefix" --libdir=lib shared no-tests
+        make -j"$(nproc)" build_sw > "$work/build.log" || { tail -100 "$work/build.log"; exit 1; }
+        make install_sw > "$work/install.log"
+        echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"

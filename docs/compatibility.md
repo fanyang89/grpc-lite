@@ -13,7 +13,7 @@ listeners and native transport use IPv4.
 | Unary, client/server streaming, bidirectional streaming | Raw Zig, typed Zig and selected synchronous C++ APIs |
 | Metadata, deadlines, gzip, graceful drain | Supported |
 | Explicit cancellation | Raw and typed Zig unary calls via `Cancellation`; streaming via `cancel()`; raw C unary has no cancellation parameter |
-| TLS 1.2+ and mandatory ALPN `h2` | Optional native Zig build with mbedTLS |
+| TLS 1.2+ and mandatory ALPN `h2` | Optional native Zig build with OpenSSL 4.x |
 | mTLS | Native Zig with explicit PEM identity and trusted CAs |
 | Transpiled-C release bundles | Cleartext Linux x86_64 and ARM64; no Zig needed by consumers |
 | Reconnection and GOAWAY replacement | New connections without replaying submitted RPCs |

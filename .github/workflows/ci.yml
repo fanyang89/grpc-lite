@@ -125,6 +125,8 @@ jobs:
       - name: Restore verified dependencies
         uses: ./.github/actions/dependencies
 
+      - uses: ./.github/actions/openssl4
+
       - name: Build and run raw public API package consumer
         run: mise run test-consumer
       - name: Build and run typed task package consumer
@@ -248,6 +250,8 @@ jobs:
       - name: Restore verified dependencies
         uses: ./.github/actions/dependencies
 
+      - uses: ./.github/actions/openssl4
+
       - name: Run TLS tests
         run: mise run test-tls
 
@@ -359,6 +363,8 @@ jobs:
 
       - name: Run bidirectional task interop with zio
         run: mise run interop-async
+
+      - uses: ./.github/actions/openssl4
 
       - name: Run official TLS interop
         if: matrix.arch == 'x64'

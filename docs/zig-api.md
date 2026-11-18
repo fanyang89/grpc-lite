@@ -439,7 +439,13 @@ alongside snapshots when diagnosing memory growth.
 
 ## TLS
 
-TLS is an optional mbedTLS 3.6.6 dependency:
+Native TLS uses the target's OpenSSL 4.x development headers and `libssl`/`libcrypto`
+through pkg-config. `-Dtls=false` (the default) does not need OpenSSL. For a
+non-system installation, set `PKG_CONFIG_PATH` to its pkg-config directory and
+configure the dynamic loader to find the corresponding libraries. When linking
+`libgrpc_lite.a` outside Zig, link OpenSSL after the archive (`pkg-config --libs openssl`,
+or `pkg-config --static --libs openssl` with static OpenSSL archives).
+grpc-lite remains MIT licensed; OpenSSL is distributed under Apache-2.0.
 
 ```bash
 mise run prepare-tls-deps
@@ -447,8 +453,8 @@ zig build -Dtls=true
 ```
 
 Downstream packages pass `.tls = true` to the grpc-lite dependency. Clients trust only
-the supplied PEM CA bundle; system roots are not searched. Hostname verification and SNI
-use the Channel target. TLS 1.2 or newer and ALPN `h2` are mandatory. TLS 1.2 is limited
+the supplied PEM CA bundle; system roots are not searched. DNS targets use hostname
+verification and SNI; IPv4 literals verify the IP SAN without SNI. TLS 1.2 or newer and ALPN `h2` are mandatory. TLS 1.2 is limited
 to ECDHE AEAD suites, while TLS 1.3 uses its AES-GCM and ChaCha20-Poly1305 suites, matching
 the HTTP/2 cipher profile. The default handshake timeout is ten seconds.
 

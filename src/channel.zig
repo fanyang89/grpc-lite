@@ -2869,10 +2869,12 @@ fn queueOwnedSocketWrite(impl: *Impl, bytes: []u8) !void {
 fn drainTlsCiphertext(impl: *Impl) !void {
     if (comptime !build_options.tls) return;
     const tls_session = impl.tls_session orelse return;
-    const ciphertext = tls_session.ciphertext();
-    if (ciphertext.len == 0) return;
-    try queueSocketWrite(impl, ciphertext);
-    tls_session.consumeCiphertext(ciphertext.len);
+    while (true) {
+        const ciphertext = tls_session.ciphertext();
+        if (ciphertext.len == 0) return;
+        try queueSocketWrite(impl, ciphertext);
+        tls_session.consumeCiphertext(ciphertext.len);
+    }
 }
 
 fn driveTlsHandshake(impl: *Impl) !void {
