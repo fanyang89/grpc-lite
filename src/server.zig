@@ -1743,6 +1743,22 @@ const Connection = struct {
         }
     }
 
+    fn needsWriteWake(self: *Connection) bool {
+        if (self.tls_handshake_needs_write) return true;
+        if (self.queued_write_bytes >= self.server.write_low_watermark_bytes) return false;
+        // Preserve deferred GOAWAY and TLS close-notify progress.
+        if (self.local_goaway_submitted) return true;
+        if (self.tls_plaintext != null) return true;
+        if (comptime build_options.tls) {
+            if (self.tls_session) |session| {
+                if (session.hasPendingWrite() or session.ciphertext().len != 0) return true;
+            }
+        }
+        return self.session != null and
+            (c.nghttp2_session_want_write(self.session) != 0 or
+                c.nghttp2_session_want_read(self.session) == 0);
+    }
+
     fn flushIdleGoAway(self: *Connection) !bool {
         try self.flush();
         if (c.nghttp2_session_want_write(self.session) != 0) return false;
@@ -2595,7 +2611,7 @@ fn onWrite(write: ?*WriteRequest, loop: *xev.Loop, _: *xev.Completion, _: xev.TC
         connection.finishCloseIfReady();
         return .disarm;
     }
-    if (connection.tls_handshake_needs_write or connection.queued_write_bytes < connection.server.write_low_watermark_bytes) {
+    if (connection.needsWriteWake()) {
         // WriteQueue adds its next completion after this callback returns.
         // Wake the async callback so queueWrite cannot reenter that ordering.
         if (connection.server.enqueueDirtyConnection(connection)) {
@@ -4513,6 +4529,35 @@ test "server write queue bookkeeping failure returns descriptor to pool" {
     try std.testing.expect(connection.write_request_pool_head == pooled);
     try std.testing.expectEqual(@as(usize, 0), connection.queued_write_bytes);
     connection.pending_writes = 0;
+}
+
+test "server write wake skips exhausted output and preserves deferred progress" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer c.nghttp2_session_del(connection.session);
+    try std.testing.expect(connection.needsWriteWake());
+    var data: [*c]const u8 = null;
+    while (true) {
+        const length = c.nghttp2_session_mem_send2(connection.session, &data);
+        try std.testing.expect(length >= 0);
+        if (length == 0) break;
+    }
+    try std.testing.expect(!connection.needsWriteWake());
+    connection.local_goaway_submitted = true;
+    try std.testing.expect(connection.needsWriteWake());
+    connection.local_goaway_submitted = false;
+    var plaintext = [_]u8{1};
+    connection.tls_plaintext = &plaintext;
+    try std.testing.expect(connection.needsWriteWake());
+    connection.tls_plaintext = null;
+    try std.testing.expectEqual(@as(c_int, 0), c.nghttp2_submit_ping(connection.session, 0, null));
+    try std.testing.expect(connection.needsWriteWake());
+    connection.queued_write_bytes = server.impl.write_low_watermark_bytes;
+    try std.testing.expect(!connection.needsWriteWake());
+    connection.tls_handshake_needs_write = true;
+    try std.testing.expect(connection.needsWriteWake());
 }
 
 test "server write callback and discard each release once" {
