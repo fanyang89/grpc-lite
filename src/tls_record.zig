@@ -1,162 +1,105 @@
 const std = @import("std");
-
-const c = @import("mbedtls_c.zig").api;
+const c = @import("openssl_bindings");
 
 const queue_capacity = 64 * 1024;
-const personalization = "grpc-lite";
-const h2_protocols = [_:null]?[*:0]const u8{ "h2", null };
-// HTTP/2 permits TLS 1.2 ECDHE AEAD suites and all TLS 1.3 suites below.
-// Keeping an explicit list prevents mbedTLS defaults from enabling RFC 7540 Appendix A suites.
-const http2_ciphersuites = [_]c_int{
-    c.MBEDTLS_TLS1_3_AES_128_GCM_SHA256,
-    c.MBEDTLS_TLS1_3_AES_256_GCM_SHA384,
-    c.MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256,
-    c.MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-    c.MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-    c.MBEDTLS_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-    c.MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-    c.MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-    c.MBEDTLS_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-    0,
-};
-var psa_state: std.atomic.Value(u8) = .init(0);
+const protocols = "\x02h2";
+const tls12_suites = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+const tls13_suites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256";
 
-/// Certificate chain and unencrypted private key an endpoint presents to its peer.
 pub const Identity = struct {
     certificate_chain_pem: []const u8,
     private_key_pem: []const u8,
 };
 
 pub const Config = struct {
-    allocator: std.mem.Allocator = undefined,
-    entropy: c.mbedtls_entropy_context = undefined,
-    drbg: c.mbedtls_ctr_drbg_context = undefined,
-    ssl: c.mbedtls_ssl_config = undefined,
-    certificate: c.mbedtls_x509_crt = undefined,
-    /// Client identity chain or server trusted client CAs.
-    identity_certificate: c.mbedtls_x509_crt = undefined,
-    private_key: c.mbedtls_pk_context = undefined,
-    initialized: bool = false,
+    allocator: std.mem.Allocator,
+    ctx: *c.SSL_CTX,
+    client: bool,
+
+    fn init(allocator: std.mem.Allocator, client: bool) !*Config {
+        const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.TlsConfigurationFailed;
+        errdefer c.SSL_CTX_free(ctx);
+        if (c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_2_VERSION) != 1 or
+            c.SSL_CTX_set_cipher_list(ctx, tls12_suites) != 1 or
+            c.SSL_CTX_set_ciphersuites(ctx, tls13_suites) != 1) return error.TlsConfigurationFailed;
+        _ = c.SSL_CTX_set_options(ctx, c.GRPC_SSL_NO_RENEGOTIATION);
+        const self = try allocator.create(Config);
+        self.* = .{ .allocator = allocator, .ctx = ctx, .client = client };
+        return self;
+    }
 
     pub fn createClient(allocator: std.mem.Allocator, ca_pem: []const u8, identity: ?Identity) !*Config {
-        const self = try allocator.create(Config);
-        self.* = .{ .allocator = allocator };
-        errdefer allocator.destroy(self);
-        try self.init(.client);
-        errdefer self.deinit();
-
-        try parseCertificate(allocator, &self.certificate, ca_pem);
-        c.mbedtls_ssl_conf_ca_chain(&self.ssl, &self.certificate, null);
-        c.mbedtls_ssl_conf_authmode(&self.ssl, c.MBEDTLS_SSL_VERIFY_REQUIRED);
-        if (identity) |id| try self.useIdentity(&self.identity_certificate, id);
+        const self = try init(allocator, true);
+        errdefer self.destroy();
+        try self.certificates(ca_pem, true);
+        c.SSL_CTX_set_verify(self.ctx, c.SSL_VERIFY_PEER, null);
+        if (c.SSL_CTX_set_alpn_protos(self.ctx, protocols, protocols.len) != 0) return error.TlsConfigurationFailed;
+        if (identity) |id| try self.useIdentity(id);
         return self;
     }
 
-    pub fn createServer(
-        allocator: std.mem.Allocator,
-        certificate_chain_pem: []const u8,
-        private_key_pem: []const u8,
-        client_ca_pem: ?[]const u8,
-    ) !*Config {
-        const self = try allocator.create(Config);
-        self.* = .{ .allocator = allocator };
-        errdefer allocator.destroy(self);
-        try self.init(.server);
-        errdefer self.deinit();
-
-        try self.useIdentity(&self.certificate, .{
-            .certificate_chain_pem = certificate_chain_pem,
-            .private_key_pem = private_key_pem,
-        });
-        if (client_ca_pem) |pem| {
-            try parseCertificate(allocator, &self.identity_certificate, pem);
-            c.mbedtls_ssl_conf_ca_chain(&self.ssl, &self.identity_certificate, null);
-            c.mbedtls_ssl_conf_authmode(&self.ssl, c.MBEDTLS_SSL_VERIFY_REQUIRED);
-        } else {
-            c.mbedtls_ssl_conf_authmode(&self.ssl, c.MBEDTLS_SSL_VERIFY_NONE);
+    pub fn createServer(allocator: std.mem.Allocator, chain: []const u8, key: []const u8, ca: ?[]const u8) !*Config {
+        const self = try init(allocator, false);
+        errdefer self.destroy();
+        try self.useIdentity(.{ .certificate_chain_pem = chain, .private_key_pem = key });
+        if (ca) |pem| {
+            try self.certificates(pem, true);
+            c.SSL_CTX_set_verify(self.ctx, c.SSL_VERIFY_PEER | c.SSL_VERIFY_FAIL_IF_NO_PEER_CERT, null);
         }
+        c.SSL_CTX_set_alpn_select_cb(self.ctx, selectH2, null);
         return self;
     }
 
-    fn useIdentity(self: *Config, certificate: *c.mbedtls_x509_crt, identity: Identity) !void {
-        try parseCertificate(self.allocator, certificate, identity.certificate_chain_pem);
-        try parsePrivateKey(self.allocator, &self.private_key, identity.private_key_pem, &self.drbg);
-        if (c.mbedtls_pk_check_pair(
-            &certificate.pk,
-            &self.private_key,
-            c.mbedtls_ctr_drbg_random,
-            &self.drbg,
-        ) != 0) return error.CertificateKeyMismatch;
-        if (c.mbedtls_ssl_conf_own_cert(&self.ssl, certificate, &self.private_key) != 0)
-            return error.TlsConfigurationFailed;
+    // Parse every block: do not accept a valid first certificate followed by an invalid CA.
+    fn certificates(self: *Config, pem: []const u8, trust: bool) !void {
+        const end = "-----END CERTIFICATE-----";
+        var rest = std.mem.trim(u8, pem, " \t\r\n");
+        var first = true;
+        while (rest.len != 0) {
+            if (!std.mem.startsWith(u8, rest, "-----BEGIN CERTIFICATE-----")) return error.InvalidCertificate;
+            const length = (std.mem.indexOf(u8, rest, end) orelse return error.InvalidCertificate) + end.len;
+            const bio = c.BIO_new_mem_buf(rest.ptr, std.math.cast(c_int, length) orelse return error.InvalidCertificate) orelse return error.OutOfMemory;
+            defer _ = c.BIO_free(bio);
+            const cert = c.PEM_read_bio_X509(bio, null, noPassword, null) orelse return error.InvalidCertificate;
+            defer c.X509_free(cert);
+            if (trust) {
+                if (c.X509_STORE_add_cert(c.SSL_CTX_get_cert_store(self.ctx), cert) != 1) return error.InvalidCertificate;
+            } else if (first) {
+                if (c.SSL_CTX_use_certificate(self.ctx, cert) != 1) return error.InvalidCertificate;
+            } else if (c.SSL_CTX_add1_chain_cert(self.ctx, cert) != 1) return error.InvalidCertificate;
+            rest = std.mem.trim(u8, rest[length..], " \t\r\n");
+            first = false;
+        }
+        if (first) return error.InvalidCertificate;
+    }
+
+    fn useIdentity(self: *Config, identity: Identity) !void {
+        try self.certificates(identity.certificate_chain_pem, false);
+        const pem = identity.private_key_pem;
+        const bio = c.BIO_new_mem_buf(pem.ptr, std.math.cast(c_int, pem.len) orelse return error.InvalidPrivateKey) orelse return error.OutOfMemory;
+        defer _ = c.BIO_free(bio);
+        const key = c.PEM_read_bio_PrivateKey(bio, null, noPassword, null) orelse return error.InvalidPrivateKey;
+        defer c.EVP_PKEY_free(key);
+        if (c.SSL_CTX_use_PrivateKey(self.ctx, key) != 1 or c.SSL_CTX_check_private_key(self.ctx) != 1)
+            return error.CertificateKeyMismatch;
     }
 
     pub fn destroy(self: *Config) void {
-        const allocator = self.allocator;
-        self.deinit();
-        allocator.destroy(self);
-    }
-
-    fn deinit(self: *Config) void {
-        if (!self.initialized) return;
-        c.mbedtls_ssl_config_free(&self.ssl);
-        c.mbedtls_pk_free(&self.private_key);
-        c.mbedtls_x509_crt_free(&self.identity_certificate);
-        c.mbedtls_x509_crt_free(&self.certificate);
-        c.mbedtls_ctr_drbg_free(&self.drbg);
-        c.mbedtls_entropy_free(&self.entropy);
-        self.initialized = false;
-    }
-
-    const Endpoint = enum { client, server };
-
-    fn init(self: *Config, endpoint: Endpoint) !void {
-        try ensurePsaInitialized();
-        c.mbedtls_entropy_init(&self.entropy);
-        c.mbedtls_ctr_drbg_init(&self.drbg);
-        c.mbedtls_ssl_config_init(&self.ssl);
-        c.mbedtls_x509_crt_init(&self.certificate);
-        c.mbedtls_x509_crt_init(&self.identity_certificate);
-        c.mbedtls_pk_init(&self.private_key);
-        self.initialized = true;
-        errdefer self.deinit();
-
-        if (c.mbedtls_ctr_drbg_seed(
-            &self.drbg,
-            c.mbedtls_entropy_func,
-            &self.entropy,
-            personalization,
-            personalization.len,
-        ) != 0) return error.RandomInitializationFailed;
-        if (c.mbedtls_ssl_config_defaults(
-            &self.ssl,
-            if (endpoint == .client) c.MBEDTLS_SSL_IS_CLIENT else c.MBEDTLS_SSL_IS_SERVER,
-            c.MBEDTLS_SSL_TRANSPORT_STREAM,
-            c.MBEDTLS_SSL_PRESET_DEFAULT,
-        ) != 0) return error.TlsConfigurationFailed;
-        c.mbedtls_ssl_conf_min_tls_version(&self.ssl, c.MBEDTLS_SSL_VERSION_TLS1_2);
-        c.mbedtls_ssl_conf_ciphersuites(&self.ssl, &http2_ciphersuites);
-        c.mbedtls_ssl_conf_rng(&self.ssl, c.mbedtls_ctr_drbg_random, &self.drbg);
-        if (c.mbedtls_ssl_conf_alpn_protocols(&self.ssl, @ptrCast(@constCast(&h2_protocols))) != 0)
-            return error.TlsConfigurationFailed;
+        c.SSL_CTX_free(self.ctx);
+        self.allocator.destroy(self);
     }
 };
 
-fn ensurePsaInitialized() !void {
-    while (true) switch (psa_state.load(.acquire)) {
-        0 => {
-            if (psa_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) continue;
-            if (c.psa_crypto_init() != c.PSA_SUCCESS) {
-                psa_state.store(0, .release);
-                return error.RandomInitializationFailed;
-            }
-            psa_state.store(2, .release);
-            return;
-        },
-        1 => std.atomic.spinLoopHint(),
-        2 => return,
-        else => unreachable,
-    };
+fn noPassword(_: [*c]u8, _: c_int, _: c_int, _: ?*anyopaque) callconv(.c) c_int {
+    return 0;
+}
+
+fn selectH2(_: ?*c.SSL, out: [*c][*c]const u8, len: [*c]u8, input: [*c]const u8, size: c_uint, _: ?*anyopaque) callconv(.c) c_int {
+    var selected: [*c]u8 = null;
+    if (c.SSL_select_next_proto(&selected, len, protocols, protocols.len, input, size) != c.OPENSSL_NPN_NEGOTIATED)
+        return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+    out.* = selected;
+    return c.SSL_TLSEXT_ERR_OK;
 }
 
 pub const Result = union(enum) {
@@ -171,249 +114,142 @@ pub const Result = union(enum) {
 };
 
 pub const Session = struct {
-    const State = enum { handshaking, active, failed };
+    allocator: std.mem.Allocator,
+    ssl: *c.SSL,
+    network: *c.BIO,
+    pending: [16 * 1024]u8 = undefined,
+    pending_len: usize = 0,
+    state: enum { handshaking, active, failed } = .handshaking,
 
-    allocator: std.mem.Allocator = undefined,
-    ssl: c.mbedtls_ssl_context = undefined,
-    inbound: ByteQueue = .{},
-    outbound: ByteQueue = .{},
-    transport_eof: bool = false,
-    initialized: bool = false,
-    pending_write: [c.MBEDTLS_SSL_OUT_CONTENT_LEN]u8 = undefined,
-    pending_write_length: usize = 0,
-    state: State = .handshaking,
-
-    pub fn create(
-        allocator: std.mem.Allocator,
-        config: *const Config,
-        hostname: ?[]const u8,
-    ) !*Session {
+    pub fn create(allocator: std.mem.Allocator, config: *const Config, hostname: ?[]const u8) !*Session {
+        const ssl = c.SSL_new(config.ctx) orelse return error.TlsSessionInitializationFailed;
+        errdefer c.SSL_free(ssl);
+        if (config.client) {
+            const name = hostname orelse return error.InvalidServerName;
+            if (name.len == 0 or name.len > 255 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidServerName;
+            const z = try allocator.dupeSentinel(u8, name, 0);
+            defer allocator.free(z);
+            if (std.Io.net.IpAddress.parseIp4(name, 0)) |_| {
+                if (c.X509_VERIFY_PARAM_set1_ip_asc(c.SSL_get0_param(ssl), z.ptr) != 1) return error.InvalidServerName;
+            } else |_| {
+                if (c.SSL_set1_host(ssl, z.ptr) != 1 or c.SSL_set_tlsext_host_name(ssl, z.ptr) != 1) return error.InvalidServerName;
+            }
+            c.SSL_set_connect_state(ssl);
+        } else c.SSL_set_accept_state(ssl);
         const self = try allocator.create(Session);
-        self.* = .{ .allocator = allocator };
         errdefer allocator.destroy(self);
-        c.mbedtls_ssl_init(&self.ssl);
-        self.initialized = true;
-        errdefer self.deinit();
-
-        if (c.mbedtls_ssl_setup(&self.ssl, &config.ssl) != 0)
-            return error.TlsSessionInitializationFailed;
-        c.mbedtls_ssl_set_bio(&self.ssl, self, bioSend, bioRecv, null);
-        if (hostname) |name| {
-            if (name.len == 0 or name.len > c.MBEDTLS_SSL_MAX_HOST_NAME_LEN)
-                return error.InvalidServerName;
-            var name_z: [c.MBEDTLS_SSL_MAX_HOST_NAME_LEN + 1]u8 = undefined;
-            @memcpy(name_z[0..name.len], name);
-            name_z[name.len] = 0;
-            if (c.mbedtls_ssl_set_hostname(&self.ssl, @ptrCast(&name_z)) != 0)
-                return error.InvalidServerName;
-        }
+        var internal: ?*c.BIO = null;
+        var network: ?*c.BIO = null;
+        if (c.BIO_new_bio_pair(&internal, queue_capacity, &network, queue_capacity) != 1) return error.TlsSessionInitializationFailed;
+        c.SSL_set_bio(ssl, internal, internal);
+        self.* = .{ .allocator = allocator, .ssl = ssl, .network = network.? };
         return self;
     }
 
     pub fn destroy(self: *Session) void {
-        const allocator = self.allocator;
-        self.deinit();
-        allocator.destroy(self);
-    }
-
-    fn deinit(self: *Session) void {
-        if (!self.initialized) return;
-        c.mbedtls_ssl_free(&self.ssl);
-        self.initialized = false;
+        c.SSL_free(self.ssl);
+        _ = c.BIO_free(self.network);
+        self.allocator.destroy(self);
     }
 
     pub fn feedCiphertext(self: *Session, bytes: []const u8) !void {
-        try self.inbound.append(bytes);
+        if (bytes.len == 0) return;
+        if (bytes.len > c.BIO_ctrl_get_write_guarantee(self.network)) return error.TlsBufferFull;
+        if (c.BIO_write(self.network, bytes.ptr, @intCast(bytes.len)) != bytes.len) return error.TlsConnectionFailed;
     }
 
     pub fn markTransportEof(self: *Session) void {
-        self.transport_eof = true;
+        _ = c.BIO_shutdown_wr(self.network);
     }
 
     pub fn ciphertext(self: *const Session) []const u8 {
-        return self.outbound.readable();
+        var ptr: [*c]u8 = null;
+        const n = c.BIO_nread0(self.network, &ptr);
+        return if (n > 0) ptr[0..@intCast(n)] else &.{};
     }
 
     pub fn consumeCiphertext(self: *Session, count: usize) void {
-        self.outbound.consume(count);
+        if (count == 0) return;
+        var ptr: [*c]u8 = null;
+        const consumed = c.BIO_nread(self.network, &ptr, @intCast(count));
+        std.debug.assert(consumed == count);
+    }
+
+    fn classify(self: *Session, rc: c_int) Result {
+        const err = c.SSL_get_error(self.ssl, rc);
+        return switch (err) {
+            c.SSL_ERROR_WANT_READ => .want_read,
+            c.SSL_ERROR_WANT_WRITE => .want_write,
+            c.SSL_ERROR_ZERO_RETURN => .peer_closed,
+            else => blk: {
+                self.state = .failed;
+                if (err == c.SSL_ERROR_SSL and c.ERR_GET_REASON(c.ERR_peek_last_error()) == c.SSL_R_UNEXPECTED_EOF_WHILE_READING) break :blk .transport_eof;
+                break :blk .{ .failed = err };
+            },
+        };
     }
 
     pub fn handshake(self: *Session) Result {
         if (self.state == .active) return .complete;
-        if (self.state == .failed) return .{ .failed = c.MBEDTLS_ERR_SSL_BAD_INPUT_DATA };
-        const result = c.mbedtls_ssl_handshake(&self.ssl);
-        if (result == 0) {
-            if (!self.negotiatedHttp2()) {
-                self.state = .failed;
-                return .alpn_mismatch;
-            }
-            self.state = .active;
-        } else if (result != c.MBEDTLS_ERR_SSL_WANT_READ and result != c.MBEDTLS_ERR_SSL_WANT_WRITE) {
+        if (self.state == .failed) return .{ .failed = c.SSL_ERROR_SSL };
+        c.ERR_clear_error();
+        const rc = c.SSL_do_handshake(self.ssl);
+        if (rc != 1) return self.classify(rc);
+        if (!self.negotiatedHttp2()) {
             self.state = .failed;
+            return .alpn_mismatch;
         }
-        return classify(result, false);
+        self.state = .active;
+        return .complete;
+    }
+
+    pub fn negotiatedHttp2(self: *const Session) bool {
+        var ptr: [*c]const u8 = null;
+        var len: c_uint = 0;
+        c.SSL_get0_alpn_selected(self.ssl, &ptr, &len);
+        return len == 2 and std.mem.eql(u8, ptr[0..2], "h2");
     }
 
     pub fn read(self: *Session, output: []u8) !Result {
         if (self.state != .active) return error.TlsHandshakeIncomplete;
         if (output.len == 0) return .{ .bytes = 0 };
-        const result = c.mbedtls_ssl_read(&self.ssl, output.ptr, output.len);
-        if (result == 0 and self.transport_eof) return .transport_eof;
-        if (result < 0 and result != c.MBEDTLS_ERR_SSL_WANT_READ and result != c.MBEDTLS_ERR_SSL_WANT_WRITE and result != c.MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY)
-            self.state = .failed;
-        return classify(result, true);
+        c.ERR_clear_error();
+        const rc = c.SSL_read(self.ssl, output.ptr, @intCast(@min(output.len, std.math.maxInt(c_int))));
+        return if (rc > 0) .{ .bytes = @intCast(rc) } else self.classify(rc);
     }
 
     pub fn beginWrite(self: *Session, input: []const u8) !Result {
         if (self.state != .active) return error.TlsHandshakeIncomplete;
-        if (self.pending_write_length != 0) return error.TlsWriteInProgress;
+        if (self.hasPendingWrite()) return error.TlsWriteInProgress;
         if (input.len == 0) return .{ .bytes = 0 };
-        self.pending_write_length = @min(input.len, self.pending_write.len);
-        @memcpy(self.pending_write[0..self.pending_write_length], input[0..self.pending_write_length]);
-        return try self.continueWrite();
+        self.pending_len = @min(input.len, self.pending.len);
+        @memcpy(self.pending[0..self.pending_len], input[0..self.pending_len]);
+        return self.continueWrite();
     }
 
     pub fn continueWrite(self: *Session) !Result {
         if (self.state != .active) return error.TlsHandshakeIncomplete;
-        std.debug.assert(self.pending_write_length != 0);
-        const result = c.mbedtls_ssl_write(
-            &self.ssl,
-            &self.pending_write,
-            self.pending_write_length,
-        );
-        if (result > 0) self.pending_write_length = 0;
-        if (result < 0 and result != c.MBEDTLS_ERR_SSL_WANT_READ and result != c.MBEDTLS_ERR_SSL_WANT_WRITE)
-            self.state = .failed;
-        return classify(result, true);
+        std.debug.assert(self.hasPendingWrite());
+        c.ERR_clear_error();
+        const rc = c.SSL_write(self.ssl, &self.pending, @intCast(self.pending_len));
+        if (rc <= 0) return self.classify(rc);
+        self.pending_len = 0;
+        return .{ .bytes = @intCast(rc) };
     }
 
     pub fn hasPendingWrite(self: *const Session) bool {
-        return self.pending_write_length != 0;
+        return self.pending_len != 0;
     }
 
     pub fn closeNotify(self: *Session) !Result {
         if (self.state != .active) return error.TlsHandshakeIncomplete;
-        if (self.pending_write_length != 0) return error.TlsWriteInProgress;
-        return classify(c.mbedtls_ssl_close_notify(&self.ssl), false);
-    }
-
-    pub fn negotiatedHttp2(self: *const Session) bool {
-        const protocol = c.mbedtls_ssl_get_alpn_protocol(&self.ssl);
-        return protocol != null and std.mem.eql(u8, std.mem.span(protocol), "h2");
-    }
-
-    fn bioSend(context: ?*anyopaque, buffer: [*c]const u8, length: usize) callconv(.c) c_int {
-        const self: *Session = @ptrCast(@alignCast(context.?));
-        const written = self.outbound.appendPartial(buffer[0..length]);
-        if (written == 0) return c.MBEDTLS_ERR_SSL_WANT_WRITE;
-        return @intCast(written);
-    }
-
-    fn bioRecv(context: ?*anyopaque, buffer: [*c]u8, length: usize) callconv(.c) c_int {
-        const self: *Session = @ptrCast(@alignCast(context.?));
-        const available = self.inbound.readable();
-        if (available.len == 0)
-            return if (self.transport_eof) 0 else c.MBEDTLS_ERR_SSL_WANT_READ;
-        const read_length = @min(length, available.len);
-        @memcpy(buffer[0..read_length], available[0..read_length]);
-        self.inbound.consume(read_length);
-        return @intCast(read_length);
+        if (self.hasPendingWrite()) return error.TlsWriteInProgress;
+        c.ERR_clear_error();
+        const rc = c.SSL_shutdown(self.ssl);
+        // Zero means our alert was sent; the transport need not await the peer's alert.
+        return if (rc >= 0) .complete else self.classify(rc);
     }
 };
-
-const ByteQueue = struct {
-    bytes: [queue_capacity]u8 = undefined,
-    start: usize = 0,
-    end: usize = 0,
-
-    fn append(self: *ByteQueue, input: []const u8) !void {
-        if (input.len > self.bytes.len - (self.end - self.start)) return error.TlsBufferFull;
-        std.debug.assert(self.appendPartial(input) == input.len);
-    }
-
-    fn appendPartial(self: *ByteQueue, input: []const u8) usize {
-        self.compact();
-        const count = @min(input.len, self.bytes.len - self.end);
-        @memcpy(self.bytes[self.end..][0..count], input[0..count]);
-        self.end += count;
-        return count;
-    }
-
-    fn readable(self: *const ByteQueue) []const u8 {
-        return self.bytes[self.start..self.end];
-    }
-
-    fn consume(self: *ByteQueue, count: usize) void {
-        std.debug.assert(count <= self.end - self.start);
-        self.start += count;
-        if (self.start == self.end) {
-            self.start = 0;
-            self.end = 0;
-        }
-    }
-
-    fn compact(self: *ByteQueue) void {
-        if (self.start == 0) return;
-        std.mem.copyForwards(u8, self.bytes[0 .. self.end - self.start], self.bytes[self.start..self.end]);
-        self.end -= self.start;
-        self.start = 0;
-    }
-};
-
-fn classify(result: c_int, has_bytes: bool) Result {
-    if (result > 0 and has_bytes) return .{ .bytes = @intCast(result) };
-    if (result == 0) return .complete;
-    return switch (result) {
-        c.MBEDTLS_ERR_SSL_WANT_READ => .want_read,
-        c.MBEDTLS_ERR_SSL_WANT_WRITE => .want_write,
-        c.MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY => .peer_closed,
-        else => .{ .failed = result },
-    };
-}
-
-fn parseCertificate(allocator: std.mem.Allocator, certificate: *c.mbedtls_x509_crt, pem: []const u8) !void {
-    const pem_z = try allocator.dupeSentinel(u8, pem, 0);
-    defer allocator.free(pem_z);
-    if (c.mbedtls_x509_crt_parse(certificate, pem_z.ptr, pem_z.len + 1) != 0)
-        return error.InvalidCertificate;
-}
-
-fn parsePrivateKey(
-    allocator: std.mem.Allocator,
-    private_key: *c.mbedtls_pk_context,
-    pem: []const u8,
-    drbg: *c.mbedtls_ctr_drbg_context,
-) !void {
-    const pem_z = try allocator.dupeSentinel(u8, pem, 0);
-    defer {
-        @memset(pem_z, 0);
-        allocator.free(pem_z);
-    }
-    if (c.mbedtls_pk_parse_key(
-        private_key,
-        pem_z.ptr,
-        pem_z.len + 1,
-        null,
-        0,
-        c.mbedtls_ctr_drbg_random,
-        drbg,
-    ) != 0) return error.InvalidPrivateKey;
-}
-
-test "byte queue compacts consumed input" {
-    var queue: ByteQueue = .{};
-    try queue.append("first");
-    queue.consume(5);
-    try queue.append("second");
-    try std.testing.expectEqualStrings("second", queue.readable());
-}
-
-test "byte queue rejects input beyond its bound" {
-    var queue: ByteQueue = .{};
-    const input = try std.testing.allocator.alloc(u8, queue_capacity + 1);
-    defer std.testing.allocator.free(input);
-    try std.testing.expectError(error.TlsBufferFull, queue.append(input));
-}
 
 test "client and server negotiate h2 and exchange plaintext" {
     const certificate = @embedFile("testdata/localhost-cert.pem");
@@ -457,6 +293,53 @@ test "client and server negotiate h2 and exchange plaintext" {
         else => return error.UnexpectedTlsResult,
     };
     try std.testing.expectEqualStrings(message, plaintext[0..read_length]);
+
+    // A full ciphertext batch may end mid-record; retry must not duplicate plaintext.
+    const Drain = struct {
+        fn run(source: *Session, destination: *Session, received: *usize) !void {
+            try transferCiphertext(source, destination);
+            var buffer: [4096]u8 = undefined;
+            while (true) {
+                switch (try destination.read(&buffer)) {
+                    .bytes => |count| {
+                        for (buffer[0..count]) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
+                        received.* += count;
+                    },
+                    .want_read => return,
+                    else => return error.UnexpectedTlsResult,
+                }
+            }
+        }
+    };
+    const payload: [8 * 1024]u8 = @splat(0x5a);
+    var received: usize = 0;
+    var blocked: usize = 0;
+    for (0..10) |_| {
+        var result = try client.beginWrite(&payload);
+        while (true) {
+            switch (result) {
+                .bytes => |count| {
+                    try std.testing.expectEqual(payload.len, count);
+                    break;
+                },
+                .want_write => {
+                    blocked += 1;
+                    try std.testing.expect(client.hasPendingWrite());
+                    try std.testing.expectError(error.TlsWriteInProgress, client.beginWrite("overlap"));
+                    try std.testing.expectError(error.TlsWriteInProgress, client.closeNotify());
+                    try std.testing.expectEqual(queue_capacity, c.BIO_ctrl_pending(client.network));
+                    try Drain.run(client, server, &received);
+                    result = try client.continueWrite();
+                },
+                else => return error.UnexpectedTlsResult,
+            }
+        }
+    }
+    try std.testing.expect(blocked > 0);
+    try Drain.run(client, server, &received);
+    try std.testing.expectEqual(10 * payload.len, received);
+    try std.testing.expect(!client.hasPendingWrite());
+    try std.testing.expectEqual(@as(usize, 0), client.ciphertext().len);
 }
 
 test "client rejects a certificate for a different hostname" {
@@ -607,7 +490,10 @@ fn handshakeStep(session: *Session) !bool {
 }
 
 fn transferCiphertext(source: *Session, destination: *Session) !void {
-    const bytes = source.ciphertext();
-    try destination.feedCiphertext(bytes);
-    source.consumeCiphertext(bytes.len);
+    while (true) {
+        const bytes = source.ciphertext();
+        if (bytes.len == 0) return;
+        try destination.feedCiphertext(bytes);
+        source.consumeCiphertext(bytes.len);
+    }
 }

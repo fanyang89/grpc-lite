@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
         else
             null,
     };
-    const enable_tls = b.option(bool, "tls", "Enable TLS transport support through mbedTLS") orelse false;
+    const enable_tls = b.option(bool, "tls", "Enable TLS transport support through system OpenSSL 4.x") orelse false;
     const enable_zio = b.option(bool, "zio", "Build zio examples and integration tests") orelse false;
     const enable_protobuf = b.option(
         bool,
@@ -137,15 +137,10 @@ pub fn build(b: *std.Build) void {
         b.lazyDependency("gperftools", .{}) orelse return
     else
         null;
-    const mbedtls_dependency = if (enable_tls)
-        b.lazyDependency("mbedtls", .{}) orelse return
-    else
-        null;
     const native = addNativeDependencies(
         b,
         nghttp2_dependency.path(""),
         cares_dependency.path(""),
-        if (mbedtls_dependency) |dependency| dependency.path("") else null,
         if (gperftools_dependency) |dependency| dependency.path("") else null,
         target,
         optimize,
@@ -173,17 +168,18 @@ pub fn build(b: *std.Build) void {
     grpc_lite.addIncludePath(native.cares_include);
     grpc_lite.addObjectFile(native.cares_archive);
     addCpuCycles(b, grpc_lite, cpucycles_dependency, target);
-    if (mbedtls_dependency) |dependency| {
-        grpc_lite.addIncludePath(dependency.path("include"));
-        grpc_lite.addIncludePath(b.path("tools"));
-        grpc_lite.addObjectFile(native.mbedtls_archive.?);
-    }
     addCBindings(b, grpc_lite, "nghttp2_bindings", "#define _FORTIFY_SOURCE 0\n#include <nghttp2/nghttp2.h>\n", target);
     addCBindings(b, grpc_lite, "cares_bindings", "#define CARES_STATICLIB 1\n#include <ares.h>\n", target);
     addCBindings(b, grpc_lite, "cpucycles_bindings", "#include <cpucycles.h>\n#include <stdio.h>\n", target);
-    if (enable_tls) addCBindings(b, grpc_lite, "mbedtls_bindings", "#define MBEDTLS_USER_CONFIG_FILE \"mbedtls_user_config.h\"\n" ++
-        "#include <psa/crypto.h>\n#include <mbedtls/ctr_drbg.h>\n#include <mbedtls/entropy.h>\n" ++
-        "#include <mbedtls/error.h>\n#include <mbedtls/pk.h>\n#include <mbedtls/ssl.h>\n#include <mbedtls/x509_crt.h>\n", target);
+    const openssl_libdir: ?std.Build.LazyPath = if (enable_tls) blk: {
+        const include: std.Build.LazyPath = .{ .cwd_relative = std.mem.trim(u8, b.run(&.{ "pkg-config", "--variable=includedir", "libssl" }), " \t\r\n") };
+        const lib: std.Build.LazyPath = .{ .cwd_relative = std.mem.trim(u8, b.run(&.{ "pkg-config", "--variable=libdir", "libssl" }), " \t\r\n") };
+        const bindings = b.addTranslateC(.{ .root_source_file = b.path("src/openssl.h"), .target = target, .optimize = optimize });
+        bindings.addSystemIncludePath(include);
+        grpc_lite.addImport("openssl_bindings", bindings.createModule());
+        linkOpenSSL(grpc_lite, lib);
+        break :blk lib;
+    } else null;
     grpc_lite.addImport("xev", xev);
     grpc_lite.addImport("nanozlog", nanozlog_dependency.module("nanozlog"));
     const test_step = b.step("test", "Run unit tests");
@@ -337,7 +333,6 @@ pub fn build(b: *std.Build) void {
     package_static_library.addArg(b.graph.zig_exe);
     package_static_library.addFileArg(native.nghttp2_archive);
     package_static_library.addFileArg(native.cares_archive);
-    if (native.mbedtls_archive) |archive| package_static_library.addFileArg(archive);
     if (native.gperftools_archive) |archive| package_static_library.addFileArg(archive);
     const install_library = b.addInstallFileWithDir(
         packaged_static_library,
@@ -425,7 +420,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("tests/c_api_smoke.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
-    linkCApiTestLibrary(c_api_smoke_module, packaged_static_library, shared_library, sanitizers);
+    linkCApiTestLibrary(c_api_smoke_module, packaged_static_library, shared_library, sanitizers, openssl_libdir);
     const c_api_smoke = b.addExecutable(.{
         .name = "c-api-smoke",
         .root_module = c_api_smoke_module,
@@ -444,7 +439,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("tests/cpp_c_api_smoke.cc"),
         .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
     });
-    linkCApiTestLibrary(cpp_c_api_smoke_module, packaged_static_library, shared_library, sanitizers);
+    linkCApiTestLibrary(cpp_c_api_smoke_module, packaged_static_library, shared_library, sanitizers, openssl_libdir);
     const cpp_c_api_smoke = b.addExecutable(.{
         .name = "cpp-c-api-smoke",
         .root_module = cpp_c_api_smoke_module,
@@ -463,7 +458,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("tests/cpp_native_api_test.cc"),
         .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
     });
-    linkCApiTestLibrary(cpp_native_api_test_module, packaged_static_library, shared_library, sanitizers);
+    linkCApiTestLibrary(cpp_native_api_test_module, packaged_static_library, shared_library, sanitizers, openssl_libdir);
     const cpp_native_api_test = b.addExecutable(.{
         .name = "cpp-native-api-test",
         .root_module = cpp_native_api_test_module,
@@ -505,7 +500,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("tests/grpcpp_facade_test.cc"),
         .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
     });
-    linkCApiTestLibrary(grpcpp_facade_test_module, packaged_static_library, shared_library, sanitizers);
+    linkCApiTestLibrary(grpcpp_facade_test_module, packaged_static_library, shared_library, sanitizers, openssl_libdir);
     const grpcpp_facade_test = b.addExecutable(.{
         .name = "grpcpp-facade-test",
         .root_module = grpcpp_facade_test_module,
@@ -524,7 +519,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("tests/grpcpp_streaming_facade_test.cc"),
         .flags = &.{ "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror" },
     });
-    linkCApiTestLibrary(grpcpp_streaming_facade_test_module, packaged_static_library, shared_library, sanitizers);
+    linkCApiTestLibrary(grpcpp_streaming_facade_test_module, packaged_static_library, shared_library, sanitizers, openssl_libdir);
     const grpcpp_streaming_facade_test = b.addExecutable(.{
         .name = "grpcpp-streaming-facade-test",
         .root_module = grpcpp_streaming_facade_test_module,
@@ -550,7 +545,7 @@ pub fn build(b: *std.Build) void {
             .file = b.path("tests/grpcpp_generated_test.cc"),
             .flags = &.{ "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror" },
         });
-        linkCApiTestLibrary(grpcpp_generated_test_module, packaged_static_library, shared_library, sanitizers);
+        linkCApiTestLibrary(grpcpp_generated_test_module, packaged_static_library, shared_library, sanitizers, openssl_libdir);
         const grpcpp_generated_test = b.addExecutable(.{
             .name = "grpcpp-generated-test",
             .root_module = grpcpp_generated_test_module,
@@ -575,7 +570,7 @@ pub fn build(b: *std.Build) void {
             .file = b.path("tests/grpcpp_generated_server_test.cc"),
             .flags = &.{ "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror" },
         });
-        linkCApiTestLibrary(grpcpp_generated_server_test_module, packaged_static_library, shared_library, sanitizers);
+        linkCApiTestLibrary(grpcpp_generated_server_test_module, packaged_static_library, shared_library, sanitizers, openssl_libdir);
         const grpcpp_generated_server_test = b.addExecutable(.{
             .name = "grpcpp-generated-server-test",
             .root_module = grpcpp_generated_server_test_module,
@@ -1093,19 +1088,26 @@ const NativeDependencies = struct {
     nghttp2_include: std.Build.LazyPath,
     cares_archive: std.Build.LazyPath,
     cares_include: std.Build.LazyPath,
-    mbedtls_archive: ?std.Build.LazyPath,
     gperftools_archive: ?std.Build.LazyPath,
     gperftools_force_link: ?std.Build.LazyPath,
 };
+
+fn linkOpenSSL(module: *std.Build.Module, libdir: std.Build.LazyPath) void {
+    module.addLibraryPath(libdir);
+    module.linkSystemLibrary("ssl", .{});
+    module.linkSystemLibrary("crypto", .{});
+}
 
 fn linkCApiTestLibrary(
     module: *std.Build.Module,
     static_library: std.Build.LazyPath,
     shared_library: *std.Build.Step.Compile,
     sanitizers: Sanitizers,
+    openssl_libdir: ?std.Build.LazyPath,
 ) void {
     if (sanitizers.thread == true) {
         module.addObjectFile(static_library);
+        if (openssl_libdir) |lib| linkOpenSSL(module, lib);
     } else {
         module.linkLibrary(shared_library);
     }
@@ -1132,7 +1134,6 @@ fn addNativeDependencies(
     b: *std.Build,
     nghttp2_source_dir: std.Build.LazyPath,
     cares_source_dir: std.Build.LazyPath,
-    mbedtls_source_dir: ?std.Build.LazyPath,
     gperftools_source_dir: ?std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -1173,21 +1174,6 @@ fn addNativeDependencies(
         false,
         false,
     );
-    const build_mbedtls = if (mbedtls_source_dir) |source_dir|
-        addNativeBuild(
-            b,
-            "mbedtls",
-            source_dir,
-            cmake_build_type,
-            cc,
-            cxx,
-            target_triple,
-            sanitizers,
-            false,
-            false,
-        )
-    else
-        null;
 
     const build_gperftools = if (gperftools_source_dir) |source_dir|
         addNativeBuild(
@@ -1211,7 +1197,6 @@ fn addNativeDependencies(
         .cares_archive = build_cares.path(b, "lib/libcares.a"),
         // CMake generates ares_build.h in the build root, not include/.
         .cares_include = build_cares,
-        .mbedtls_archive = if (build_mbedtls) |output| output.path(b, "libmbedtls_combined.a") else null,
         .gperftools_archive = if (build_gperftools) |output| output.path(b, "libgrpc_lite_gperftools.a") else null,
         .gperftools_force_link = if (build_gperftools) |output| output.path(b, "gperftools_force_link.o") else null,
     };
@@ -1242,7 +1227,6 @@ fn addNativeBuild(
         target_triple,
     });
     run.addFileArg(b.path("tools/gperftools_force_link.c"));
-    run.addFileArg(b.path("tools/mbedtls_user_config.h"));
     run.addArgs(&.{
         if (sanitizers.thread == true) "true" else "false",
         if (sanitizers.c == .full) "true" else "false",

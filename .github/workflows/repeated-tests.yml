@@ -50,6 +50,9 @@ jobs:
         with:
           version: 2026.7.14
 
+      - uses: ./.github/actions/openssl4
+        if: matrix.task == 'test-tls-tsan'
+
       - name: Run repeated tests
         run: |
           if ((TEST_ITERATIONS < 1)); then

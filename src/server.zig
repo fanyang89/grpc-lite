@@ -1823,10 +1823,12 @@ const Connection = struct {
     fn drainTlsCiphertext(self: *Connection) !void {
         if (comptime !build_options.tls) return;
         const tls_session = self.tls_session orelse return;
-        const ciphertext = tls_session.ciphertext();
-        if (ciphertext.len == 0) return;
-        try self.queueSocketWrite(ciphertext);
-        tls_session.consumeCiphertext(ciphertext.len);
+        while (true) {
+            const ciphertext = tls_session.ciphertext();
+            if (ciphertext.len == 0) return;
+            try self.queueSocketWrite(ciphertext);
+            tls_session.consumeCiphertext(ciphertext.len);
+        }
     }
 
     fn driveTlsHandshake(self: *Connection) !void {

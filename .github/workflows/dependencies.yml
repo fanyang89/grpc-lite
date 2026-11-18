@@ -39,6 +39,8 @@ jobs:
           python3 tests/prepare_dependencies_test.py
           mise run prepare-dependencies
 
+      - uses: ./.github/actions/openssl4
+
       - name: Verify an offline build with optional integrations
         shell: bash
         run: |
@@ -46,6 +48,8 @@ jobs:
           cp .zig-cache/dependencies/p/*.tar.gz .zig-cache/offline-global/p/
           sudo unshare --net -- runuser -u "$(id -un)" -- env \
             "PATH=$PATH" \
+            "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" \
+            "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
             "ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-cache/offline-global" \
             zig build -Dzio=true -Dtls=true -Dgperftools=true
 
