@@ -251,9 +251,28 @@ void TestConversionAllocationContract() {
   assert(live_allocations == baseline);
   assert(opens == 2 && destroys == 2);
 }
+void TestTerminalStatusCodes() {
+  grpc_lite::Channel channel;
+  for (int code : {-1, 0, 8, 16, 17}) {
+    grpc_lite::ClientStream stream;
+    grpc_lite::ClientStreamCallbacks callbacks;
+    bool called = false;
+    callbacks.on_terminal = [&](grpc_lite::Status status, grpc_lite::MetadataEntries) {
+      assert(static_cast<int>(status.code()) == (code == -1 || code == 17 ? 2 : code));
+      assert(status.message() == "detail");
+      called = true;
+    };
+    assert(grpc_lite::ClientStream::Open(channel, "method", {},
+                                        std::move(callbacks), &stream).ok());
+    captured.on_terminal(captured.user_data, &fake_stream, code,
+                         grpc_lite::internal::Bytes("detail"), nullptr);
+    assert(called);
+  }
+}
 }  // namespace
 
 int main() {
   TestCallbackStateAllocation();
   TestConversionAllocationContract();
+  TestTerminalStatusCodes();
 }

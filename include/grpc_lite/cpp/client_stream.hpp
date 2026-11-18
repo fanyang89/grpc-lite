@@ -148,8 +148,11 @@ class ClientStream {
                           const grpc_lite_metadata_view* trailing_metadata) noexcept {
     auto& callback =
         static_cast<CallbackState*>(user_data)->callbacks.on_terminal;
-    Status status(static_cast<StatusCode>(status_code),
-                  internal::CopyBytes(status_message));
+    const auto code = status_code >= static_cast<std::int32_t>(StatusCode::Ok) &&
+                              status_code <= static_cast<std::int32_t>(StatusCode::Unauthenticated)
+                          ? static_cast<StatusCode>(status_code)
+                          : StatusCode::Unknown;
+    Status status(code, internal::CopyBytes(status_message));
     MetadataEntries copy = internal::CopyMetadataView(trailing_metadata);
     if (callback) callback(std::move(status), std::move(copy));
   }
