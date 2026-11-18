@@ -2,6 +2,7 @@
 #define GRPCPP_CLIENT_CONTEXT_H
 
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -51,7 +52,8 @@ class ClientContext {
     const long double system_now = std::chrono::duration<long double>(
                                        std::chrono::system_clock::now().time_since_epoch()).count();
     deadline_seconds_ = system_now + (clock_deadline - clock_now);
-    deadline_extreme_ = 0;
+    // Treat an indeterminate deadline as already expired.
+    deadline_extreme_ = std::isnan(deadline_seconds_) ? -1 : 0;
     has_deadline_ = true;
   }
 

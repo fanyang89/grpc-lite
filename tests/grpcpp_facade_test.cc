@@ -2,6 +2,7 @@
 #include <grpcpp/impl/client_unary_call.h>
 
 #include <cassert>
+#include <limits>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -94,6 +95,10 @@ int main() {
   grpc::ClientContext extreme_context;
   extreme_context.set_deadline(std::chrono::system_clock::time_point::max());
   assert(extreme_context.deadline() == std::chrono::system_clock::time_point::max());
+  using Seconds = std::chrono::duration<double>;
+  using Deadline = std::chrono::time_point<std::chrono::system_clock, Seconds>;
+  extreme_context.set_deadline(Deadline(Seconds(std::numeric_limits<double>::quiet_NaN())));
+  assert(extreme_context.deadline() == std::chrono::system_clock::time_point::min());
   extreme_context.set_deadline(std::chrono::system_clock::time_point::min());
   assert(extreme_context.deadline() == std::chrono::system_clock::time_point::min());
 
