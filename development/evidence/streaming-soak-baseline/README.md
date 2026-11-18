@@ -73,8 +73,8 @@ duckdb -json :memory: < recompute.sql
 
 Recomputation verifies upstream hashes, sample schema/counts, stable identities,
 ordered samples, matching environment (except timestamp), original summary statistics,
-all growth checks and actual invocation exit files. Do not use Python `-O`, which
-would disable its assertions. Cross-trial statistics give **one vote per trial**, not
+all growth checks and actual invocation exit files. Optimized Python is rejected
+before reading evidence or printing JSON. Cross-trial statistics give **one vote per trial**, not
 10,221 independent observations; time-series samples and repeated same-seed trials are
 correlated. First/last thirds use chronological order, floor(steady_count/3), not SQL
 terciles that might assign the remainder differently.
