@@ -39,7 +39,7 @@ jobs:
           python3 tests/prepare_dependencies_test.py
           mise run prepare-dependencies
 
-      - uses: ./.github/actions/openssl4
+      - uses: ./.github/actions/openssl
 
       - name: Verify an offline build with optional integrations
         shell: bash

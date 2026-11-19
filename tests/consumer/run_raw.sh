@@ -55,6 +55,22 @@ fi
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
     -Dtls=true --summary all
 /usr/bin/timeout --kill-after=2s 30s "$consumer/zig-out/bin/grpc-lite-raw-consumer"
+mbedtls_path="$consumer/zig-pkg/N-V-__8AAI1FmQLj92go7nR7_J6kwr-7uYyuitngGqydvWkd"
+if [[ -e "$mbedtls_path" || -L "$mbedtls_path" ]]; then
+    printf '%s\n' 'OpenSSL consumer unexpectedly resolved mbedTLS' >&2
+    exit 1
+fi
+prefetch_zigfetch_url_package \
+    'https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/mbedtls-3.6.6' \
+    'N-V-__8AAI1FmQLj92go7nR7_J6kwr-7uYyuitngGqydvWkd' \
+    'mbedtls.tar.gz'
+ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
+    -Dtls-backend=mbedtls --summary all
+/usr/bin/timeout --kill-after=2s 30s "$consumer/zig-out/bin/grpc-lite-raw-consumer"
+if ldd "$consumer/zig-out/bin/grpc-lite-raw-consumer" | grep -E 'lib(ssl|crypto)\.so' >/dev/null; then
+    echo 'mbedTLS consumer unexpectedly links OpenSSL' >&2
+    exit 1
+fi
 ZIG_GLOBAL_CACHE_DIR="$global_cache" zig build --build-file "$consumer/build.zig" \
     -Doptimize=ReleaseFast -Dgperftools=true --summary all
 "$consumer/zig-out/bin/grpc-lite-raw-consumer"
