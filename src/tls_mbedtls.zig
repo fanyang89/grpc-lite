@@ -179,8 +179,7 @@ pub const Session = struct {
     outbound: ByteQueue = .{},
     transport_eof: bool = false,
     initialized: bool = false,
-    pending_write: [c.MBEDTLS_SSL_OUT_CONTENT_LEN]u8 = undefined,
-    pending_write_length: usize = 0,
+    pending_write: []const u8 = &.{},
     state: State = .handshaking,
 
     pub fn create(
@@ -268,36 +267,36 @@ pub const Session = struct {
         return classify(result, true);
     }
 
+    /// Keep input alive and unchanged until write completion or session destruction.
     pub fn beginWrite(self: *Session, input: []const u8) !Result {
         if (self.state != .active) return error.TlsHandshakeIncomplete;
-        if (self.pending_write_length != 0) return error.TlsWriteInProgress;
+        if (self.pending_write.len != 0) return error.TlsWriteInProgress;
         if (input.len == 0) return .{ .bytes = 0 };
-        self.pending_write_length = @min(input.len, self.pending_write.len);
-        @memcpy(self.pending_write[0..self.pending_write_length], input[0..self.pending_write_length]);
+        self.pending_write = input[0..@min(input.len, c.MBEDTLS_SSL_OUT_CONTENT_LEN)];
         return try self.continueWrite();
     }
 
     pub fn continueWrite(self: *Session) !Result {
         if (self.state != .active) return error.TlsHandshakeIncomplete;
-        std.debug.assert(self.pending_write_length != 0);
+        std.debug.assert(self.pending_write.len != 0);
         const result = c.mbedtls_ssl_write(
             &self.ssl,
-            &self.pending_write,
-            self.pending_write_length,
+            self.pending_write.ptr,
+            self.pending_write.len,
         );
-        if (result > 0) self.pending_write_length = 0;
+        if (result > 0) self.pending_write = &.{};
         if (result < 0 and result != c.MBEDTLS_ERR_SSL_WANT_READ and result != c.MBEDTLS_ERR_SSL_WANT_WRITE)
             self.state = .failed;
         return classify(result, true);
     }
 
     pub fn hasPendingWrite(self: *const Session) bool {
-        return self.pending_write_length != 0;
+        return self.pending_write.len != 0;
     }
 
     pub fn closeNotify(self: *Session) !Result {
         if (self.state != .active) return error.TlsHandshakeIncomplete;
-        if (self.pending_write_length != 0) return error.TlsWriteInProgress;
+        if (self.pending_write.len != 0) return error.TlsWriteInProgress;
         return classify(c.mbedtls_ssl_close_notify(&self.ssl), false);
     }
 

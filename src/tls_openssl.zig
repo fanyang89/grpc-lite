@@ -117,8 +117,7 @@ pub const Session = struct {
     allocator: std.mem.Allocator,
     ssl: *c.SSL,
     network: *c.BIO,
-    pending: [16 * 1024]u8 = undefined,
-    pending_len: usize = 0,
+    pending_write: []const u8 = &.{},
     state: enum { handshaking, active, failed } = .handshaking,
 
     pub fn create(allocator: std.mem.Allocator, config: *const Config, hostname: ?[]const u8) !*Session {
@@ -222,12 +221,12 @@ pub const Session = struct {
         return if (rc > 0) .{ .bytes = @intCast(rc) } else self.classify(rc);
     }
 
+    /// Keep input alive and unchanged until write completion or session destruction.
     pub fn beginWrite(self: *Session, input: []const u8) !Result {
         if (self.state != .active) return error.TlsHandshakeIncomplete;
         if (self.hasPendingWrite()) return error.TlsWriteInProgress;
         if (input.len == 0) return .{ .bytes = 0 };
-        self.pending_len = @min(input.len, self.pending.len);
-        @memcpy(self.pending[0..self.pending_len], input[0..self.pending_len]);
+        self.pending_write = input[0..@min(input.len, 16 * 1024)];
         return self.continueWrite();
     }
 
@@ -235,14 +234,14 @@ pub const Session = struct {
         if (self.state != .active) return error.TlsHandshakeIncomplete;
         std.debug.assert(self.hasPendingWrite());
         c.ERR_clear_error();
-        const rc = c.SSL_write(self.ssl, &self.pending, @intCast(self.pending_len));
+        const rc = c.SSL_write(self.ssl, self.pending_write.ptr, @intCast(self.pending_write.len));
         if (rc <= 0) return self.classify(rc);
-        self.pending_len = 0;
+        self.pending_write = &.{};
         return .{ .bytes = @intCast(rc) };
     }
 
     pub fn hasPendingWrite(self: *const Session) bool {
-        return self.pending_len != 0;
+        return self.pending_write.len != 0;
     }
 
     pub fn closeNotify(self: *Session) !Result {
