@@ -88,6 +88,7 @@ test "client and server negotiate h2 and exchange plaintext" {
                 .want_write => {
                     blocked += 1;
                     try std.testing.expect(client.hasPendingWrite());
+                    try std.testing.expect(client.pending_write.ptr == payload[0..].ptr);
                     try std.testing.expectError(error.TlsWriteInProgress, client.beginWrite("overlap"));
                     try std.testing.expectError(error.TlsWriteInProgress, client.closeNotify());
                     try std.testing.expectEqual(@as(usize, 64 * 1024), try Drain.run(client, server, &received));
