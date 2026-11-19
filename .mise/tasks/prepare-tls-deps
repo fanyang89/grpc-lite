@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-#MISE description="Check for target OpenSSL 4.x development files"
+#MISE description="Check for development files for the default TLS backend"
 set -euo pipefail
-pkg-config --print-errors --exists 'openssl >= 4.0' 'openssl < 5'
+pkg-config --print-errors --exists 'openssl >= 3.5' 'openssl < 5'

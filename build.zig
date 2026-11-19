@@ -40,7 +40,9 @@ pub fn build(b: *std.Build) void {
         else
             null,
     };
-    const enable_tls = b.option(bool, "tls", "Enable TLS transport support through system OpenSSL 4.x") orelse false;
+    const backend = b.option(enum { openssl, mbedtls }, "tls-backend", "Enable native TLS with this backend");
+    const enable_tls = b.option(bool, "tls", "Enable native TLS (defaults to OpenSSL)") orelse (backend != null);
+    const use_mbedtls = enable_tls and (backend orelse .openssl) == .mbedtls;
     const enable_zio = b.option(bool, "zio", "Build zio examples and integration tests") orelse false;
     const enable_protobuf = b.option(
         bool,
@@ -104,6 +106,7 @@ pub fn build(b: *std.Build) void {
     const grpc_lite_options = b.addOptions();
     grpc_lite_options.addOption([]const u8, "version", manifest.version);
     grpc_lite_options.addOption(bool, "tls", enable_tls);
+    grpc_lite_options.addOption(bool, "mbedtls", use_mbedtls);
     grpc_lite_options.addOption(bool, "sanitize_thread", sanitizers.thread == true);
     const grpc_lite = b.addModule("grpc_lite", .{
         .root_source_file = b.path("src/root.zig"),
@@ -137,10 +140,15 @@ pub fn build(b: *std.Build) void {
         b.lazyDependency("gperftools", .{}) orelse return
     else
         null;
+    const mbedtls_dependency = if (use_mbedtls)
+        b.lazyDependency("mbedtls", .{}) orelse return
+    else
+        null;
     const native = addNativeDependencies(
         b,
         nghttp2_dependency.path(""),
         cares_dependency.path(""),
+        if (mbedtls_dependency) |dependency| dependency.path("") else null,
         if (gperftools_dependency) |dependency| dependency.path("") else null,
         target,
         optimize,
@@ -171,11 +179,19 @@ pub fn build(b: *std.Build) void {
     addCBindings(b, grpc_lite, "nghttp2_bindings", "#define _FORTIFY_SOURCE 0\n#include <nghttp2/nghttp2.h>\n", target);
     addCBindings(b, grpc_lite, "cares_bindings", "#define CARES_STATICLIB 1\n#include <ares.h>\n", target);
     addCBindings(b, grpc_lite, "cpucycles_bindings", "#include <cpucycles.h>\n#include <stdio.h>\n", target);
-    const openssl_libdir: ?std.Build.LazyPath = if (enable_tls) blk: {
+    if (mbedtls_dependency) |dependency| {
+        grpc_lite.addIncludePath(dependency.path("include"));
+        grpc_lite.addIncludePath(b.path("tools"));
+        grpc_lite.addObjectFile(native.mbedtls_archive.?);
+        addCBindings(b, grpc_lite, "mbedtls_bindings", "#define MBEDTLS_USER_CONFIG_FILE \"mbedtls_user_config.h\"\n" ++
+            "#include <psa/crypto.h>\n#include <mbedtls/ctr_drbg.h>\n#include <mbedtls/entropy.h>\n" ++
+            "#include <mbedtls/error.h>\n#include <mbedtls/pk.h>\n#include <mbedtls/ssl.h>\n#include <mbedtls/x509_crt.h>\n", target);
+    }
+    const openssl_libdir: ?std.Build.LazyPath = if (enable_tls and !use_mbedtls) blk: {
         const include: std.Build.LazyPath = .{ .cwd_relative = std.mem.trim(u8, b.run(&.{ "pkg-config", "--variable=includedir", "libssl" }), " \t\r\n") };
         const lib: std.Build.LazyPath = .{ .cwd_relative = std.mem.trim(u8, b.run(&.{ "pkg-config", "--variable=libdir", "libssl" }), " \t\r\n") };
         const bindings = b.addTranslateC(.{ .root_source_file = b.path("src/openssl.h"), .target = target, .optimize = optimize });
-        bindings.addSystemIncludePath(include);
+        bindings.addIncludePath(include);
         grpc_lite.addImport("openssl_bindings", bindings.createModule());
         linkOpenSSL(grpc_lite, lib);
         break :blk lib;
@@ -333,6 +349,7 @@ pub fn build(b: *std.Build) void {
     package_static_library.addArg(b.graph.zig_exe);
     package_static_library.addFileArg(native.nghttp2_archive);
     package_static_library.addFileArg(native.cares_archive);
+    if (native.mbedtls_archive) |archive| package_static_library.addFileArg(archive);
     if (native.gperftools_archive) |archive| package_static_library.addFileArg(archive);
     const install_library = b.addInstallFileWithDir(
         packaged_static_library,
@@ -1088,6 +1105,7 @@ const NativeDependencies = struct {
     nghttp2_include: std.Build.LazyPath,
     cares_archive: std.Build.LazyPath,
     cares_include: std.Build.LazyPath,
+    mbedtls_archive: ?std.Build.LazyPath,
     gperftools_archive: ?std.Build.LazyPath,
     gperftools_force_link: ?std.Build.LazyPath,
 };
@@ -1134,6 +1152,7 @@ fn addNativeDependencies(
     b: *std.Build,
     nghttp2_source_dir: std.Build.LazyPath,
     cares_source_dir: std.Build.LazyPath,
+    mbedtls_source_dir: ?std.Build.LazyPath,
     gperftools_source_dir: ?std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -1175,6 +1194,22 @@ fn addNativeDependencies(
         false,
     );
 
+    const build_mbedtls = if (mbedtls_source_dir) |source_dir|
+        addNativeBuild(
+            b,
+            "mbedtls",
+            source_dir,
+            cmake_build_type,
+            cc,
+            cxx,
+            target_triple,
+            sanitizers,
+            false,
+            false,
+        )
+    else
+        null;
+
     const build_gperftools = if (gperftools_source_dir) |source_dir|
         addNativeBuild(
             b,
@@ -1197,6 +1232,7 @@ fn addNativeDependencies(
         .cares_archive = build_cares.path(b, "lib/libcares.a"),
         // CMake generates ares_build.h in the build root, not include/.
         .cares_include = build_cares,
+        .mbedtls_archive = if (build_mbedtls) |output| output.path(b, "libmbedtls_combined.a") else null,
         .gperftools_archive = if (build_gperftools) |output| output.path(b, "libgrpc_lite_gperftools.a") else null,
         .gperftools_force_link = if (build_gperftools) |output| output.path(b, "gperftools_force_link.o") else null,
     };
@@ -1227,6 +1263,7 @@ fn addNativeBuild(
         target_triple,
     });
     run.addFileArg(b.path("tools/gperftools_force_link.c"));
+    run.addFileArg(b.path("tools/mbedtls_user_config.h"));
     run.addArgs(&.{
         if (sanitizers.thread == true) "true" else "false",
         if (sanitizers.c == .full) "true" else "false",

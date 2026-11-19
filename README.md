@@ -90,7 +90,7 @@ Typed generated C++ services keep the official Protobuf runtime as an explicit e
 dependency; the raw transport and grpcpp-shaped facade do not require Protobuf or
 Abseil. See [the C and C++ API guide](docs/c-cpp-api.md) for extraction, offline CMake,
 and code-generation details. The native Zig build supports Linux x86_64 and arm64, with
-TLS available through an optional OpenSSL 4.x build.
+TLS available through an optional native build with system OpenSSL (3.5+/4.x) or pinned mbedTLS.
 
 ## Compatibility
 

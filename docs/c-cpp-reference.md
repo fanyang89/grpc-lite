@@ -266,7 +266,7 @@ above use x86_64. CMake rejects bundles generated for a different architecture.
 
 The generated-only asset targets insecure Linux x86_64 and ARM64. TLS is out of scope for this
 transpiled-C release bundle until separately selected, and CMake rejects
-`GRPC_LITE_ENABLE_TLS=ON`. This does not change the optional OpenSSL 4.x support available to
+`GRPC_LITE_ENABLE_TLS=ON`. This does not change the optional OpenSSL or mbedTLS support available to
 native Zig builds.
 
 The asset contains only its manifest, two generated C translation units, and the matching

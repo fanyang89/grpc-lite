@@ -35,6 +35,7 @@ UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
     zig build test -Doptimize=Debug -Dsanitize-thread=false -Dsanitize-c=true --summary all
 
 .mise/tasks/prepare-tls-deps
+zig build test -Dtls-backend=mbedtls -Doptimize=ReleaseSafe --summary all
 zig build test -Dtls=true --summary all
 zig build test -Dtls=true -Doptimize=ReleaseSafe --summary all
 TSAN_OPTIONS="halt_on_error=1:exitcode=66:suppressions=$project_root/tools/tsan.supp" \

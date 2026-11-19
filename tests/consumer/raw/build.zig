@@ -6,7 +6,8 @@ pub fn build(b: *std.Build) void {
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
     const sanitize_c = b.option(bool, "sanitize-c", "Enable C undefined behavior detection") orelse false;
     const enable_gperftools = b.option(bool, "gperftools", "Enable gperftools support") orelse false;
-    const enable_tls = b.option(bool, "tls", "Enable TLS support") orelse false;
+    const backend = b.option(enum { openssl, mbedtls }, "tls-backend", "TLS backend");
+    const enable_tls = b.option(bool, "tls", "Enable TLS support") orelse (backend != null);
     const grpc_lite = b.dependency("grpc_lite", .{
         .target = target,
         .optimize = optimize,
@@ -15,6 +16,7 @@ pub fn build(b: *std.Build) void {
         .gperftools = enable_gperftools,
         .protobuf = false,
         .tls = enable_tls,
+        .@"tls-backend" = @tagName(backend orelse .openssl),
     });
     const root_module = b.createModule(.{
         .root_source_file = b.path(if (enable_gperftools) "src/gperftools.zig" else "src/main.zig"),

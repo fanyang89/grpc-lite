@@ -125,7 +125,7 @@ jobs:
       - name: Restore verified dependencies
         uses: ./.github/actions/dependencies
 
-      - uses: ./.github/actions/openssl4
+      - uses: ./.github/actions/openssl
 
       - name: Build and run raw public API package consumer
         run: mise run test-consumer
@@ -232,7 +232,14 @@ jobs:
 
   tls-test:
     needs: dependencies
-    name: TLS
+    name: TLS (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: OpenSSL 4, backend: openssl, series: '4' }
+          - { label: OpenSSL 3.5, backend: openssl, series: '3.5' }
+          - { label: mbedTLS, backend: mbedtls }
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -250,19 +257,22 @@ jobs:
       - name: Restore verified dependencies
         uses: ./.github/actions/dependencies
 
-      - uses: ./.github/actions/openssl4
+      - uses: ./.github/actions/openssl
+        if: matrix.backend == 'openssl'
+        with:
+          series: ${{ matrix.series }}
 
       - name: Run TLS tests
-        run: mise run test-tls
+        run: zig build test -Dtls-backend=${{ matrix.backend }} --summary all
 
       - name: Run ReleaseSafe TLS tests
-        run: zig build test -Dtls=true -Doptimize=ReleaseSafe --summary all
+        run: zig build test -Dtls-backend=${{ matrix.backend }} -Doptimize=ReleaseSafe --summary all
 
       - name: Run TLS ThreadSanitizer tests
-        run: mise run test-tls-tsan
+        run: TSAN_OPTIONS="halt_on_error=1:exitcode=66:suppressions=$PWD/tools/tsan.supp" zig build test -Dtls-backend=${{ matrix.backend }} -Doptimize=ReleaseSafe -Dsanitize-thread=true -Dsanitize-c=false --summary all --test-timeout 30s
 
       - name: Run TLS UndefinedBehaviorSanitizer tests
-        run: UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Dtls=true -Dsanitize-thread=false -Dsanitize-c=true --summary all
+        run: UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 zig build test -Dtls-backend=${{ matrix.backend }} -Dsanitize-thread=false -Dsanitize-c=true --summary all
 
   gperftools:
     needs: dependencies
@@ -364,7 +374,7 @@ jobs:
       - name: Run bidirectional task interop with zio
         run: mise run interop-async
 
-      - uses: ./.github/actions/openssl4
+      - uses: ./.github/actions/openssl
 
       - name: Run official TLS interop
         if: matrix.arch == 'x64'

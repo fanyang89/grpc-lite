@@ -439,22 +439,33 @@ alongside snapshots when diagnosing memory growth.
 
 ## TLS
 
-Native TLS uses the target's OpenSSL 4.x development headers and `libssl`/`libcrypto`
-through pkg-config. `-Dtls=false` (the default) does not need OpenSSL. For a
-non-system installation, set `PKG_CONFIG_PATH` to its pkg-config directory and
-configure the dynamic loader to find the corresponding libraries. When linking
-`libgrpc_lite.a` outside Zig, link OpenSSL after the archive (`pkg-config --libs openssl`,
-or `pkg-config --static --libs openssl` with static OpenSSL archives).
-grpc-lite remains MIT licensed; OpenSSL is distributed under Apache-2.0.
+TLS is off by default: the cleartext build neither probes nor links either TLS library.
+Select one backend at build time for all channels and servers:
 
 ```bash
-mise run prepare-tls-deps
-zig build -Dtls=true
+zig build                               # cleartext
+zig build -Dtls=true                    # TLS with system OpenSSL (default TLS backend)
+zig build -Dtls-backend=openssl         # same as above
+zig build -Dtls-backend=mbedtls         # TLS with pinned mbedTLS 3.6.6
 ```
 
-Downstream packages pass `.tls = true` to the grpc-lite dependency. Clients trust only
+Downstream Zig packages can pass `.tls = true` or `.@"tls-backend" = "mbedtls"`
+to `b.dependency`. Selecting a backend enables TLS unless `.tls = false` is explicit.
+
+- **OpenSSL**: use the target's OpenSSL 3.5 or later in the 3.x series, or 4.x.
+  Supply matching headers and libraries via pkg-config. For a non-system installation,
+  set `PKG_CONFIG_PATH` and configure the loader to find the corresponding libraries.
+  When linking `libgrpc_lite.a` outside Zig, link OpenSSL after the archive
+  (`pkg-config --libs openssl`, or `pkg-config --static --libs openssl` with static
+  OpenSSL archives). Build against the major version that will be deployed.
+- **mbedTLS**: Zig fetches the pinned source only when selected, builds it for the
+  target and includes it in the native static archive. No system OpenSSL dependency.
+  grpc-lite remains MIT; redistribute the selected dependency with its applicable
+  license and notices (OpenSSL: Apache-2.0; mbedTLS offers Apache-2.0).
+
+Clients trust only
 the supplied PEM CA bundle; system roots are not searched. DNS targets use hostname
-verification and SNI; IPv4 literals verify the IP SAN without SNI. TLS 1.2 or newer and ALPN `h2` are mandatory. TLS 1.2 is limited
+verification and SNI; with OpenSSL, IPv4 literals verify the IP SAN without SNI. TLS 1.2 or newer and ALPN `h2` are mandatory. TLS 1.2 is limited
 to ECDHE AEAD suites, while TLS 1.3 uses its AES-GCM and ChaCha20-Poly1305 suites, matching
 the HTTP/2 cipher profile. The default handshake timeout is ten seconds.
 
