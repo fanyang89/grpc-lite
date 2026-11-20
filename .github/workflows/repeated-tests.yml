@@ -19,7 +19,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  dependencies:
+    uses: ./.github/workflows/dependencies.yml
+
   repeated-tests:
+    needs: dependencies
     name: ${{ matrix.name }} x${{ inputs.iterations || '20' }}
     strategy:
       fail-fast: false
@@ -49,6 +53,9 @@ jobs:
         uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
           version: 2026.7.14
+
+      - name: Restore verified dependencies
+        uses: ./.github/actions/dependencies
 
       - uses: ./.github/actions/openssl
         if: matrix.task == 'test-tls-tsan'
