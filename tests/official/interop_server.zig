@@ -132,7 +132,11 @@ pub const Service = struct {
         var writer: std.Io.Writer.Allocating = .init(allocator);
         defer writer.deinit();
         try response.encode(&writer.writer, allocator);
-        return grpc.UnaryResponse.ok(allocator, writer.written());
+        return .{
+            .allocator = allocator,
+            .status = .ok,
+            .payload = try writer.toOwnedSlice(),
+        };
     }
 
     fn streamingOutputStart(

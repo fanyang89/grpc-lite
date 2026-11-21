@@ -17,7 +17,8 @@ const raw_stream = @import("stream.zig");
 const tls_record = if (build_options.tls) @import("tls_record.zig") else @import("tls_disabled.zig");
 
 // Bounds socket-write aggregation only; HTTP/2 frame boundaries remain unchanged.
-const socket_write_batch_target = 64 * 1024;
+const cleartext_write_batch_target = 256 * 1024;
+const tls_write_batch_target = 64 * 1024;
 const response_header_stack_capacity = 4;
 const encoded_value_stack_capacity = 4;
 const local_page_size = @max(std.heap.page_size_max, 128 * 1024);
@@ -1732,9 +1733,9 @@ const Connection = struct {
             if (try batch.append(
                 self.allocator(),
                 data[0..@intCast(length)],
-                socket_write_batch_target,
+                cleartext_write_batch_target,
             )) |bytes| try self.queueOwnedSocketWrite(bytes);
-            if (batch.ready(socket_write_batch_target)) {
+            if (batch.ready(cleartext_write_batch_target)) {
                 try self.queueOwnedSocketWrite((try batch.take(self.allocator())).?);
             }
         }
@@ -1744,7 +1745,7 @@ const Connection = struct {
     fn flushTls(self: *Connection) !void {
         const tls_session = self.tls_session.?;
         while (!self.closing) {
-            if (tls_session.pendingCiphertextBytes() >= socket_write_batch_target) try self.drainTlsCiphertext();
+            if (tls_session.pendingCiphertextBytes() >= tls_write_batch_target) try self.drainTlsCiphertext();
             if (tls_session.hasPendingWrite()) {
                 const result = try tls_session.continueWrite();
                 if (try self.finishTlsWrite(result)) continue;
