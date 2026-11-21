@@ -1,0 +1,39 @@
+--- a/native/grpc.cc
++++ b/native/grpc.cc
+@@ -1,15 +1,25 @@
+ #include "load.h"
+ #include "benchmark.grpc.pb.h"
+ #include <grpcpp/grpcpp.h>
++#include <fstream>
++#include <iterator>
+ 
+ int main(int argc, char** argv) {
+   try {
+     auto config = load::parse(argc, argv);
++    auto credentials = grpc::InsecureChannelCredentials();
++    if (const char* ca = std::getenv("TLS_CA")) {
++      std::ifstream pem(ca);
++      grpc::SslCredentialsOptions options;
++      options.pem_root_certs.assign(std::istreambuf_iterator<char>(pem), {});
++      if (options.pem_root_certs.empty()) throw std::runtime_error("missing TLS CA");
++      credentials = grpc::SslCredentials(options);
++    }
+     return load::run(config, [&] {
+       grpc::ChannelArguments arguments;
+       arguments.SetInt("grpc.use_local_subchannel_pool", 1);
+       arguments.SetInt("grpc.enable_retries", 0);
+-      auto channel = grpc::CreateCustomChannel(config.address, grpc::InsecureChannelCredentials(), arguments);
++      auto channel = grpc::CreateCustomChannel(config.address, credentials, arguments);
+       if (!channel->WaitForConnected(std::chrono::system_clock::now() + std::chrono::seconds(10)))
+         throw std::runtime_error("connect timeout");
+       auto client = grpc::testing::TestService::NewStub(channel);
+--- a/native/load.h
++++ b/native/load.h
+@@ -88,6 +88,7 @@
+     changed.wait(lock, [&] { return ready == config.concurrency; });
+     begin = Clock::now() + std::chrono::milliseconds(config.warmup_ms);
+     finish = begin + std::chrono::milliseconds(config.duration_ms);
++    std::cerr << "workers ready\n";
+     start = true;
+     changed.notify_all();
+   }

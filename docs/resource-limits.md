@@ -53,6 +53,10 @@ Receive pause defers flow-control credit. Inbound overflow fails the RPC with
 `RESOURCE_EXHAUSTED`. Message limits and buffer capacities must be configured together;
 each stream capacity must be at least `max_message_size + 5`.
 
+The cleartext server batches ready HTTP/2 output into socket writes targeting
+256 KiB. It counts pending batch bytes toward the write high watermark and
+flushes a partial batch when no more output is ready; it does not wait to fill it.
+
 Native TLS batches ciphertext in its existing 64 KiB output queue. A flush drains
 the batch when full, when TLS needs I/O, or when no more HTTP/2 output can be
 admitted; small tails do not wait for a timer. Write high-watermark admission

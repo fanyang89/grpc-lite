@@ -1,0 +1,6 @@
+{"server": "grpc-lite", "req": 1048576, "resp": 64, "completed": 136, "transport_stalls": 2638, "stream_stalls": 864, "window_updates": 7154, "response_data_frames": 136}
+{"server": "tonic", "req": 1048576, "resp": 64, "completed": 330, "transport_stalls": 404, "stream_stalls": 21, "window_updates": 1095, "response_data_frames": 330}
+{"server": "tonic", "req": 64, "resp": 1048576, "completed": 269, "transport_stalls": 0, "stream_stalls": 0, "window_updates": 32, "response_data_frames": 269}
+{"server": "grpc-lite", "req": 64, "resp": 1048576, "completed": 191, "transport_stalls": 0, "stream_stalls": 0, "window_updates": 0, "response_data_frames": 12415}
+{"server": "grpc-lite", "req": 1048576, "resp": 1048576, "completed": 94, "transport_stalls": 1820, "stream_stalls": 727, "window_updates": 4943, "response_data_frames": 6110}
+{"server": "tonic", "req": 1048576, "resp": 1048576, "completed": 203, "transport_stalls": 245, "stream_stalls": 14, "window_updates": 712, "response_data_frames": 203}
