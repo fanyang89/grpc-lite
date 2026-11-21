@@ -1,0 +1,19 @@
+profile	samples	caller_pcs_minus_one	copy_site
+profile-plain-grpc-lite-1048576-1048576-1	34	0x10b20c0,0x10b2368,0x10f4ce9,0x10a903e	request body assembly
+profile-plain-grpc-lite-1048576-1048576-1	33	0x10bf650,0x10b0722,0x10f2cfb,0x10f4d3a	UnaryResponse.init: owned payload dupe
+profile-plain-grpc-lite-1048576-1048576-1	32	0x10cd1fe,0x10b9dea,0x10bf5ed,0x10b0722	protobuf response encoding via Allocating.drain
+profile-plain-grpc-lite-1048576-1048576-1	28	0x10bdc5f,0x10beb64,0x10b0722,0x10f2cfb	request protobuf decode
+profile-plain-grpc-lite-1048576-1048576-1	26	0x109e6f0,0x10a9056,0x109b45d,0x109a3ea	CleartextWriteBatch.append: append
+profile-plain-grpc-lite-1048576-1048576-1	26	0x10cd1fe,0x10b9e87,0x10bf5ed,0x10b0722	protobuf response encoding via Allocating.drain
+profile-plain-grpc-lite-1048576-1048576-1	18	0x10ad85d,0x10f61ae,0x10ef689,0x10eec29	readResponseData: nghttp2 output
+profile-plain-grpc-lite-1048576-1048576-1	5	0x109e5b1,0x10a9056,0x109b45d,0x109a3ea	CleartextWriteBatch.append: grow
+profile-plain-grpc-lite-1048576-1048576-1	1	0x10a9056,0x109b45d,0x109a3ea	server.onRead
+profile-plain-grpc-lite-1048576-64-1	69	0x10bdc5f,0x10beb64,0x10b0722,0x10f2cfb	request protobuf decode
+profile-plain-grpc-lite-1048576-64-1	61	0x10b20c0,0x10b2368,0x10f4ce9,0x10a903e	request body assembly
+profile-plain-grpc-lite-1048576-64-1	1	0x10fc9c9,0x10f3d52,0x10a903e,0x109b45d	nghttp2_cpymem
+profile-plain-grpc-lite-64-1048576-1	54	0x109e6f0,0x10a9056,0x109b45d,0x109a3ea	CleartextWriteBatch.append: append
+profile-plain-grpc-lite-64-1048576-1	45	0x10bf650,0x10b0722,0x10f2cfb,0x10f4d3a	UnaryResponse.init: owned payload dupe
+profile-plain-grpc-lite-64-1048576-1	42	0x10cd1fe,0x10b9e87,0x10bf5ed,0x10b0722	protobuf response encoding via Allocating.drain
+profile-plain-grpc-lite-64-1048576-1	28	0x10cd1fe,0x10b9dea,0x10bf5ed,0x10b0722	protobuf response encoding via Allocating.drain
+profile-plain-grpc-lite-64-1048576-1	18	0x109e5b1,0x10a9056,0x109b45d,0x109a3ea	CleartextWriteBatch.append: grow
+profile-plain-grpc-lite-64-1048576-1	17	0x10ad85d,0x10f61ae,0x10ef689,0x10eec29	readResponseData: nghttp2 output
