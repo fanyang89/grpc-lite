@@ -171,6 +171,9 @@ the official HTTP/2 framing and TLS profile suites passed.
 
 ## Reproduce
 
+For the later server receive-path experiment based on PR #115, see
+`receive/README.md`.
+
 Benchmark source: https://github.com/fanyang89/rpc-framework-bench
 at `dd1f8f65a7fcc437931f6b1adddc1ba63703b45a`. Use its built `bin/tonic-server`
 and `scripts/certificates.sh` for a valid benchmark CA and localhost certificate.
