@@ -132,11 +132,7 @@ jobs:
       - name: Build and run typed task package consumer
         run: mise run test-consumer-async
       - name: Install protobuf C++ tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends \
-            protobuf-compiler \
-            libprotobuf-dev
+        run: sudo bash .github/scripts/install-protobuf.sh
       - name: Test installed C++ headers and unary/streaming package consumers
         run: mise run test-consumer-cpp
 
@@ -362,11 +358,7 @@ jobs:
         run: mise run interop
 
       - name: Install protobuf C++ tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends \
-            protobuf-compiler \
-            libprotobuf-dev
+        run: sudo bash .github/scripts/install-protobuf.sh
 
       - name: Run official insecure interop
         run: mise run interop-official
