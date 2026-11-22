@@ -1665,7 +1665,8 @@ const Connection = struct {
     write_request_pool_head: ?*WriteRequest = null,
     write_request_pool_count: usize = 0,
     read_buffer: []u8 = &.{},
-    plaintext_buffer: [16 * 1024]u8 = undefined,
+    // Cleartext socket input or decrypted TLS input; TLS ciphertext always uses read_buffer.
+    inline_read_buffer: [16 * 1024]u8 = undefined,
     tls_session: ?*tls_record.Session = null,
     tls_handshaking: bool = false,
     connection_deadline: ?ConnectionDeadline = null,
@@ -1905,11 +1906,11 @@ const Connection = struct {
         if (comptime !build_options.tls) return error.TlsUnavailable;
         const tls_session = self.tls_session orelse return error.TlsUnavailable;
         while (true) {
-            switch (try tls_session.read(&self.plaintext_buffer)) {
+            switch (try tls_session.read(&self.inline_read_buffer)) {
                 .bytes => |length| {
                     const consumed = c.nghttp2_session_mem_recv2(
                         self.session,
-                        self.plaintext_buffer[0..length].ptr,
+                        self.inline_read_buffer[0..length].ptr,
                         length,
                     );
                     if (consumed < 0 or consumed != @as(c.nghttp2_ssize, @intCast(length)))
@@ -1943,9 +1944,12 @@ const Connection = struct {
 
     fn startRead(self: *Connection, loop: *xev.Loop) !void {
         if (self.close_after_writes or self.closing or self.read_active) return;
-        if (self.read_buffer.len == 0) self.read_buffer = try self.allocator().alloc(u8, 16 * 1024);
+        if (self.tls_session != null and self.read_buffer.len == 0) {
+            self.read_buffer = try self.allocator().alloc(u8, self.inline_read_buffer.len);
+        }
         self.read_active = true;
-        self.tcp.read(loop, &self.read_completion, .{ .slice = self.read_buffer }, Connection, self, onRead);
+        const buffer = if (self.read_buffer.len != 0) self.read_buffer else &self.inline_read_buffer;
+        self.tcp.read(loop, &self.read_completion, .{ .slice = buffer }, Connection, self, onRead);
     }
 
     fn closeTerminatedSession(self: *Connection, loop: *xev.Loop) void {
@@ -2623,6 +2627,10 @@ fn onRead(connection: ?*Connection, loop: *xev.Loop, _: *xev.Completion, _: xev.
     } else {
         conn.flush() catch conn.closeOnLoop(loop);
         conn.closeTerminatedSession(loop);
+        if (length == conn.inline_read_buffer.len and conn.read_buffer.len == 0 and !conn.closing and !conn.close_after_writes) {
+            // The inline buffer remains usable if the optional larger read buffer cannot be allocated.
+            conn.read_buffer = conn.allocator().alloc(u8, 64 * 1024) catch &.{};
+        }
         if (!conn.close_after_writes) conn.startRead(loop) catch conn.closeOnLoop(loop);
     }
     if (conn.closing) conn.submitCloseIfReady(loop);
@@ -3614,6 +3622,8 @@ fn completeStreamingRemoteEnd(target: *Stream) void {
 
 fn finishRequest(session: *c.nghttp2_session, stream: *Stream) void {
     stream.responded = true;
+    // The request borrow ends with the handler; queued responses own their payload.
+    defer if (stream.connection.tls_session == null) stream.request_body.clearAndFree(stream.allocator);
     removeStreamDeadline(stream);
     if (stream.header_too_large or stream.request_too_large) {
         submitFailure(session, stream, .resource_exhausted, "request too large");
@@ -6351,6 +6361,25 @@ test "invalid HTTP/2 max frame size emits protocol error GOAWAY" {
     }
     try std.testing.expectEqual(output.len, offset);
     try std.testing.expect(saw_protocol_error_goaway);
+}
+
+test "completed unary request releases its input while the response is queued" {
+    const Handler = struct {
+        fn handle(_: *@This(), allocator: std.mem.Allocator, _: *service.ServerContext, request: []const u8) !service.UnaryResponse {
+            return service.UnaryResponse.ok(allocator, request);
+        }
+    };
+    var handler = Handler{};
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    try server.registerUnary("/test.Echo/Unary", service.UnaryHandler.bind(Handler, &handler, Handler.handle));
+    var connection = Connection{ .server = server.impl };
+    try connection.initializeSession();
+    defer deinitTestConnection(&connection);
+    try feedTestRequest(&connection, .{ .body = "echo" });
+    const stream = connection.streams.get(1).?;
+    try std.testing.expectEqual(0, stream.request_body.capacity);
+    try std.testing.expectEqualStrings("echo", stream.response_body);
 }
 
 test "server validates registration and has deterministic lifecycle" {

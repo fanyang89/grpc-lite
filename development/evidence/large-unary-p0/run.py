@@ -19,13 +19,15 @@ assert phase in (
     "profile-tls",
     "flow",
     "ab",
+    "tls-ab",
     "profile-ab",
 )
 flow = phase == "flow"
 profile = phase.startswith("profile-")
-tls = phase.endswith("tls")
+tls = phase.endswith("tls") or phase == "tls-ab"
 out.mkdir(parents=True, exist_ok=True)
 certs = bench / "bin/certs"
+workers = os.environ.get("BENCH_WORKERS", "32")
 
 
 def ticks(pid):
@@ -81,7 +83,7 @@ def run(server, req, resp, rep, binary=lite):
                             client,
                             "client",
                             addr,
-                            "32",
+                            workers,
                             str(req),
                             str(resp),
                             "0",
@@ -124,7 +126,7 @@ def run(server, req, resp, rep, binary=lite):
                     client,
                     "client",
                     addr,
-                    "32",
+                    workers,
                     str(req),
                     str(resp),
                     "1000",
@@ -191,9 +193,19 @@ def run(server, req, resp, rep, binary=lite):
                 req=req,
                 resp=resp,
                 rep=rep,
+                workers=int(workers),
                 cpu_s=cpu_s,
                 cpu_window_s=wall_s,
                 cpu_pct=100 * cpu_s / wall_s,
+                server_peak_rss_kib=int(
+                    next(
+                        line.split()[1]
+                        for line in Path(f"/proc/{srv.pid}/status")
+                        .read_text()
+                        .splitlines()
+                        if line.startswith("VmHWM:")
+                    )
+                ),
             )
             print(json.dumps(result), flush=True)
         finally:

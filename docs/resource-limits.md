@@ -56,6 +56,9 @@ each stream capacity must be at least `max_message_size + 5`.
 The cleartext server batches ready HTTP/2 output into socket writes targeting
 256 KiB. It counts pending batch bytes toward the write high watermark and
 flushes a partial batch when no more output is ready; it does not wait to fill it.
+Cleartext input starts in the connection's inline 16 KiB buffer. After a full
+read, the server can allocate a 64 KiB receive buffer for the remaining
+connection lifetime. This does not change HTTP/2 receive windows or RPC limits.
 
 Native TLS batches ciphertext in its existing 64 KiB output queue. A flush drains
 the batch when full, when TLS needs I/O, or when no more HTTP/2 output can be
